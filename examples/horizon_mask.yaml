@@ -1,0 +1,30 @@
+# terminus horizon mask (Seestar S50, EQ mode, RA/Dec goto).
+# azimuth/altitude are TRUE (polar-aligned); altitude = lowest clear sky.
+# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.
+# Example only — a plausible suburban backyard (houses low, trees flanking NE/E).
+meta: {measured: '2026-08-02 14:30', lat: 39.7917, lon: -104.894, az_step: 15, sun_cone_deg: 30, clear_thresh: 0.85}
+horizon:
+  0: {alt: 22.0, type: structure}
+  15: {alt: 24.5, type: structure}
+  30: {alt: 31.0, type: tree}
+  45: {alt: 38.0, type: tree}
+  60: {alt: 33.5, type: tree}
+  75: {alt: 20.0, type: tree}
+  90: {alt: 12.0, type: structure}
+  105: {alt: 15.0, type: structure}
+  120: {alt: 14.5, type: structure}
+  135: {alt: 10.0, type: structure}
+  150: {alt: 8.0, type: open}
+  165: {alt: 7.5, type: open}
+  180: {alt: 9.0, type: open}
+  195: {alt: 12.0, type: structure}
+  210: {alt: 18.0, type: structure}
+  225: {alt: 24.0, type: structure}
+  240: {alt: 20.0, type: structure}
+  255: {alt: 16.0, type: structure}
+  270: {alt: 14.0, type: structure}
+  285: {alt: 19.0, type: tree}
+  300: {alt: 28.0, type: tree}
+  315: {alt: 30.0, type: tree}
+  330: {alt: 26.0, type: structure}
+  345: {alt: 23.0, type: structure}

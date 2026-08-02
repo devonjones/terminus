@@ -1,0 +1,21 @@
+# terminus configuration. Copy to config.toml and edit.
+# Only [scope] is required. [site] can be omitted (read from the scope).
+
+[scope]
+host = "10.5.2.65"                            # your Seestar's IP (a static lease helps)
+pem  = "~/.seestar/seestar_client_key.pem"   # interop key; see README (never commit this)
+
+[site]                       # optional — omit to use the location stored on the scope
+# lat = 39.7917              # degrees north
+# lon = -104.894            # degrees east (west is negative)
+# elev_m = 1600
+
+[sweep]
+az_step       = 5     # azimuth step, degrees (5 = 72 spokes; 10 is quicker/coarser)
+alt_min       = 0     # lowest altitude searched
+alt_max       = 45    # highest; raise if obstructions reach higher
+alt_tol       = 0.7   # altitude bisection tolerance, degrees
+sun_cone_deg  = 30    # never point within this angle of the Sun
+clear_thresh  = 0.85  # sky fraction to call a frame "clear" (high = conservative;
+                      # dappled tree canopy counts as blocked = top-of-canopy horizon)
+slew_step_deg = 5     # max slew increment; every step is re-checked against the Sun

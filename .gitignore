@@ -1,0 +1,18 @@
+# secrets — never commit, anywhere
+*.pem
+config.toml
+
+# measured outputs / review artifacts from root-level runs (examples/ are kept)
+/horizon_mask*.yaml
+/*.hrz
+/*.stellarium.txt
+*_frames/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/

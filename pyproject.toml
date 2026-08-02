@@ -1,0 +1,39 @@
+[project]
+name = "terminus-horizon"
+version = "0.1.0"
+description = "Measure your local horizon with a Seestar S50 and export it for N.I.N.A., Stellarium, and planning tools"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Devon Jones" }]
+keywords = ["astronomy", "seestar", "horizon", "nina", "stellarium", "astrophotography"]
+dependencies = [
+    "numpy",
+    "pillow",
+    "cryptography",
+    "astropy",
+    "pyyaml",
+]
+
+[project.urls]
+Homepage = "https://github.com/devonjones/terminus"
+
+[project.scripts]
+terminus = "terminus.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "black"]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "terminus"
+module-root = "src"
+
+[tool.black]
+line-length = 100
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
