@@ -29,9 +29,9 @@ def load_config(path):
         with open(path, "rb") as f:
             doc = tomllib.load(f)
     except FileNotFoundError:
-        raise ConfigError(f"config not found: {path} (copy config.example.toml)")
+        raise ConfigError(f"config not found: {path} (copy config.example.toml)") from None
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"bad TOML in {path}: {e}")
+        raise ConfigError(f"bad TOML in {path}: {e}") from e
 
     scope = doc.get("scope") or {}
     if not scope.get("host") or not scope.get("pem"):

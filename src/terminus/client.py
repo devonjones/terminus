@@ -45,7 +45,7 @@ class Seestar:
         except FileNotFoundError:
             raise SeestarError(
                 f"interop key not found at {pem_path} — see the README for how to extract it"
-            )
+            ) from None
         self.cmdid = 100
         self.buf = ""
         self.s = socket.socket()
@@ -61,7 +61,7 @@ class Seestar:
             self.s.settimeout(max(0.1, deadline - time.monotonic()))
             try:
                 chunk = self.s.recv(65536)
-            except socket.timeout:
+            except TimeoutError:
                 return None
             if not chunk:
                 return None
@@ -162,7 +162,7 @@ class Seestar:
             )
             return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            raise SeestarError(f"RTSP capture failed (is scenery view running?): {e}")
+            raise SeestarError(f"RTSP capture failed (is scenery view running?): {e}") from e
         finally:
             if os.path.exists(path):
                 os.remove(path)

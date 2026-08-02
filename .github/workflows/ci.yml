@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: uv sync --dev
+      - name: Lint (ruff)
+        run: uv run ruff check src tests
+      - name: Format check (black)
+        run: uv run black --check src tests
+      - name: Unit tests
+        run: uv run pytest -q

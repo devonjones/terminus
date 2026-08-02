@@ -21,8 +21,8 @@ Homepage = "https://github.com/devonjones/terminus"
 [project.scripts]
 terminus = "terminus.cli:main"
 
-[project.optional-dependencies]
-dev = ["pytest", "black"]
+[dependency-groups]
+dev = ["pytest>=8", "black>=24", "ruff>=0.6"]
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
@@ -34,6 +34,13 @@ module-root = "src"
 
 [tool.black]
 line-length = 100
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]  # black owns line wrapping; long strings/URLs are fine
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

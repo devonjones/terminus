@@ -59,6 +59,7 @@ def measure_horizon(config_path="config.toml", az_start=0, az_end=350, out="hori
     """High-level convenience: connect, sweep, write the mask, export. Returns
     (mask, skipped). For scripted/one-shot use; the CLI wraps the same flow."""
     import os
+
     from .export import default_meta
 
     cfg = load_config(config_path)

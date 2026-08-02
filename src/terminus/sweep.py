@@ -20,9 +20,9 @@ import warnings
 import numpy as np
 
 warnings.filterwarnings("ignore")
+import astropy.units as u  # noqa: E402
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun  # noqa: E402
 from astropy.time import Time  # noqa: E402
-import astropy.units as u  # noqa: E402
 
 SETTLE = 1.5
 GOTO_TIMEOUT = 35
@@ -33,7 +33,7 @@ class SunGuard(Exception):
 
 
 def _now():
-    return Time(datetime.datetime.now(datetime.timezone.utc))
+    return Time(datetime.datetime.now(datetime.UTC))
 
 
 def wrap180(d):
