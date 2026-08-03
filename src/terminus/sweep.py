@@ -415,4 +415,52 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
         except SunGuard as e:
             skipped.append(az)
             log(f"az {az:3d}: skipped ({e})", flush=True)
+
+    # ---- adaptive refinement ------------------------------------------------
+    # A uniform step wastes time on flat stretches (a long roofline) and still
+    # misses narrow features (a gap between houses, one tree) wherever the
+    # horizon moves faster than the step. Subdivide only between neighbours that
+    # disagree, which is where the detail actually is.
+    refine_to = cfg.get("az_refine_deg", 0)
+    trigger = cfg.get("refine_threshold_deg", 10.0)
+    budget = cfg.get("refine_max_columns", 24)
+    if refine_to and not dry:
+        work = True
+        while work and budget > 0:
+            work = False
+            known = sorted(mask)
+            for a0, a1 in zip(known, known[1:], strict=False):
+                gap = a1 - a0
+                if gap > 2 * cfg["az_step"]:
+                    continue  # a Sun-skipped hole, not a measured neighbour
+                if gap / 2 < refine_to or abs(mask[a1][0] - mask[a0][0]) < trigger:
+                    continue
+                mid = int(round((a0 + a1) / 2))
+                if mid in mask or budget <= 0:
+                    continue
+                try:
+                    alt, status, typ, profile = scan_horizon(
+                        ptr,
+                        sc,
+                        mid,
+                        cfg["alt_min"],
+                        cfg["alt_max"],
+                        cfg.get("coarse_step", 5.0),
+                        cfg["alt_tol"],
+                        sky_ref,
+                        frames_dir=(f"{save_dir}/scan" if save_dir else None),
+                    )
+                    mask[mid] = (alt, typ)
+                    if profile:
+                        profiles[mid] = profile
+                    if save_dir:
+                        save_boundary_frame(sc, ptr, mid, alt, typ, save_dir)
+                    budget -= 1
+                    work = True
+                    log(
+                        f"az {mid:3d}: alt {alt:5.1f}  {typ:9s} [refine {a0}-{a1}]",
+                        flush=True,
+                    )
+                except SunGuard as e:
+                    log(f"az {mid:3d}: refine skipped ({e})", flush=True)
     return mask, skipped, profiles
