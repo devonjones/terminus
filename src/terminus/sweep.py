@@ -269,18 +269,25 @@ def find_edge(profile):
     return (k - 1, step, snr) if (k is not None and snr >= EDGE_SNR) else (None, step, snr)
 
 
-def save_scan_frame(rgb, az, alt, lum, save_dir):
+def save_scan_frame(rgb, az, alt, lum, save_dir, sky_ref=None):
     """Persist one scan sample. Keeping the whole scan, not just the chosen
     boundary, is what makes a run re-analysable: the classifier can be re-tuned
-    against real frames instead of guessed thresholds."""
+    against real frames instead of guessed thresholds.
+
+    Scaling is FIXED against the run's open-sky reference, never a per-frame
+    percentile stretch. A stretch normalises every frame to full range, so a
+    uniformly dark terrain frame comes back as amplified noise and looks much
+    like open sky — which destroys both visual review and any attempt to recover
+    brightness from disk. With a common scale, dark frames stay dark and frames
+    are comparable to each other.
+    """
     import os
 
     from PIL import Image
 
     os.makedirs(save_dir, exist_ok=True)
-    lo, hi = np.percentile(rgb, 1), np.percentile(rgb, 99.5)
-    span = max(hi - lo, 1e-6)
-    im = Image.fromarray(np.clip((rgb - lo) / span * 255, 0, 255).astype(np.uint8))
+    scale = (1.3 * sky_ref) if sky_ref else 255.0
+    im = Image.fromarray(np.clip(rgb / max(scale, 1e-6) * 255, 0, 255).astype(np.uint8))
     im.save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:05.1f}.png")
 
 
@@ -321,7 +328,7 @@ def scan_horizon(
             if lum > best_lum:
                 best_rgb, best_lum = rgb, lum
         if frames_dir:
-            save_scan_frame(best_rgb, az, alt, best_lum, frames_dir)
+            save_scan_frame(best_rgb, az, alt, best_lum, frames_dir, sky_ref)
         return best_rgb, best_lum
 
     profile, frames = [], {}
@@ -370,14 +377,14 @@ def scan_horizon(
     return round(hi, 1), f"edge(rel {rel:.2f})", obstruction_type(v, st), profile
 
 
-def save_boundary_frame(sc, ptr, az, alt, typ, save_dir):
+def save_boundary_frame(sc, ptr, az, alt, typ, save_dir, sky_ref=None):
     from PIL import Image, ImageDraw
 
     os.makedirs(save_dir, exist_ok=True)
     ptr.point_to(az, alt)
     rgb = sc.capture_rgb()
-    lo, hi = np.percentile(rgb, 1), np.percentile(rgb, 99.5)
-    im = Image.fromarray(np.clip((rgb - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8))
+    scale = (1.3 * sky_ref) if sky_ref else 255.0
+    im = Image.fromarray(np.clip(rgb / max(scale, 1e-6) * 255, 0, 255).astype(np.uint8))
     ImageDraw.Draw(im).text((12, 12), f"az {az}  alt {alt}  {typ}", fill=(255, 0, 0))
     path = f"{save_dir}/az{int(az):03d}.png"
     im.save(path)
@@ -429,7 +436,7 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
                 peak = max(lum for _, lum in profile)
                 sky_ref = peak if sky_ref is None else max(sky_ref, peak)
             frame = (
-                save_boundary_frame(sc, ptr, az, alt, typ, save_dir)
+                save_boundary_frame(sc, ptr, az, alt, typ, save_dir, sky_ref)
                 if (save_dir and not dry)
                 else "-"
             )
@@ -477,7 +484,7 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
                     if profile:
                         profiles[mid] = profile
                     if save_dir:
-                        save_boundary_frame(sc, ptr, mid, alt, typ, save_dir)
+                        save_boundary_frame(sc, ptr, mid, alt, typ, save_dir, sky_ref)
                     budget -= 1
                     work = True
                     log(
