@@ -14,6 +14,7 @@ SWEEP_DEFAULTS = {
     "alt_max": 45.0,
     "alt_tol": 0.7,
     "coarse_step": 5.0,
+    "samples_per_point": 1,  # captures per pointing; >1 rides out drifting cloud
     "az_refine_deg": 5,  # finest azimuth spacing the refinement pass may reach
     "refine_threshold_deg": 10.0,  # neighbour disagreement that triggers refinement
     "refine_max_columns": 24,  # cap on extra columns, so refinement cannot run away

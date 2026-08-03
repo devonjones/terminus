@@ -284,7 +284,18 @@ def save_scan_frame(rgb, az, alt, lum, save_dir):
     im.save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:05.1f}.png")
 
 
-def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None, frames_dir=None):
+def scan_horizon(
+    ptr,
+    sc,
+    az,
+    alt_min,
+    alt_max,
+    coarse_step,
+    tol,
+    sky_ref=None,
+    frames_dir=None,
+    repeats=1,
+):
     """Walk a column from `alt_max` down, then refine the brightness step.
 
     Returns (horizon_alt, status, obstruction_type, profile). `profile` is the
@@ -295,12 +306,23 @@ def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None, 
         return alt_min, "open_to_min", "open", []
 
     def sample(alt):
+        """Brightest of `repeats` captures at this pointing.
+
+        Under drifting cloud the sky's brightness varies while terrain stays
+        black, so the maximum is what separates them: repeated looks can only
+        find sky, never invent it. Averaging would let a momentarily dark sky
+        drift toward the terrain level and blur the very step being measured.
+        """
         ptr.point_to(az, alt)
-        rgb = sc.capture_rgb(warmup=0.3)
-        lum = float((rgb.sum(2) / 3.0).mean())
+        best_rgb, best_lum = None, -1.0
+        for _ in range(max(1, repeats)):
+            rgb = sc.capture_rgb(warmup=0.3)
+            lum = float((rgb.sum(2) / 3.0).mean())
+            if lum > best_lum:
+                best_rgb, best_lum = rgb, lum
         if frames_dir:
-            save_scan_frame(rgb, az, alt, lum, frames_dir)
-        return rgb, lum
+            save_scan_frame(best_rgb, az, alt, best_lum, frames_dir)
+        return best_rgb, best_lum
 
     profile, frames = [], {}
     alt = alt_max
@@ -400,6 +422,7 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
                 cfg["alt_tol"],
                 sky_ref,
                 frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
+                repeats=cfg.get("samples_per_point", 1),
             )
             if profile:
                 profiles[az] = profile
