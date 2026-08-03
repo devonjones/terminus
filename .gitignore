@@ -4,6 +4,7 @@ config.toml
 
 # measured outputs / review artifacts from root-level runs (examples/ are kept)
 /horizon_mask*.yaml
+/horizon_mask*_profiles.json
 /*.hrz
 /*.stellarium.txt
 *_frames/
@@ -16,3 +17,6 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# measured horizon captures (large; kept on disk, not in git)
+captures/

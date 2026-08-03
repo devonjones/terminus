@@ -269,7 +269,22 @@ def find_edge(profile):
     return (k - 1, step, snr) if (k is not None and snr >= EDGE_SNR) else (None, step, snr)
 
 
-def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None):
+def save_scan_frame(rgb, az, alt, lum, save_dir):
+    """Persist one scan sample. Keeping the whole scan, not just the chosen
+    boundary, is what makes a run re-analysable: the classifier can be re-tuned
+    against real frames instead of guessed thresholds."""
+    import os
+
+    from PIL import Image
+
+    os.makedirs(save_dir, exist_ok=True)
+    lo, hi = np.percentile(rgb, 1), np.percentile(rgb, 99.5)
+    span = max(hi - lo, 1e-6)
+    im = Image.fromarray(np.clip((rgb - lo) / span * 255, 0, 255).astype(np.uint8))
+    im.save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:05.1f}.png")
+
+
+def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None, frames_dir=None):
     """Walk a column from `alt_max` down, then refine the brightness step.
 
     Returns (horizon_alt, status, obstruction_type, profile). `profile` is the
@@ -282,7 +297,10 @@ def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None):
     def sample(alt):
         ptr.point_to(az, alt)
         rgb = sc.capture_rgb(warmup=0.3)
-        return rgb, float((rgb.sum(2) / 3.0).mean())
+        lum = float((rgb.sum(2) / 3.0).mean())
+        if frames_dir:
+            save_scan_frame(rgb, az, alt, lum, frames_dir)
+        return rgb, lum
 
     profile, frames = [], {}
     alt = alt_max
@@ -298,14 +316,22 @@ def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None):
         # up. Only brightness relative to known open sky can tell those apart, so
         # without a reference the column is reported as unknown rather than
         # guessed at — an unmeasured azimuth is safer than a wrong one.
-        peak = max(lum for _, lum in profile)
         if sky_ref is None:
             return alt_max, "no_reference", "unknown", profile
-        if peak < 0.5 * sky_ref:
+        lums = sorted(lum for _, lum in profile)
+        median = lums[len(lums) // 2]
+        # Median, not peak: a blocked column can still contain one bright sample
+        # (a gap in foliage, a streetlight, a passing reflection), and judging by
+        # the maximum lets that single outlier declare the whole column open.
+        if median < 0.5 * sky_ref:
             dark = frames[profile[0][0]]
             _, v, st, _ = classify(dark, sky_ref)
             return alt_max, "blocked_above", obstruction_type(v, st), profile
-        return alt_min, "open_to_min", "open", profile
+        if lums[0] >= 0.5 * sky_ref:
+            return alt_min, "open_to_min", "open", profile
+        # Bright overall but with dark samples that form no clean step: report it
+        # as unmeasured rather than inventing a horizon.
+        return alt_max, "inconclusive", "unknown", profile
 
     hi_alt, hi_lum = profile[idx]
     lo_alt, lo_lum = profile[idx + 1]
@@ -373,6 +399,7 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
                 cfg.get("coarse_step", 5.0),
                 cfg["alt_tol"],
                 sky_ref,
+                frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
             )
             if profile:
                 profiles[az] = profile

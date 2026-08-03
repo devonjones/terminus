@@ -96,6 +96,10 @@ def cmd_sweep(sc, cfg, args):
     if not args.dry_run:
         sc.stop_view()
         time.sleep(1)
+        # Lock exposure BEFORE the view starts: with auto-exposure the camera
+        # renormalises every frame and the sky/terrain difference disappears.
+        locked = sc.lock_exposure(exp_ms=cfg["sweep"].get("exp_ms"), gain=cfg["sweep"].get("gain"))
+        print(f"exposure locked: {locked}")
         sc.start_view("scenery")
         time.sleep(3)
     mask, skipped, profiles = run_sweep(
