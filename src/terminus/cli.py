@@ -11,6 +11,7 @@ Global: --config PATH (default ./config.toml). sweep: --az-start --az-end --out
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -97,11 +98,16 @@ def cmd_sweep(sc, cfg, args):
         time.sleep(1)
         sc.start_view("scenery")
         time.sleep(3)
-    mask, skipped = run_sweep(
+    mask, skipped, profiles = run_sweep(
         sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
     )
     if not args.dry_run:
         sc.stop_view()
+    if profiles:
+        prof_path = os.path.splitext(out)[0] + "_profiles.json"
+        with open(prof_path, "w") as f:
+            json.dump(profiles, f, indent=1)
+        print(f"wrote {prof_path} (raw column brightness profiles)")
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
     write_mask(

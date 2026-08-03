@@ -6,7 +6,7 @@ import pytest
 
 from terminus import Horizon, ang_sep, classify, to_nina_hrz, to_stellarium_txt
 from terminus.export import _ascending_pairs, load_mask, write_mask
-from terminus.sweep import obstruction_type, sky_reference, wrap180, wrap_ra
+from terminus.sweep import find_edge, obstruction_type, sky_reference, wrap180, wrap_ra
 
 
 # ---- horizon interpolation -----------------------------------------------
@@ -93,6 +93,21 @@ def test_classifier_tags_obstruction_type():
     ref = sky_reference(solid((150, 170, 210)))
     assert classify(solid((40, 80, 20)), ref)[1] > 0.9  # green -> vegetation
     assert classify(solid((60, 60, 60)), ref)[2] > 0.9  # neutral -> structure
+
+
+def test_find_edge_survives_a_twilight_gradient():
+    # Sky brightening steadily toward the horizon (sunset glow), then terrain.
+    # An absolute threshold fails here; the step is only visible as a drop.
+    profile = [(40, 90), (35, 100), (30, 110), (25, 120), (20, 130), (15, 40), (10, 38), (5, 36)]
+    idx, drop, rel = find_edge(profile)
+    assert profile[idx][0] == 20 and profile[idx + 1][0] == 15  # edge between 20 and 15
+    assert rel > 0.2
+
+
+def test_find_edge_reports_none_on_a_smooth_column():
+    profile = [(40, 90), (35, 95), (30, 100), (25, 105), (20, 110)]
+    idx, _, rel = find_edge(profile)
+    assert idx is None and rel < 0.2
 
 
 def test_obstruction_type():

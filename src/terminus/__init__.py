@@ -7,7 +7,7 @@ Two sides:
     from terminus import Seestar, Sky, run_sweep
     sc = Seestar(host, pem); sc.authenticate()
     sky = Sky(lat, lon, elev_m)
-    mask, skipped = run_sweep(sc, sky, sweep_cfg)
+    mask, skipped, profiles = run_sweep(sc, sky, sweep_cfg)
 
   Planning (no scope, no network — this is what a planner like SSC consumes):
     from terminus import Horizon
@@ -75,7 +75,7 @@ def measure_horizon(config_path="config.toml", az_start=0, az_end=350, out="hori
             sky = Sky(lat, lon, site.get("elev_m", 0.0))
         sc.stop_view()
         sc.start_view("scenery")
-        mask, skipped = run_sweep(
+        mask, skipped, _profiles = run_sweep(
             sc, sky, cfg["sweep"], az_start, az_end, save_dir=os.path.splitext(out)[0] + "_frames"
         )
         sc.stop_view()

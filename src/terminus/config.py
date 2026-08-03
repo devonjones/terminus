@@ -13,6 +13,7 @@ SWEEP_DEFAULTS = {
     "alt_min": 0.0,
     "alt_max": 45.0,
     "alt_tol": 0.7,
+    "coarse_step": 5.0,
     "sun_cone_deg": 30.0,
     "clear_thresh": 0.85,
     "slew_step_deg": 5.0,

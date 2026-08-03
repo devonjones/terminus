@@ -231,48 +231,81 @@ def column_touches_sun(sky, az, alt_min, alt_max, cone):
     )
 
 
-def bisect_horizon(ptr, sc, az, alt_min, alt_max, tol, clear_thresh, sky_ref=None):
-    """Return (horizon_alt, status, obstruction_type). A pointing is 'clear' only
-    when sky fraction exceeds clear_thresh, so dappled canopy counts as blocked
-    (conservative top-of-canopy horizon).
+EDGE_REL = 0.20  # a drop this large, relative to the column's brightest sample,
+#                  counts as the sky/terrain edge rather than a lighting gradient
 
-    sky_ref anchors the brightness split; the frame at the top of this column
-    supplies it when the column starts clear, so the reference tracks fading
-    light and cloud instead of assuming a fixed brightness.
+
+def find_edge(profile):
+    """Locate the sky->terrain step in a column brightness profile.
+
+    `profile` is [(alt, mean_lum), ...] ordered from high altitude down. The
+    horizon is the largest DROP between consecutive samples. Working on the
+    difference rather than an absolute level is what makes this survive twilight:
+    the sky itself brightens or dims steadily with altitude (a strong vertical
+    gradient near sunset), but only terrain produces a step.
+
+    Returns (index_above_edge, drop, relative_drop); index is None if no step
+    stands out from the column's own gradient.
     """
-    last_obstr = (0.0, 0.0)
-    ref = [sky_ref]
+    if len(profile) < 2:
+        return None, 0.0, 0.0
+    peak = max(lum for _, lum in profile) or 1.0
+    drops = [(profile[i][1] - profile[i + 1][1], i) for i in range(len(profile) - 1)]
+    drop, idx = max(drops)
+    return (idx, drop, drop / peak) if drop / peak >= EDGE_REL else (None, drop, drop / peak)
 
-    def is_clear(alt):
-        nonlocal last_obstr
+
+def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None):
+    """Walk a column from `alt_max` down, then refine the brightness step.
+
+    Returns (horizon_alt, status, obstruction_type, profile). `profile` is the
+    raw [(alt, mean_lum)] samples — recorded so a column can be re-judged later
+    without re-observing it.
+    """
+    if ptr.dry:
+        return alt_min, "open_to_min", "open", []
+
+    def sample(alt):
         ptr.point_to(az, alt)
-        if ptr.dry:
-            return True
-        rgb = sc.capture_rgb()
-        s, v, st, _ = classify(rgb, ref[0])
-        if s <= clear_thresh:
-            last_obstr = (v, st)
-        return s > clear_thresh
+        rgb = sc.capture_rgb(warmup=0.3)
+        return rgb, float((rgb.sum(2) / 3.0).mean())
 
-    # The top of the column doubles as this column's open-sky brightness sample.
-    ptr.point_to(az, alt_max)
-    if not ptr.dry:
-        top = sc.capture_rgb()
-        top_ref = sky_reference(top)
-        s, v, st, _ = classify(top, ref[0])
-        if s <= clear_thresh:
-            return alt_max, "blocked_above", obstruction_type(v, st)
-        ref[0] = top_ref if ref[0] is None else max(ref[0], top_ref)
-    if is_clear(alt_min):
-        return alt_min, "open_to_min", "open"
-    lo, hi = alt_min, alt_max
+    profile, frames = [], {}
+    alt = alt_max
+    while alt >= alt_min - 1e-6:
+        rgb, lum = sample(alt)
+        profile.append((round(alt, 1), round(lum, 1)))
+        frames[round(alt, 1)] = rgb
+        alt -= coarse_step
+
+    idx, drop, rel = find_edge(profile)
+    if idx is None:
+        # No step: either the whole column is open, or it is blocked all the way
+        # up. Only brightness relative to known open sky can tell those apart, so
+        # without a reference the column is reported as unknown rather than
+        # guessed at — an unmeasured azimuth is safer than a wrong one.
+        peak = max(lum for _, lum in profile)
+        if sky_ref is None:
+            return alt_max, "no_reference", "unknown", profile
+        if peak < 0.5 * sky_ref:
+            dark = frames[profile[0][0]]
+            _, v, st, _ = classify(dark, sky_ref)
+            return alt_max, "blocked_above", obstruction_type(v, st), profile
+        return alt_min, "open_to_min", "open", profile
+
+    hi_alt, hi_lum = profile[idx]
+    lo_alt, lo_lum = profile[idx + 1]
+    mid_lum = (hi_lum + lo_lum) / 2.0  # halfway across this column's own step
+    lo, hi = lo_alt, hi_alt
     while hi - lo > tol:
-        mid = (lo + hi) / 2
-        if is_clear(mid):
+        mid = (lo + hi) / 2.0
+        _, lum = sample(mid)
+        if lum >= mid_lum:
             hi = mid
         else:
             lo = mid
-    return round(hi, 1), "ok", obstruction_type(*last_obstr)
+    _, v, st, _ = classify(frames[lo_alt], hi_lum)
+    return round(hi, 1), f"edge(rel {rel:.2f})", obstruction_type(v, st), profile
 
 
 def save_boundary_frame(sc, ptr, az, alt, typ, save_dir):
@@ -290,28 +323,55 @@ def save_boundary_frame(sc, ptr, az, alt, typ, save_dir):
 
 
 def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, log=print):
-    """Sweep azimuths, returning ({az: (alt, type)}, [skipped_az])."""
+    """Sweep azimuths, returning ({az: (alt, type)}, [skipped_az], {az: profile}).
+
+    Each column's raw brightness profile is returned alongside the verdict, so a
+    run can be re-judged later without re-observing the sky.
+    """
     ptr = Pointer(sc, sky, cfg["sun_cone_deg"], cfg["slew_step_deg"], dry)
     saz, salt = sky.sun()
-    log(f"Sun az {saz:.0f} alt {salt:.0f}")
-    mask, skipped = {}, []
+    log(f"Sun az {saz:.0f} alt {salt:.0f}", flush=True)
+    mask, skipped, profiles = {}, [], {}
+    # Seed the open-sky brightness from a near-zenith frame, opposite the Sun.
+    # Without it the first column has nothing to compare against, and a fully
+    # blocked column is indistinguishable from a clear one.
+    sky_ref = None
+    if not dry:
+        try:
+            zen_az = (saz + 180.0) % 360.0
+            ptr.point_to(zen_az, 75.0)
+            sky_ref = sky_reference(sc.capture_rgb(warmup=0.3))
+            log(f"sky reference (az {zen_az:.0f} alt 75): {sky_ref:.1f}", flush=True)
+        except (SunGuard, OSError) as e:
+            log(f"could not seed sky reference: {e}", flush=True)
     for az in range(int(az_start), int(az_end) + 1, cfg["az_step"]):
         if column_touches_sun(sky, az, cfg["alt_min"], cfg["alt_max"], cfg["sun_cone_deg"]):
             skipped.append(az)
-            log(f"az {az:3d}: skipped (Sun cone)")
+            log(f"az {az:3d}: skipped (Sun cone)", flush=True)
             continue
         try:
-            alt, status, typ = bisect_horizon(
-                ptr, sc, az, cfg["alt_min"], cfg["alt_max"], cfg["alt_tol"], cfg["clear_thresh"]
+            alt, status, typ, profile = scan_horizon(
+                ptr,
+                sc,
+                az,
+                cfg["alt_min"],
+                cfg["alt_max"],
+                cfg.get("coarse_step", 5.0),
+                cfg["alt_tol"],
+                sky_ref,
             )
+            if profile:
+                profiles[az] = profile
+                peak = max(lum for _, lum in profile)
+                sky_ref = peak if sky_ref is None else max(sky_ref, peak)
             frame = (
                 save_boundary_frame(sc, ptr, az, alt, typ, save_dir)
                 if (save_dir and not dry)
                 else "-"
             )
             mask[az] = (alt, typ)
-            log(f"az {az:3d}: horizon alt {alt:5.1f}  {typ:9s} [{status}]  {frame}")
+            log(f"az {az:3d}: alt {alt:5.1f}  {typ:9s} [{status}]  {frame}", flush=True)
         except SunGuard as e:
             skipped.append(az)
-            log(f"az {az:3d}: skipped ({e})")
-    return mask, skipped
+            log(f"az {az:3d}: skipped ({e})", flush=True)
+    return mask, skipped, profiles
