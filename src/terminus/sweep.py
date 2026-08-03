@@ -5,10 +5,13 @@ Coordinates: pointing is by RA/Dec goto (reliable in EQ mode) with az/alt
 converted through astropy for the moment of pointing, so the mask is in TRUE
 az/alt to the accuracy of the polar alignment.
 
-Safety: slews are broken into small steps (<= slew_step_deg); at every step the
-Sun's position is recomputed for the exact current time and the target is
-refused inside `sun_cone_deg`. Because each step is short and both ends are kept
-outside the cone, the tube cannot arc through the Sun between waypoints.
+Safety: the mount slews along its RA and Dec axes, so a goto traces a path
+through RA/Dec space rather than through az/alt. Every candidate path (the
+diagonal and both L-routes, since the axes may drive together or in sequence) is
+sampled, converted to az/alt, and checked against the Sun's live position before
+any motion; anything inside `sun_cone_deg` is refused, and a route over the top
+is tried first. Endpoint-only checks are not sufficient — they let the tube swing
+across the Sun between two safe positions.
 """
 
 import datetime
@@ -70,17 +73,43 @@ class Sky:
         return float(s.az.deg), float(s.alt.deg)
 
 
-# ---- color classifier -----------------------------------------------------
-def classify(rgb):
+# ---- classifier -----------------------------------------------------------
+# Sky is the light source; everything terrestrial is lit BY it and silhouettes
+# darker. Luminance is therefore the robust discriminator, and it holds whether
+# the sky is blue, overcast, or twilight-lit. Colour alone does not work: a dark
+# branch silhouetted against bright sky still reads blue (scattered skylight plus
+# optical blur), so a blue-dominance test scores obstructions as sky.
+#
+# Clouds are bright, so they classify as sky — which is what a HORIZON mask wants:
+# it records permanent terrain, not weather.
+SKY_LUM_FRACTION = 0.55  # a pixel below this fraction of the sky reference is obstruction
+
+
+def sky_reference(rgb):
+    """Brightness level representing open sky in this frame (95th percentile)."""
+    return float(np.percentile(rgb.sum(2) / 3.0, 95))
+
+
+def classify(rgb, sky_ref=None):
     """Return (sky, veg, structure, median_lum) area fractions.
-    sky = blue-dominant + bright; vegetation = green/yellow (tree); structure =
-    any other non-sky (roof/wall/fence). Blue-dominance survives auto-exposure."""
+
+    sky_ref: the luminance of open sky, from a known-clear frame in the same
+    column (see `sky_reference`). Passing it makes the split absolute, so a frame
+    filled entirely with obstruction is still recognised as dark. Without it the
+    frame's own 95th percentile is used, which only works when the frame contains
+    some sky.
+
+    Vegetation vs structure is a best-effort tag on the obstruction pixels and is
+    only meaningful in daylight; near sunset everything silhouettes to neutral
+    black and obstructions come back as 'structure'.
+    """
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    lum = r + g + b
-    lmax = lum.max() if lum.max() > 0 else 1.0
-    sky = (b > r * 1.06) & (b > g * 0.90) & (lum > 0.20 * lmax)
-    veg = (~sky) & (g > b) & (r > b) & ((g - b) > 0.10 * (g + 1.0))
-    structure = (~sky) & (~veg)
+    lum = (r + g + b) / 3.0
+    ref = sky_ref if sky_ref else sky_reference(rgb)
+    sky = lum >= SKY_LUM_FRACTION * ref
+    obstr = ~sky
+    veg = obstr & (g > b) & (r > b) & ((g - b) > 0.10 * (g + 1.0))
+    structure = obstr & ~veg
     return float(sky.mean()), float(veg.mean()), float(structure.mean()), float(np.median(lum))
 
 
@@ -91,7 +120,28 @@ def obstruction_type(veg_frac, struct_frac):
 
 
 # ---- path-safe pointing ---------------------------------------------------
+PATH_SAMPLES = 40  # points sampled along a candidate slew path when Sun-checking
+
+
+def wrap_ra(d_hours):
+    """Shortest signed RA difference, in hours."""
+    return (d_hours + 12.0) % 24.0 - 12.0
+
+
 class Pointer:
+    """Points the scope by RA/Dec goto, refusing any slew whose PATH approaches
+    the Sun.
+
+    The mount moves along its RA and Dec axes, so a slew traces a path through
+    RA/Dec space — not through az/alt. Checking only the endpoints (or stepping
+    in az/alt) can therefore miss a tube that swings across the Sun in between.
+    Here every candidate path is sampled in RA/Dec, converted to az/alt, and
+    checked against the Sun's live position. Because the mount may drive the two
+    axes together or one-then-the-other, all three plausible shapes are checked:
+    the diagonal and both L-routes. If the direct path is unsafe, a route "over
+    the top" (via high altitude) is tried before giving up.
+    """
+
     def __init__(self, sc, sky, cone, slew_step, dry=False):
         self.sc, self.sky, self.cone, self.slew_step, self.dry = sc, sky, cone, slew_step, dry
 
@@ -105,30 +155,70 @@ class Pointer:
         if sep < self.cone:
             raise SunGuard(f"({az:.0f},{alt:.0f}) is {sep:.1f} deg from Sun (< {self.cone})")
 
-    def _goto_wait(self, az, alt, settle):
-        ra, dec = self.sky.altaz_to_radec(az, alt)
+    def path_min_sep(self, rd0, rd1):
+        """Smallest Sun separation (deg) over every plausible RA/Dec path from
+        rd0 to rd1. Sun position is recomputed now, at call time."""
+        saz, salt = self.sky.sun()
+        ra0, dec0 = rd0
+        ra1, dec1 = rd1
+        dra = wrap_ra(ra1 - ra0)
+        worst = 180.0
+        for shape in ("diag", "ra_first", "dec_first"):
+            for i in range(PATH_SAMPLES + 1):
+                t = i / PATH_SAMPLES
+                if shape == "diag":
+                    ra, dec = ra0 + dra * t, dec0 + (dec1 - dec0) * t
+                elif shape == "ra_first":
+                    ra = ra0 + dra * min(1.0, 2 * t)
+                    dec = dec0 + (dec1 - dec0) * max(0.0, 2 * t - 1)
+                else:
+                    dec = dec0 + (dec1 - dec0) * min(1.0, 2 * t)
+                    ra = ra0 + dra * max(0.0, 2 * t - 1)
+                az, alt = self.sky.radec_to_altaz(ra % 24.0, dec)
+                worst = min(worst, ang_sep(az, alt, saz, salt))
+        return worst
+
+    def _goto_wait(self, ra, dec, settle):
         self.sc.goto(ra, dec)
         deadline = time.time() + GOTO_TIMEOUT
         while time.time() < deadline:
-            time.sleep(1.0)
+            time.sleep(0.7)
             rd = self.sc.equ_coord()
-            if rd and abs(rd[0] - ra) < 0.05 and abs(rd[1] - dec) < 0.5:
+            if rd and abs(wrap_ra(rd[0] - ra)) < 0.05 and abs(rd[1] - dec) < 0.5:
                 break
         time.sleep(settle)
 
     def point_to(self, az, alt):
-        """Slew to (az, alt) in small, Sun-checked steps. Returns final az/alt."""
+        """Slew to (az, alt) along a Sun-safe path. Returns the final az/alt."""
         self._sun_check(az, alt)
         if self.dry:
             return az, alt
-        cur_az, cur_alt = self.current_azalt()
-        d_az, d_alt = wrap180(az - cur_az), alt - cur_alt
-        n = max(1, math.ceil(max(abs(d_az), abs(d_alt)) / self.slew_step))
-        for i in range(1, n + 1):
-            wp_az = (cur_az + d_az * i / n) % 360.0
-            wp_alt = cur_alt + d_alt * i / n
-            self._sun_check(wp_az, wp_alt)  # exact-time Sun check per step
-            self._goto_wait(wp_az, wp_alt, SETTLE if i == n else 0.3)
+        cur = self.sc.equ_coord()
+        if cur is None:
+            raise SunGuard("cannot read current pointing; refusing to slew")
+        self._sun_check(*self.sky.radec_to_altaz(*cur))
+        target = self.sky.altaz_to_radec(az, alt)
+
+        if self.path_min_sep(cur, target) >= self.cone:
+            self._goto_wait(*target, SETTLE)  # whole path is clear
+        else:
+            # Route over the top: the Sun is never at high altitude from a
+            # mid-latitude site, so a high waypoint clears it when a direct
+            # slew would not.
+            via_alt = min(85.0, max(alt, 70.0))
+            via_az = (az + wrap180(self.current_azalt()[0] - az) / 2) % 360.0
+            via = self.sky.altaz_to_radec(via_az, via_alt)
+            if (
+                self.path_min_sep(cur, via) >= self.cone
+                and self.path_min_sep(via, target) >= self.cone
+            ):
+                self._goto_wait(*via, 0.3)
+                self._goto_wait(*target, SETTLE)
+            else:
+                raise SunGuard(
+                    f"no Sun-safe path to ({az:.0f},{alt:.0f}) "
+                    f"(direct min sep {self.path_min_sep(cur, target):.1f} deg)"
+                )
         rd = self.sc.equ_coord()
         return self.sky.radec_to_altaz(*rd) if rd else (az, alt)
 
@@ -141,24 +231,38 @@ def column_touches_sun(sky, az, alt_min, alt_max, cone):
     )
 
 
-def bisect_horizon(ptr, sc, az, alt_min, alt_max, tol, clear_thresh):
+def bisect_horizon(ptr, sc, az, alt_min, alt_max, tol, clear_thresh, sky_ref=None):
     """Return (horizon_alt, status, obstruction_type). A pointing is 'clear' only
     when sky fraction exceeds clear_thresh, so dappled canopy counts as blocked
-    (conservative top-of-canopy horizon)."""
+    (conservative top-of-canopy horizon).
+
+    sky_ref anchors the brightness split; the frame at the top of this column
+    supplies it when the column starts clear, so the reference tracks fading
+    light and cloud instead of assuming a fixed brightness.
+    """
     last_obstr = (0.0, 0.0)
+    ref = [sky_ref]
 
     def is_clear(alt):
         nonlocal last_obstr
         ptr.point_to(az, alt)
         if ptr.dry:
             return True
-        s, v, st, _ = classify(sc.capture_rgb())
+        rgb = sc.capture_rgb()
+        s, v, st, _ = classify(rgb, ref[0])
         if s <= clear_thresh:
             last_obstr = (v, st)
         return s > clear_thresh
 
-    if not is_clear(alt_max):
-        return alt_max, "blocked_above", obstruction_type(*last_obstr)
+    # The top of the column doubles as this column's open-sky brightness sample.
+    ptr.point_to(az, alt_max)
+    if not ptr.dry:
+        top = sc.capture_rgb()
+        top_ref = sky_reference(top)
+        s, v, st, _ = classify(top, ref[0])
+        if s <= clear_thresh:
+            return alt_max, "blocked_above", obstruction_type(v, st)
+        ref[0] = top_ref if ref[0] is None else max(ref[0], top_ref)
     if is_clear(alt_min):
         return alt_min, "open_to_min", "open"
     lo, hi = alt_min, alt_max

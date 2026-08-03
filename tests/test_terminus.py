@@ -6,7 +6,7 @@ import pytest
 
 from terminus import Horizon, ang_sep, classify, to_nina_hrz, to_stellarium_txt
 from terminus.export import _ascending_pairs, load_mask, write_mask
-from terminus.sweep import obstruction_type, wrap180
+from terminus.sweep import obstruction_type, sky_reference, wrap180, wrap_ra
 
 
 # ---- horizon interpolation -----------------------------------------------
@@ -67,15 +67,32 @@ def test_mask_roundtrip(tmp_path):
 
 
 # ---- classifier & geometry ------------------------------------------------
-def test_classifier_labels_sky_veg_structure():
-    def solid(rgb):
-        a = np.zeros((4, 4, 3), np.float32)
-        a[:] = rgb
-        return a
+def solid(rgb, shape=(4, 4)):
+    a = np.zeros((*shape, 3), np.float32)
+    a[:] = rgb
+    return a
 
-    assert classify(solid((40, 90, 240)))[0] > 0.9  # blue -> sky
-    assert classify(solid((90, 200, 30)))[1] > 0.9  # green -> vegetation
-    assert classify(solid((120, 120, 120)))[2] > 0.9  # gray -> structure
+
+def test_classifier_splits_on_brightness_not_colour():
+    bright_sky = solid((150, 170, 210))
+    assert classify(bright_sky)[0] > 0.9  # open sky
+    ref = sky_reference(bright_sky)
+    # A silhouette against bright sky still reads blue (scattered light + blur);
+    # brightness must call it an obstruction anyway. Colour alone got this wrong.
+    assert classify(solid((30, 40, 70)), ref)[0] < 0.1
+
+
+def test_classifier_calls_cloud_sky_not_obstruction():
+    # A horizon mask records terrain, not weather: bright cloud is not an
+    # obstruction even though it is grey rather than blue.
+    ref = sky_reference(solid((150, 170, 210)))
+    assert classify(solid((200, 200, 205)), ref)[0] > 0.9
+
+
+def test_classifier_tags_obstruction_type():
+    ref = sky_reference(solid((150, 170, 210)))
+    assert classify(solid((40, 80, 20)), ref)[1] > 0.9  # green -> vegetation
+    assert classify(solid((60, 60, 60)), ref)[2] > 0.9  # neutral -> structure
 
 
 def test_obstruction_type():
@@ -90,3 +107,11 @@ def test_ang_sep_and_wrap():
     assert ang_sep(0, 45, 180, 45) == pytest.approx(90)  # over the zenith
     assert wrap180(350) == pytest.approx(-10)
     assert wrap180(-190) == pytest.approx(170)
+
+
+def test_wrap_ra_takes_the_short_way():
+    # RA is 24-hour cyclic; a slew from 23h to 1h is +2h, not -22h. The Sun
+    # path-check interpolates on this, so a wrong sign would sample the wrong arc.
+    assert wrap_ra(1 - 23) == pytest.approx(2)
+    assert wrap_ra(23 - 1) == pytest.approx(-2)
+    assert wrap_ra(0) == pytest.approx(0)
