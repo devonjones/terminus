@@ -129,6 +129,28 @@ class Seestar:
     def start_view(self, mode="scenery"):
         return self.call("iscope_start_view", {"mode": mode})
 
+    def lock_exposure(self, exp_ms=None, gain=None):
+        """Fix exposure and gain so frame brightness means something.
+
+        With auto-exposure the camera normalises every frame toward mid-grey,
+        which cancels the very sky-versus-terrain brightness difference the sweep
+        measures — measured profiles then hover at one level regardless of where
+        the scope points. Locking makes brightness comparable between pointings.
+        Returns the settings the scope reports afterwards.
+        """
+        params = {"manual_exp": True}
+        if exp_ms is not None:
+            params["isp_exp_ms"] = exp_ms
+        if gain is not None:
+            params["isp_gain"] = gain
+        self.call("set_setting", params)
+        s = self.call("get_setting").get("result", {})
+        return {k: s.get(k) for k in ("manual_exp", "isp_exp_ms", "isp_gain")}
+
+    def auto_exposure(self):
+        """Hand exposure back to the camera."""
+        self.call("set_setting", {"manual_exp": False})
+
     def stop_view(self):
         return self.call("iscope_stop_view", {"stage": "Stack"})
 

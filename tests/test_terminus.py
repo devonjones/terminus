@@ -97,17 +97,28 @@ def test_classifier_tags_obstruction_type():
 
 def test_find_edge_survives_a_twilight_gradient():
     # Sky brightening steadily toward the horizon (sunset glow), then terrain.
-    # An absolute threshold fails here; the step is only visible as a drop.
+    # An absolute threshold fails here; the step is only visible as a level change.
     profile = [(40, 90), (35, 100), (30, 110), (25, 120), (20, 130), (15, 40), (10, 38), (5, 36)]
-    idx, drop, rel = find_edge(profile)
+    idx, step, snr = find_edge(profile)
     assert profile[idx][0] == 20 and profile[idx + 1][0] == 15  # edge between 20 and 15
-    assert rel > 0.2
+    assert snr > 2.5
 
 
 def test_find_edge_reports_none_on_a_smooth_column():
     profile = [(40, 90), (35, 95), (30, 100), (25, 105), (20, 110)]
-    idx, _, rel = find_edge(profile)
-    assert idx is None and rel < 0.2
+    idx, _, snr = find_edge(profile)
+    assert idx is None and snr < 2.5
+
+
+def test_find_edge_rejects_noise_masquerading_as_an_edge():
+    # Real column measured 2026-08-02 at az 20 with auto-exposure enabled: the
+    # camera renormalises each frame, so the profile is scatter with no true
+    # step. A detector keyed on the largest single drop reported an edge at
+    # alt 30 here (76 -> 116 -> 88 is a spike, not terrain); requiring the step
+    # to beat the column's own noise rejects it.
+    profile = [(35, 76), (30, 116), (25, 88), (20, 92), (15, 101), (10, 104), (5, 97), (0, 79)]
+    idx, _, snr = find_edge(profile)
+    assert idx is None and snr < 2.5
 
 
 def test_obstruction_type():

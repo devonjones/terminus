@@ -231,28 +231,42 @@ def column_touches_sun(sky, az, alt_min, alt_max, cone):
     )
 
 
-EDGE_REL = 0.20  # a drop this large, relative to the column's brightest sample,
-#                  counts as the sky/terrain edge rather than a lighting gradient
+EDGE_SNR = 2.5  # a step must exceed the column's own sample-to-sample noise by
+#                 this factor; below it, the "step" is indistinguishable from
+#                 measurement scatter and the column is reported as unmeasured
 
 
 def find_edge(profile):
     """Locate the sky->terrain step in a column brightness profile.
 
-    `profile` is [(alt, mean_lum), ...] ordered from high altitude down. The
-    horizon is the largest DROP between consecutive samples. Working on the
-    difference rather than an absolute level is what makes this survive twilight:
-    the sky itself brightens or dims steadily with altitude (a strong vertical
-    gradient near sunset), but only terrain produces a step.
+    `profile` is [(alt, mean_lum), ...] ordered from high altitude down. The fit
+    is a change point: for each split, compare the mean brightness above it with
+    the mean below, and take the split that maximises the difference. Terrain
+    darkens *everything* below the horizon, so a real edge separates two levels;
+    a single large drop between neighbouring samples does not qualify, since one
+    noisy frame produces exactly that.
 
-    Returns (index_above_edge, drop, relative_drop); index is None if no step
-    stands out from the column's own gradient.
+    The step is accepted only when it exceeds the column's own sample-to-sample
+    noise by EDGE_SNR. That guard matters: with auto-exposure enabled the camera
+    normalises each frame toward mid-grey, which flattens real contrast and
+    leaves scatter that a naive detector happily reports as a horizon.
+
+    Returns (index_above_edge, step_size, snr); index is None when nothing in the
+    column stands clear of its noise.
     """
-    if len(profile) < 2:
+    if len(profile) < 3:
         return None, 0.0, 0.0
-    peak = max(lum for _, lum in profile) or 1.0
-    drops = [(profile[i][1] - profile[i + 1][1], i) for i in range(len(profile) - 1)]
-    drop, idx = max(drops)
-    return (idx, drop, drop / peak) if drop / peak >= EDGE_REL else (None, drop, drop / peak)
+    lums = [lum for _, lum in profile]
+    noise = sum(abs(lums[i + 1] - lums[i]) for i in range(len(lums) - 1)) / (len(lums) - 1)
+    best = (0.0, None)
+    for k in range(1, len(lums)):
+        above = sum(lums[:k]) / k
+        below = sum(lums[k:]) / (len(lums) - k)
+        if above - below > best[0]:
+            best = (above - below, k)
+    step, k = best
+    snr = step / noise if noise > 0 else 0.0
+    return (k - 1, step, snr) if (k is not None and snr >= EDGE_SNR) else (None, step, snr)
 
 
 def scan_horizon(ptr, sc, az, alt_min, alt_max, coarse_step, tol, sky_ref=None):
