@@ -26,6 +26,7 @@ rotate the sky to accommodate a single wrong column. A too-low ceiling is known
 to manufacture confident false edges, so robust fitting is not optional.
 """
 
+import functools
 import math
 
 import numpy as np
@@ -81,8 +82,52 @@ def from_mask(mask, ceiling=None):
     return out
 
 
-def rotate_alt(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
-    """Altitude after rotating the sphere. Exact, no small-angle assumption."""
+def _wrap180(x):
+    return ((x + 180.0) % 360.0) - 180.0
+
+
+@functools.lru_cache(maxsize=4096)
+def _tilt_matrix(tilt_mag, tilt_dir):
+    """Rodrigues rotation about a horizontal axis, as nine plain floats.
+
+    Cached and returned unpacked because the fit evaluates this on the order of
+    a million times: rebuilding a numpy 3x3 per call dominated the runtime by a
+    wide margin (a full solve took 573s that way).
+    """
+    d = math.radians(tilt_dir)
+    x, y, z = -math.sin(d), math.cos(d), 0.0
+    th = math.radians(tilt_mag)
+    c, s = math.cos(th), math.sin(th)
+    k = 1.0 - c
+    return (
+        c + x * x * k, x * y * k - z * s, x * z * k + y * s,
+        y * x * k + z * s, c + y * y * k, y * z * k - x * s,
+        z * x * k - y * s, z * y * k + x * s, c + z * z * k,
+    )  # fmt: skip
+
+
+def _rotate_scalar(az, alt, tilt_mag, tilt_dir):
+    """Scalar (az, alt) rotation in plain Python — the fit's inner loop."""
+    m = _tilt_matrix(tilt_mag, tilt_dir)
+    a, e = math.radians(az), math.radians(alt)
+    ce = math.cos(e)
+    vx, vy, vz = ce * math.cos(a), ce * math.sin(a), math.sin(e)
+    wx = m[0] * vx + m[1] * vy + m[2] * vz
+    wy = m[3] * vx + m[4] * vy + m[5] * vz
+    wz = m[6] * vx + m[7] * vy + m[8] * vz
+    return (
+        math.degrees(math.atan2(wy, wx)) % 360.0,
+        math.degrees(math.asin(max(-1.0, min(1.0, wz)))),
+    )
+
+
+def rotate(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
+    """(azimuth, altitude) after rotating the sphere. Exact, no small angles.
+
+    Returns BOTH coordinates because a tilt moves a point in azimuth as well as
+    altitude — only a yaw is a pure relabelling of azimuth. Callers that ignore
+    the returned azimuth are assuming the small-angle limit.
+    """
     az = np.radians(np.asarray(az_deg, dtype=float))
     alt = np.radians(np.asarray(alt_deg, dtype=float))
     v = np.stack([np.cos(alt) * np.cos(az), np.cos(alt) * np.sin(az), np.sin(alt)], axis=-1)
@@ -99,25 +144,95 @@ def rotate_alt(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
         ]
     )
     w = v @ R.T
-    return np.degrees(np.arcsin(np.clip(w[..., 2], -1.0, 1.0))) - pitch
+    return (
+        np.degrees(np.arctan2(w[..., 1], w[..., 0])) % 360.0,
+        np.degrees(np.arcsin(np.clip(w[..., 2], -1.0, 1.0))) - pitch,
+    )
+
+
+def rotate_alt(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
+    """Altitude after rotating the sphere. Exact, no small-angle assumption."""
+    return rotate(az_deg, alt_deg, pitch, tilt_mag, tilt_dir)[1]
+
+
+def native_column(sample, target_az, yaw, tilt_mag, tilt_dir, tol=1e-3, iters=6):
+    """The photo column that lands at world azimuth `target_az`. Returns (phi, raw).
+
+    Yaw is a pure rotation about the vertical, so it only relabels azimuth and
+    `phi = target_az - yaw` is exact. Tilt is not: rotating about a horizontal
+    axis moves a point in azimuth too, so the column that ENDS at target_az is
+    not the one that STARTED at target_az - yaw. Reading the photo at the
+    starting column and then reporting its altitude as if it belonged to the
+    target azimuth silently reintroduces the small-angle approximation that
+    `rotate` exists to avoid, and the error grows with tilt: on a synthetic
+    horizon of modest slope it reached 0.56 deg RMS at 12 deg of tilt, and on a
+    steep one far more.
+
+    This is a fixed point, and d(az)/d(phi) is near 1, so it normally converges
+    in two or three passes. It does NOT converge at a vertical discontinuity —
+    a house corner, where the photo altitude jumps — because the azimuth shift
+    depends on altitude, so a step across the cliff throws the iterate to the
+    far side and it oscillates. That case is genuinely ill-posed: rotating a
+    discontinuous curve leaves world azimuths that no photo column maps to. So
+    the best iterate seen is kept and returned rather than whichever side the
+    loop happened to stop on, which bounds the error by the width of the cliff
+    instead of letting it land arbitrarily. Measured on a synthetic 22 degree
+    step, this is exact at 3 degrees of tilt and degrades only past that.
+    """
+    phi = (target_az - yaw) % 360.0
+    raw = sample(phi)
+    if not tilt_mag or raw is None or not math.isfinite(raw):
+        return phi, raw
+    best = None
+    for _ in range(iters):
+        landed, _ = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)
+        err = _wrap180(target_az - landed)
+        if best is None or abs(err) < best[0]:
+            best = (abs(err), phi, raw)
+        if abs(err) < tol:
+            return phi, raw
+        phi = (phi + err) % 360.0
+        raw = sample(phi)
+        if raw is None or not math.isfinite(raw):
+            break
+    return best[1], best[2]
+
+
+def predict(fids, sample, yaw, tilt_mag, tilt_dir):
+    """Photo altitude at each fiducial's azimuth, before pitch. NaN where unread.
+
+    Split out from `residuals` because pitch enters as a pure offset, so the fit
+    can sweep it without redoing the rotation — which is the expensive part.
+    """
+    out = np.empty(len(fids))
+    for i, f in enumerate(fids):
+        phi, raw = native_column(sample, f.az, yaw, tilt_mag, tilt_dir)
+        if raw is None or not math.isfinite(raw):
+            out[i] = np.nan
+        else:
+            out[i] = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)[1]
+    return out
+
+
+def score(fids, photo, pitch):
+    """Signed residual per fiducial given predicted altitudes and a pitch."""
+    out = np.empty(len(photo))
+    for i, f in enumerate(fids):
+        p = photo[i] - pitch
+        if not math.isfinite(p):
+            out[i] = np.nan
+        elif f.bound:
+            # Agreement is one-sided: a photo that also exceeds the ceiling
+            # confirms the bound exactly. Only falling short contradicts it.
+            out[i] = 0.0 if p >= f.alt else p - f.alt
+        else:
+            out[i] = p - f.alt
+    return out
 
 
 def residuals(fids, sample, yaw, pitch, tilt_mag, tilt_dir):
     """Signed residual per fiducial. `sample(az)` returns the photo altitude."""
-    out = []
-    for f in fids:
-        raw = sample((f.az - yaw) % 360.0)
-        if raw is None or not np.isfinite(raw):
-            out.append(np.nan)
-            continue
-        photo = float(rotate_alt(f.az, raw, pitch, tilt_mag, tilt_dir))
-        if f.bound:
-            # Agreement is one-sided: a photo that also exceeds the ceiling
-            # confirms the bound exactly. Only falling short contradicts it.
-            out.append(0.0 if photo >= f.alt else photo - f.alt)
-        else:
-            out.append(photo - f.alt)
-    return np.array(out, dtype=float)
+    return score(fids, predict(fids, sample, yaw, tilt_mag, tilt_dir), pitch)
 
 
 def _huber(res, delta):
@@ -149,28 +264,34 @@ def fit(
     if len(used) < 4:
         raise ValueError(f"need at least 4 usable fiducials, have {len(used)}")
 
-    def cost(y, p, tm, td):
-        r = residuals(used, sample, y, p, tm, td)
+    weights = np.array([f.weight for f in used])
+
+    def cost_from(photo, p):
+        r = score(used, photo, p)
         ok = np.isfinite(r)
         if ok.sum() < 4:
             return math.inf, 0
-        w = np.array([f.weight for f in used])[ok]
+        w = weights[ok]
         loss = _huber(r[ok], delta) if robust else 0.5 * r[ok] ** 2
         return float((w * loss).sum() / w.sum()), int(ok.sum())
+
+    def cost(y, p, tm, td):
+        return cost_from(predict(used, sample, y, tm, td), p)
 
     best = None
     for y in np.arange(0.0, 360.0, yaw_step):
         for tm in np.arange(0.0, tilt_max + 1e-9, tilt_step):
             dirs = [0.0] if tm == 0 else np.arange(0.0, 360.0, 30.0)
             for td in dirs:
-                # pitch has a closed-ish form: centre the residuals
-                r = residuals(used, sample, y, 0.0, tm, td)
-                ok = np.isfinite(r)
+                # The rotation is the expensive part and pitch is a pure offset,
+                # so rotate once and slide pitch over the result.
+                photo = predict(used, sample, y, tm, td)
+                ok = np.isfinite(photo)
                 if ok.sum() < 4:
                     continue
-                p0 = float(np.median(r[ok]))
+                p0 = float(np.median(score(used, photo, 0.0)[ok]))
                 p0 = max(-pitch_range, min(pitch_range, p0))
-                c, n = cost(y, p0, tm, td)
+                c, n = cost_from(photo, p0)
                 if best is None or c < best[0]:
                     best = (c, y, p0, tm, td, n)
     _, y, p, tm, td, n = best

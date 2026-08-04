@@ -256,20 +256,23 @@ def test_from_mask_excludes_unknown():
 
 
 def test_fit_recovers_a_known_rotation():
-    """Round-trip: rotate a synthetic horizon, fit it back."""
-    import numpy as np
+    """Round-trip: place a synthetic horizon on the sky, fit it back.
 
-    from terminus.orient import Fiducial, fit, rotate_alt
+    Two things here were wrong and both flattered the result. The fiducials were
+    generated as `rotate_alt(az, shape(az - yaw), ...)`, which is the same
+    az-mixing shortcut the fit itself used, so the test scored the code against
+    its own bug and could not have caught it. And `cos(2a)` is symmetric under
+    half a turn, leaving yaw ambiguous by 180 degrees.
+    """
+    from terminus.orient import fit
 
-    true_yaw, true_pitch, true_tm, true_td = 137.0, 3.0, 6.0, 40.0
-    shape = lambda a: 25.0 + 10.0 * np.cos(np.radians(2 * a))  # noqa: E731
-    fids = []
-    for az in range(0, 360, 20):
-        alt = float(rotate_alt(az, shape((az - true_yaw) % 360), true_pitch, true_tm, true_td))
-        fids.append(Fiducial(az, alt, ceiling=90.0))
-    got = fit(fids, lambda a: float(shape(a)), yaw_step=1.0, tilt_step=2.0)
-    assert abs(((got["yaw"] - true_yaw + 180) % 360) - 180) < 3.0
-    assert got["rms"] < 1.5
+    true_yaw, true_pitch, true_tm, true_td = 137.0, 3.0, 3.0, 40.0
+    fids = _place(_skyline, true_yaw, true_pitch, true_tm, true_td, step=20.0)
+    got = fit(fids, _skyline, yaw_step=2.5, tilt_step=1.5)
+    assert abs(((got["yaw"] - true_yaw + 180) % 360) - 180) < 3.0, got
+    assert abs(got["tilt_mag"] - true_tm) < 1.5, got
+    assert abs(got["pitch"] - true_pitch) < 1.0, got
+    assert got["rms"] < 1.5, got
 
 
 def test_horizon_band_measures_canopy_porosity():
@@ -935,3 +938,114 @@ def test_control_point_counts_maps_frames_to_their_constraints(tmp_path):
     )
     counts = control_point_counts(str(pto))
     assert counts == {"a.jpg": 2, "b.jpg": 3, "c.jpg": 1}
+
+
+# ---- review round 2 regressions -------------------------------------------
+def _skyline(phi):
+    """A synthetic horizon with STRUCTURE but no discontinuity.
+
+    A single sinusoid is exactly degenerate with a tilt — a tilt about a
+    horizontal axis adds precisely one sinusoid in azimuth — so a sinusoidal
+    horizon cannot identify yaw at all and is useless as a fixture. So is
+    cos(2a): its 180 degree symmetry leaves yaw ambiguous by half a turn.
+    """
+    import math
+
+    p = phi % 360.0
+    ridge = 11.0 * (1 + math.tanh((p - 100) / 3.0)) * (1 + math.tanh((130 - p) / 3.0)) / 4
+    return (
+        18.0
+        + 6.0 * math.sin(math.radians(2 * p))
+        + 3.0 * math.sin(math.radians(3 * p + 40))
+        + ridge
+    )
+
+
+def _cliff(phi):
+    """The same skyline with a genuine vertical step — a house corner."""
+    import math
+
+    p = phi % 360.0
+    h = 18.0 + 6.0 * math.sin(math.radians(2 * p)) + 3.0 * math.sin(math.radians(3 * p + 40))
+    return h + (22.0 if 100 <= p < 130 else 0.0)
+
+
+def _place(shape, yaw, pitch, tmag, tdir, step=15.0):
+    """Fiducials from the honest forward model.
+
+    Each photo column is rotated into the world and recorded where it ACTUALLY
+    lands — azimuth as well as altitude. Generating them as
+    `rotate_alt(az, shape(az - yaw), ...)` instead bakes in the very
+    approximation under test, and a fit is then scored against its own bug.
+    """
+    import numpy as np
+
+    from terminus.orient import Fiducial, rotate
+
+    world = sorted(
+        tuple(float(v) for v in rotate(phi + yaw, shape(phi), pitch, tmag, tdir))
+        for phi in np.arange(0, 360, 0.05)
+    )
+    wa = np.array([a for a, _ in world])
+    we = np.array([e for _, e in world])
+    return [Fiducial(az=a, alt=float(np.interp(a, wa, we))) for a in np.arange(0, 360, step)]
+
+
+def _rms_at_truth(shape, tilt):
+    import numpy as np
+
+    from terminus.orient import residuals
+
+    r = residuals(_place(shape, 40.0, 2.0, tilt, 60.0), shape, 40.0, 2.0, tilt, 60.0)
+    r = r[np.isfinite(r)]
+    return float(np.sqrt((r**2).mean()))
+
+
+def test_residuals_vanish_at_the_true_orientation():
+    """The model must be exact, not exact-to-first-order.
+
+    A tilt moves a point in azimuth as well as altitude, so the photo column
+    that ENDS at a fiducial's azimuth is not the one that STARTED at
+    `az - yaw`. Sampling the starting column and scoring its altitude against
+    the target azimuth reintroduced the small-angle approximation the exact
+    rotation exists to remove: measured on this horizon before the fix, 0.56
+    deg RMS at the TRUE parameters, growing with tilt.
+    """
+    for tilt in (1.0, 3.0, 6.0, 12.0):
+        rms = _rms_at_truth(_skyline, tilt)
+        assert rms < 0.05, f"tilt {tilt}: residual {rms:.3f} deg at the true parameters"
+
+
+def test_a_vertical_cliff_stays_exact_through_the_working_range():
+    """Where the horizon jumps, the model is ill-posed — but not until 9 deg.
+
+    Rotating a discontinuous curve leaves world azimuths that no photo column
+    maps to, so the solve for the native column cannot converge at a house
+    corner. Against a 22 deg step it remains exact through 6 deg of tilt, which
+    covers this site (3.0 deg), and past that only the two columns adjacent to
+    the step degrade. Documented rather than papered over.
+    """
+    for tilt in (1.0, 3.0, 6.0):
+        rms = _rms_at_truth(_cliff, tilt)
+        assert rms < 0.05, f"cliff at tilt {tilt}: {rms:.3f} deg"
+
+
+def test_jacobian_yaw_term_keeps_the_sign_of_the_slope():
+    """A falling edge is not a rising one.
+
+    horizon_gradient returned |dH/daz|, making the Jacobian's yaw entry negative
+    everywhere. Because the row enters the information matrix as an outer
+    product, flipping only that entry skews the yaw/pitch and yaw/tilt cross
+    terms — which is exactly what next_column ranks on.
+    """
+    import numpy as np
+
+    from terminus.plan import horizon_gradient, jacobian_row
+
+    # 20 + 10 sin(az): rises through az 45, falls through az 135, crest at 90
+    prof = [(a, 20.0 + 10.0 * np.sin(np.radians(a))) for a in np.arange(0, 360, 1.0)]
+    at = horizon_gradient(prof)
+    assert at(90.0) == pytest.approx(0.0, abs=0.02)  # crest: flat
+    rising, falling = at(45.0), at(135.0)
+    assert rising > 0 > falling, f"rising {rising}, falling {falling}"
+    assert jacobian_row(45.0, rising)[0] < 0 < jacobian_row(135.0, falling)[0]

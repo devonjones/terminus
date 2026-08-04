@@ -35,12 +35,22 @@ def jacobian_row(az_deg, gradient_deg_per_deg):
 
 
 def horizon_gradient(profile):
-    """|dH/daz| as a function of azimuth, from a dense (az, alt) profile."""
+    """SIGNED dH/daz as a function of azimuth, from a dense (az, alt) profile.
+
+    The sign matters, and taking the magnitude here was wrong: it made the
+    Jacobian's yaw entry -|dH/daz| everywhere, giving a falling edge the sign of
+    a rising one. Flipping one entry of the row is not harmless the way flipping
+    the whole row would be — the row enters the information matrix as an outer
+    product, so it corrupts the yaw/pitch and yaw/tilt cross terms and skews
+    column selection wherever the horizon slopes downward.
+
+    The only consumer is `jacobian_row`, which negates it.
+    """
     prof = np.asarray(profile, dtype=float)
     az, alt = prof[:, 0], prof[:, 1]
     order = np.argsort(az)
     az, alt = az[order], alt[order]
-    grad = np.abs(np.gradient(alt, az))
+    grad = np.gradient(alt, az)
 
     def at(a):
         return float(np.interp(a % 360.0, az, grad, period=360.0))
