@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from terminus import Horizon, ang_sep, classify, to_nina_hrz, to_stellarium_txt
-from terminus.export import _ascending_pairs, load_mask, write_mask
+from terminus.export import _ascending_pairs, export_all, load_mask, write_mask
 from terminus.sweep import find_edge, obstruction_type, sky_reference, wrap180, wrap_ra
 
 
@@ -41,11 +41,35 @@ def test_ascending_pairs_adds_wrap_endpoints():
 
 
 def test_nina_hrz_format():
-    txt = to_nina_hrz([(0, 12, "tree"), (90, 30.5, "structure")])
+    txt = to_nina_hrz([(0, 12, "tree"), (90, 30.5, "structure")], tree_buffer=0)
     body = [ln for ln in txt.splitlines() if not ln.startswith("#")]
     assert body[0] == "0 12"
     assert "90 30.5" in body
     assert body[-1].startswith("360 ")  # wrap endpoint present
+
+
+def test_exporters_buffer_vegetation_when_called_directly():
+    """The margin must not depend on going through export_all.
+
+    Both exporters are public API and documented for direct import. Applying the
+    buffer only in the export_all wrapper meant `load_mask()` -> `to_nina_hrz()`
+    silently produced a horizon with no margin around foliage — the one place
+    the mask is deliberately not to be trusted.
+    """
+    rows = [(0, 12, "tree"), (90, 30.5, "structure")]
+    hrz = [ln for ln in to_nina_hrz(rows).splitlines() if not ln.startswith("#")]
+    txt = to_stellarium_txt(rows).splitlines()
+    assert hrz[0] == "0 15" and txt[0] == "0 15", "vegetation must be raised 3 deg"
+    assert "90 30.5" in hrz and "90 30.5" in txt, "a roofline needs no margin"
+
+
+def test_export_all_applies_the_buffer_exactly_once(tmp_path):
+    """Buffering in both the wrapper and the exporters would double the margin."""
+    p = tmp_path / "m.yaml"
+    write_mask(str(p), {0: (12.0, "tree")}, [], {"lat": 40, "lon": -105})
+    hrz, _ = export_all(str(p), str(tmp_path / "out"))
+    body = [ln for ln in open(hrz).read().splitlines() if not ln.startswith("#")]
+    assert body[0] == "0 15", f"expected one 3 deg buffer, got {body[0]}"
 
 
 def test_stellarium_txt_has_no_comments():
@@ -767,3 +791,147 @@ def test_floor_pinned_result_is_not_a_measurement():
     alt, detail = find_horizon(prof, sky_ref=50.0)
     assert alt is None
     assert "open" in detail["reason"]
+
+
+# ---- review round 1 regressions -------------------------------------------
+def test_second_leg_rechecks_the_sun_after_the_waypoint():
+    """A two-hop route must not fire its second leg on a stale clearance.
+
+    GOTO_TIMEOUT is 90s and extends while the mount still reports motion, so the
+    first leg can run for minutes. The clearance was computed before it started;
+    by the time the second leg fires the Sun has moved. It must be recomputed
+    against where the mount actually landed.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky, SunGuard
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    ptr = Pointer(sc, sky, 30, 5)
+
+    legs = []
+
+    def fake_goto(ra, dec, settle):
+        legs.append((ra, dec))
+
+    # Direct path blocked -> route via a waypoint; both legs clear when planned;
+    # then the second leg is no longer clear once the waypoint is reached.
+    seps = iter([1.0, 90.0, 90.0, 1.0])
+    with (
+        patch.object(Pointer, "_goto_wait", side_effect=fake_goto),
+        patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
+        patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
+        patch.object(Pointer, "path_min_sep", lambda self, a, b: next(seps, 1.0)),
+    ):
+        with pytest.raises(SunGuard, match="Sun has moved"):
+            ptr.point_to(200.0, 20.0)
+    assert len(legs) == 1, "the second leg must not fire once the path is no longer clear"
+
+
+def test_avoid_pole_nudges_azimuth_not_altitude():
+    """Due north at altitude == latitude IS the celestial pole.
+
+    A sweep stalled there twice: RA is undefined, so the mount makes enormous RA
+    swings to reach neighbours. Altitude is the measured quantity and must not
+    move; a degree or two of azimuth is inside the mask's own resolution.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5)
+
+    az, alt = ptr.avoid_pole(0.0, 39.7917)  # straight at the pole
+    assert alt == 39.7917, "altitude is the measurement and must not be nudged"
+    assert az != 0.0, "azimuth must move off the pole"
+    _, dec = sky.altaz_to_radec(az, alt)
+    assert abs(dec) <= 88.5, f"nudged target still at dec {dec:.2f}"
+
+    # A target nowhere near the pole is returned untouched.
+    assert ptr.avoid_pole(180.0, 30.0) == (180.0, 30.0)
+
+
+def test_night_skips_a_lamp_and_finds_the_horizon_below_it():
+    """The lamp-skip branch, exercised on a column that IS open at the top.
+
+    The existing streetlight test exits early at the sky-floor gate, so it never
+    reaches this code. Here the sky is genuinely open down to 25, then a lamp
+    outshines it at 20, then real terrain.
+    """
+    from terminus.night import find_horizon
+
+    prof = [
+        (60, 20.0),
+        (50, 22.0),
+        (45, 23.0),
+        (40, 24.0),
+        (35, 25.0),
+        (30, 26.0),
+        (25, 27.0),
+        (20, 90.0),  # streetlight, far brighter than the sky model
+        (15, 3.0),  # terrain
+        (10, 2.8),
+        (5, 2.6),
+        (0, 2.5),
+    ]
+    alt, detail = find_horizon(prof, sky_ref=22.0)
+    assert alt == 15.0, f"expected the horizon below the lamp, got {alt} ({detail})"
+    assert 20.0 in detail["lights_at"], "the lamp must be identified, not treated as terrain"
+
+
+def test_heuristic_sky_rejects_warm_and_green_surfaces():
+    """The CI-reachable classifier path: no torch, so this is what runs by default."""
+    import numpy as np
+
+    from terminus.skymask import heuristic_sky
+
+    img = np.zeros((10, 3, 3), np.float32)
+    img[:, 0] = (120, 150, 200)  # blue sky
+    img[:, 1] = (180, 120, 90)  # warm brick
+    img[:, 2] = (60, 110, 70)  # green foliage
+    sky = heuristic_sky(img, px_per_deg=1.0, half_deg=1.0)
+    assert sky[:, 0].all(), "blue sky must classify as sky"
+    assert not sky[:, 1].any(), "warm masonry must not"
+    assert not sky[:, 2].any(), "foliage must not"
+
+
+def test_obstruction_classes_votes_below_the_horizon():
+    """The class is taken from the band just BELOW the skyline, not above it."""
+    import numpy as np
+
+    from terminus.skymask import obstruction_classes
+
+    seg = np.zeros((20, 2), int)
+    seg[:10, :] = 2  # sky above
+    seg[10:, 0] = 4  # tree below in column 0
+    seg[10:, 1] = 1  # building below in column 1
+    out = obstruction_classes(seg, np.array([9.0, 9.0]), window=6)
+    assert list(out) == [4, 1]
+
+    # A column with no measured horizon yields no class rather than a wrong one.
+    out = obstruction_classes(seg, np.array([np.nan, 9.0]), window=6)
+    assert out[0] == -1 and out[1] == 1
+
+
+def test_control_point_counts_maps_frames_to_their_constraints(tmp_path):
+    """The count drives frame dropping: a frame with too few is unconstrained.
+
+    autooptimiser will place a frame with ZERO control points, and did — a garage
+    umbrella landed in the sky. Miscounting here silently reinstates that bug.
+    """
+    from terminus.mosaic import control_point_counts
+
+    pto = tmp_path / "p.pto"
+    pto.write_text(
+        'i w100 h100 f0 n"/photos/a.jpg"\n'
+        'i w100 h100 f0 n"/photos/b.jpg"\n'
+        'i w100 h100 f0 n"/photos/c.jpg"\n'
+        "c n0 N1 x1 y1 X2 Y2 t0\n"
+        "c n0 N1 x3 y3 X4 Y4 t0\n"
+        "c n1 N2 x5 y5 X6 Y6 t0\n"
+    )
+    counts = control_point_counts(str(pto))
+    assert counts == {"a.jpg": 2, "b.jpg": 3, "c.jpg": 1}

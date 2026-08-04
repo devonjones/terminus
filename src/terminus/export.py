@@ -74,8 +74,18 @@ def apply_tree_buffer(rows, buffer_deg=TREE_BUFFER_DEG, types=("tree", "vegetati
     return out
 
 
-def _ascending_pairs(rows):
-    """(az, alt) ascending, guaranteeing endpoints at 0 and 360 for full wrap."""
+def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
+    """(az, alt) ascending, guaranteeing endpoints at 0 and 360 for full wrap.
+
+    The vegetation buffer is applied HERE, not in the callers. Every exporter
+    routes through this function, and it is the last point at which a row still
+    carries its type — past it, rows are bare (az, alt) numbers. Applying the
+    buffer in `export_all` instead left `to_nina_hrz` and `to_stellarium_txt`
+    exporting raw altitudes whenever they were imported directly, which is a
+    documented public path. The margin is not meant to be optional.
+    """
+    if tree_buffer:
+        rows = apply_tree_buffer(rows, tree_buffer)
     pairs = [(az, alt) for az, alt, _ in rows]
     if not pairs:
         raise ValueError("mask has no horizon points")
@@ -86,11 +96,11 @@ def _ascending_pairs(rows):
     return pairs
 
 
-def to_nina_hrz(rows, meta=None):
-    pairs = _ascending_pairs(rows)
+def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG):
+    pairs = _ascending_pairs(rows, tree_buffer)
     out = ["# terminus horizon for N.I.N.A. (az alt), true-north azimuth."]
-    if meta and meta.get("tree_buffer_deg"):
-        out.append(f"# vegetation columns raised {meta['tree_buffer_deg']:g} deg (seasonal, gappy)")
+    if tree_buffer:
+        out.append(f"# vegetation columns raised {tree_buffer:g} deg (seasonal, gappy)")
     if meta:
         out.append(
             f"# measured {meta.get('measured','?')} at {meta.get('lat','?')},{meta.get('lon','?')}"
@@ -99,20 +109,21 @@ def to_nina_hrz(rows, meta=None):
     return "\n".join(out) + "\n"
 
 
-def to_stellarium_txt(rows):
+def to_stellarium_txt(rows, tree_buffer=TREE_BUFFER_DEG):
     # Stellarium polygonal landscape: same "az alt" list, ascending, no header needed.
-    return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows)) + "\n"
+    return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows, tree_buffer)) + "\n"
 
 
 def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG):
+    # Deliberately does NOT buffer here: the exporters do it themselves, so a
+    # caller reaching past this wrapper still gets the margin. Buffering in both
+    # places would apply it twice.
     meta, rows = load_mask(mask_path)
-    if tree_buffer:
-        rows = apply_tree_buffer(rows, tree_buffer)
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
-        f.write(to_nina_hrz(rows, meta))
+        f.write(to_nina_hrz(rows, meta, tree_buffer))
     with open(txt, "w") as f:
-        f.write(to_stellarium_txt(rows))
+        f.write(to_stellarium_txt(rows, tree_buffer))
     return hrz, txt
 
 

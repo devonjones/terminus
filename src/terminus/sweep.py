@@ -296,6 +296,24 @@ class Pointer:
                     break
             if via:
                 self._goto_wait(*via, 0.3)
+                # Re-verify before the second leg. The first one can now run for
+                # minutes — GOTO_TIMEOUT is 90s and extends while the mount still
+                # reports motion — so the clearance computed above is stale by the
+                # time it is used, and the Sun has moved. Recompute against where
+                # the mount ACTUALLY landed rather than where it was asked to go,
+                # and re-derive the target: az/alt is fixed, but the RA/Dec that
+                # holds it drifts about a degree every four minutes.
+                landed = self.sc.equ_coord()
+                if landed is None:
+                    raise SunGuard("cannot read pointing after the waypoint; refusing to slew")
+                self._sun_check(*self.sky.radec_to_altaz(*landed))
+                target = self.sky.altaz_to_radec(az, alt)
+                sep = self.path_min_sep(landed, target)
+                if sep < self.cone:
+                    raise SunGuard(
+                        f"waypoint reached but the Sun has moved: second leg to "
+                        f"({az:.0f},{alt:.0f}) now clears by only {sep:.1f} deg"
+                    )
                 self._goto_wait(*target, SETTLE)
             else:
                 raise SunGuard(
