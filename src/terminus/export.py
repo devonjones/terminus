@@ -49,9 +49,10 @@ def _column(value):
 
 def write_mask(path, mask, skipped, meta):
     """Write the mask YAML. `mask` is {az: (alt, type)} or {az: {...}}."""
-    # A photo-derived mask is in the panorama's own azimuth until `terminus
-    # orient` solves the yaw, and saying otherwise in the header would invite a
-    # planner to point at a horizon rotated by an unknown amount.
+    # A photo-derived mask is in the panorama's own azimuth until the yaw is
+    # solved against telescope-measured columns, and saying otherwise in the
+    # header would invite a planner to point at a horizon rotated by an unknown
+    # amount.
     oriented = is_oriented(meta)
     columns = {az: _column(v) for az, v in mask.items()}
     extra = any(c.get(k) is not None for c in columns.values() for k in COLUMN_FIELDS)
