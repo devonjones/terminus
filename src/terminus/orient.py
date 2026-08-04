@@ -35,19 +35,31 @@ import numpy as np
 class Fiducial:
     """One telescope-measured column.
 
-    alt      measured altitude, or the ceiling if the column was capped
-    ceiling  the altitude ceiling this column was scanned with
-    bound    True if the scan hit its ceiling (alt is a lower bound)
+    alt         measured altitude, or the ceiling if the column was capped
+    ceiling     the altitude ceiling this column was scanned with
+    bound       True if the scan hit its ceiling (alt is a lower bound)
+    weight      how much this column counts in the fit
+    photo_type  obstruction type from the panorama segmentation, or None
+    scope_type  obstruction type from the telescope's own frame, or None
+
+    The two type sources are kept SEPARATE rather than merged into one field.
+    They can disagree, and the disagreement is itself informative — averaging it
+    away destroys the only signal that either is wrong. Today only `photo_type`
+    is populated; `scope_type` arrives once the scope can autofocus on the edge.
     """
 
-    __slots__ = ("az", "alt", "ceiling", "bound", "weight")
+    __slots__ = ("az", "alt", "ceiling", "bound", "weight", "photo_type", "scope_type")
 
-    def __init__(self, az, alt, ceiling=None, bound=False, weight=1.0):
+    def __init__(
+        self, az, alt, ceiling=None, bound=False, weight=1.0, photo_type=None, scope_type=None
+    ):
         self.az = float(az)
         self.alt = float(alt)
         self.ceiling = float(ceiling) if ceiling is not None else None
         self.bound = bool(bound)
         self.weight = float(weight)
+        self.photo_type = photo_type
+        self.scope_type = scope_type
 
     def headroom(self):
         """Gap between the result and its own ceiling.

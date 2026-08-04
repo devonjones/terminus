@@ -2369,3 +2369,95 @@ def test_truncation_happens_after_filtering_not_before():
     picks = rank_columns([0.0, 180.0], cands, grad, top=3, reachable=ok)
     assert len(picks) == 3, f"asked for 3 feasible columns, got {picks}"
     assert not (set(picks) & blocked), "returned a column the Sun refuses"
+
+
+# ---- type-weighted fiducials (terminus-36) ---------------------------------
+def test_vegetation_and_structure_move_the_fit_by_different_amounts():
+    """The whole point: identical SNR and identical error must NOT count equally.
+
+    SNR says how well an edge was DETECTED; type says how well the thing
+    detected STAYS PUT between the photograph and the measurement. A crisp
+    canopy edge scores excellently on the first and badly on the second, and
+    before this the fit trusted it exactly as much as a roofline.
+
+    Two otherwise identical fiducials carry the same wrong altitude. The one
+    labelled vegetation must drag the solved yaw less far than the one labelled
+    structure.
+    """
+    from terminus.orient import Fiducial, fit
+    from terminus.plan import as_fiducial
+
+    truth = 40.0
+    good = _place(_skyline, truth, 0.0, 0.0, 0.0, step=30.0)
+
+    def solve(uncertainty):
+        fids = list(good[:-1])
+        bad_az = good[-1].az
+        # Same SNR, same 8-degree error; only the type prior differs.
+        f = as_fiducial(
+            bad_az,
+            {"alt": good[-1].alt + 8.0, "snr": 8.0},
+            90.0,
+            Fiducial,
+            uncertainty=uncertainty,
+            photo_type="tree" if uncertainty and uncertainty > 2 else "structure",
+        )
+        fids.append(f)
+        return fit(fids, _skyline, yaw_step=1.0, tilt_step=5.0, robust=False)["yaw"]
+
+    pull_structure = abs(((solve(1.0) - truth + 180) % 360) - 180)
+    pull_vegetation = abs(((solve(3.0) - truth + 180) % 360) - 180)
+    assert pull_vegetation < pull_structure, (
+        f"a vegetation column pulled the fit {pull_vegetation:.2f} deg and a structure "
+        f"column {pull_structure:.2f} — the type prior is not reaching the fit"
+    )
+
+
+def test_the_two_type_sources_are_recorded_separately():
+    """Photo and scope can disagree, and the disagreement is the signal.
+
+    Merging them into one field destroys the only evidence that either is
+    wrong, so `Fiducial` keeps both and neither defaults from the other.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    f = as_fiducial(
+        10.0,
+        {"alt": 20.0, "snr": 8.0},
+        60.0,
+        Fiducial,
+        photo_type="tree",
+        scope_type="structure",
+    )
+    assert f.photo_type == "tree" and f.scope_type == "structure"
+
+    only_photo = as_fiducial(10.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, photo_type="tree")
+    assert only_photo.scope_type is None, "an absent scope type must not inherit the photo's"
+
+
+def test_type_multiplies_the_snr_term_rather_than_replacing_it():
+    """They measure different things, so a column must fail on either."""
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    crisp_canopy = as_fiducial(
+        0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=3.0
+    ).weight
+    noisy_wall = as_fiducial(0.0, {"alt": 20.0, "snr": 1.0}, 60.0, Fiducial, uncertainty=1.0).weight
+    crisp_wall = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=1.0).weight
+
+    assert crisp_wall > crisp_canopy, "a well-detected canopy edge still moves"
+    assert crisp_wall > noisy_wall, "a poorly detected wall is still poorly detected"
+    # 1/sigma^2, so tripling the uncertainty costs a factor of nine.
+    assert crisp_canopy == pytest.approx(crisp_wall / 9.0)
+
+
+def test_an_untyped_column_weighs_exactly_as_before():
+    """No type known must mean no change, or every existing mask shifts."""
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    for snr in (1.0, 4.0, 8.0, 20.0):
+        f = as_fiducial(0.0, {"alt": 20.0, "snr": snr}, 60.0, Fiducial)
+        assert f.weight == pytest.approx(min(1.0, snr / 8.0))

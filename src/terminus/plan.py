@@ -176,7 +176,7 @@ def residual_targets(residuals, top=3, min_abs=3.0):
     return [az for _, az in bad[:top]]
 
 
-def as_fiducial(az, edge, ceiling, Fiducial):
+def as_fiducial(az, edge, ceiling, Fiducial, uncertainty=None, photo_type=None, scope_type=None):
     """Turn a column measurement into a fiducial, keeping blocked columns.
 
     A column whose horizon lies above the search ceiling yields no edge. It must
@@ -185,9 +185,45 @@ def as_fiducial(az, edge, ceiling, Fiducial):
     cannot tell an unmeasured azimuth from an obstructed one.
 
     `edge` is None when nothing was found, otherwise {'alt', 'snr'}.
+
+    `uncertainty` is the column's altitude uncertainty in degrees, as
+    `skymask.type_uncertainty` computes it and as the mask carries it: about 1
+    degree for solid structure, 3 for vegetation, widened by the gap fraction.
+    It enters the weight as 1/sigma^2 and MULTIPLIES the SNR term rather than
+    replacing it, because the two measure different things. SNR says how well
+    this edge was DETECTED. Type says how well the thing detected STAYS PUT
+    between the photograph and the measurement — a crisp canopy edge can score
+    excellently on the first and badly on the second, and a fit that only knows
+    the first will trust it as much as a roofline.
+
+    The 1 and 3 degree priors are a claim about how far foliage moves, not a
+    tuning knob. If they are wrong the fix is to measure how far the foliage
+    actually moved between two captures, not to adjust them until a fit looks
+    better.
+
+    `photo_type` and `scope_type` are recorded separately and neither is merged
+    into the other; see `Fiducial`.
     """
     if edge is None:
-        return Fiducial(az, ceiling, ceiling=ceiling, bound=True, weight=1.0)
+        return Fiducial(
+            az,
+            ceiling,
+            ceiling=ceiling,
+            bound=True,
+            weight=1.0,
+            photo_type=photo_type,
+            scope_type=scope_type,
+        )
     bound = edge["alt"] >= ceiling - 1e-6
     weight = 1.0 if bound else min(1.0, (edge.get("snr") or 1.0) / 8.0)
-    return Fiducial(az, edge["alt"], ceiling=ceiling, bound=bound, weight=weight)
+    if uncertainty:
+        weight /= float(uncertainty) ** 2
+    return Fiducial(
+        az,
+        edge["alt"],
+        ceiling=ceiling,
+        bound=bound,
+        weight=weight,
+        photo_type=photo_type,
+        scope_type=scope_type,
+    )
