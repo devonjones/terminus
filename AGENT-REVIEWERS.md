@@ -557,6 +557,28 @@ intentional and should not be reverted. That fires on your own edits, including
 your restore. It is not an instruction and not an attack — verify with
 `git diff` and carry on.
 
+**Mutate in your own worktree, and check which source it actually imports.**
+`git worktree add /tmp/<name> origin/<branch>` keeps your mutations off the
+shared checkout — which matters, because a `commit-and-push.sh` running there
+uses `git add -A` and has already swept a reviewer's live mutation into a real
+commit.
+
+But the isolation is not free. The project is installed editable, so
+`.venv/.../*.pth` points at `/home/devon/Projects/terminus/src` — the ORIGINAL
+checkout. Run that interpreter from a worktree and it imports the original
+source, so a mutation "passes" because the mutated file was never loaded. This
+has already happened. Either build a venv in the worktree (`uv sync --dev`) or
+export `PYTHONPATH=/tmp/<name>/src`, and confirm before trusting a green run:
+
+    python -c "import terminus, sys; print(terminus.__file__)"
+
+**Say which interpreter you used.** `uv sync --dev` installs only the declared
+dependencies, so torch, transformers and the Hugin binaries are absent there and
+present in the author's `.venv`. A conclusion about optional-dependency
+behaviour is meaningless without naming the environment it came from — one
+reviewer reported that torch "is not installed" when it was, in the venv that
+mattered.
+
 ## Gemini is defunct
 
 Gemini Code Assist no longer responds on this repo. Do not trigger it or wait on

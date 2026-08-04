@@ -51,9 +51,16 @@ its own frame).
 | Scope sweep, mask, exports, `Horizon` queries | **Working, on the CLI** |
 | Photo registration, segmentation, orientation fit, adaptive column choice, night detection | **Implemented and tested, not yet on the CLI** |
 
-The photo modules (`skymask`, `mosaic`, `orient`, `plan`, `night`) are in the
-package and covered by tests, but are not exported from the top-level API and no
-subcommand reaches them — they are importable only by full module path.
+The photo modules (`skymask`, `mosaic`, `orient`, `plan`, `night`) are exported
+from the package API and covered by tests, so they can be driven from a script
+today — but no subcommand reaches them yet.
+
+```python
+from terminus import mosaic, skymask, orient, plan
+```
+
+Importing terminus never pulls in torch or transformers and never shells out to
+Hugin; `skymask.available()` and `mosaic.hugin_available()` report what you have.
 
 So `terminus sweep` today runs the **scope-only** fallback: a blind circle, with
 obstruction type guessed from colour in a blurred frame. Treat that type column

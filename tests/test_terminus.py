@@ -1577,3 +1577,164 @@ def test_a_failing_stop_view_never_costs_the_measurement(tmp_path, boom):
         cli.cmd_sweep(sc, cfg, args)  # must NOT raise
     assert out.exists(), "a failed stop_view must not cost the mask"
     assert "12.0" in out.read_text()
+
+
+# ---- public API surface ----------------------------------------------------
+def test_importing_terminus_does_not_pull_in_torch_or_transformers():
+    """The heavy optional stack must stay optional.
+
+    torch and transformers are installed in this dev environment, so absence
+    cannot be the test — a fresh interpreter is asked what it actually loaded.
+    Importing them eagerly would add seconds to every CLI invocation and make
+    the package uninstallable on a Pi that only ever runs the scope path.
+    """
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, terminus; "
+            "print(int(any(m == 'torch' or m.startswith('torch.') for m in sys.modules))); "
+            "print(int(any(m == 'transformers' for m in sys.modules)))",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    torch_loaded, transformers_loaded = out.stdout.split()
+    assert torch_loaded == "0", "importing terminus must not load torch"
+    assert transformers_loaded == "0", "importing terminus must not load transformers"
+
+
+def _in_clean_interpreter(body, timeout=180):
+    """Run `body` in a fresh interpreter and return its stdout.
+
+    Anything asking "what does importing terminus do" has to run in its own
+    process. Inside the suite the answer is already contaminated: an earlier test
+    doing `from terminus.skymask import horizon_rows` binds `terminus.skymask`
+    as a side effect of the import system, so a reachability check run in-process
+    passes whether or not `__init__` imports it at all.
+    """
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-c", body], capture_output=True, text=True, timeout=timeout
+    )
+    assert out.returncode == 0, f"subprocess failed:\n{out.stdout}\n{out.stderr}"
+    return out.stdout.strip()
+
+
+def test_importing_terminus_does_not_shell_out():
+    """Hugin is optional and probing for it is not free.
+
+    `mosaic.hugin_available()` exists so a caller can ask; the import must not
+    ask on its behalf. Every spawn route is blocked, not just `subprocess.run` —
+    `Popen` and `os.system` bypass it entirely, and `check_output` only happens
+    to be caught because it delegates to `run`.
+    """
+    body = (
+        "import os, subprocess\n"
+        "def boom(*a, **k):\n"
+        "    raise AssertionError('terminus spawned a process during import')\n"
+        "subprocess.run = boom\n"
+        "subprocess.Popen = boom\n"
+        "subprocess.call = boom\n"
+        "subprocess.check_call = boom\n"
+        "subprocess.check_output = boom\n"
+        "os.system = boom\n"
+        "os.popen = boom\n"
+        "import terminus\n"
+        "print('ok')\n"
+    )
+    assert _in_clean_interpreter(body) == "ok"
+
+
+def test_photo_pipeline_is_reachable_from_the_package():
+    """The published method must not be absent from the package's own API.
+
+    Checked in a clean interpreter: importing `terminus` alone must bind all
+    five, with nothing else having imported them first.
+    """
+    body = (
+        "import terminus\n"
+        "mods = ('skymask', 'mosaic', 'orient', 'plan', 'night')\n"
+        "missing = [m for m in mods if not hasattr(terminus, m)]\n"
+        "unlisted = [m for m in mods if m not in terminus.__all__]\n"
+        "entry = all([\n"
+        "    callable(terminus.mosaic.solve), callable(terminus.mosaic.render),\n"
+        "    callable(terminus.mosaic.composite), callable(terminus.skymask.sky_mask),\n"
+        "    callable(terminus.skymask.available), callable(terminus.skymask.horizon_band),\n"
+        "    callable(terminus.orient.fit), callable(terminus.orient.from_mask),\n"
+        "    callable(terminus.orient.residuals), callable(terminus.night.find_horizon),\n"
+        "])\n"
+        "print(repr((missing, unlisted, entry)))\n"
+    )
+    missing, unlisted, entry = eval(_in_clean_interpreter(body))
+    assert not missing, f"importing terminus does not bind: {missing}"
+    assert not unlisted, f"not in __all__: {unlisted}"
+    assert entry, "an entry point named in the ticket is missing or not callable"
+
+
+def test_every_exported_name_actually_exists():
+    """A stale __all__ entry raises AttributeError on `from terminus import *`."""
+    import terminus
+
+    missing = [n for n in terminus.__all__ if not hasattr(terminus, n)]
+    assert not missing, f"__all__ names nothing: {missing}"
+
+
+def test_segmentation_backend_tracks_the_imports_not_the_environment():
+    """`available('segment')` must answer about torch, not about this machine.
+
+    The previous version blocked torch/transformers with a meta_path finder and
+    asserted False. That is inert wherever they are genuinely absent — which is
+    CI, since `uv sync --dev` installs only the declared dependencies and neither
+    is one. The finder could be deleted outright and the test still passed.
+
+    So both directions are forced here, with stubs rather than with whatever
+    happens to be installed: make the imports succeed and the answer must be
+    True; make them fail and it must be False. That proves the function responds
+    to the imports, and it reads the same in CI as on a workstation that has the
+    segmentation stack installed.
+    """
+    present = (
+        "import sys, types\n"
+        "for n in ('torch', 'transformers'):\n"
+        "    sys.modules[n] = types.ModuleType(n)\n"
+        "from terminus import skymask\n"
+        "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
+    )
+    absent = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] in ('torch', 'transformers'):\n"
+        "            raise ImportError('blocked for test: ' + name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "sys.modules.pop('torch', None); sys.modules.pop('transformers', None)\n"
+        "from terminus import skymask\n"
+        "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
+    )
+    seg_yes, heur_yes = eval(_in_clean_interpreter(present))
+    seg_no, heur_no = eval(_in_clean_interpreter(absent))
+
+    assert seg_yes is True, "with both modules importable, the segment backend must report True"
+    assert seg_no is False, "without them, it must report False rather than raising"
+    assert heur_yes is True and heur_no is True, "the heuristic backend needs nothing"
+
+
+def test_hugin_probe_reports_rather_than_raising():
+    """`hugin_available()` must answer on a machine with no Hugin installed."""
+    from unittest.mock import patch
+
+    import terminus
+
+    with patch("shutil.which", return_value=None):
+        assert terminus.mosaic.hugin_available() is False
+    with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
+        assert terminus.mosaic.hugin_available() is True
