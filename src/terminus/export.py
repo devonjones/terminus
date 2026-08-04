@@ -6,7 +6,7 @@ Mask YAML (terminus's own durable artifact, hand-editable after review):
     horizon:
       0: {alt: 12.3, type: tree}
       5: {alt: 18.0, type: structure}
-      10: {alt: 60.0, type: tree, clipped: True, porosity: 0.4, uncertainty: 4.2}
+      10: {alt: 60.0, type: tree, clipped: True, gap_fraction: 0.4, uncertainty: 4.2}
       ...
 
 `alt` and `type` are always present. The rest appear only when a photo-derived
@@ -31,12 +31,17 @@ import yaml
 #   clipped      the obstruction reached the top of the data. This records where
 #                the FRAME was cropped, not where the horizon is, and is never a
 #                measurement — a consumer must treat it as "at least this high".
-#   porosity     fraction of the band between first and top obstruction that is
+#   gap_fraction fraction of the band between first and top obstruction that is
 #                still sky. A wall is 0; a gappy canopy is high, and its single
-#                altitude misrepresents it in both directions.
+#                altitude misrepresents it in both directions. The field's term
+#                (Jonckheere 2004); it was briefly called porosity, which is
+#                windbreak vocabulary. Read on load as well, so a mask written
+#                before the rename still opens.
 #   uncertainty  per-column altitude uncertainty in degrees, already widened for
-#                vegetation by type and porosity.
-COLUMN_FIELDS = ("clipped", "porosity", "uncertainty")
+#                vegetation by type and gap_fraction.
+COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty")
+# Old spellings still accepted when reading, never written.
+_RENAMED = {"gap_fraction": "porosity"}
 
 
 def _column(value):
@@ -71,7 +76,7 @@ def write_mask(path, mask, skipped, meta):
     if extra:
         lines += [
             "# clipped: true = obstruction ran off the top of the data; a lower BOUND,",
-            "#          not a measurement. porosity: sky fraction within the canopy",
+            "#          not a measurement. gap_fraction: sky fraction within the canopy",
             "#          band. uncertainty: degrees, already widened for vegetation.",
         ]
     lines += [f"meta: {meta}", "horizon:"]
@@ -101,7 +106,7 @@ def load_mask(path):
 
 
 def load_columns(path):
-    """(meta, {az: {alt, type, clipped?, porosity?, uncertainty?}}).
+    """(meta, {az: {alt, type, clipped?, gap_fraction?, uncertainty?}}).
 
     The full record, for consumers that must not treat a clipped column as a
     measurement or must widen a target's margin by a column's uncertainty.
@@ -114,8 +119,11 @@ def load_columns(path):
         if isinstance(v, dict):
             col = {"alt": float(v["alt"]), "type": v.get("type", "") or ""}
             for key in COLUMN_FIELDS:
-                if v.get(key) is not None:
-                    col[key] = bool(v[key]) if key == "clipped" else float(v[key])
+                raw = v.get(key)
+                if raw is None and key in _RENAMED:
+                    raw = v.get(_RENAMED[key])  # a mask written before the rename
+                if raw is not None:
+                    col[key] = bool(raw) if key == "clipped" else float(raw)
         else:  # bare "az: alt"
             col = {"alt": float(v), "type": ""}
         cols[int(az)] = col

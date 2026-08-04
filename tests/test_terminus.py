@@ -277,8 +277,8 @@ def test_fit_recovers_a_known_rotation():
     assert got["rms"] < 1.5, got
 
 
-def test_horizon_band_measures_canopy_porosity():
-    """A gappy canopy reports a band and high porosity; a wall does not."""
+def test_horizon_band_measures_canopy_gap_fraction():
+    """A gappy canopy reports a band and high gap_fraction; a wall does not."""
     import numpy as np
 
     from terminus.skymask import horizon_band
@@ -291,9 +291,9 @@ def test_horizon_band_measures_canopy_porosity():
     sky[50:57, 1] = True
     b = horizon_band(sky, run=4)
     assert b["first"][0] == 60 and b["top"][0] == 60
-    assert b["porosity"][0] == 0.0
+    assert b["gap_fraction"][0] == 0.0
     assert b["top"][1] == 40  # foliage really starts higher up
-    assert b["porosity"][1] > 0.1  # and it is gappy in between
+    assert b["gap_fraction"][1] > 0.1  # and it is gappy in between
 
 
 def test_type_uncertainty_widens_for_vegetation():
@@ -303,8 +303,8 @@ def test_type_uncertainty_widens_for_vegetation():
     from terminus.skymask import type_uncertainty
 
     classes = np.array([4, 1])  # tree, wall
-    porosity = np.array([0.5, 0.0])
-    u = type_uncertainty(classes, porosity)
+    gap_fraction = np.array([0.5, 0.0])
+    u = type_uncertainty(classes, gap_fraction)
     assert u[0] > u[1] * 2
     assert u[1] == 1.0
 
@@ -1762,7 +1762,7 @@ def test_skymask_writes_an_unoriented_mask_with_the_extra_columns(tmp_path):
     """The two fields that had nowhere to live in the schema must survive.
 
     `clipped` records that the obstruction ran off the top of the data — where
-    the FRAME was cropped, never where the horizon is — and porosity/uncertainty
+    the FRAME was cropped, never where the horizon is — and gap_fraction/uncertainty
     carry how gappy the canopy is. Without them a consumer cannot tell a bound
     from a measurement.
     """
@@ -1783,7 +1783,7 @@ def test_skymask_writes_an_unoriented_mask_with_the_extra_columns(tmp_path):
     assert clipped, "the column blocked to the top of frame must be marked clipped"
     assert all(50 <= a <= 70 for a in clipped), f"clipped in the wrong place: {clipped}"
     for c in cols.values():
-        assert "porosity" in c and "uncertainty" in c
+        assert "gap_fraction" in c and "uncertainty" in c
         assert c["uncertainty"] > 0
 
     # The three-tuple contract every exporter depends on is untouched.
@@ -1967,7 +1967,7 @@ def test_cli_export_refuses_an_unoriented_mask(tmp_path, capsys):
 def test_a_scope_mask_gains_no_new_header(tmp_path):
     """The schema addition must be invisible to a mask that does not use it.
 
-    The header explained clipped/porosity/uncertainty unconditionally, so every
+    The header explained clipped/gap_fraction/uncertainty unconditionally, so every
     scope-measured mask grew three comment lines about fields it does not carry
     — while the docstring claimed such a mask was byte-for-byte unchanged.
     """
@@ -1977,7 +1977,7 @@ def test_a_scope_mask_gains_no_new_header(tmp_path):
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
     assert len(head) == 4, f"a scope mask should carry 4 comment lines, got {len(head)}"
-    assert not any("clipped" in ln or "porosity" in ln for ln in head)
+    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head)
 
     rich = tmp_path / "photo.yaml"
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
@@ -2114,3 +2114,49 @@ def test_write_mask_does_not_truncate_on_a_bad_flag(tmp_path):
     with pytest.raises(MaskError):
         write_mask(str(p), {0: (1.0, "tree")}, [], {"oriented": "flase"})
     assert p.read_text() == "PRE-EXISTING\n"
+
+
+def test_a_mask_written_before_the_rename_still_loads(tmp_path):
+    """`porosity` was the wrong word, but files carrying it already exist.
+
+    Gap fraction is the field's term (Jonckheere et al. 2004); porosity is
+    windbreak vocabulary. The rename is worth doing before the API is public —
+    but a mask written this morning must not become unreadable, so the old key
+    is accepted on load and never written back.
+    """
+    from terminus.export import load_columns
+
+    p = tmp_path / "old.yaml"
+    p.write_text(
+        "meta: {lat: 40}\n"
+        "horizon:\n"
+        "  0: {alt: 12.0, type: tree, clipped: True, porosity: 0.4, uncertainty: 4.2}\n"
+    )
+    _, cols = load_columns(str(p))
+    assert cols[0]["gap_fraction"] == 0.4, "the old spelling must still be read"
+    assert "porosity" not in cols[0], "but it is not carried forward under the old name"
+
+
+def test_the_new_spelling_wins_when_both_are_present(tmp_path):
+    """A hand-edited file could carry both. Prefer the current name."""
+    from terminus.export import load_columns
+
+    p = tmp_path / "both.yaml"
+    p.write_text(
+        "meta: {lat: 40}\n"
+        "horizon:\n"
+        "  0: {alt: 12.0, type: tree, porosity: 0.1, gap_fraction: 0.9}\n"
+    )
+    _, cols = load_columns(str(p))
+    assert cols[0]["gap_fraction"] == 0.9
+
+
+def test_gap_fraction_is_written_not_porosity(tmp_path):
+    """The wrong word must not reappear in anything we emit."""
+    from terminus.export import write_mask
+
+    p = tmp_path / "new.yaml"
+    write_mask(str(p), {0: {"alt": 12.0, "type": "tree", "gap_fraction": 0.4}}, [], {})
+    text = p.read_text()
+    assert "gap_fraction: 0.4" in text
+    assert "porosity" not in text

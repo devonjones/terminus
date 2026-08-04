@@ -23,6 +23,27 @@ cloud is *more* textured than siding. Do not reinstate it without re-measuring.
 
 The heuristic therefore accepts a known compromise, and the segmentation backend
 exists because no threshold resolves it.
+
+Terminology, in the field's language rather than ours:
+
+**Gap fraction** is the fraction of a direction still open to sky through
+foliage, which `horizon_band` computes per column — more precisely *directional
+gap fraction* (Jonckheere et al. 2004, Agric. For. Meteorol. 121(1-2), 19-35;
+Rich 1990, Remote Sensing Reviews 5(1), 13-29). It was briefly called
+*porosity*, which is windbreak and shelterbelt vocabulary and absent from the
+canopy-photography canon. The wrong word marks the work as out-of-field to
+exactly the readers best placed to check it.
+
+Gap fraction is **not** the sky view factor and the two must not be swapped:
+SVF is cosine-weighted for radiative exchange (Steyn et al. 1986), while gap
+fraction is unweighted. Conflating them is the classic out-of-field tell.
+
+The quantity here — gap fraction retained BELOW a per-azimuth skyline altitude —
+appears to have no established name. Forestry computes gap fraction on
+zenith-ring by azimuth-sector grids and never produces h(az); the solar
+horizon-profile field produces h(az) and treats obstructions as opaque. "Gap
+fraction above the horizon line" is the phrasing both fields read without
+objection.
 """
 
 import numpy as np
@@ -240,21 +261,24 @@ def horizon_band(sky, valid=None, run=6):
     hides that there is usable sky in between.
 
     Returns a dict of arrays:
-      first     row where obstruction first appears (lowest altitude)
-      top       row above which everything is sky (highest altitude)
-      porosity  fraction of rows between top and first that ARE sky
-      clipped   obstruction reaches the top of the data
+      first         row where obstruction first appears (lowest altitude)
+      top           row above which everything is sky (highest altitude)
+      gap_fraction  fraction of rows between top and first that ARE sky
+      clipped       obstruction reaches the top of the data
 
-    porosity near 0 is a solid edge; a high value means a gappy canopy where the
-    horizon is genuinely ambiguous and the mask should carry that as uncertainty
-    rather than pretending to a single number.
+    A gap fraction near 0 is a solid edge; a high value means a gappy canopy
+    where the horizon is genuinely ambiguous, and the mask should carry that as
+    uncertainty rather than pretend to a single number.
+
+    On the name: see the module docstring for why this is gap fraction rather
+    than porosity, and how it differs from the sky view factor.
     """
     h, w = sky.shape
     if valid is None:
         valid = np.ones((h, w), bool)
     first = np.full(w, np.nan)
     top = np.full(w, np.nan)
-    porosity = np.zeros(w)
+    gap_fraction = np.zeros(w)
     clipped = np.zeros(w, bool)
     kern = np.ones(run)
     for x in range(w):
@@ -279,8 +303,8 @@ def horizon_band(sky, valid=None, run=6):
         # see through, which is the honest measure of how ill-defined the
         # boundary is.
         span = blocked[t:]
-        porosity[x] = float((~span).mean()) if len(span) else 0.0
-    return {"first": first, "top": top, "porosity": porosity, "clipped": clipped}
+        gap_fraction[x] = float((~span).mean()) if len(span) else 0.0
+    return {"first": first, "top": top, "gap_fraction": gap_fraction, "clipped": clipped}
 
 
 def obstruction_classes(seg, rows, valid=None, window=12):
@@ -313,7 +337,7 @@ def obstruction_classes(seg, rows, valid=None, window=12):
     return out
 
 
-def type_uncertainty(classes, porosity, veg_deg=3.0, solid_deg=1.0):
+def type_uncertainty(classes, gap_fraction, veg_deg=3.0, solid_deg=1.0):
     """Per-column altitude uncertainty, widened for vegetation.
 
     Vegetation earns extra fuzz for two independent reasons: its boundary is
@@ -323,4 +347,4 @@ def type_uncertainty(classes, porosity, veg_deg=3.0, solid_deg=1.0):
     """
     veg = np.isin(classes, VEG_CLASSES_ADE20K)
     base = np.where(veg, veg_deg, solid_deg)
-    return base * (1.0 + np.clip(porosity, 0.0, 1.0))
+    return base * (1.0 + np.clip(gap_fraction, 0.0, 1.0))
