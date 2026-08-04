@@ -371,8 +371,12 @@ def reachable_now(ptr, alt, cone=None):
     return ok
 
 
-def hours_until_reachable(sky, az, alt, cone, within=8.0, step_min=15.0):
-    """When does this column come out from behind the Sun? None if not within `within`.
+def hours_until_endpoint_clear(sky, az, alt, cone, within=8.0, step_min=15.0):
+    """When does this column's ENDPOINT come out from behind the Sun?
+
+    Returns hours, or None if not within `within`. Named for what it measures
+    rather than for what a caller wants, because the two differ: "reachable"
+    would promise a slew will be allowed, and this cannot promise that.
 
     A refused column is not permanently lost — the Sun moves about 15 degrees an
     hour — and under an observing deadline the right move is sometimes to wait

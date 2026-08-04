@@ -2243,7 +2243,7 @@ def test_nothing_reachable_is_a_state_not_a_crash():
     assert feasible == [] and refused == cands
 
 
-def test_hours_until_reachable_reports_a_wait(monkeypatch):
+def test_hours_until_endpoint_clear_reports_a_wait(monkeypatch):
     """A refused column is not permanently lost — report when it frees up."""
     import datetime
 
@@ -2266,9 +2266,83 @@ def test_hours_until_reachable_reports_a_wait(monkeypatch):
         return _FakeSunCoord(100.0 + 15.0 * elapsed, 40.0)
 
     monkeypatch.setattr(sweep, "get_sun", fake_get_sun)
-    wait = sweep.hours_until_reachable(sky, 100.0, 30.0, cone=30.0, within=8.0, step_min=30.0)
+    wait = sweep.hours_until_endpoint_clear(sky, 100.0, 30.0, cone=30.0, within=8.0, step_min=30.0)
     assert wait is not None and 1.0 <= wait <= 4.0, wait
 
     # A column the Sun never approaches is available immediately.
-    assert sweep.hours_until_reachable(sky, 280.0, 30.0, cone=30.0) == 0.0
+    assert sweep.hours_until_endpoint_clear(sky, 280.0, 30.0, cone=30.0) == 0.0
     assert isinstance(datetime.timedelta(minutes=1), datetime.timedelta)
+
+
+def test_the_feasibility_check_tests_the_same_azimuth_point_to_will_slew_to():
+    """The predicate and the slew must agree about which azimuth is meant.
+
+    `point_to` nudges an azimuth off the celestial pole before converting to
+    RA/Dec, so a predicate that checked the RAW azimuth would be answering about
+    a different path than the one later flown. Both call `avoid_pole`; nothing
+    pinned that they must, and removing it from the predicate left the whole
+    suite green.
+    """
+    from unittest.mock import patch
+
+    from terminus.sweep import Sky, reachable_now
+
+    ptr, sky = _pointer_with_sun(123.0, 55.8)
+    # Due north at altitude == latitude IS the pole, which is what avoid_pole
+    # exists to dodge; at this site that is az 0, alt 39.79.
+    pole_az, pole_alt = 0.0, 39.7917
+    nudged_az, nudged_alt = ptr.avoid_pole(pole_az, pole_alt)
+    assert nudged_az != pole_az, "fixture is wrong: this azimuth is not pole-adjacent"
+
+    seen = []
+    real = Sky.altaz_to_radec
+
+    def record(self, az, alt, when=None):
+        seen.append(round(az, 4))
+        return real(self, az, alt, when)
+
+    with (
+        patch.object(Sky, "sun", lambda self: (123.0, 55.8)),
+        patch.object(Sky, "altaz_to_radec", record),
+    ):
+        reachable_now(ptr, pole_alt)(pole_az)
+
+    # avoid_pole itself converts candidates while searching, so the raw azimuth
+    # legitimately appears. What matters is the LAST conversion — the one whose
+    # RA/Dec the path check actually uses.
+    assert seen[-1] == round(nudged_az, 4), (
+        f"predicate's path target was az {seen[-1]} but point_to would slew to "
+        f"{nudged_az:.4f} — the check and the slew disagree about the path"
+    )
+
+
+def test_a_set_sun_blocks_nothing():
+    """Below SUN_SAFE_ALT the Earth is in the way, so every column is clear now.
+
+    Without this branch the function would step forward through the night
+    looking for a separation that is already irrelevant, and report a wait where
+    the answer is zero. Deleting the check left the whole suite green.
+    """
+    from terminus import sweep
+
+    sky = sweep.Sky(39.7917, -104.894, 1600)
+
+    class _Set:
+        az = type("D", (), {"deg": 100.0})()
+        alt = type("D", (), {"deg": -20.0})()
+
+        def transform_to(self, frame):
+            return self
+
+    # The column must sit INSIDE the cone in angular separation, or the
+    # separation test passes on its own and the altitude branch is never
+    # exercised — which is exactly how the first version of this test let the
+    # mutation survive. Sun at az 100 alt -20, column at az 100 alt 0: 20 deg
+    # apart, inside a 30 deg cone, and refused by separation alone.
+    orig = sweep.get_sun
+    try:
+        sweep.get_sun = lambda when: _Set()
+        assert sweep.ang_sep(100.0, 0.0, 100.0, -20.0) < 30.0, "fixture must be inside the cone"
+        assert sweep.hours_until_endpoint_clear(sky, 100.0, 0.0, cone=30.0) == 0.0
+    finally:
+        sweep.get_sun = orig
