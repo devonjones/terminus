@@ -1846,6 +1846,14 @@ def test_offline_commands_need_no_config_file(tmp_path, monkeypatch):
     main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"])
     assert (tmp_path / "pano_mask.yaml").exists()
 
+    # `export` is offline too — re-exporting a mask must not demand a config
+    # file. CI, which has none, is what caught this; a local run never could.
+    from terminus.export import write_mask
+
+    write_mask(str(tmp_path / "m.yaml"), {0: (10.0, "tree")}, [], {"lat": 40})
+    main(["export", str(tmp_path / "m.yaml")])
+    assert (tmp_path / "m.hrz").exists()
+
     # and the scope commands still do demand one
     with pytest.raises(SystemExit):
         main(["preflight"])

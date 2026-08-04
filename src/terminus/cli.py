@@ -327,7 +327,11 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
 NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
 # Offline: no scope, no network, and no config.toml — a user with photographs
 # and no telescope must not be made to write one.
-OFFLINE = {"mosaic", "skymask"}
+# `export` belongs here too: it reads a mask file and writes two more, and
+# never looks at cfg. Demanding config.toml for it meant a machine with no
+# telescope could not re-export its own mask — and it was CI, which has no
+# config.toml, that surfaced this rather than any local run.
+OFFLINE = {"mosaic", "skymask", "export"}
 
 
 def main(argv=None):
