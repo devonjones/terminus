@@ -53,6 +53,8 @@ def write_mask(path, mask, skipped, meta):
     # orient` solves the yaw, and saying otherwise in the header would invite a
     # planner to point at a horizon rotated by an unknown amount.
     oriented = meta.get("oriented", True) if isinstance(meta, dict) else True
+    columns = {az: _column(v) for az, v in mask.items()}
+    extra = any(c.get(k) is not None for c in columns.values() for k in COLUMN_FIELDS)
     lines = [
         "# terminus horizon mask (Seestar S50, EQ mode, RA/Dec goto).",
         (
@@ -62,14 +64,18 @@ def write_mask(path, mask, skipped, meta):
             "# !! orientation with `terminus orient` before any planner consumes this."
         ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
-        "# clipped: true = obstruction ran off the top of the data; a lower BOUND,",
-        "#          not a measurement. porosity: sky fraction within the canopy",
-        "#          band. uncertainty: degrees, already widened for vegetation.",
-        f"meta: {meta}",
-        "horizon:",
     ]
-    for az in sorted(mask):
-        col = _column(mask[az])
+    # Only explain the photo-derived fields when the file actually carries them,
+    # so a scope-measured mask is byte-for-byte what it always was.
+    if extra:
+        lines += [
+            "# clipped: true = obstruction ran off the top of the data; a lower BOUND,",
+            "#          not a measurement. porosity: sky fraction within the canopy",
+            "#          band. uncertainty: degrees, already widened for vegetation.",
+        ]
+    lines += [f"meta: {meta}", "horizon:"]
+    for az in sorted(columns):
+        col = columns[az]
         parts = [f"alt: {col['alt']}", f"type: {col.get('type', '')}"]
         for key in COLUMN_FIELDS:
             if col.get(key) is not None:
@@ -161,7 +167,10 @@ def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
     return pairs
 
 
-def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG):
+def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=False):
+    # Also checked here, because this is a documented direct-import path and its
+    # header is the thing that would lie: it declares "true-north azimuth".
+    require_oriented(meta, allow_unoriented)
     pairs = _ascending_pairs(rows, tree_buffer)
     out = ["# terminus horizon for N.I.N.A. (az alt), true-north azimuth."]
     if tree_buffer:
@@ -179,14 +188,44 @@ def to_stellarium_txt(rows, tree_buffer=TREE_BUFFER_DEG):
     return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows, tree_buffer)) + "\n"
 
 
-def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG):
+class UnorientedMask(ValueError):
+    """A mask still in the panorama's own azimuth was asked to be exported."""
+
+
+def require_oriented(meta, allow_unoriented=False):
+    """Refuse to export a mask whose azimuth is not true north.
+
+    A photo-derived mask starts in the panorama's own azimuth and stays there
+    until the orientation is solved. Exporting it produces a file that LOOKS
+    like every other horizon — the .hrz even declares "true-north azimuth" in
+    its header — while being rotated by an unknown amount. A planner then
+    refuses targets that are clear and accepts targets that are behind a roof,
+    with nothing anywhere to say why.
+
+    The check lives here rather than in the CLI because `export_all` is the one
+    place that has both the file and its meta. This is the same lesson as the
+    vegetation buffer: a guard that only exists in one caller is not a guard.
+    """
+    if isinstance(meta, dict) and meta.get("oriented") is False and not allow_unoriented:
+        raise UnorientedMask(
+            "this mask is UNORIENTED — its azimuth is the panorama's own, not true "
+            "north. Solve the orientation first (`terminus orient`), or pass "
+            "allow_unoriented=True if you know the azimuths are already true."
+        )
+
+
+def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=False):
     # Deliberately does NOT buffer here: the exporters do it themselves, so a
     # caller reaching past this wrapper still gets the margin. Buffering in both
     # places would apply it twice.
     meta, rows = load_mask(mask_path)
+    require_oriented(meta, allow_unoriented)
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
-        f.write(to_nina_hrz(rows, meta, tree_buffer))
+        # Forward the override: to_nina_hrz checks again for the benefit of
+        # direct callers, and without this an explicit allow_unoriented would be
+        # granted here and then refused one line later.
+        f.write(to_nina_hrz(rows, meta, tree_buffer, allow_unoriented=True))
     with open(txt, "w") as f:
         f.write(to_stellarium_txt(rows, tree_buffer))
     return hrz, txt

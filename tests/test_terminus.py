@@ -1,6 +1,8 @@
 """Hardware-free tests for the pure logic: horizon interpolation, exporters,
 classifier, and Sun geometry. Run with: uv run pytest  (or pytest)."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -1891,3 +1893,85 @@ def test_segment_classes_votes_by_majority_across_tiles():
     assert out.shape == (h, w)
     assert set(np.unique(out)) == {4, 17}
     assert (out[: h // 2] == 4).all() and (out[h // 2 :] == 17).all()
+
+
+def test_an_unoriented_mask_cannot_be_exported(tmp_path):
+    """The refusal must be structural, not a message in one command.
+
+    A photo mask is in the panorama's own azimuth until the orientation is
+    solved. Exported anyway it produces a file that looks like every other
+    horizon — the .hrz header even declares "true-north azimuth" — while being
+    rotated by an unknown amount. A planner then refuses targets that are clear
+    and accepts targets sitting behind a roof, with nothing to say why.
+
+    Previously the only refusal was a print inside `cmd_skymask`, which never
+    exports anyway; `terminus export` on the same file produced the wrong .hrz
+    silently.
+    """
+    import pytest
+
+    from terminus.export import UnorientedMask, export_all, to_nina_hrz, write_mask
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree"), 90: (20.0, "structure")}, [], {"oriented": False})
+
+    with pytest.raises(UnorientedMask, match="UNORIENTED"):
+        export_all(str(p), str(tmp_path / "out"))
+    assert not (tmp_path / "out.hrz").exists(), "nothing may be written before the refusal"
+
+    # The documented direct-import path refuses too, since its header is the lie.
+    _, rows = __import__("terminus.export", fromlist=["load_mask"]).load_mask(str(p))
+    with pytest.raises(UnorientedMask):
+        to_nina_hrz(rows, {"oriented": False})
+
+    # Escape hatch, for someone who knows the azimuths are already true.
+    hrz, txt = export_all(str(p), str(tmp_path / "forced"), allow_unoriented=True)
+    assert os.path.exists(hrz) and os.path.exists(txt)
+
+
+def test_an_oriented_mask_still_exports(tmp_path):
+    """The guard must not fire on a scope-measured mask, which has no flag."""
+    from terminus.export import export_all, write_mask
+
+    p = tmp_path / "o.yaml"
+    write_mask(str(p), {0: (10.0, "tree")}, [], {"lat": 40})
+    hrz, _ = export_all(str(p), str(tmp_path / "ok"))
+    assert os.path.exists(hrz)
+
+
+def test_cli_export_refuses_an_unoriented_mask(tmp_path, capsys):
+    """Exit 1 with the reason, not a traceback."""
+    import pytest
+
+    from terminus.cli import main
+    from terminus.export import write_mask
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree")}, [], {"oriented": False})
+    with pytest.raises(SystemExit) as info:
+        main(["export", str(p)])
+    assert info.value.code == 1
+    assert "UNORIENTED" in capsys.readouterr().err
+    main(["export", str(p), "--allow-unoriented"])  # must not raise
+    assert (tmp_path / "u.hrz").exists()
+
+
+def test_a_scope_mask_gains_no_new_header(tmp_path):
+    """The schema addition must be invisible to a mask that does not use it.
+
+    The header explained clipped/porosity/uncertainty unconditionally, so every
+    scope-measured mask grew three comment lines about fields it does not carry
+    — while the docstring claimed such a mask was byte-for-byte unchanged.
+    """
+    from terminus.export import write_mask
+
+    plain = tmp_path / "scope.yaml"
+    write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
+    head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
+    assert len(head) == 4, f"a scope mask should carry 4 comment lines, got {len(head)}"
+    assert not any("clipped" in ln or "porosity" in ln for ln in head)
+
+    rich = tmp_path / "photo.yaml"
+    write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
+    rich_head = [ln for ln in rich.read_text().splitlines() if ln.startswith("#")]
+    assert any("clipped" in ln for ln in rich_head), "explain the fields that ARE present"

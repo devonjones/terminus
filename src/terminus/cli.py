@@ -18,7 +18,7 @@ import time
 
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
-from .export import default_meta, export_all, write_mask
+from .export import UnorientedMask, default_meta, export_all, write_mask
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     Pointer,
@@ -171,7 +171,11 @@ def cmd_sweep(sc, cfg, args):
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
-    hrz, txt = export_all(args.mask, os.path.splitext(args.mask)[0])
+    hrz, txt = export_all(
+        args.mask,
+        os.path.splitext(args.mask)[0],
+        allow_unoriented=getattr(args, "allow_unoriented", False),
+    )
     print(f"wrote {hrz}\nwrote {txt}")
 
 
@@ -317,8 +321,7 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     )
     print(f"wrote {out}: {len(mask)} columns, {clipped_n} clipped")
     print("NOTE: azimuth is the panorama's own, NOT true north — run `terminus orient`")
-    if not args.no_export:
-        print("skipping export: an unoriented mask must not be handed to a planner")
+    print("not exporting: an unoriented mask must not be handed to a planner")
 
 
 NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
@@ -348,6 +351,11 @@ def main(argv=None):
     sw.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("export")
     ex.add_argument("mask")
+    ex.add_argument(
+        "--allow-unoriented",
+        action="store_true",
+        help="export a mask whose azimuth is not yet true north",
+    )
 
     mo = sub.add_parser("mosaic", help="register photographs into an equirectangular panorama")
     mo.add_argument("image_dir")
@@ -384,7 +392,6 @@ def main(argv=None):
     sk.add_argument(
         "--envelope", type=float, default=2.0, help="half-width in degrees for the upper envelope"
     )
-    sk.add_argument("--no-export", action="store_true")
     for sp in (sub.choices["preflight"], sub.choices["classify"]):
         sp.add_argument("--dry-run", action="store_true")  # harmless, keeps a uniform namespace
     args = p.parse_args(argv)
@@ -407,7 +414,7 @@ def main(argv=None):
         finally:
             if sc:
                 sc.close()
-    except (ConfigError, SeestarError, MosaicError) as e:
+    except (ConfigError, SeestarError, MosaicError, UnorientedMask) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
