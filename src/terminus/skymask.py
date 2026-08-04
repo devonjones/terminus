@@ -23,6 +23,27 @@ cloud is *more* textured than siding. Do not reinstate it without re-measuring.
 
 The heuristic therefore accepts a known compromise, and the segmentation backend
 exists because no threshold resolves it.
+
+Terminology, in the field's language rather than ours:
+
+**Gap fraction** is the fraction of a direction still open to sky through
+foliage, which `horizon_band` computes per column — more precisely *directional
+gap fraction* (Jonckheere et al. 2004, Agric. For. Meteorol. 121(1-2), 19-35;
+Rich 1990, Remote Sensing Reviews 5(1), 13-29). It was briefly called
+*porosity*, which is windbreak and shelterbelt vocabulary and absent from the
+canopy-photography canon. The wrong word marks the work as out-of-field to
+exactly the readers best placed to check it.
+
+Gap fraction is **not** the sky view factor and the two must not be swapped:
+SVF is cosine-weighted for radiative exchange (Steyn et al. 1986), while gap
+fraction is unweighted. Conflating them is the classic out-of-field tell.
+
+The quantity here — gap fraction retained BELOW a per-azimuth skyline altitude —
+appears to have no established name. Forestry computes gap fraction on
+zenith-ring by azimuth-sector grids and never produces h(az); the solar
+horizon-profile field produces h(az) and treats obstructions as opaque. "Gap
+fraction above the horizon line" is the phrasing both fields read without
+objection.
 """
 
 import numpy as np
@@ -249,25 +270,8 @@ def horizon_band(sky, valid=None, run=6):
     where the horizon is genuinely ambiguous, and the mask should carry that as
     uncertainty rather than pretend to a single number.
 
-    **On the name.** This was called `porosity`, which is windbreak and
-    shelterbelt vocabulary ("optical porosity") and is absent from the
-    canopy-photography literature. The established term for the fraction of a
-    direction that is still open sky through foliage is **gap fraction**, and
-    more precisely directional gap fraction (Jonckheere et al. 2004, Agric. For.
-    Meteorol. 121(1-2), 19-35; Rich 1990, Remote Sensing Reviews 5(1), 13-29).
-    Using the wrong word marks the work as out-of-field to exactly the readers
-    best placed to check it.
-
-    Note also that gap fraction is NOT the sky view factor, and the two must not
-    be swapped: SVF is cosine-weighted for radiative exchange (Steyn et al.
-    1986), while this is an unweighted open-sky fraction.
-
-    What this function computes — gap fraction retained BELOW a per-azimuth
-    skyline altitude — seems to have no established name, because the forestry
-    field computes gap fraction on zenith-ring by azimuth-sector grids and never
-    produces h(az), while the solar horizon-profile field produces h(az) and
-    treats obstructions as opaque. "Gap fraction above the horizon line" is the
-    phrasing both fields read without objection.
+    On the name: see the module docstring for why this is gap fraction rather
+    than porosity, and how it differs from the sky view factor.
     """
     h, w = sky.shape
     if valid is None:
