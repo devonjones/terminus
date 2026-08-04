@@ -244,10 +244,15 @@ def horizon_band(sky, valid=None, run=6):
 def obstruction_classes(seg, rows, valid=None, window=12):
     """Dominant ADE20K class just below the horizon, per column.
 
-    Taken from the segmentation of an in-focus photograph. The telescope cannot
-    supply this: at 250mm focused at infinity every terrestrial target is far
-    inside the hyperfocal distance, so its frames are a blur and any type it
-    reports is inferred from colour alone.
+    Taken from the segmentation of an in-focus photograph, because a telescope
+    focused at infinity cannot supply it: at 250mm every terrestrial target is
+    far inside the hyperfocal distance, so its frames are a blur and any type it
+    reports from there is inferred from colour alone.
+
+    That is a limit of the focus position rather than of the instrument — the
+    scope can autofocus in scenery mode and resolve terrestrial detail, which
+    would let it measure type directly (terminus-32). This function is the
+    photograph's answer either way.
     """
     h, w = seg.shape
     out = np.full(w, -1, dtype=int)

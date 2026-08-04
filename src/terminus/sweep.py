@@ -800,10 +800,16 @@ def fit_transition(samples, sky_ref, frac=SKY_LUM_FRACTION):
 
 # ---- per-boundary models --------------------------------------------------
 # A roofline and a tree crown are not the same kind of edge, so they should not
-# be measured or judged by the same rule. Which one a column holds is known from
-# the photo segmentation, never from the telescope: at 250mm focused at infinity
-# every terrestrial target is far inside the hyperfocal distance, so the scope
-# sees only a blur and can report brightness but not identity.
+# be measured or judged by the same rule. Which one a column holds currently
+# comes from the photo segmentation, because at 250mm focused at infinity every
+# terrestrial target is far inside the hyperfocal distance, so the scope sees a
+# blur and can report brightness but not identity.
+#
+# That is a limit of the focus position, not of the instrument. The scope can
+# autofocus in scenery mode and resolve terrestrial detail, which would make
+# type measurable from the telescope too and the two sources cross-checkable
+# rather than one substituting for the other. See terminus-32; nothing below
+# depends on it yet.
 BOUNDARY_MODELS = {
     # A hard edge really is a step. Demand a clean one, expect it to be narrow,
     # and treat a wide transition as evidence something is wrong — most likely a
