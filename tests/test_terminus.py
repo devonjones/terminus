@@ -2042,3 +2042,39 @@ def test_the_oriented_flag_is_interpreted_not_identity_checked(tmp_path):
     assert is_oriented({"lat": 40})
     assert is_oriented({})
     assert is_oriented(None)
+
+
+def test_an_unrecognised_oriented_value_raises_rather_than_guessing():
+    """Matching only the false words fails open, which is the same bug inverted.
+
+    `oriented: flase` is a typo a person will make in a file the project
+    documents as hand-editable. Read as a negative allowlist it means "not one
+    of the false words, therefore true" — and a horizon rotated by an unknown
+    amount goes out with no warning. A typo is not evidence of orientation.
+    """
+    import pytest
+
+    from terminus.export import is_oriented
+
+    for bad in ("flase", "nope", "unoriented", "maybe", "TRUEISH"):
+        with pytest.raises(ValueError, match="neither true nor false"):
+            is_oriented({"oriented": bad})
+
+    # The vocabulary it does accept, both ways.
+    for good in ("true", "TRUE", " yes ", "y", "on", "1"):
+        assert is_oriented({"oriented": good}) is True
+    for good in ("false", "No", "n", "off", "0", ""):
+        assert is_oriented({"oriented": good}) is False
+
+
+def test_a_typo_in_the_oriented_flag_blocks_export(tmp_path):
+    """The refusal must reach the export path, not just the helper."""
+    import pytest
+
+    from terminus.export import export_all
+
+    p = tmp_path / "typo.yaml"
+    p.write_text("meta: {oriented: flase}\nhorizon:\n  0: {alt: 10.0, type: tree}\n")
+    with pytest.raises(ValueError, match="neither true nor false"):
+        export_all(str(p), str(tmp_path / "out"))
+    assert not (tmp_path / "out.hrz").exists()

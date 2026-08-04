@@ -197,6 +197,10 @@ class UnorientedMask(ValueError):
     """A mask still in the panorama's own azimuth was asked to be exported."""
 
 
+_TRUE = frozenset(("true", "yes", "y", "on", "1"))
+_FALSE = frozenset(("false", "no", "n", "off", "0", ""))
+
+
 def is_oriented(meta):
     """Is this mask's azimuth true north?
 
@@ -207,12 +211,28 @@ def is_oriented(meta):
     mask is documented as hand-editable, so `oriented: 'false'` and `oriented: 0`
     are things a person will actually write, and `meta.get("oriented") is False`
     waves both straight through to a planner.
+
+    A string that is neither RAISES rather than being guessed. Matching only the
+    false words fails open — `oriented: flase` would read as true and export a
+    horizon rotated by an unknown amount, which is the same defect this function
+    exists to prevent, reached from the other side. A typo in a hand-edited file
+    is not evidence of orientation, and the one thing that must not happen is
+    quietly deciding it is.
     """
     if not isinstance(meta, dict) or "oriented" not in meta:
         return True
     v = meta["oriented"]
     if isinstance(v, str):
-        return v.strip().lower() not in ("false", "no", "0", "off", "")
+        word = v.strip().lower()
+        if word in _TRUE:
+            return True
+        if word in _FALSE:
+            return False
+        raise ValueError(
+            f"mask meta has oriented: {v!r}, which is neither true nor false. "
+            f"Use one of {sorted(_TRUE)} or {sorted(_FALSE)} — guessing would risk "
+            "exporting a horizon rotated by an unknown amount."
+        )
     return bool(v)
 
 
