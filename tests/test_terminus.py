@@ -1687,16 +1687,28 @@ def test_every_exported_name_actually_exists():
     assert not missing, f"__all__ names nothing: {missing}"
 
 
-def test_segmentation_backend_degrades_instead_of_raising():
-    """The claim is that terminus runs without torch — so test it without torch.
+def test_segmentation_backend_tracks_the_imports_not_the_environment():
+    """`available('segment')` must answer about torch, not about this machine.
 
-    torch and transformers are installed in this dev environment, so
-    `available('segment')` returns True here and the ImportError branch never
-    executes. Asserting it returns a bool proves nothing about the machine that
-    lacks them. This blocks both imports in a child interpreter and checks the
-    real degradation path: report False, do not propagate.
+    The previous version blocked torch/transformers with a meta_path finder and
+    asserted False. That is inert wherever they are genuinely absent — which is
+    CI, since `uv sync --dev` installs only the declared dependencies and neither
+    is one. The finder could be deleted outright and the test still passed.
+
+    So both directions are forced here, with stubs rather than with whatever
+    happens to be installed: make the imports succeed and the answer must be
+    True; make them fail and it must be False. That proves the function responds
+    to the imports, and it reads the same in CI as on a workstation that has the
+    segmentation stack installed.
     """
-    body = (
+    present = (
+        "import sys, types\n"
+        "for n in ('torch', 'transformers'):\n"
+        "    sys.modules[n] = types.ModuleType(n)\n"
+        "from terminus import skymask\n"
+        "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
+    )
+    absent = (
         "import sys\n"
         "class Block:\n"
         "    def find_spec(self, name, path=None, target=None):\n"
@@ -1704,12 +1716,16 @@ def test_segmentation_backend_degrades_instead_of_raising():
         "            raise ImportError('blocked for test: ' + name)\n"
         "        return None\n"
         "sys.meta_path.insert(0, Block())\n"
+        "sys.modules.pop('torch', None); sys.modules.pop('transformers', None)\n"
         "from terminus import skymask\n"
         "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
     )
-    segment, heuristic = eval(_in_clean_interpreter(body))
-    assert segment is False, "without transformers, the segment backend must report False"
-    assert heuristic is True, "the heuristic backend needs nothing and must stay available"
+    seg_yes, heur_yes = eval(_in_clean_interpreter(present))
+    seg_no, heur_no = eval(_in_clean_interpreter(absent))
+
+    assert seg_yes is True, "with both modules importable, the segment backend must report True"
+    assert seg_no is False, "without them, it must report False rather than raising"
+    assert heur_yes is True and heur_no is True, "the heuristic backend needs nothing"
 
 
 def test_hugin_probe_reports_rather_than_raising():

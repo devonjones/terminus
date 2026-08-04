@@ -41,6 +41,12 @@ own.
 # The photo-first modules. Exported both as modules (the documented spelling)
 # and by name below. None of them imports torch, transformers or Hugin at module
 # level, so this stays cheap and dependency-free.
+#
+# This line is load bearing and only LOOKS redundant. Four of the five are also
+# bound as a side effect of the `from .mosaic import ...` style lines below, so
+# deleting their names here appears harmless — until the flat exports are
+# narrowed, which has already happened once, and the module quietly stops being
+# reachable. `skymask` has no such line and depends on this one alone.
 from . import mosaic, night, orient, plan, skymask
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
