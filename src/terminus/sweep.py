@@ -28,11 +28,29 @@ from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun  # noqa:
 from astropy.time import Time  # noqa: E402
 
 SETTLE = 1.5
-GOTO_TIMEOUT = 35
+GOTO_TIMEOUT = 90
+SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
+ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
+MAX_TARGET_DEC = 88.5  # never command a goto nearer a pole than this
+MAX_VIA_DEC = 80.0  # a waypoint nearer a pole than this is unreachable: RA is
+#                     singular there and the mount cannot converge
 
 
 class SunGuard(Exception):
     pass
+
+
+class PointingError(Exception):
+    """A slew did not arrive where it was told to go.
+
+    `partial` carries whatever a sweep had measured before it gave up, so an
+    abort late in a multi-hour run does not throw the night away. It defaults to
+    None at CLASS level deliberately: `_goto_wait` raises this from deep inside a
+    slew where no sweep state exists, and a caller reading `.partial` on one of
+    those must get None rather than AttributeError.
+    """
+
+    partial = None
 
 
 def _now():
@@ -120,6 +138,8 @@ def obstruction_type(veg_frac, struct_frac):
 
 
 # ---- path-safe pointing ---------------------------------------------------
+SUN_SAFE_ALT = -3.0  # below this the Sun is occulted by the Earth and harmless
+#                      (refraction lifts it about 0.6 deg, so this keeps margin)
 PATH_SAMPLES = 40  # points sampled along a candidate slew path when Sun-checking
 
 
@@ -151,6 +171,8 @@ class Pointer:
 
     def _sun_check(self, az, alt):
         saz, salt = self.sky.sun()
+        if salt < SUN_SAFE_ALT:
+            return  # the Earth is between the optics and the Sun
         sep = ang_sep(az, alt, saz, salt)
         if sep < self.cone:
             raise SunGuard(f"({az:.0f},{alt:.0f}) is {sep:.1f} deg from Sun (< {self.cone})")
@@ -159,6 +181,8 @@ class Pointer:
         """Smallest Sun separation (deg) over every plausible RA/Dec path from
         rd0 to rd1. Sun position is recomputed now, at call time."""
         saz, salt = self.sky.sun()
+        if salt < SUN_SAFE_ALT:
+            return 180.0  # Sun is set; no path can approach it
         ra0, dec0 = rd0
         ra1, dec1 = rd1
         dra = wrap_ra(ra1 - ra0)
@@ -178,15 +202,67 @@ class Pointer:
                 worst = min(worst, ang_sep(az, alt, saz, salt))
         return worst
 
+    def _moving(self):
+        try:
+            m = self.sc.call("get_device_state").get("result", {}).get("mount", {})
+            return m.get("move_type") not in (None, "none")
+        except Exception:
+            return False
+
     def _goto_wait(self, ra, dec, settle):
         self.sc.goto(ra, dec)
         deadline = time.time() + GOTO_TIMEOUT
         while time.time() < deadline:
             time.sleep(0.7)
             rd = self.sc.equ_coord()
-            if rd and abs(wrap_ra(rd[0] - ra)) < 0.05 and abs(rd[1] - dec) < 0.5:
-                break
-        time.sleep(settle)
+            # True angular separation, never a raw RA difference. RA converges to
+            # a singularity at the poles: at this site, due north at altitude
+            # ~= latitude IS the celestial pole, so scanning azimuth 0 walks
+            # straight onto it and an arcminute of position error there swings RA
+            # by hours. A raw-RA test can never be satisfied, which stalled a live
+            # sweep at Dec 89.8 that the mount had in fact reached.
+            if rd and ang_sep(rd[0] * 15.0, rd[1], ra * 15.0, dec) < ARRIVE_DEG:
+                time.sleep(settle)
+                return
+            # Extend while the mount is demonstrably still slewing. A long swing
+            # in RA can outlast any fixed timeout, and giving up mid-slew is the
+            # dangerous case: the scope keeps moving after we stop watching.
+            if self._moving():
+                deadline = max(deadline, time.time() + GOTO_TIMEOUT)
+        # Never fall through silently. A goto that quietly fails to arrive voids
+        # every Sun-safety guarantee: the caller believes the scope is where it
+        # asked, and plans the next path from a position the mount never reached.
+        # Seen for real with the arm closed — point reported a successful landing
+        # while the mount had not moved at all.
+        rd = self.sc.equ_coord()
+        where = f"RA {rd[0]:.3f} Dec {rd[1]:.2f}" if rd else "unreadable"
+        raise PointingError(
+            f"goto did not arrive within {GOTO_TIMEOUT}s "
+            f"(wanted RA {ra:.3f} Dec {dec:.2f}, at {where}); "
+            "mount may be closed, parked, or not tracking"
+        )
+
+    def avoid_pole(self, az, alt):
+        """Nudge a target in azimuth if it lands on a celestial pole.
+
+        Due north at altitude equal to the site latitude IS the pole, so a
+        horizon sweep of azimuth 0 walks straight onto it. Pointing there is
+        not merely inaccurate: RA becomes undefined, the mount makes enormous
+        RA swings to reach nearby targets, and a live sweep stalled there twice.
+
+        Azimuth is nudged rather than altitude because altitude is the quantity
+        being measured — moving it would corrupt the horizon reading, whereas a
+        degree or two of azimuth is well inside the mask's own resolution. The
+        actual azimuth used is returned so callers record what was measured.
+        """
+        for delta in (0.0, 1.5, -1.5, 3.0, -3.0, 5.0, -5.0):
+            cand_az = (az + delta) % 360.0
+            _, dec = self.sky.altaz_to_radec(cand_az, alt)
+            if abs(dec) <= MAX_TARGET_DEC:
+                return cand_az, alt
+        # Every nudge still lands on the pole: shift altitude as a last resort
+        # so the column yields something rather than aborting the whole sweep.
+        return (az + 1.5) % 360.0, alt + 1.5
 
     def point_to(self, az, alt):
         """Slew to (az, alt) along a Sun-safe path. Returns the final az/alt."""
@@ -197,6 +273,7 @@ class Pointer:
         if cur is None:
             raise SunGuard("cannot read current pointing; refusing to slew")
         self._sun_check(*self.sky.radec_to_altaz(*cur))
+        az, alt = self.avoid_pole(az, alt)
         target = self.sky.altaz_to_radec(az, alt)
 
         if self.path_min_sep(cur, target) >= self.cone:
@@ -205,14 +282,47 @@ class Pointer:
             # Route over the top: the Sun is never at high altitude from a
             # mid-latitude site, so a high waypoint clears it when a direct
             # slew would not.
-            via_alt = min(85.0, max(alt, 70.0))
-            via_az = (az + wrap180(self.current_azalt()[0] - az) / 2) % 360.0
-            via = self.sky.altaz_to_radec(via_az, via_alt)
-            if (
-                self.path_min_sep(cur, via) >= self.cone
-                and self.path_min_sep(via, target) >= self.cone
-            ):
+            #
+            # Candidates are tried in order and every one is rejected if it
+            # lands near a celestial pole. RA is a singularity there, so the
+            # mount cannot converge: a waypoint at Dec 89.9 stalled at Dec 80.6
+            # and aborted a live sweep. Staying under MAX_VIA_DEC keeps the
+            # waypoint somewhere the mount can actually reach.
+            mid_az = (az + wrap180(self.current_azalt()[0] - az) / 2) % 360.0
+            via = None
+            for via_alt in (min(85.0, max(alt, 70.0)), 75.0, 65.0, 55.0):
+                for via_az in (mid_az, (mid_az + 30.0) % 360.0, (mid_az - 30.0) % 360.0):
+                    cand = self.sky.altaz_to_radec(via_az, via_alt)
+                    if abs(cand[1]) > MAX_VIA_DEC:
+                        continue
+                    if (
+                        self.path_min_sep(cur, cand) >= self.cone
+                        and self.path_min_sep(cand, target) >= self.cone
+                    ):
+                        via = cand
+                        break
+                if via:
+                    break
+            if via:
                 self._goto_wait(*via, 0.3)
+                # Re-verify before the second leg. The first one can now run for
+                # minutes — GOTO_TIMEOUT is 90s and extends while the mount still
+                # reports motion — so the clearance computed above is stale by the
+                # time it is used, and the Sun has moved. Recompute against where
+                # the mount ACTUALLY landed rather than where it was asked to go,
+                # and re-derive the target: az/alt is fixed, but the RA/Dec that
+                # holds it drifts about a degree every four minutes.
+                landed = self.sc.equ_coord()
+                if landed is None:
+                    raise SunGuard("cannot read pointing after the waypoint; refusing to slew")
+                self._sun_check(*self.sky.radec_to_altaz(*landed))
+                target = self.sky.altaz_to_radec(az, alt)
+                sep = self.path_min_sep(landed, target)
+                if sep < self.cone:
+                    raise SunGuard(
+                        f"waypoint reached but the Sun has moved: second leg to "
+                        f"({az:.0f},{alt:.0f}) now clears by only {sep:.1f} deg"
+                    )
                 self._goto_wait(*target, SETTLE)
             else:
                 raise SunGuard(
@@ -226,17 +336,22 @@ class Pointer:
 # ---- horizon search -------------------------------------------------------
 def column_touches_sun(sky, az, alt_min, alt_max, cone):
     saz, salt = sky.sun()
+    if salt < SUN_SAFE_ALT:
+        return False
     return (
         ang_sep(az, max(alt_min, 0.0), saz, salt) < cone or ang_sep(az, alt_max, saz, salt) < cone
     )
 
 
+EDGE_MIN_STEP_FRAC = 0.25  # a step must also be this fraction of the sky reference
+EDGE_TOP_FRACTION = 0.9  # a higher split wins if within this fraction of the best
+MAX_POINTING_MISSES = 3  # consecutive non-arrivals before a sweep is abandoned
 EDGE_SNR = 2.5  # a step must exceed the column's own sample-to-sample noise by
 #                 this factor; below it, the "step" is indistinguishable from
 #                 measurement scatter and the column is reported as unmeasured
 
 
-def find_edge(profile):
+def find_edge(profile, sky_ref=None):
     """Locate the sky->terrain step in a column brightness profile.
 
     `profile` is [(alt, mean_lum), ...] ordered from high altitude down. The fit
@@ -257,16 +372,83 @@ def find_edge(profile):
     if len(profile) < 3:
         return None, 0.0, 0.0
     lums = [lum for _, lum in profile]
-    noise = sum(abs(lums[i + 1] - lums[i]) for i in range(len(lums) - 1)) / (len(lums) - 1)
-    best = (0.0, None)
+    # Scatter from SECOND differences, which cancel any linear trend. Under light
+    # pollution the open sky is not flat with altitude — skyglow brightens toward
+    # the horizon, measured here as 36.9 at alt 60 rising to 73.7 at alt 11. A
+    # first-difference estimate counts that gradient as noise and divides a real
+    # step by the trend it sits on: four of five bright columns were rejected
+    # that way, with true scatter under 1 count reported as 6-11.
+    if len(lums) >= 3:
+        sec = [lums[i + 2] - 2 * lums[i + 1] + lums[i] for i in range(len(lums) - 2)]
+        # RMS, not median: the median is robust to large excursions, but in a
+        # scatter-only profile those excursions ARE the noise, and discounting
+        # them lets pure scatter pass as an edge.
+        noise = math.sqrt(sum(v * v for v in sec) / len(sec)) / math.sqrt(6.0)
+    else:
+        noise = sum(abs(lums[i + 1] - lums[i]) for i in range(len(lums) - 1)) / (len(lums) - 1)
+    noise = max(noise, 1e-6)
+    steps = []
     for k in range(1, len(lums)):
         above = sum(lums[:k]) / k
         below = sum(lums[k:]) / (len(lums) - k)
-        if above - below > best[0]:
-            best = (above - below, k)
-    step, k = best
+        steps.append((above - below, k))
+    best_step = max(s for s, _ in steps)
+    # Take the HIGHEST competitive split, not the largest one. A pale structure
+    # in twilight is not a silhouette: a lit roof sits partway between sky and
+    # ground, so the column has three levels and two plausible change points —
+    # sky/roof and roof/ground. Maximising the step picks between them almost at
+    # random (measured on a real column: 98.2 against 99.4, a 1% margin) and the
+    # lower one is the roof meeting the ground, not the sky meeting the horizon.
+    # Everything below the true horizon is already terrain, so the topmost
+    # significant transition is the one being looked for.
+    candidates = [(s, k) for s, k in steps if s >= EDGE_TOP_FRACTION * best_step]
+    step, k = min(candidates, key=lambda sk: sk[1]) if candidates else (best_step, None)
     snr = step / noise if noise > 0 else 0.0
-    return (k - 1, step, snr) if (k is not None and snr >= EDGE_SNR) else (None, step, snr)
+    # Two gates, because each is blind to what the other catches. SNR is
+    # scale-free and cannot tell whether there were enough photons at all; an
+    # absolute floor cannot tell a clean step from a noisy one. Without the
+    # floor, a trend-insensitive noise estimate makes a 19 percent wobble in the
+    # skyglow gradient pass as a horizon.
+    big_enough = sky_ref is None or step >= EDGE_MIN_STEP_FRAC * sky_ref
+    ok = k is not None and snr >= EDGE_SNR and big_enough
+    return (k - 1, step, snr) if ok else (None, step, snr)
+
+
+def edge_candidates(profile):
+    """All change points, best first, as (step, index_above_edge, altitude).
+
+    Exposed so a caller can see whether a column had a genuine choice to make.
+    """
+    lums = [lum for _, lum in profile]
+    out = []
+    for k in range(1, len(lums)):
+        above = sum(lums[:k]) / k
+        below = sum(lums[k:]) / (len(lums) - k)
+        out.append((above - below, k - 1, profile[k - 1][0]))
+    return sorted(out, reverse=True)
+
+
+def edge_is_ambiguous(profile, score_tol=0.05, alt_gap=5.0):
+    """True when a column has two comparable change points far apart.
+
+    A pale structure in twilight puts the column at three levels — sky, lit
+    roof, dark ground — giving two plausible boundaries whose scores can sit
+    within a percent of each other while their altitudes differ by tens of
+    degrees. Whichever the detector picks is then close to a coin toss.
+
+    The column says this about itself, with no external reference: two strong
+    candidates separated in altitude means the answer is not determined by the
+    data at hand. Such a column should be re-measured at finer altitude spacing
+    rather than trusted, and its verdict flagged until it is.
+    """
+    cands = edge_candidates(profile)
+    if len(cands) < 2:
+        return False, None
+    best_s, _, best_alt = cands[0]
+    for s, _, alt in cands[1:]:
+        if s >= (1.0 - score_tol) * best_s and abs(alt - best_alt) >= alt_gap:
+            return True, (best_alt, alt, s / best_s if best_s else 0.0)
+    return False, None
 
 
 def save_scan_frame(rgb, az, alt, lum, save_dir, sky_ref=None):
@@ -405,19 +587,43 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
     # Without it the first column has nothing to compare against, and a fully
     # blocked column is indistinguishable from a clear one.
     sky_ref = None
+    misses = 0  # consecutive pointing failures; see MAX_POINTING_MISSES
     if not dry:
         try:
             zen_az = (saz + 180.0) % 360.0
             ptr.point_to(zen_az, 75.0)
             sky_ref = sky_reference(sc.capture_rgb(warmup=0.3))
             log(f"sky reference (az {zen_az:.0f} alt 75): {sky_ref:.1f}", flush=True)
-        except (SunGuard, OSError) as e:
+        except (SunGuard, PointingError, OSError) as e:
+            # PointingError belongs here for the same reason it does on the
+            # mid-sweep refresh: seeding is a convenience, not a measurement, and
+            # a mount that cannot reach the zenith will fail the columns too,
+            # where the miss counter judges it properly. Letting it escape from
+            # HERE is the worst case — it is the earliest goto in the sweep, so a
+            # dead mount raises before a single column exists, and that exception
+            # carries no partial result for the caller to save.
             log(f"could not seed sky reference: {e}", flush=True)
+    ref_taken = time.time()
     for az in range(int(az_start), int(az_end) + 1, cfg["az_step"]):
         if column_touches_sun(sky, az, cfg["alt_min"], cfg["alt_max"], cfg["sun_cone_deg"]):
             skipped.append(az)
             log(f"az {az:3d}: skipped (Sun cone)", flush=True)
             continue
+        # Re-seed the reference as the sky changes. A full sweep spans hours, and
+        # across twilight the sky itself changes by orders of magnitude while a
+        # once-measured reference stays pinned at its daylight value. Everything
+        # is then judged against a sky that no longer exists, and every remaining
+        # column reports "blocked" — a whole hemisphere lost to a stale number.
+        if sky_ref is not None and time.time() - ref_taken > SKY_REF_MAX_AGE:
+            try:
+                saz_now, _ = sky.sun()
+                ptr.point_to((saz_now + 180.0) % 360.0, 75.0)
+                new_ref = sky_reference(sc.capture_rgb(warmup=0.3))
+                log(f"sky reference refreshed: {sky_ref:.1f} -> {new_ref:.1f}", flush=True)
+                sky_ref, ref_taken = new_ref, time.time()
+            except (SunGuard, PointingError, OSError) as e:
+                log(f"sky reference refresh failed ({e}); keeping {sky_ref:.1f}", flush=True)
+                ref_taken = time.time()
         try:
             alt, status, typ, profile = scan_horizon(
                 ptr,
@@ -445,6 +651,32 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
         except SunGuard as e:
             skipped.append(az)
             log(f"az {az:3d}: skipped ({e})", flush=True)
+        except PointingError as e:
+            # One column that would not arrive is not worth losing a night over,
+            # but a mount that cannot point is: skipping every column silently
+            # would produce an empty mask and hide exactly the failure this
+            # exception was added to surface (a goto once reported success while
+            # the arm was closed and nothing moved). So skip, and give up if they
+            # keep coming.
+            skipped.append(az)
+            misses += 1
+            log(f"az {az:3d}: skipped ({e}) [{misses}/{MAX_POINTING_MISSES}]", flush=True)
+            if misses >= MAX_POINTING_MISSES:
+                # Abandon the sweep, but do NOT discard what it measured. The
+                # default az_step is 5 degrees, so three consecutive misses span
+                # only a 15 degree arc — narrow enough to be a local stall near
+                # the pole rather than a dead mount. Losing thirty good columns
+                # to that would be a worse bug than the one being guarded
+                # against. The partial result rides on the exception so the
+                # caller can save it and still fail loudly.
+                err = PointingError(
+                    f"{misses} consecutive pointing failures ending at az {az}; "
+                    f"the mount is not tracking commands"
+                )
+                err.partial = (mask, skipped, profiles)
+                raise err from e
+        else:
+            misses = 0
 
     # ---- adaptive refinement ------------------------------------------------
     # A uniform step wastes time on flat stretches (a long roofline) and still
@@ -491,6 +723,139 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
                         f"az {mid:3d}: alt {alt:5.1f}  {typ:9s} [refine {a0}-{a1}]",
                         flush=True,
                     )
-                except SunGuard as e:
+                except (SunGuard, PointingError) as e:
                     log(f"az {mid:3d}: refine skipped ({e})", flush=True)
     return mask, skipped, profiles
+
+
+# ---- targeted measurement -------------------------------------------------
+def plan_targeted(prior_alt, sigma=3.0, span=2.5, step=None, repeats=3):
+    """Altitudes to sample when the horizon is already roughly known.
+
+    A blind scan spends every pointing locating a boundary to within its own
+    step size and returns a single number with no error bar. Given a prior — a
+    photo-derived horizon, or a previous sweep — the same budget can be spent
+    *at* the boundary instead, sampling it repeatedly.
+
+    That buys two things a blind scan cannot give. Repeats at one altitude turn
+    a moving branch from an unmeasurable bias into measurable variance, so wind
+    shows up as spread rather than as a wrong answer. And sampling across the
+    boundary rather than down to it yields the transition's width, which is the
+    honest uncertainty of a canopy edge that genuinely is not a line.
+
+    Returns [(altitude, repeats), ...] from high to low.
+    """
+    step = step or max(0.5, sigma * span / 5.0)
+    lo = prior_alt - sigma * span
+    hi = prior_alt + sigma * span
+    n = max(3, int(round((hi - lo) / step)) + 1)
+    alts = [hi - i * (hi - lo) / (n - 1) for i in range(n)]
+    return [(round(a, 2), repeats) for a in alts]
+
+
+def fit_transition(samples, sky_ref, frac=SKY_LUM_FRACTION):
+    """Estimate the horizon and its uncertainty from repeated samples.
+
+    `samples` is [(altitude, [lum, lum, ...]), ...]. Each altitude is scored by
+    the fraction of its repeats that read as sky, giving a soft profile rather
+    than a hard one; the horizon is where that fraction crosses one half, found
+    by linear interpolation between the bracketing altitudes.
+
+    Returns (altitude, sigma, detail). `sigma` is the width of the transition —
+    the altitude span over which the sky fraction goes from mostly-sky to
+    mostly-terrain. A wall gives a narrow transition; a windblown canopy gives a
+    wide one, and that width is the uncertainty the mask should carry.
+    """
+    thresh = frac * sky_ref
+    rows = []
+    for alt, lums in sorted(samples, key=lambda s: -s[0]):
+        if not lums:
+            continue
+        rows.append((alt, sum(1 for v in lums if v >= thresh) / len(lums), len(lums)))
+    if len(rows) < 2:
+        return None, None, {"reason": "not enough altitudes"}
+    if rows[0][1] < 0.5:
+        return None, None, {"reason": "no sky at the top of the sampled range"}
+    if rows[-1][1] >= 0.5:
+        return None, None, {"reason": "still sky at the bottom of the sampled range"}
+    cross = None
+    for i in range(len(rows) - 1):
+        (a0, f0, _), (a1, f1, _) = rows[i], rows[i + 1]
+        if f0 >= 0.5 > f1:
+            t = (f0 - 0.5) / (f0 - f1) if f0 != f1 else 0.5
+            cross = a0 + t * (a1 - a0)
+            break
+    if cross is None:
+        return None, None, {"reason": "no crossing"}
+    upper = [a for a, f, _ in rows if f >= 0.84]
+    lower = [a for a, f, _ in rows if f <= 0.16]
+    width = (min(upper) - max(lower)) if (upper and lower) else None
+    sigma = abs(width) / 2.0 if width is not None else None
+    return (
+        round(cross, 2),
+        round(sigma, 2) if sigma is not None else None,
+        {"profile": rows, "n_alts": len(rows)},
+    )
+
+
+# ---- per-boundary models --------------------------------------------------
+# A roofline and a tree crown are not the same kind of edge, so they should not
+# be measured or judged by the same rule. Which one a column holds is known from
+# the photo segmentation, never from the telescope: at 250mm focused at infinity
+# every terrestrial target is far inside the hyperfocal distance, so the scope
+# sees only a blur and can report brightness but not identity.
+BOUNDARY_MODELS = {
+    # A hard edge really is a step. Demand a clean one, expect it to be narrow,
+    # and treat a wide transition as evidence something is wrong — most likely a
+    # pale surface in twilight sitting partway between sky and ground.
+    "structure": {
+        "edge_snr": 2.5,
+        "run": 6,
+        "expect_width_deg": 1.0,
+        "max_width_deg": 4.0,
+        "repeats": 2,
+        "buffer_deg": 1.0,
+        "seasonal": False,
+    },
+    # Foliage is partially transmissive and moves. A wide transition is the
+    # correct answer, not a failure, so accept a weaker step but insist on more
+    # repeats to separate wind from structure.
+    "tree": {
+        "edge_snr": 2.0,
+        "run": 4,
+        "expect_width_deg": 4.0,
+        "max_width_deg": 12.0,
+        "repeats": 4,
+        "buffer_deg": 3.0,
+        "seasonal": True,
+    },
+}
+DEFAULT_MODEL = "structure"
+
+
+def boundary_model(kind):
+    """Measurement and acceptance parameters for a boundary of this kind."""
+    return BOUNDARY_MODELS.get((kind or "").lower(), BOUNDARY_MODELS[DEFAULT_MODEL])
+
+
+def judge_width(kind, width_deg):
+    """Is a measured transition width consistent with this kind of boundary?
+
+    Returns (verdict, note). The interesting case is a structure boundary that
+    comes back wide: a wall does not have a soft edge, so the width is telling
+    you the column is not what it was labelled, or that the sky/terrain contrast
+    has collapsed — exactly what a lit roof against a darkening sky produces.
+    """
+    m = boundary_model(kind)
+    if width_deg is None:
+        return "unknown", "no width measured"
+    if width_deg > m["max_width_deg"]:
+        if kind == "structure":
+            return "suspect", (
+                f"a hard edge should be sharp; {width_deg:.1f} deg of transition "
+                "suggests a pale surface against a dim sky, or a mislabelled column"
+            )
+        return "suspect", f"{width_deg:.1f} deg exceeds even foliage tolerance"
+    if kind == "tree" and width_deg < 0.5:
+        return "suspect", "foliage with a knife edge is more likely a mislabelled structure"
+    return "ok", f"{width_deg:.1f} deg is consistent with {kind}"

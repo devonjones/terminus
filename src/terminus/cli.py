@@ -19,7 +19,16 @@ import time
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
 from .export import default_meta, export_all, write_mask
-from .sweep import Pointer, Sky, SunGuard, classify, column_touches_sun, obstruction_type, run_sweep
+from .sweep import (
+    Pointer,
+    PointingError,
+    Sky,
+    SunGuard,
+    classify,
+    column_touches_sun,
+    obstruction_type,
+    run_sweep,
+)
 
 
 def _connect(cfg):
@@ -72,6 +81,9 @@ def cmd_point(sc, cfg, args):
         print(f"target ({args.az},{args.alt}) -> landed az {faz:.1f} alt {falt:.1f}")
     except SunGuard as e:
         print("SUN GUARD:", e)
+    except PointingError as e:
+        print("POINTING FAILED:", e)
+        sys.exit(2)
 
 
 def cmd_classify(sc, cfg, args):
@@ -102,11 +114,37 @@ def cmd_sweep(sc, cfg, args):
         print(f"exposure locked: {locked}")
         sc.start_view("scenery")
         time.sleep(3)
-    mask, skipped, profiles = run_sweep(
-        sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
-    )
+    aborted = None
+    try:
+        mask, skipped, profiles = run_sweep(
+            sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
+        )
+    except PointingError as e:
+        # A sweep runs for hours. Losing every column already measured because
+        # the mount stalled near the end is a worse outcome than the fault being
+        # reported, so save what was measured and then fail loudly. Without this
+        # the abort exits through main() as a bare traceback and writes nothing.
+        aborted = e
+        # `partial` is None when the failure happened before any sweep state
+        # existed — a goto that never arrived, raised from inside the slew.
+        mask, skipped, profiles = e.partial or ({}, [], {})
     if not args.dry_run:
-        sc.stop_view()
+        try:
+            sc.stop_view()
+        except (OSError, SeestarError) as e:
+            # Never let this skip the save below. A scenery view left running is
+            # the documented precondition for the frozen-RTSP failure, so it is
+            # worth attempting and worth reporting — but the measurement matters
+            # more.
+            #
+            # BOTH types are needed. stop_view goes through client.call, which
+            # reconnects on a dropped socket; that path raises OSError from the
+            # socket itself but SeestarError when re-authentication fails or the
+            # re-entrancy guard trips. Catching only OSError left the second one
+            # skipping write_mask — the same bug one exception class over, and it
+            # would also have exited 1 rather than the 2 that means "abandoned
+            # but saved".
+            print(f"warning: could not stop the view ({e})", file=sys.stderr)
     if profiles:
         prof_path = os.path.splitext(out)[0] + "_profiles.json"
         with open(prof_path, "w") as f:
@@ -123,6 +161,12 @@ def cmd_sweep(sc, cfg, args):
     if not args.no_export and mask:
         hrz, txt = export_all(out, os.path.splitext(out)[0])
         print(f"exported {hrz} and {txt}")
+    if aborted is not None:
+        # Non-zero exit: the mask on disk is real but incomplete, and nothing
+        # downstream should treat a truncated sweep as a finished one.
+        print(f"\nSWEEP ABANDONED: {aborted}", file=sys.stderr)
+        print("the partial mask above was saved; re-run to cover the rest", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline

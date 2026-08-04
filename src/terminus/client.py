@@ -48,9 +48,9 @@ class Seestar:
             ) from None
         self.cmdid = 100
         self.buf = ""
-        self.s = socket.socket()
-        self.s.settimeout(10)
-        self.s.connect((host, CONTROL_PORT))
+        self.s = None
+        self._reconnecting = False
+        self._open()
 
     # ---- control channel -------------------------------------------------
     def _readline(self, timeout):
@@ -69,13 +69,52 @@ class Seestar:
         line, _, self.buf = self.buf.partition("\r\n")
         return line
 
-    def call(self, method, params=None, timeout=10):
+    def _open(self):
+        """(Re)establish the control connection and re-authenticate."""
+        try:
+            if self.s is not None:
+                self.s.close()
+        except OSError:
+            pass
+        self.buf = ""
+        self.s = socket.socket()
+        self.s.settimeout(10)
+        self.s.connect((self.host, CONTROL_PORT))
+
+    def reconnect(self):
+        """Reopen and re-authenticate after a dropped connection.
+
+        A horizon sweep runs for hours, and the scope will occasionally close
+        the socket — an idle moment, a second client touching it, a Wi-Fi blip.
+        Without this the whole run dies partway round the circle and the
+        remaining sky is simply lost, which is what happened on 2026-08-03.
+        """
+        if self._reconnecting:
+            # authenticate() issues calls of its own; without this guard a
+            # socket that fails during re-authentication recurses forever.
+            raise SeestarError("connection lost during reconnection")
+        self._reconnecting = True
+        try:
+            self._open()
+            if not self.authenticate():
+                raise SeestarError("reconnected but authentication failed")
+        finally:
+            self._reconnecting = False
+        return True
+
+    def call(self, method, params=None, timeout=10, _retry=True):
         self.cmdid += 1
         cid = self.cmdid
         msg = {"id": cid, "method": method}
         if params is not None:
             msg["params"] = params
-        self.s.sendall((json.dumps(msg) + "\r\n").encode())
+        try:
+            self.s.sendall((json.dumps(msg) + "\r\n").encode())
+        except OSError:
+            if not _retry:
+                raise
+            self.reconnect()
+            return self.call(method, params, timeout, _retry=False)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             line = self._readline(deadline - time.monotonic())
@@ -136,7 +175,12 @@ class Seestar:
         which cancels the very sky-versus-terrain brightness difference the sweep
         measures — measured profiles then hover at one level regardless of where
         the scope points. Locking makes brightness comparable between pointings.
-        Returns the settings the scope reports afterwards.
+        Returns the settings the scope reports afterwards, and raises if the lock
+        did not take. Verifying matters: the scope has been observed to accept
+        set_setting and still report manual_exp False with the auto sentinels
+        (-999000 / -9990). Silently continuing then measures brightness under
+        auto-exposure, which is the one condition this call exists to prevent —
+        every column reads the same and the whole sweep is quietly worthless.
         """
         params = {"manual_exp": True}
         if exp_ms is not None:
@@ -145,7 +189,20 @@ class Seestar:
             params["isp_gain"] = gain
         self.call("set_setting", params)
         s = self.call("get_setting").get("result", {})
-        return {k: s.get(k) for k in ("manual_exp", "isp_exp_ms", "isp_gain")}
+        got = {k: s.get(k) for k in ("manual_exp", "isp_exp_ms", "isp_gain")}
+        if not got.get("manual_exp"):
+            raise SeestarError(
+                f"exposure lock failed: scope still reports {got}. "
+                "Brightness would not be comparable between pointings; refusing to sweep."
+            )
+        # The scope may clamp the requested values (scenery mode has its own
+        # limits). That is acceptable — consistency between frames is what the
+        # sweep needs — but say so rather than let it pass unremarked.
+        for key, want in (("isp_exp_ms", exp_ms), ("isp_gain", gain)):
+            if want is not None and got.get(key) is not None:
+                if abs(float(got[key]) - float(want)) > 0.05 * max(abs(float(want)), 1.0):
+                    got.setdefault("clamped", []).append(f"{key}: asked {want}, got {got[key]}")
+        return got
 
     def auto_exposure(self):
         """Hand exposure back to the camera."""
@@ -154,9 +211,23 @@ class Seestar:
     def stop_view(self):
         return self.call("iscope_stop_view", {"stage": "Stack"})
 
-    def capture_rgb(self, warmup=1.0):
+    def capture_rgb(self, warmup=1.0, retries=2):
         """One RGB frame (float32 HxWx3) from the scenery RTSP stream via ffmpeg.
-        start_view('scenery') must be active. `warmup` skips stale buffered frames."""
+
+        start_view('scenery') must be active. `warmup` skips stale buffered frames.
+
+        A frame IDENTICAL to the previous one is rejected and re-taken. That is
+        the detectable form of the failure worth guarding against: the stream has
+        been seen to freeze after hours of use, serving one stale frame however
+        the mount moved, which fabricated ten blocked azimuths out of open sky
+        before anyone noticed.
+
+        Note what this deliberately does NOT do. An earlier version rejected
+        frames that were merely dark, which is wrong twice over: genuinely unlit
+        terrain reads about 0.09 counts and would be retried on every sample,
+        while the frozen frames that motivated the check read 0.8 — brighter than
+        real terrain. Darkness cannot separate them; repetition can.
+        """
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
             path = tf.name
         try:
@@ -182,7 +253,13 @@ class Seestar:
                 check=True,
                 timeout=30,
             )
-            return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            sig = (float(rgb.mean()), float(rgb.std()), float(rgb[::37, ::37].sum()))
+            if retries > 0 and sig == getattr(self, "_last_frame_sig", None):
+                time.sleep(0.6)
+                return self.capture_rgb(warmup=warmup + 0.4, retries=retries - 1)
+            self._last_frame_sig = sig
+            return rgb
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             raise SeestarError(f"RTSP capture failed (is scenery view running?): {e}") from e
         finally:
