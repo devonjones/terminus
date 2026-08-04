@@ -1,6 +1,8 @@
 """Hardware-free tests for the pure logic: horizon interpolation, exporters,
 classifier, and Sun geometry. Run with: uv run pytest  (or pytest)."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -1738,3 +1740,377 @@ def test_hugin_probe_reports_rather_than_raising():
         assert terminus.mosaic.hugin_available() is False
     with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
         assert terminus.mosaic.hugin_available() is True
+
+
+# ---- offline photo CLI (terminus-19) ---------------------------------------
+def _synthetic_panorama(path, w=720, h=360, blocked=None):
+    """A panorama with a sinusoidal green skyline, optionally blocked to the top."""
+    import numpy as np
+    from PIL import Image
+
+    img = np.zeros((h, w, 3), np.uint8)
+    img[:, :] = (120, 150, 200)
+    for x in range(w):
+        img[int(h / 2 + (h / 12) * np.sin(2 * np.pi * x / w)) :, x] = (60, 110, 70)
+    if blocked:
+        img[:, blocked[0] : blocked[1]] = (60, 110, 70)
+    Image.fromarray(img).save(path)
+    return w, h
+
+
+def test_skymask_writes_an_unoriented_mask_with_the_extra_columns(tmp_path):
+    """The two fields that had nowhere to live in the schema must survive.
+
+    `clipped` records that the obstruction ran off the top of the data — where
+    the FRAME was cropped, never where the horizon is — and porosity/uncertainty
+    carry how gappy the canopy is. Without them a consumer cannot tell a bound
+    from a measurement.
+    """
+    from terminus.cli import main
+    from terminus.export import load_columns, load_mask
+
+    pano = tmp_path / "pano.png"
+    _synthetic_panorama(str(pano), blocked=(100, 140))
+    main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "10"])
+
+    out = tmp_path / "pano_mask.yaml"
+    assert out.exists()
+    meta, cols = load_columns(str(out))
+    assert meta["oriented"] is False, "a photo mask is not in true azimuth yet"
+    assert meta["backend"] == "heuristic"
+
+    clipped = sorted(a for a, c in cols.items() if c["clipped"])
+    assert clipped, "the column blocked to the top of frame must be marked clipped"
+    assert all(50 <= a <= 70 for a in clipped), f"clipped in the wrong place: {clipped}"
+    for c in cols.values():
+        assert "porosity" in c and "uncertainty" in c
+        assert c["uncertainty"] > 0
+
+    # The three-tuple contract every exporter depends on is untouched.
+    _, rows = load_mask(str(out))
+    assert rows and all(len(r) == 3 for r in rows)
+
+
+def test_an_unoriented_mask_says_so_in_its_header(tmp_path):
+    """The header is what a human reads. It must not claim true north.
+
+    The file previously said 'azimuth/altitude are TRUE (polar-aligned)'
+    unconditionally, which on a photo-derived mask invites a planner to point at
+    a horizon rotated by an unknown amount.
+    """
+    from terminus.export import write_mask
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree")}, [], {"oriented": False})
+    head = p.read_text()
+    assert "UNORIENTED" in head and "NOT true north" in head
+    assert "Solve the" in head and "orientation" in head
+
+    q = tmp_path / "o.yaml"
+    write_mask(str(q), {0: (10.0, "tree")}, [], {"lat": 40})
+    assert "UNORIENTED" not in q.read_text(), "a scope mask is oriented; do not warn"
+    assert "are TRUE (polar-aligned)" in q.read_text()
+
+
+def test_skymask_refuses_a_coverage_map_from_a_different_run(tmp_path, capsys):
+    """Mismatched coverage would silently mask the wrong pixels.
+
+    It must fail loudly and say why: the CLI turns this into exit 1 with a
+    message, not a traceback and not a quietly wrong horizon.
+    """
+    import numpy as np
+    import pytest
+
+    from terminus.cli import main
+
+    pano = tmp_path / "pano.png"
+    w, h = _synthetic_panorama(str(pano))
+    cov = tmp_path / "wrong.npy"
+    np.save(cov, np.ones((h // 2, w // 2)))
+    with pytest.raises(SystemExit) as info:
+        main(["skymask", str(pano), "--backend", "heuristic", "--coverage", str(cov)])
+    assert info.value.code == 1
+    assert "does not match" in capsys.readouterr().err
+    assert not (tmp_path / "pano_mask.yaml").exists(), "must not write a mask it could not trust"
+
+
+def test_offline_commands_need_no_config_file(tmp_path, monkeypatch):
+    """A user with photographs and no telescope must not have to write one."""
+    import pytest
+
+    from terminus.cli import main
+
+    monkeypatch.chdir(tmp_path)  # no config.toml here
+    pano = tmp_path / "pano.png"
+    _synthetic_panorama(str(pano))
+    main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"])
+    assert (tmp_path / "pano_mask.yaml").exists()
+
+    # `export` is offline too — re-exporting a mask must not demand a config
+    # file. CI, which has none, is what caught this; a local run never could.
+    from terminus.export import write_mask
+
+    write_mask(str(tmp_path / "m.yaml"), {0: (10.0, "tree")}, [], {"lat": 40})
+    main(["export", str(tmp_path / "m.yaml")])
+    assert (tmp_path / "m.hrz").exists()
+
+    # and the scope commands still do demand one
+    with pytest.raises(SystemExit):
+        main(["preflight"])
+
+
+def test_mosaic_without_hugin_explains_itself(tmp_path):
+    """Not an ImportError traceback — the install message require_hugin produces."""
+    from unittest.mock import patch
+
+    import pytest
+
+    from terminus.cli import main
+
+    with patch("shutil.which", return_value=None):
+        with pytest.raises(SystemExit) as info:
+            main(["mosaic", str(tmp_path)])
+    assert info.value.code == 1
+
+
+def test_segment_classes_votes_by_majority_across_tiles():
+    """Class indices are labels, not magnitudes — averaging them is meaningless.
+
+    A wide panorama is segmented in overlapping square tiles, so the seams need
+    a rule. `segment_sky` can average a sky FRACTION; classes cannot, and the
+    mean of 'tree' and 'building' is neither.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import skymask
+
+    h, w = 40, 160
+    img = Image.new("RGB", (w, h))
+
+    def fake(image):
+        # every tile says class 4 on top, 17 below — majority must preserve both
+        a = np.full((image.size[1], image.size[0]), 4, dtype=int)
+        a[image.size[1] // 2 :, :] = 17
+        return a
+
+    with patch.object(skymask, "_SEG", fake):
+        out = skymask.segment_classes(img)
+    assert out.shape == (h, w)
+    assert set(np.unique(out)) == {4, 17}
+    assert (out[: h // 2] == 4).all() and (out[h // 2 :] == 17).all()
+
+
+def test_an_unoriented_mask_cannot_be_exported(tmp_path):
+    """The refusal must be structural, not a message in one command.
+
+    A photo mask is in the panorama's own azimuth until the orientation is
+    solved. Exported anyway it produces a file that looks like every other
+    horizon — the .hrz header even declares "true-north azimuth" — while being
+    rotated by an unknown amount. A planner then refuses targets that are clear
+    and accepts targets sitting behind a roof, with nothing to say why.
+
+    Previously the only refusal was a print inside `cmd_skymask`, which never
+    exports anyway; `terminus export` on the same file produced the wrong .hrz
+    silently.
+    """
+    import pytest
+
+    from terminus.export import UnorientedMask, export_all, to_nina_hrz, write_mask
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree"), 90: (20.0, "structure")}, [], {"oriented": False})
+
+    with pytest.raises(UnorientedMask, match="UNORIENTED"):
+        export_all(str(p), str(tmp_path / "out"))
+    assert not (tmp_path / "out.hrz").exists(), "nothing may be written before the refusal"
+
+    # The documented direct-import path refuses too, since its header is the lie.
+    _, rows = __import__("terminus.export", fromlist=["load_mask"]).load_mask(str(p))
+    with pytest.raises(UnorientedMask):
+        to_nina_hrz(rows, {"oriented": False})
+
+    # Escape hatch, for someone who knows the azimuths are already true.
+    hrz, txt = export_all(str(p), str(tmp_path / "forced"), allow_unoriented=True)
+    assert os.path.exists(hrz) and os.path.exists(txt)
+
+
+def test_an_oriented_mask_still_exports(tmp_path):
+    """The guard must not fire on a scope-measured mask, which has no flag."""
+    from terminus.export import export_all, write_mask
+
+    p = tmp_path / "o.yaml"
+    write_mask(str(p), {0: (10.0, "tree")}, [], {"lat": 40})
+    hrz, _ = export_all(str(p), str(tmp_path / "ok"))
+    assert os.path.exists(hrz)
+
+
+def test_cli_export_refuses_an_unoriented_mask(tmp_path, capsys):
+    """Exit 1 with the reason, not a traceback."""
+    import pytest
+
+    from terminus.cli import main
+    from terminus.export import write_mask
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree")}, [], {"oriented": False})
+    with pytest.raises(SystemExit) as info:
+        main(["export", str(p)])
+    assert info.value.code == 1
+    assert "UNORIENTED" in capsys.readouterr().err
+    main(["export", str(p), "--allow-unoriented"])  # must not raise
+    assert (tmp_path / "u.hrz").exists()
+
+
+def test_a_scope_mask_gains_no_new_header(tmp_path):
+    """The schema addition must be invisible to a mask that does not use it.
+
+    The header explained clipped/porosity/uncertainty unconditionally, so every
+    scope-measured mask grew three comment lines about fields it does not carry
+    — while the docstring claimed such a mask was byte-for-byte unchanged.
+    """
+    from terminus.export import write_mask
+
+    plain = tmp_path / "scope.yaml"
+    write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
+    head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
+    assert len(head) == 4, f"a scope mask should carry 4 comment lines, got {len(head)}"
+    assert not any("clipped" in ln or "porosity" in ln for ln in head)
+
+    rich = tmp_path / "photo.yaml"
+    write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
+    rich_head = [ln for ln in rich.read_text().splitlines() if ln.startswith("#")]
+    assert any("clipped" in ln for ln in rich_head), "explain the fields that ARE present"
+
+
+def test_every_exporter_refuses_an_unoriented_mask(tmp_path):
+    """Not most of them. The first guard covered two of the three call sites.
+
+    `to_stellarium_txt` is the one that matters most: the format forbids
+    comments, so an unoriented landscape cannot even carry a warning inside the
+    file the way a .hrz header could.
+    """
+    import pytest
+
+    from terminus.export import (
+        UnorientedMask,
+        load_mask,
+        to_nina_hrz,
+        to_stellarium_txt,
+        write_mask,
+    )
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree"), 90: (20.0, "structure")}, [], {"oriented": False})
+    _, rows = load_mask(str(p))
+    unoriented = {"oriented": False}
+
+    with pytest.raises(UnorientedMask):
+        to_nina_hrz(rows, unoriented)
+    with pytest.raises(UnorientedMask):
+        to_stellarium_txt(rows, unoriented)
+
+    # Both still work when the mask is oriented, or when overridden.
+    assert to_nina_hrz(rows, {"lat": 40})
+    assert to_stellarium_txt(rows, {"lat": 40})
+    assert to_stellarium_txt(rows, unoriented, allow_unoriented=True)
+
+
+def test_the_oriented_flag_is_interpreted_not_identity_checked(tmp_path):
+    """The mask is documented as hand-editable, so people will write these.
+
+    `meta.get("oriented") is False` waves `oriented: 'false'` and `oriented: 0`
+    straight through to a planner, because neither is the False singleton.
+    """
+    import pytest
+
+    from terminus.export import UnorientedMask, export_all, is_oriented, write_mask
+
+    for value in (False, "false", "False", "no", 0, "0", "off"):
+        assert not is_oriented({"oriented": value}), f"{value!r} should read as unoriented"
+        p = tmp_path / f"m{hash(str(value))}.yaml"
+        write_mask(str(p), {0: (10.0, "tree")}, [], {"oriented": value})
+        with pytest.raises(UnorientedMask):
+            export_all(str(p), str(tmp_path / "o"))
+
+    for value in (True, "true", "yes", 1):
+        assert is_oriented({"oriented": value}), f"{value!r} should read as oriented"
+
+    # Absent means oriented: a scope mask has never carried the key.
+    assert is_oriented({"lat": 40})
+    assert is_oriented({})
+    assert is_oriented(None)
+
+
+def test_an_unrecognised_oriented_value_raises_rather_than_guessing():
+    """Matching only the false words fails open, which is the same bug inverted.
+
+    `oriented: flase` is a typo a person will make in a file the project
+    documents as hand-editable. Read as a negative allowlist it means "not one
+    of the false words, therefore true" — and a horizon rotated by an unknown
+    amount goes out with no warning. A typo is not evidence of orientation.
+    """
+    import pytest
+
+    from terminus.export import is_oriented
+
+    for bad in ("flase", "nope", "unoriented", "maybe", "TRUEISH"):
+        with pytest.raises(ValueError, match="neither true nor false"):
+            is_oriented({"oriented": bad})
+
+    # The vocabulary it does accept, both ways.
+    for good in ("true", "TRUE", " yes ", "y", "on", "1"):
+        assert is_oriented({"oriented": good}) is True
+    for good in ("false", "No", "n", "off", "0", ""):
+        assert is_oriented({"oriented": good}) is False
+
+
+def test_a_typo_in_the_oriented_flag_blocks_export(tmp_path):
+    """The refusal must reach the export path, not just the helper."""
+    import pytest
+
+    from terminus.export import export_all
+
+    p = tmp_path / "typo.yaml"
+    p.write_text("meta: {oriented: flase}\nhorizon:\n  0: {alt: 10.0, type: tree}\n")
+    with pytest.raises(ValueError, match="neither true nor false"):
+        export_all(str(p), str(tmp_path / "out"))
+    assert not (tmp_path / "out.hrz").exists()
+
+
+def test_an_unreadable_mask_flag_reaches_the_user_as_a_message(tmp_path, capsys):
+    """A typo must not produce a traceback while a valid refusal produces prose.
+
+    `main()` caught UnorientedMask but not the plain ValueError raised for an
+    unparseable flag, so `oriented: flase` — the easier of the two to fix —
+    was the one that dumped a stack trace.
+    """
+    import pytest
+
+    from terminus.cli import main
+    from terminus.export import MaskError, UnorientedMask
+
+    assert issubclass(UnorientedMask, MaskError), "the CLI catches the base"
+
+    p = tmp_path / "typo.yaml"
+    p.write_text("meta: {oriented: flase}\nhorizon:\n  0: {alt: 10.0, type: tree}\n")
+    with pytest.raises(SystemExit) as info:
+        main(["export", str(p)])
+    assert info.value.code == 1
+    assert "neither true nor false" in capsys.readouterr().err
+
+
+def test_write_mask_does_not_truncate_on_a_bad_flag(tmp_path):
+    """The flag is validated before the file is opened, so a failed write
+    leaves whatever was there rather than an empty file."""
+    import pytest
+
+    from terminus.export import MaskError, write_mask
+
+    p = tmp_path / "existing.yaml"
+    p.write_text("PRE-EXISTING\n")
+    with pytest.raises(MaskError):
+        write_mask(str(p), {0: (1.0, "tree")}, [], {"oriented": "flase"})
+    assert p.read_text() == "PRE-EXISTING\n"

@@ -49,11 +49,26 @@ its own frame).
 | | State |
 |---|---|
 | Scope sweep, mask, exports, `Horizon` queries | **Working, on the CLI** |
-| Photo registration, segmentation, orientation fit, adaptive column choice, night detection | **Implemented and tested, not yet on the CLI** |
+| Photo registration and segmentation | **Working, on the CLI** (`mosaic`, `skymask`) |
+| Orientation fit, adaptive column choice, night detection | **Implemented and tested, not yet on the CLI** |
 
-The photo modules (`skymask`, `mosaic`, `orient`, `plan`, `night`) are exported
-from the package API and covered by tests, so they can be driven from a script
-today — but no subcommand reaches them yet.
+`terminus mosaic` and `terminus skymask` build a horizon from photographs and
+need no telescope, no network and no `config.toml`. What they produce is
+**unoriented** — azimuth is the panorama's own until the orientation is solved
+against telescope-measured columns, so it declares that in its header and
+refuses to export.
+
+**That refusal is currently a dead end, and worth knowing before you start.**
+The step that resolves it is the orientation fit, which is implemented but not
+yet on the CLI, so today a photo mask is something you inspect rather than
+something you can hand to a planner. `terminus export --allow-unoriented` will
+force it out, and is only correct if you know the azimuths are already true —
+if you set north by hand, say. Otherwise the exported horizon is rotated by an
+unknown amount, which a planner cannot detect.
+
+The remaining modules (`orient`, `plan`, `night`) are exported from the package
+API and covered by tests, so they can be driven from a script today, but no
+subcommand reaches them yet.
 
 ```python
 from terminus import mosaic, skymask, orient, plan
