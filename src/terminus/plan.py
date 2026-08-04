@@ -176,6 +176,19 @@ def residual_targets(residuals, top=3, min_abs=3.0):
     return [az for _, az in bad[:top]]
 
 
+def _sigma(uncertainty):
+    """Degrees this column's boundary may move. 1.0 when unknown.
+
+    Tested with `is None` rather than truthiness: 0.0 is a real value meaning
+    "perfectly certain", and reading it as "unknown" would be a silent
+    downgrade. It is clamped away from zero because a zero sigma is a division
+    by zero dressed as infinite confidence, which nothing has earned.
+    """
+    if uncertainty is None:
+        return 1.0
+    return max(float(uncertainty), 1e-6)
+
+
 def as_fiducial(az, edge, ceiling, Fiducial, uncertainty=None, photo_type=None, scope_type=None):
     """Turn a column measurement into a fiducial, keeping blocked columns.
 
@@ -211,19 +224,19 @@ def as_fiducial(az, edge, ceiling, Fiducial, uncertainty=None, photo_type=None, 
             ceiling=ceiling,
             bound=True,
             weight=1.0,
+            sigma=_sigma(uncertainty),
             photo_type=photo_type,
             scope_type=scope_type,
         )
     bound = edge["alt"] >= ceiling - 1e-6
     weight = 1.0 if bound else min(1.0, (edge.get("snr") or 1.0) / 8.0)
-    if uncertainty:
-        weight /= float(uncertainty) ** 2
     return Fiducial(
         az,
         edge["alt"],
         ceiling=ceiling,
         bound=bound,
         weight=weight,
+        sigma=_sigma(uncertainty),
         photo_type=photo_type,
         scope_type=scope_type,
     )

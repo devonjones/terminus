@@ -2436,21 +2436,87 @@ def test_the_two_type_sources_are_recorded_separately():
     assert only_photo.scope_type is None, "an absent scope type must not inherit the photo's"
 
 
-def test_type_multiplies_the_snr_term_rather_than_replacing_it():
-    """They measure different things, so a column must fail on either."""
+def test_detection_and_movement_are_kept_as_separate_numbers():
+    """SNR and type answer different questions, so they are stored separately.
+
+    `weight` is how well the edge was DETECTED. `sigma` is how far the thing
+    detected may MOVE. Folding the second into the first looks equivalent and is
+    not — see `test_sigma_standardises_the_residual_before_the_robust_loss`.
+    """
     from terminus.orient import Fiducial
     from terminus.plan import as_fiducial
 
-    crisp_canopy = as_fiducial(
-        0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=3.0
-    ).weight
-    noisy_wall = as_fiducial(0.0, {"alt": 20.0, "snr": 1.0}, 60.0, Fiducial, uncertainty=1.0).weight
-    crisp_wall = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=1.0).weight
+    canopy = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=3.0)
+    wall = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=1.0)
+    noisy_wall = as_fiducial(0.0, {"alt": 20.0, "snr": 1.0}, 60.0, Fiducial, uncertainty=1.0)
 
-    assert crisp_wall > crisp_canopy, "a well-detected canopy edge still moves"
-    assert crisp_wall > noisy_wall, "a poorly detected wall is still poorly detected"
-    # 1/sigma^2, so tripling the uncertainty costs a factor of nine.
-    assert crisp_canopy == pytest.approx(crisp_wall / 9.0)
+    # Detection quality is identical for the first two; only movement differs.
+    assert canopy.weight == wall.weight == pytest.approx(1.0)
+    assert canopy.sigma == pytest.approx(3.0) and wall.sigma == pytest.approx(1.0)
+    # And a badly detected wall is still badly detected, independently.
+    assert noisy_wall.weight < wall.weight and noisy_wall.sigma == pytest.approx(1.0)
+
+
+def test_sigma_standardises_the_residual_before_the_robust_loss():
+    """Scaling the loss and scaling the residual are NOT the same under Huber.
+
+    `delta` is a threshold on the residual, so a column allowed to move 3
+    degrees must have its residual measured in units of that 3 degrees. The
+    earlier implementation multiplied the finished loss by 1/sigma^2, which is
+    inverse-variance weighting only while residuals stay inside the quadratic
+    core. At r=10, sigma=3, delta=4 the two differ by 36 per cent — precisely
+    the regime, a large residual on a high-sigma vegetation column, that this
+    weighting exists to handle.
+    """
+    from terminus.orient import _huber
+
+    r, sigma, delta = 10.0, 3.0, 4.0
+    standardised = float(_huber(np.array([r / sigma]), delta)[0])
+    scaled_loss = float(_huber(np.array([r]), delta)[0]) / sigma**2
+    assert standardised == pytest.approx(5.5556, abs=1e-3)
+    assert scaled_loss == pytest.approx(3.5556, abs=1e-3)
+    assert standardised > scaled_loss, "the wrong form under-penalises a far-off column"
+
+    # Inside the core they agree exactly, which is why this hid.
+    small = 2.0
+    assert float(_huber(np.array([small / sigma]), delta)[0]) == pytest.approx(
+        float(_huber(np.array([small]), delta)[0]) / sigma**2
+    )
+
+
+def test_a_bound_column_carries_its_sigma_too():
+    """Both bound paths must agree. One hard-coded weight=1.0 and skipped type.
+
+    A column that hit its ceiling and one whose edge landed at the ceiling are
+    the same kind of statement, and were getting sigmas differing by 9x
+    depending only on which branch produced them.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    no_edge = as_fiducial(0.0, None, 60.0, Fiducial, uncertainty=3.0, photo_type="tree")
+    at_ceiling = as_fiducial(
+        0.0, {"alt": 60.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=3.0, photo_type="tree"
+    )
+    assert no_edge.bound and at_ceiling.bound
+    assert no_edge.sigma == at_ceiling.sigma == pytest.approx(3.0)
+    assert no_edge.photo_type == at_ceiling.photo_type == "tree"
+
+
+def test_zero_uncertainty_is_a_value_not_a_missing_one():
+    """`if uncertainty:` read 0.0 as "unknown", silently downgrading it.
+
+    Zero means perfectly certain. It is clamped rather than taken literally,
+    because a sigma of zero is a division by zero dressed as infinite
+    confidence, and nothing has earned that.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    certain = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=0.0)
+    unknown = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=None)
+    assert certain.sigma < unknown.sigma, "0 must not be read as 'no information'"
+    assert certain.sigma > 0.0, "a zero sigma would divide by zero in the fit"
 
 
 def test_an_untyped_column_weighs_exactly_as_before():
@@ -2461,3 +2527,30 @@ def test_an_untyped_column_weighs_exactly_as_before():
     for snr in (1.0, 4.0, 8.0, 20.0):
         f = as_fiducial(0.0, {"alt": 20.0, "snr": snr}, 60.0, Fiducial)
         assert f.weight == pytest.approx(min(1.0, snr / 8.0))
+
+
+def test_the_fit_objective_standardises_rather_than_scaling():
+    """Pins the order INSIDE the cost the fit actually minimises.
+
+    The Huber property was tested in isolation, which left the fit free to use
+    the wrong form: reverting `objective` to scale the finished loss by
+    1/sigma^2 passed all 123 tests. The invariant has to be asserted where it is
+    applied, not where it is true in the abstract.
+    """
+    import numpy as np
+
+    from terminus.orient import objective
+
+    r, sigma, delta = np.array([10.0]), np.array([3.0]), 4.0
+    w = np.array([1.0])
+    standardised = objective(r, w, sigma, delta=delta)
+    wrong = float(__import__("terminus.orient", fromlist=["_huber"])._huber(r, delta)[0]) / 9.0
+
+    assert standardised == pytest.approx(5.5556, abs=1e-3)
+    assert wrong == pytest.approx(3.5556, abs=1e-3)
+    assert standardised > wrong, "the fit is under-penalising far-off high-sigma columns"
+
+    # A sigma of 1 must leave the cost exactly as it was before sigma existed.
+    assert objective(r, w, np.array([1.0]), delta=delta) == pytest.approx(
+        float(__import__("terminus.orient", fromlist=["_huber"])._huber(r, delta)[0])
+    )
