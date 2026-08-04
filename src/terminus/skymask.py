@@ -100,58 +100,12 @@ class _Segmenter:
 _SEG = None
 
 
-def _tiles(w, h):
-    """Left edges of overlapping square tiles covering a wide image.
-
-    The model expects something like a normal photograph; squashing a 6:1
-    panorama into its square input distorts it past recognition.
-    """
-    step = int(h * 0.75)
-    xs = list(range(0, max(1, w - h + 1), step))
-    if xs[-1] != w - h:
-        xs.append(w - h)
-    return xs
-
-
-def segment_classes(image, tile=True):
-    """Raw ADE20K class per pixel, as an int array.
-
-    `segment_sky` reduces to sky/not-sky, which throws away the one thing the
-    telescope cannot supply: WHICH obstruction. `obstruction_classes` needs the
-    classes themselves, and without this there is no way to get them through the
-    package — the type would have to come from colour again, which is the
-    failure the segmentation replaced.
-
-    Where tiles overlap, the class is decided by majority vote. Averaging is not
-    available here as it is for the boolean mask: class indices are labels, not
-    magnitudes, and the mean of "tree" and "building" is neither.
-    """
-    global _SEG
-    if _SEG is None:
-        _SEG = _Segmenter()
-    w, h = image.size
-    if not tile or w <= h * 1.6:
-        return np.asarray(_SEG(image), dtype=int)
-    votes = {}
-    for x0 in _tiles(w, h):
-        seg = np.asarray(_SEG(image.crop((x0, 0, x0 + h, h))), dtype=int)
-        for cls in np.unique(seg):
-            box = votes.setdefault(int(cls), np.zeros((h, w), np.int32))
-            box[:, x0 : x0 + h] += seg == cls
-    if not votes:
-        return np.zeros((h, w), dtype=int)
-    labels = sorted(votes)
-    stack = np.stack([votes[c] for c in labels], axis=0)
-    return np.asarray(labels, dtype=int)[np.argmax(stack, axis=0)]
-
-
 def segment_sky(image, tile=True):
     """Sky mask for a PIL image, via semantic segmentation.
 
-    Kept separate from `segment_classes` rather than derived from it: the
-    boolean mask votes on the sky FRACTION across overlapping tiles, which is a
-    softer and better-behaved decision at a tile seam than taking whichever
-    single class won.
+    Very wide images are processed in overlapping square tiles. The model expects
+    something like a normal photograph; squashing a 6:1 panorama into its square
+    input distorts it past recognition.
     """
     global _SEG
     if _SEG is None:
@@ -159,9 +113,13 @@ def segment_sky(image, tile=True):
     w, h = image.size
     if not tile or w <= h * 1.6:
         return _SEG(image) == SKY_CLASS_ADE20K
+    step = int(h * 0.75)
     acc = np.zeros((h, w), np.float32)
     cnt = np.zeros((h, w), np.float32)
-    for x0 in _tiles(w, h):
+    xs = list(range(0, max(1, w - h + 1), step))
+    if xs[-1] != w - h:
+        xs.append(w - h)
+    for x0 in xs:
         seg = _SEG(image.crop((x0, 0, x0 + h, h)))
         acc[:, x0 : x0 + h] += (seg == SKY_CLASS_ADE20K).astype(np.float32)
         cnt[:, x0 : x0 + h] += 1

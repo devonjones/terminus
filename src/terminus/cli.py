@@ -19,7 +19,6 @@ import time
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
 from .export import default_meta, export_all, write_mask
-from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     Pointer,
     PointingError,
@@ -175,156 +174,7 @@ def cmd_export(sc, cfg, args):  # sc unused; export is offline
     print(f"wrote {hrz}\nwrote {txt}")
 
 
-# ---- offline photo pipeline -----------------------------------------------
-# Neither command touches the scope, the network, or config.toml. They are the
-# desktop half: build a panorama from photographs, then read a horizon off it.
-def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
-    import numpy as np
-    from PIL import Image
-
-    from . import mosaic
-
-    mosaic.require_hugin()  # raises MosaicError naming what to install
-    work = args.work or os.path.join(args.image_dir.rstrip("/") + "_mosaic")
-    os.makedirs(work, exist_ok=True)
-    base = args.out or os.path.join(work, "equirect")
-
-    pto, dropped = mosaic.solve(
-        args.image_dir,
-        work,
-        lens=args.lens,
-        min_points=args.min_points,
-        celeste=not args.no_celeste,
-    )
-    counts = mosaic.control_point_counts(pto)
-    kept = [n for n in counts if n not in dropped]
-    print(f"registered {len(kept)} frames, dropped {len(dropped)}")
-    # Report every dropped frame and its count. A frame that cannot be
-    # constrained is silently missing sky, and autooptimiser will happily place
-    # one with zero control points — that is how a garage umbrella ended up in
-    # the sky and was blamed on the classifier.
-    for name in sorted(dropped):
-        print(
-            f"  dropped {name}: {counts.get(name, 0)} control points " f"(need {args.min_points})"
-        )
-    if not kept:
-        raise mosaic.MosaicError("no frame could be constrained; nothing to render")
-
-    tiffs, final = mosaic.render(pto, work, width=args.width, height=args.height)
-    img, coverage, gains = mosaic.composite(tiffs, args.width, args.height)
-    Image.fromarray(img).save(base + ".png")
-    np.save(base + ".coverage.npy", coverage)
-    mosaic.write_manifest(
-        base + ".manifest.json",
-        image_dir=os.path.abspath(args.image_dir),
-        pto=os.path.abspath(final),
-        width=args.width,
-        height=args.height,
-        kept=sorted(kept),
-        dropped=sorted(dropped),
-        control_points=counts,
-        min_points=args.min_points,
-        gains={n: float(g) for n, g in zip(sorted(tiffs), gains, strict=False)},
-    )
-    covered = float((coverage > 0).any(axis=0).mean()) * 100.0
-    print(f"wrote {base}.png ({args.width}x{args.height}, {covered:.0f}% of azimuth covered)")
-    print(f"wrote {base}.coverage.npy and {base}.manifest.json")
-
-
-def _type_name(cls):
-    """ADE20K class -> the mask's vocabulary. -1 means nothing was segmented."""
-    from .skymask import VEG_CLASSES_ADE20K
-
-    if cls < 0:
-        return ""
-    return "tree" if cls in VEG_CLASSES_ADE20K else "structure"
-
-
-def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
-    import numpy as np
-    from PIL import Image
-
-    from . import skymask
-    from .export import write_mask
-
-    Image.MAX_IMAGE_PIXELS = None
-    image = Image.open(args.image).convert("RGB")
-    w, h = image.size
-    backend = args.backend
-    if backend == "auto":
-        backend = "segment" if skymask.available("segment") else "heuristic"
-    if backend == "segment" and not skymask.available("segment"):
-        raise SeestarError(
-            "the segment backend needs torch, torchvision and transformers.\n"
-            "Install them, or pass --backend heuristic (markedly worse: colour "
-            "rules read an off-white wall as sky)."
-        )
-    print(f"backend: {backend} ({w}x{h})")
-
-    valid = None
-    if args.coverage:
-        valid = np.load(args.coverage) > 0
-        if valid.shape != (h, w):
-            raise SeestarError(
-                f"coverage {valid.shape} does not match image {(h, w)}; "
-                "it must come from the same mosaic run"
-            )
-
-    sky = skymask.sky_mask(image, backend=backend)
-    band = skymask.horizon_band(sky, valid=valid, run=args.run)
-    px_per_deg = w / 360.0
-    top = skymask.upper_envelope(band["top"], half_deg=args.envelope, px_per_deg=px_per_deg)
-
-    classes = np.full(w, -1, dtype=int)
-    if backend == "segment":
-        classes = skymask.obstruction_classes(
-            skymask.segment_classes(image), band["top"], valid=valid
-        )
-    unc = skymask.type_uncertainty(classes, band["porosity"])
-
-    step = max(1, int(round(args.az_step * px_per_deg)))
-    mask, clipped_n = {}, 0
-    for x in range(0, w, step):
-        if not np.isfinite(top[x]):
-            continue
-        az = int(round(x / px_per_deg)) % 360
-        alt = 90.0 - (float(top[x]) / h) * 180.0
-        is_clipped = bool(band["clipped"][x])
-        clipped_n += is_clipped
-        mask[az] = {
-            "alt": round(alt, 2),
-            "type": _type_name(int(classes[x])),
-            "clipped": is_clipped,
-            "porosity": round(float(band["porosity"][x]), 3),
-            "uncertainty": round(float(unc[x]), 2),
-        }
-    if not mask:
-        raise SeestarError("no column yielded a horizon; check the image and --coverage")
-
-    out = args.out or os.path.splitext(args.image)[0] + "_mask.yaml"
-    write_mask(
-        out,
-        mask,
-        [],
-        {
-            "source": os.path.abspath(args.image),
-            "backend": backend,
-            "oriented": False,  # native panorama azimuth; yaw is not known yet
-            "az_step": args.az_step,
-            "width": w,
-            "height": h,
-        },
-    )
-    print(f"wrote {out}: {len(mask)} columns, {clipped_n} clipped")
-    print("NOTE: azimuth is the panorama's own, NOT true north — run `terminus orient`")
-    if not args.no_export:
-        print("skipping export: an unoriented mask must not be handed to a planner")
-
-
 NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
-# Offline: no scope, no network, and no config.toml — a user with photographs
-# and no telescope must not be made to write one.
-OFFLINE = {"mosaic", "skymask"}
 
 
 def main(argv=None):
@@ -348,43 +198,6 @@ def main(argv=None):
     sw.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("export")
     ex.add_argument("mask")
-
-    mo = sub.add_parser("mosaic", help="register photographs into an equirectangular panorama")
-    mo.add_argument("image_dir")
-    mo.add_argument("--work", default=None, help="scratch dir (default: <image_dir>_mosaic)")
-    mo.add_argument("--out", default=None, help="output basename (default: <work>/equirect)")
-    mo.add_argument("--lens", type=float, default=None, help="horizontal FOV hint, degrees")
-    mo.add_argument(
-        "--min-points",
-        type=int,
-        default=MIN_CONTROL_POINTS,
-        help="drop a frame below this many control points",
-    )
-    mo.add_argument("--width", type=int, default=2880)
-    mo.add_argument("--height", type=int, default=1440)
-    mo.add_argument("--no-celeste", action="store_true", help="skip cpfind's sky filter")
-
-    sk = sub.add_parser("skymask", help="read a horizon off a panorama (UNORIENTED)")
-    sk.add_argument("image")
-    sk.add_argument("--backend", choices=("auto", "segment", "heuristic"), default="auto")
-    sk.add_argument(
-        "--coverage",
-        default=None,
-        help="the .coverage.npy from `terminus mosaic`; without it, "
-        "uncovered pixels read as terrain",
-    )
-    sk.add_argument("--out", default=None)
-    sk.add_argument("--az-step", type=float, default=1.0)
-    sk.add_argument(
-        "--run",
-        type=int,
-        default=6,
-        help="rows of sustained non-sky before the skyline is believed",
-    )
-    sk.add_argument(
-        "--envelope", type=float, default=2.0, help="half-width in degrees for the upper envelope"
-    )
-    sk.add_argument("--no-export", action="store_true")
     for sp in (sub.choices["preflight"], sub.choices["classify"]):
         sp.add_argument("--dry-run", action="store_true")  # harmless, keeps a uniform namespace
     args = p.parse_args(argv)
@@ -396,18 +209,16 @@ def main(argv=None):
         "classify": cmd_classify,
         "sweep": cmd_sweep,
         "export": cmd_export,
-        "mosaic": cmd_mosaic,
-        "skymask": cmd_skymask,
     }
     try:
-        cfg = {} if args.cmd in OFFLINE else load_config(args.config)
+        cfg = load_config(args.config)
         sc = _connect(cfg) if args.cmd in NEEDS_SCOPE else None
         try:
             handlers[args.cmd](sc, cfg, args)
         finally:
             if sc:
                 sc.close()
-    except (ConfigError, SeestarError, MosaicError) as e:
+    except (ConfigError, SeestarError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
