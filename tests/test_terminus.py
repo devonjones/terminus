@@ -1609,55 +1609,74 @@ def test_importing_terminus_does_not_pull_in_torch_or_transformers():
     assert transformers_loaded == "0", "importing terminus must not load transformers"
 
 
-def test_importing_terminus_does_not_shell_out():
-    """Hugin is optional and probing for it is not free.
+def _in_clean_interpreter(body, timeout=180):
+    """Run `body` in a fresh interpreter and return its stdout.
 
-    `mosaic.hugin_available()` exists so a caller can ask; the import must not
-    ask on its behalf.
+    Anything asking "what does importing terminus do" has to run in its own
+    process. Inside the suite the answer is already contaminated: an earlier test
+    doing `from terminus.skymask import horizon_rows` binds `terminus.skymask`
+    as a side effect of the import system, so a reachability check run in-process
+    passes whether or not `__init__` imports it at all.
     """
     import subprocess
     import sys
 
     out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import subprocess; "
-            "subprocess.run = lambda *a, **k: (_ for _ in ()).throw("
-            "AssertionError('terminus shelled out during import')); "
-            "import terminus; print('ok')",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
+        [sys.executable, "-c", body], capture_output=True, text=True, timeout=timeout
     )
-    assert out.returncode == 0, out.stderr
-    assert "ok" in out.stdout
+    assert out.returncode == 0, f"subprocess failed:\n{out.stdout}\n{out.stderr}"
+    return out.stdout.strip()
+
+
+def test_importing_terminus_does_not_shell_out():
+    """Hugin is optional and probing for it is not free.
+
+    `mosaic.hugin_available()` exists so a caller can ask; the import must not
+    ask on its behalf. Every spawn route is blocked, not just `subprocess.run` —
+    `Popen` and `os.system` bypass it entirely, and `check_output` only happens
+    to be caught because it delegates to `run`.
+    """
+    body = (
+        "import os, subprocess\n"
+        "def boom(*a, **k):\n"
+        "    raise AssertionError('terminus spawned a process during import')\n"
+        "subprocess.run = boom\n"
+        "subprocess.Popen = boom\n"
+        "subprocess.call = boom\n"
+        "subprocess.check_call = boom\n"
+        "subprocess.check_output = boom\n"
+        "os.system = boom\n"
+        "os.popen = boom\n"
+        "import terminus\n"
+        "print('ok')\n"
+    )
+    assert _in_clean_interpreter(body) == "ok"
 
 
 def test_photo_pipeline_is_reachable_from_the_package():
     """The published method must not be absent from the package's own API.
 
-    Every one of these was previously importable only by full module path,
-    which is not a documented interface.
+    Checked in a clean interpreter: importing `terminus` alone must bind all
+    five, with nothing else having imported them first.
     """
-    import terminus
-
-    for mod in ("skymask", "mosaic", "orient", "plan", "night"):
-        assert hasattr(terminus, mod), f"terminus.{mod} is not exported"
-        assert mod in terminus.__all__
-
-    # The entry points a photo-first user needs, module-qualified.
-    assert callable(terminus.mosaic.solve)
-    assert callable(terminus.mosaic.render)
-    assert callable(terminus.mosaic.composite)
-    assert callable(terminus.skymask.sky_mask)
-    assert callable(terminus.skymask.available)
-    assert callable(terminus.skymask.horizon_band)
-    assert callable(terminus.orient.fit)
-    assert callable(terminus.orient.from_mask)
-    assert callable(terminus.orient.residuals)
-    assert callable(terminus.night.find_horizon)
+    body = (
+        "import terminus\n"
+        "mods = ('skymask', 'mosaic', 'orient', 'plan', 'night')\n"
+        "missing = [m for m in mods if not hasattr(terminus, m)]\n"
+        "unlisted = [m for m in mods if m not in terminus.__all__]\n"
+        "entry = all([\n"
+        "    callable(terminus.mosaic.solve), callable(terminus.mosaic.render),\n"
+        "    callable(terminus.mosaic.composite), callable(terminus.skymask.sky_mask),\n"
+        "    callable(terminus.skymask.available), callable(terminus.skymask.horizon_band),\n"
+        "    callable(terminus.orient.fit), callable(terminus.orient.from_mask),\n"
+        "    callable(terminus.orient.residuals), callable(terminus.night.find_horizon),\n"
+        "])\n"
+        "print(repr((missing, unlisted, entry)))\n"
+    )
+    missing, unlisted, entry = eval(_in_clean_interpreter(body))
+    assert not missing, f"importing terminus does not bind: {missing}"
+    assert not unlisted, f"not in __all__: {unlisted}"
+    assert entry, "an entry point named in the ticket is missing or not callable"
 
 
 def test_every_exported_name_actually_exists():
@@ -1668,10 +1687,38 @@ def test_every_exported_name_actually_exists():
     assert not missing, f"__all__ names nothing: {missing}"
 
 
-def test_optional_backends_report_rather_than_raise():
-    """Both probes must answer on a machine missing either dependency."""
+def test_segmentation_backend_degrades_instead_of_raising():
+    """The claim is that terminus runs without torch — so test it without torch.
+
+    torch and transformers are installed in this dev environment, so
+    `available('segment')` returns True here and the ImportError branch never
+    executes. Asserting it returns a bool proves nothing about the machine that
+    lacks them. This blocks both imports in a child interpreter and checks the
+    real degradation path: report False, do not propagate.
+    """
+    body = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] in ('torch', 'transformers'):\n"
+        "            raise ImportError('blocked for test: ' + name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "from terminus import skymask\n"
+        "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
+    )
+    segment, heuristic = eval(_in_clean_interpreter(body))
+    assert segment is False, "without transformers, the segment backend must report False"
+    assert heuristic is True, "the heuristic backend needs nothing and must stay available"
+
+
+def test_hugin_probe_reports_rather_than_raising():
+    """`hugin_available()` must answer on a machine with no Hugin installed."""
+    from unittest.mock import patch
+
     import terminus
 
-    assert isinstance(terminus.mosaic.hugin_available(), bool)
-    assert isinstance(terminus.skymask.available("segment"), bool)
-    assert isinstance(terminus.skymask.available("heuristic"), bool)
+    with patch("shutil.which", return_value=None):
+        assert terminus.mosaic.hugin_available() is False
+    with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
+        assert terminus.mosaic.hugin_available() is True
