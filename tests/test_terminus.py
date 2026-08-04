@@ -1049,3 +1049,46 @@ def test_jacobian_yaw_term_keeps_the_sign_of_the_slope():
     rising, falling = at(45.0), at(135.0)
     assert rising > 0 > falling, f"rising {rising}, falling {falling}"
     assert jacobian_row(45.0, rising)[0] < 0 < jacobian_row(135.0, falling)[0]
+
+
+def test_native_column_falls_back_to_its_best_iterate():
+    """At a severe discontinuity the fixed point oscillates; keep the best try.
+
+    Rotating a discontinuous curve leaves world azimuths no photo column maps
+    to, so the solve cannot converge at a house corner. Returning whichever side
+    the loop happened to stop on is arbitrary: measured against a 60 deg step at
+    15 deg of tilt, the last iterate lands 35.9 deg from the requested azimuth
+    while the best one lands 3.5 deg away. Keeping the best bounds the error by
+    roughly the width of the cliff instead of letting it land anywhere.
+    """
+    import math
+
+    from terminus.orient import _rotate_scalar, _wrap180, native_column
+
+    def steep_cliff(phi):
+        p = phi % 360.0
+        h = 18.0 + 6.0 * math.sin(math.radians(2 * p)) + 3.0 * math.sin(math.radians(3 * p + 40))
+        return h + (60.0 if 100 <= p < 130 else 0.0)
+
+    yaw, tilt_mag, tilt_dir, target = 40.0, 15.0, 60.0, 139.0
+    phi, raw = native_column(steep_cliff, target, yaw, tilt_mag, tilt_dir)
+    landed, _ = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)
+    err = abs(_wrap180(target - landed))
+    assert err < 10.0, f"fell back to a poor iterate: landed {err:.1f} deg from the target"
+
+
+def test_local_refinement_beats_the_coarse_grid():
+    """The refinement passes must actually earn their place.
+
+    On a grid fine enough to hit the tolerance by itself, disabling refinement
+    changes nothing and the loop is untested. Here the coarse grid can only
+    place yaw within half a step (2.5 deg), so meeting 1.5 deg requires the
+    refinement to run.
+    """
+    from terminus.orient import fit
+
+    true_yaw = 137.0
+    fids = _place(_skyline, true_yaw, 3.0, 3.0, 40.0, step=20.0)
+    got = fit(fids, _skyline, yaw_step=5.0, tilt_step=3.0)
+    off = abs(((got["yaw"] - true_yaw + 180) % 360) - 180)
+    assert off < 1.5, f"yaw off by {off:.2f} deg — coarse grid alone cannot do better than 2.5"
