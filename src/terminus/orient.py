@@ -155,7 +155,7 @@ def rotate_alt(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
     return rotate(az_deg, alt_deg, pitch, tilt_mag, tilt_dir)[1]
 
 
-def native_column(sample, target_az, yaw, tilt_mag, tilt_dir, tol=1e-3, iters=6):
+def native_column(sample, target_az, yaw, tilt_mag, tilt_dir, tol=1e-3, iters=8):
     """The photo column that lands at world azimuth `target_az`. Returns (phi, raw).
 
     Yaw is a pure rotation about the vertical, so it only relabels azimuth and
@@ -169,7 +169,11 @@ def native_column(sample, target_az, yaw, tilt_mag, tilt_dir, tol=1e-3, iters=6)
     steep one far more.
 
     This is a fixed point, and d(az)/d(phi) is near 1, so it normally converges
-    in two or three passes. It does NOT converge at a vertical discontinuity —
+    in two or three passes and exits early when it does — `iters` only bounds the
+    hard cases, so raising it is nearly free. It was 6, which left almost no
+    margin: worst landing error across this site's tilt range ran 0.013 deg at 6
+    and 0.038 at 5, so a single-step regression would have degraded the fit
+    without any test noticing. At 8 it is 0.002. It does NOT converge at a vertical discontinuity —
     a house corner, where the photo altitude jumps — because the azimuth shift
     depends on altitude, so a step across the cliff throws the iterate to the
     far side and it oscillates. That case is genuinely ill-posed: rotating a

@@ -1422,3 +1422,114 @@ def test_the_sky_reference_seeding_swallows_a_pointing_failure():
             sc, sky, cfg, az_start=0, az_end=300, dry=False, log=lambda *a, **k: None
         )
     assert mask, "a failed sky reference must not abort the sweep before it starts"
+
+
+def test_min_drop_frac_is_pinned_not_merely_incidental():
+    """Every other night fixture departs the sky model so drastically that the
+    threshold could be moved 0.5 -> 0.9 unnoticed.
+
+    A real column can sit near it: distant terrain under light haze, or a low
+    pale wall, reads a substantial fraction of the modelled sky. Get this wrong
+    and the horizon is reported lower than it is, which is the dangerous
+    direction — a planner will then start an imaging run into the obstruction.
+    """
+    from terminus.night import find_horizon
+
+    sky = lambda a: 50.0 - 0.5 * a  # noqa: E731  measured skyglow gradient
+    alts = [60, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5, 0]
+
+    def column(frac):
+        return [(a, sky(a)) for a in alts if a >= 25] + [(a, sky(a) * frac) for a in alts if a < 25]
+
+    # Comfortably below the threshold: terrain.
+    alt, detail = find_horizon(column(0.45), sky_ref=22.0)
+    assert alt == 20.0, f"a drop to 0.45x the model is terrain, got {alt} ({detail['reason']})"
+    # Comfortably above it: still sky, however dim.
+    alt, detail = find_horizon(column(0.55), sky_ref=22.0)
+    assert alt is None, f"a drop to only 0.55x is not an obstruction, got {alt}"
+    assert "open" in detail["reason"]
+
+
+def test_an_abandoned_sweep_keeps_its_profiles_too():
+    """profiles is the record that lets a run be re-judged without re-observing.
+
+    The abort carried mask and skipped but could drop profiles unnoticed, which
+    would leave _profiles.json empty for columns that were measured perfectly
+    well before the stall.
+    """
+    import pytest
+
+    from terminus.sweep import PointingError
+
+    with pytest.raises(PointingError) as exc:
+        _sweep_with_failures({240, 270, 300})
+    mask, skipped, profiles = exc.value.partial
+    assert profiles, "the raw brightness profiles must survive the abort"
+    assert set(profiles) == set(mask), "every measured column keeps its profile"
+
+
+def test_an_aborted_sweep_still_exports(tmp_path):
+    """The operator gets the planning files for what WAS measured.
+
+    Checking the abort before the export would silently skip .hrz/.stellarium.txt
+    on a partial sweep — the YAML appears, the files a planner actually consumes
+    do not, and nothing says so.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.sweep import PointingError
+
+    out = tmp_path / "h.yaml"
+    err = PointingError("3 consecutive pointing failures ending at az 300")
+    err.partial = ({0: (12.0, "tree"), 30: (18.0, "structure")}, [300], {})
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {
+            "az_step": 5,
+            "alt_min": 0,
+            "alt_max": 60,
+            "sun_cone_deg": 30,
+            "clear_thresh": 0.6,
+        },
+    }
+    args = SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350, no_export=False
+    )
+    with patch.object(cli, "run_sweep", side_effect=err):
+        with pytest.raises(SystemExit) as info:
+            cli.cmd_sweep(sc, cfg, args)
+    assert info.value.code == 2
+    assert (tmp_path / "h.hrz").exists(), "the partial sweep must still export for N.I.N.A."
+    assert (tmp_path / "h.stellarium.txt").exists()
+
+
+def test_native_column_converges_at_its_shipped_defaults():
+    """Pin the contract, not the iteration count.
+
+    Dropping `iters` from 6 to 5 left every test green while quietly degrading
+    convergence at high tilt. Asserting "5 fails and 6 passes" would over-fit to
+    one fixture; asserting that the shipped defaults actually converge to `tol`
+    catches the same regression for the right reason.
+    """
+    import math
+
+    from terminus.orient import _rotate_scalar, _wrap180, native_column
+
+    for tilt in (3.0, 6.0, 9.0, 12.0, 15.0):
+        worst = 0.0
+        for target in range(0, 360, 7):
+            phi, raw = native_column(_skyline, float(target), 40.0, tilt, 60.0)
+            landed, _ = _rotate_scalar(phi + 40.0, raw, tilt, 60.0)
+            worst = max(worst, abs(_wrap180(target - landed)))
+        # 0.02 deg of azimuth is about 0.1 deg of altitude even on a steep
+        # 5 deg/deg horizon — an order below the measurement error. Measured:
+        # 0.002 at the shipped iters=8, 0.013 at 6, 0.038 at 5.
+        assert worst < 0.02, f"tilt {tilt}: worst landing error {worst:.4f} deg at the defaults"
+        assert math.isfinite(worst)
