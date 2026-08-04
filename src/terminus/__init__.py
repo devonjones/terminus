@@ -7,7 +7,7 @@ Three sides. The photographs are the mask; the telescope calibrates them.
   parameters that place a photo-derived horizon on the sky:
     from terminus import orient, plan
     fids = orient.from_mask(measured)          # capped columns become BOUNDS
-    az   = plan.next_column(done, cands, grad) # by information gain
+    az, _ = plan.next_column(done, cands, grad)  # by information gain
     sol  = orient.fit(fids, sample)            # yaw, pitch, tilt
     ok, spread = plan.is_stable(history)       # stop on stability, not on RMS
 
@@ -54,6 +54,7 @@ from .export import (
 from .horizon import Horizon
 from .mosaic import MosaicError, hugin_available, write_manifest
 from .night import fit_skyglow, mask_lights
+from .night import find_horizon as classify  # mutation: shadow sweep.classify
 from .orient import Fiducial
 from .plan import (
     as_fiducial,
