@@ -19,7 +19,16 @@ import time
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
 from .export import default_meta, export_all, write_mask
-from .sweep import Pointer, Sky, SunGuard, classify, column_touches_sun, obstruction_type, run_sweep
+from .sweep import (
+    Pointer,
+    PointingError,
+    Sky,
+    SunGuard,
+    classify,
+    column_touches_sun,
+    obstruction_type,
+    run_sweep,
+)
 
 
 def _connect(cfg):
@@ -72,6 +81,9 @@ def cmd_point(sc, cfg, args):
         print(f"target ({args.az},{args.alt}) -> landed az {faz:.1f} alt {falt:.1f}")
     except SunGuard as e:
         print("SUN GUARD:", e)
+    except PointingError as e:
+        print("POINTING FAILED:", e)
+        sys.exit(2)
 
 
 def cmd_classify(sc, cfg, args):

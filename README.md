@@ -77,6 +77,26 @@ terminus export horizon_mask.yaml  # re-export a mask without re-sweeping
 Review the `*_frames/` images, correct any misjudged rows in the mask by hand,
 then `terminus export` again.
 
+### When to run it
+
+**On a clouded-out night.** A full circle takes hours and returns nothing you
+could have imaged instead, so it costs a night you were going to lose anyway.
+
+Cloud is not merely tolerable here, it helps. The sweep finds the horizon by
+brightness: sky is the light source and everything terrestrial silhouettes
+against it. An overcast sky under suburban light pollution is a bright, even
+backdrop, which is close to ideal. A clear moonless sky is the *harder* case —
+darker overhead means less contrast against the treeline, not more.
+
+Two things do matter:
+
+- **Let the Sun set first.** The Sun guard refuses any slew whose path passes
+  near it, so daytime columns toward the Sun are skipped rather than measured.
+- **Expect it to take the evening.** 36 columns at 10 degree spacing, plus
+  adaptive refinement where the horizon moves fastest, runs several hours. The
+  open-sky reference is re-measured as it goes, so a run may safely span
+  twilight into full dark.
+
 ### As a library
 
 ```python

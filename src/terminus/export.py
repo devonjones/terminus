@@ -50,6 +50,30 @@ def load_mask(path):
     return doc.get("meta", {}), sorted(rows)
 
 
+# Vegetation is not a hard edge and not a fixed one. Its boundary is a band
+# rather than a line — gaps with more canopy above them — and it is seasonal: a
+# deciduous crown measured in August is not the horizon you get in January. A
+# roofline is neither, so it needs no margin.
+TREE_BUFFER_DEG = 3.0
+
+
+def apply_tree_buffer(rows, buffer_deg=TREE_BUFFER_DEG, types=("tree", "vegetation", "plant")):
+    """Raise vegetation columns by a margin before export.
+
+    Planning tools take the horizon literally: N.I.N.A. will start an imaging
+    run at an altitude the mask calls clear. Around foliage that confidence is
+    not warranted, so the exported horizon is deliberately pessimistic there —
+    losing a little sky beats losing a night's subframes to a branch.
+    """
+    out = []
+    for az, alt, typ in rows:
+        t = (typ or "").lower()
+        if any(k in t for k in types):
+            alt = min(90.0, alt + buffer_deg)
+        out.append((az, alt, typ))
+    return out
+
+
 def _ascending_pairs(rows):
     """(az, alt) ascending, guaranteeing endpoints at 0 and 360 for full wrap."""
     pairs = [(az, alt) for az, alt, _ in rows]
@@ -65,6 +89,8 @@ def _ascending_pairs(rows):
 def to_nina_hrz(rows, meta=None):
     pairs = _ascending_pairs(rows)
     out = ["# terminus horizon for N.I.N.A. (az alt), true-north azimuth."]
+    if meta and meta.get("tree_buffer_deg"):
+        out.append(f"# vegetation columns raised {meta['tree_buffer_deg']:g} deg (seasonal, gappy)")
     if meta:
         out.append(
             f"# measured {meta.get('measured','?')} at {meta.get('lat','?')},{meta.get('lon','?')}"
@@ -78,8 +104,10 @@ def to_stellarium_txt(rows):
     return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows)) + "\n"
 
 
-def export_all(mask_path, base_out):
+def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG):
     meta, rows = load_mask(mask_path)
+    if tree_buffer:
+        rows = apply_tree_buffer(rows, tree_buffer)
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
         f.write(to_nina_hrz(rows, meta))
