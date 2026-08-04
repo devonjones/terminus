@@ -336,6 +336,7 @@ def column_touches_sun(sky, az, alt_min, alt_max, cone):
 
 EDGE_MIN_STEP_FRAC = 0.25  # a step must also be this fraction of the sky reference
 EDGE_TOP_FRACTION = 0.9  # a higher split wins if within this fraction of the best
+MAX_POINTING_MISSES = 3  # consecutive non-arrivals before a sweep is abandoned
 EDGE_SNR = 2.5  # a step must exceed the column's own sample-to-sample noise by
 #                 this factor; below it, the "step" is indistinguishable from
 #                 measurement scatter and the column is reported as unmeasured
@@ -577,6 +578,7 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
     # Without it the first column has nothing to compare against, and a fully
     # blocked column is indistinguishable from a clear one.
     sky_ref = None
+    misses = 0  # consecutive pointing failures; see MAX_POINTING_MISSES
     if not dry:
         try:
             zen_az = (saz + 180.0) % 360.0
@@ -633,6 +635,22 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
         except SunGuard as e:
             skipped.append(az)
             log(f"az {az:3d}: skipped ({e})", flush=True)
+        except PointingError as e:
+            # One column that would not arrive is not worth losing a night over,
+            # but a mount that cannot point is: skipping every column silently
+            # would produce an empty mask and hide exactly the failure this
+            # exception was added to surface (a goto once reported success while
+            # the arm was closed and nothing moved). So skip, and give up if they
+            # keep coming.
+            skipped.append(az)
+            misses += 1
+            log(f"az {az:3d}: skipped ({e}) [{misses}/{MAX_POINTING_MISSES}]", flush=True)
+            if misses >= MAX_POINTING_MISSES:
+                raise PointingError(
+                    f"{misses} consecutive pointing failures; the mount is not tracking commands"
+                ) from e
+        else:
+            misses = 0
 
     # ---- adaptive refinement ------------------------------------------------
     # A uniform step wastes time on flat stretches (a long roofline) and still
@@ -679,7 +697,7 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
                         f"az {mid:3d}: alt {alt:5.1f}  {typ:9s} [refine {a0}-{a1}]",
                         flush=True,
                     )
-                except SunGuard as e:
+                except (SunGuard, PointingError) as e:
                     log(f"az {mid:3d}: refine skipped ({e})", flush=True)
     return mask, skipped, profiles
 

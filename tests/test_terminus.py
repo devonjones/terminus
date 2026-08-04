@@ -812,6 +812,9 @@ def test_second_leg_rechecks_the_sun_after_the_waypoint():
     sky = Sky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.equ_coord.return_value = (12.0, 20.0)
+    # A real frame: scan_horizon short-circuits entirely in dry mode and never
+    # points, so the pointing path can only be exercised with dry=False.
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
     ptr = Pointer(sc, sky, 30, 5)
 
     legs = []
@@ -1092,3 +1095,80 @@ def test_local_refinement_beats_the_coarse_grid():
     got = fit(fids, _skyline, yaw_step=5.0, tilt_step=3.0)
     off = abs(((got["yaw"] - true_yaw + 180) % 360) - 180)
     assert off < 1.5, f"yaw off by {off:.2f} deg — coarse grid alone cannot do better than 2.5"
+
+
+def _sweep_with_failures(fail_azimuths):
+    """Run run_sweep against a mount that refuses to arrive at given azimuths."""
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, PointingError, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    # A real frame: scan_horizon short-circuits entirely in dry mode and never
+    # points, so the pointing path can only be exercised with dry=False.
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30,
+        "slew_step_deg": 5,
+        "az_step": 30,
+        "alt_min": 0,
+        "alt_max": 60,
+        "alt_tol": 2.5,
+        "clear_thresh": 0.6,
+    }
+    seen = []
+
+    def point_to(self, az, alt):
+        seen.append(az)
+        if round(az) % 360 in fail_azimuths:
+            raise PointingError(f"never arrived at ({az:.0f},{alt:.0f})")
+        return az, alt
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),  # night: guard stands down
+        patch.object(Pointer, "point_to", point_to),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+    ):
+        return run_sweep(sc, sky, cfg, az_start=0, az_end=350, dry=False, log=lambda *a, **k: None)
+
+
+def test_one_bad_column_is_skipped_not_fatal():
+    """PointingError is new in this PR and the scan loop caught only SunGuard.
+
+    A single column that will not arrive is not worth losing a night's sweep
+    over — before this, one non-arrival aborted the whole run.
+    """
+    _, skipped, _ = _sweep_with_failures({90})
+    assert 90 in skipped
+    assert len(skipped) < 12, "only the bad column should be skipped"
+
+
+def test_a_mount_that_cannot_point_stops_the_sweep():
+    """The opposite failure: skipping quietly would hide a dead mount.
+
+    A goto once reported success while the arm was closed and nothing moved,
+    which is why PointingError exists. Swallowing it at every column would
+    produce an empty mask and call it a measurement.
+    """
+    import pytest
+
+    from terminus.sweep import MAX_POINTING_MISSES, PointingError
+
+    with pytest.raises(PointingError, match="consecutive pointing failures"):
+        _sweep_with_failures(set(range(0, 360, 30)))
+    assert MAX_POINTING_MISSES >= 2, "one transient miss must not abort a sweep"
+
+
+def test_scattered_pointing_failures_do_not_accumulate():
+    """The counter must reset, or a long sweep dies of unrelated hiccups."""
+    from terminus.sweep import MAX_POINTING_MISSES
+
+    # More failures than the abort threshold, but never consecutive.
+    spread = {0, 60, 120, 180, 240, 300}
+    assert len(spread) > MAX_POINTING_MISSES
+    _, skipped, _ = _sweep_with_failures(spread)
+    assert spread <= set(skipped)
