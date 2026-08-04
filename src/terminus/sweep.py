@@ -41,7 +41,16 @@ class SunGuard(Exception):
 
 
 class PointingError(Exception):
-    """A slew did not arrive where it was told to go."""
+    """A slew did not arrive where it was told to go.
+
+    `partial` carries whatever a sweep had measured before it gave up, so an
+    abort late in a multi-hour run does not throw the night away. It defaults to
+    None at CLASS level deliberately: `_goto_wait` raises this from deep inside a
+    slew where no sweep state exists, and a caller reading `.partial` on one of
+    those must get None rather than AttributeError.
+    """
+
+    partial = None
 
 
 def _now():
@@ -585,7 +594,14 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
             ptr.point_to(zen_az, 75.0)
             sky_ref = sky_reference(sc.capture_rgb(warmup=0.3))
             log(f"sky reference (az {zen_az:.0f} alt 75): {sky_ref:.1f}", flush=True)
-        except (SunGuard, OSError) as e:
+        except (SunGuard, PointingError, OSError) as e:
+            # PointingError belongs here for the same reason it does on the
+            # mid-sweep refresh: seeding is a convenience, not a measurement, and
+            # a mount that cannot reach the zenith will fail the columns too,
+            # where the miss counter judges it properly. Letting it escape from
+            # HERE is the worst case — it is the earliest goto in the sweep, so a
+            # dead mount raises before a single column exists, and that exception
+            # carries no partial result for the caller to save.
             log(f"could not seed sky reference: {e}", flush=True)
     ref_taken = time.time()
     for az in range(int(az_start), int(az_end) + 1, cfg["az_step"]):

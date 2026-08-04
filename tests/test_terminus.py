@@ -1337,3 +1337,88 @@ def test_solve_gains_equalises_a_dim_frame():
     assert len(gains) == 2
     ratio = (gains[1] * 100.0) / (gains[0] * 200.0)
     assert 0.8 < ratio < 1.25, f"overlap still disagrees by {ratio:.2f}x after solving"
+
+
+def test_a_pointing_error_without_a_sweep_behind_it_still_saves_and_exits():
+    """The abort handler must survive the earliest possible failure.
+
+    `_goto_wait` raises PointingError from inside a slew, where no sweep state
+    exists — notably from the sky-reference seeding goto, which is the FIRST
+    goto of a run. If that reaches the CLI handler without a `.partial`, the
+    handler's unpacking raises AttributeError and the whole fix is undone: bare
+    traceback, nothing written. Exactly the bug it exists to prevent.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.sweep import PointingError
+
+    raw = PointingError("never arrived at (117,75)")  # no .partial set
+    assert raw.partial is None, "the class default must make this attribute safe to read"
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    args = SimpleNamespace(
+        dry_run=True, out=None, frames=None, az_start=0, az_end=350, no_export=True
+    )
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {
+            "az_step": 5,
+            "alt_min": 0,
+            "alt_max": 60,
+            "sun_cone_deg": 30,
+            "clear_thresh": 0.6,
+        },
+    }
+    with patch.object(cli, "run_sweep", side_effect=raw), patch.object(cli, "write_mask") as wm:
+        with pytest.raises(SystemExit) as info:
+            cli.cmd_sweep(sc, cfg, args)
+    assert info.value.code == 2, "an abort must still report failure"
+    assert wm.called, "it must reach the save path rather than dying on AttributeError"
+
+
+def test_the_sky_reference_seeding_swallows_a_pointing_failure():
+    """Seeding is a convenience, not a measurement.
+
+    A mount that cannot reach the zenith will fail the columns too, where the
+    miss counter can judge it on evidence. Letting the seeding goto abort the
+    run instead reports the failure from the one place that has nothing to save.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, PointingError, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30,
+        "slew_step_deg": 5,
+        "az_step": 60,
+        "alt_min": 0,
+        "alt_max": 60,
+        "alt_tol": 2.5,
+        "clear_thresh": 0.6,
+    }
+
+    def point_to(self, az, alt):
+        if round(alt) == 75:  # the seeding goto, and only it
+            raise PointingError("never arrived at the zenith")
+        return az, alt
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Pointer, "point_to", point_to),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+    ):
+        mask, _, _ = run_sweep(
+            sc, sky, cfg, az_start=0, az_end=300, dry=False, log=lambda *a, **k: None
+        )
+    assert mask, "a failed sky reference must not abort the sweep before it starts"

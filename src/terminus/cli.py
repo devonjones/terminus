@@ -125,9 +125,18 @@ def cmd_sweep(sc, cfg, args):
         # reported, so save what was measured and then fail loudly. Without this
         # the abort exits through main() as a bare traceback and writes nothing.
         aborted = e
-        mask, skipped, profiles = e.partial
+        # `partial` is None when the failure happened before any sweep state
+        # existed — a goto that never arrived, raised from inside the slew.
+        mask, skipped, profiles = e.partial or ({}, [], {})
     if not args.dry_run:
-        sc.stop_view()
+        try:
+            sc.stop_view()
+        except OSError as e:
+            # Never let this skip the save below. A scenery view left running is
+            # the documented precondition for the frozen-RTSP failure, so it is
+            # worth attempting and worth reporting — but the measurement matters
+            # more, and stop_view can raise from the socket layer on reconnect.
+            print(f"warning: could not stop the view ({e})", file=sys.stderr)
     if profiles:
         prof_path = os.path.splitext(out)[0] + "_profiles.json"
         with open(prof_path, "w") as f:
