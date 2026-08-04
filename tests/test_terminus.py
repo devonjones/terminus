@@ -1533,3 +1533,47 @@ def test_native_column_converges_at_its_shipped_defaults():
         # 0.002 at the shipped iters=8, 0.013 at 6, 0.038 at 5.
         assert worst < 0.02, f"tilt {tilt}: worst landing error {worst:.4f} deg at the defaults"
         assert math.isfinite(worst)
+
+
+@pytest.mark.parametrize("boom", [OSError("socket gone"), None])
+def test_a_failing_stop_view_never_costs_the_measurement(tmp_path, boom):
+    """stop_view runs through client.call, which reconnects on a dropped socket.
+
+    That path raises OSError from the socket itself but SeestarError when
+    re-authentication fails or the re-entrancy guard trips. Catching only the
+    first left the second skipping write_mask — the same bug one exception class
+    over, and it would have exited 1 rather than the 2 that means "abandoned but
+    saved". A view left running is the documented precondition for the frozen
+    RTSP stream, so it is worth attempting and reporting; it is not worth a
+    night's data.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.client import SeestarError
+
+    out = tmp_path / "h.yaml"
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # The pre-sweep stop_view is deliberately NOT guarded — nothing is measured
+    # yet, so failing loudly there is right. Only the post-sweep call must be
+    # survivable, so let the first through and break the second.
+    sc.stop_view.side_effect = [None, boom or SeestarError("reconnected but auth failed")]
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {
+            "az_step": 5,
+            "alt_min": 0,
+            "alt_max": 60,
+            "sun_cone_deg": 30,
+            "clear_thresh": 0.6,
+        },
+    }
+    args = SimpleNamespace(
+        dry_run=False, out=str(out), frames=None, az_start=0, az_end=350, no_export=True
+    )
+    with patch.object(cli, "run_sweep", return_value=({0: (12.0, "tree")}, [], {})):
+        cli.cmd_sweep(sc, cfg, args)  # must NOT raise
+    assert out.exists(), "a failed stop_view must not cost the mask"
+    assert "12.0" in out.read_text()

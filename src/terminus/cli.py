@@ -131,11 +131,19 @@ def cmd_sweep(sc, cfg, args):
     if not args.dry_run:
         try:
             sc.stop_view()
-        except OSError as e:
+        except (OSError, SeestarError) as e:
             # Never let this skip the save below. A scenery view left running is
             # the documented precondition for the frozen-RTSP failure, so it is
             # worth attempting and worth reporting — but the measurement matters
-            # more, and stop_view can raise from the socket layer on reconnect.
+            # more.
+            #
+            # BOTH types are needed. stop_view goes through client.call, which
+            # reconnects on a dropped socket; that path raises OSError from the
+            # socket itself but SeestarError when re-authentication fails or the
+            # re-entrancy guard trips. Catching only OSError left the second one
+            # skipping write_mask — the same bug one exception class over, and it
+            # would also have exited 1 rather than the 2 that means "abandoned
+            # but saved".
             print(f"warning: could not stop the view ({e})", file=sys.stderr)
     if profiles:
         prof_path = os.path.splitext(out)[0] + "_profiles.json"
