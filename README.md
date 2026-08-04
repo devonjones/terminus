@@ -16,7 +16,7 @@ is used to **orient** them.
 ## The method, and why it is split this way
 
 A telescope **focused at infinity** cannot see your neighbour's roof. The Seestar
-is 250 mm at f/4.9, putting its hyperfocal distance around 4.3 km, so every
+is 250 mm at f/5, putting its hyperfocal distance around 4.3 km, so every
 terrestrial target is roughly a thousand times inside it and arrives badly
 blurred. That is the state the scope is in for astronomy, and the state the
 sweep runs in — which is why the type column it produces is not trustworthy: it
@@ -97,9 +97,13 @@ that every exporter routes through, so it cannot be bypassed.
 
 **Optional**, for the photo pipeline:
 
-- **hugin-tools** and **enblend** for registration (`pto_gen`, `cpfind`,
-  `autooptimiser`, `nona`). Without them, photo registration is unavailable; the
-  scope path is unaffected.
+- **hugin-tools** for registration — `pto_gen`, `cpfind`, `cpclean`,
+  `autooptimiser`, `nona`, `pano_modify`. Without them, photo registration is
+  unavailable; the scope path is unaffected. No blender (`enblend`) is needed:
+  `nona` renders separate `TIFF_m` layers and terminus composites them itself,
+  solving per-frame gains first, because a full circle under sun guarantees
+  frames metered differently and averaging them raw darkens every overlap that
+  includes a dim one.
 - **torch**, **torchvision**, **transformers** for semantic segmentation
   (SegFormer, ADE20K). Without them `skymask` falls back to a colour heuristic,
   which is markedly worse — it is what mistook an off-white house wall for sky
@@ -175,8 +179,10 @@ Two things do matter:
 
 - **Let the Sun set first.** The Sun guard refuses any slew whose path passes
   near it, so daytime columns toward the Sun are skipped rather than measured.
-- **Expect the blind circle to take the evening.** 36 columns at 10° spacing,
-  plus adaptive refinement where the horizon moves fastest, runs several hours.
+- **Expect the blind circle to take the evening.** The shipped default is
+  `az_step = 5`, so a full circle is **72 columns**, plus adaptive refinement
+  where the horizon moves fastest — several hours. Set `az_step = 10` for a
+  quicker, coarser 36.
   The open-sky reference is re-measured as it goes, so a run may safely span
   twilight into full dark. (The photo-first method needs far fewer columns — see
   above — but is not yet on the CLI.)

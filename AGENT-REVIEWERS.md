@@ -371,8 +371,8 @@ replacement, and a brief reason if it isn't obvious.
 ## external-process-reviewer
 
 From the pfsrd2 pack. terminus shells out constantly: **ffmpeg** for every frame
-capture, and seven **Hugin** binaries (`pto_gen`, `cpfind`, `cpclean`,
-`autooptimiser`, `nona`, `pano_modify`, `pano_trafo`) for registration. A hang or
+capture, and six **Hugin** binaries (`pto_gen`, `cpfind`, `cpclean`,
+`autooptimiser`, `nona`, `pano_modify`) for registration. A hang or
 an unhelpful error here costs an observing session that cannot be repeated on
 demand.
 
