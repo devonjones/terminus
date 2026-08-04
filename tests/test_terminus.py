@@ -1172,3 +1172,71 @@ def test_scattered_pointing_failures_do_not_accumulate():
     assert len(spread) > MAX_POINTING_MISSES
     _, skipped, _ = _sweep_with_failures(spread)
     assert spread <= set(skipped)
+
+
+def test_an_abandoned_sweep_keeps_what_it_measured():
+    """Losing hours of good columns to a late stall is worse than the stall.
+
+    The abort exists so a dead mount cannot pass off an empty mask as a
+    measurement. But az_step defaults to 5 degrees, so three consecutive misses
+    span only a 15 degree arc — plausibly a local stall near the pole, not a
+    dead mount. Discarding thirty good columns for that would be the worse bug,
+    so the partial result rides on the exception.
+    """
+    import pytest
+
+    from terminus.sweep import PointingError
+
+    # Fail only a contiguous run late in the sweep, after real columns measured.
+    with pytest.raises(PointingError) as exc:
+        _sweep_with_failures({240, 270, 300})
+    mask, skipped, profiles = exc.value.partial
+    assert mask, "the columns measured before the stall must survive the abort"
+    assert max(mask) < 240, "everything before the stall should be present"
+    assert {240, 270} <= set(skipped)
+
+
+def test_cli_saves_the_partial_mask_and_still_fails(tmp_path):
+    """The abort must write the mask AND exit non-zero.
+
+    Without a handler it leaves main() as a bare traceback having written
+    nothing, so an operator loses the night's measurement and gets a stack trace
+    instead of a horizon. Exiting zero would be worse still: a truncated sweep
+    would then look finished to anything downstream.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.sweep import PointingError
+
+    out = tmp_path / "h.yaml"
+    err = PointingError("3 consecutive pointing failures ending at az 300")
+    err.partial = ({0: (12.0, "tree"), 30: (18.0, "structure")}, [300], {})
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {
+            "az_step": 5,
+            "alt_min": 0,
+            "alt_max": 60,
+            "sun_cone_deg": 30,
+            "clear_thresh": 0.6,
+        },
+    }
+    args = SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350, no_export=True
+    )
+
+    with patch.object(cli, "run_sweep", side_effect=err):
+        with pytest.raises(SystemExit) as exit_info:
+            cli.cmd_sweep(sc, cfg, args)
+
+    assert exit_info.value.code == 2, "a truncated sweep must not report success"
+    assert out.exists(), "the partial mask must be on disk before the exit"
+    text = out.read_text()
+    assert "12.0" in text and "18.0" in text, "measured columns must survive the abort"

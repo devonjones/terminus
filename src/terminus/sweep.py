@@ -646,9 +646,19 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
             misses += 1
             log(f"az {az:3d}: skipped ({e}) [{misses}/{MAX_POINTING_MISSES}]", flush=True)
             if misses >= MAX_POINTING_MISSES:
-                raise PointingError(
-                    f"{misses} consecutive pointing failures; the mount is not tracking commands"
-                ) from e
+                # Abandon the sweep, but do NOT discard what it measured. The
+                # default az_step is 5 degrees, so three consecutive misses span
+                # only a 15 degree arc — narrow enough to be a local stall near
+                # the pole rather than a dead mount. Losing thirty good columns
+                # to that would be a worse bug than the one being guarded
+                # against. The partial result rides on the exception so the
+                # caller can save it and still fail loudly.
+                err = PointingError(
+                    f"{misses} consecutive pointing failures ending at az {az}; "
+                    f"the mount is not tracking commands"
+                )
+                err.partial = (mask, skipped, profiles)
+                raise err from e
         else:
             misses = 0
 

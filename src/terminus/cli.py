@@ -114,9 +114,18 @@ def cmd_sweep(sc, cfg, args):
         print(f"exposure locked: {locked}")
         sc.start_view("scenery")
         time.sleep(3)
-    mask, skipped, profiles = run_sweep(
-        sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
-    )
+    aborted = None
+    try:
+        mask, skipped, profiles = run_sweep(
+            sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
+        )
+    except PointingError as e:
+        # A sweep runs for hours. Losing every column already measured because
+        # the mount stalled near the end is a worse outcome than the fault being
+        # reported, so save what was measured and then fail loudly. Without this
+        # the abort exits through main() as a bare traceback and writes nothing.
+        aborted = e
+        mask, skipped, profiles = e.partial
     if not args.dry_run:
         sc.stop_view()
     if profiles:
@@ -135,6 +144,12 @@ def cmd_sweep(sc, cfg, args):
     if not args.no_export and mask:
         hrz, txt = export_all(out, os.path.splitext(out)[0])
         print(f"exported {hrz} and {txt}")
+    if aborted is not None:
+        # Non-zero exit: the mask on disk is real but incomplete, and nothing
+        # downstream should treat a truncated sweep as a finished one.
+        print(f"\nSWEEP ABANDONED: {aborted}", file=sys.stderr)
+        print("the partial mask above was saved; re-run to cover the rest", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
