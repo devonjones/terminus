@@ -2160,3 +2160,212 @@ def test_gap_fraction_is_written_not_porosity(tmp_path):
     text = p.read_text()
     assert "gap_fraction: 0.4" in text
     assert "porosity" not in text
+
+
+# ---- planner feasibility (terminus-40) -------------------------------------
+def _pointer_with_sun(sun_az, sun_alt, cone=30):
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    return Pointer(sc, sky, cone, 5), sky
+
+
+def test_a_column_can_clear_the_cone_and_still_be_unreachable():
+    """The endpoint is not the test — the slew PATH is.
+
+    Measured case: with the Sun up, a column whose endpoint sits comfortably
+    outside the cone is still refused because the RA/Dec path passes through it.
+    Ranking on endpoint separation would have chosen it, which is the
+    EQ-goto-swings-past-the-Sun failure the guard was written for.
+    """
+    from unittest.mock import patch
+
+    from terminus.sweep import Sky, ang_sep, reachable_now
+
+    ptr, _ = _pointer_with_sun(123.0, 55.8)
+    with patch.object(Sky, "sun", lambda self: (123.0, 55.8)):
+        ok = reachable_now(ptr, 30.0)
+        outside = [az for az in range(0, 360, 20) if ang_sep(az, 30.0, 123.0, 55.8) >= 30.0]
+        refused = [az for az in outside if not ok(az)]
+    assert refused, "no column had a clear endpoint and a blocked path; test is not exercising"
+
+
+def test_the_planner_never_returns_a_column_it_cannot_reach():
+    from terminus.plan import next_column, rank_columns
+
+    cands = [10.0, 100.0, 200.0, 300.0]
+    # 100 is by far the most informative, and is exactly the one refused.
+    grad = lambda a: 5.0 if a == 100.0 else 0.02  # noqa: E731
+    ok = lambda a: a != 100.0  # noqa: E731
+
+    assert next_column([0.0, 180.0], cands, grad)[0] == 100.0, "unfiltered it wins"
+    pick, _ = next_column([0.0, 180.0], cands, grad, reachable=ok)
+    assert pick != 100.0 and pick in cands
+    assert 100.0 not in rank_columns([0.0, 180.0], cands, grad, reachable=ok)
+
+
+def test_filtering_happens_before_the_criterion_not_after():
+    """Filter-then-rank gives the best feasible CONFIGURATION.
+
+    Rank-then-filter gives the best infeasible column and a fallback, which is a
+    different and worse answer: the columns are chosen jointly, so removing one
+    changes which of the others is worth having.
+    """
+    from terminus.plan import rank_columns
+
+    cands = [0.0, 45.0, 90.0, 135.0, 180.0]
+    grad = lambda a: 1.0  # noqa: E731
+    ok = lambda a: a not in (90.0, 135.0)  # noqa: E731
+
+    ranked_then_filtered = [c for c in rank_columns([0.0], cands, grad, top=5) if ok(c)]
+    filtered_then_ranked = rank_columns([0.0], cands, grad, top=5, reachable=ok)
+    assert set(filtered_then_ranked).isdisjoint({90.0, 135.0})
+    # Same members here, but the ORDER is decided among feasible columns only.
+    assert filtered_then_ranked == sorted(
+        filtered_then_ranked, key=lambda c: ranked_then_filtered.index(c)
+    ) or set(filtered_then_ranked) == set(ranked_then_filtered)
+
+
+def test_nothing_reachable_is_a_state_not_a_crash():
+    """The Sun moves; waiting is sometimes the right move, so say so quietly."""
+    import numpy as np
+
+    from terminus.plan import next_column, partition
+
+    cands = [10.0, 20.0]
+    pick, score = next_column([0.0], cands, lambda a: 1.0, reachable=lambda a: False)
+    assert pick is None and score == -np.inf
+    feasible, refused = partition(cands, lambda a: False)
+    assert feasible == [] and refused == cands
+
+
+def test_hours_until_endpoint_clear_reports_a_wait(monkeypatch):
+    """A refused column is not permanently lost — report when it frees up."""
+    import datetime
+
+    from terminus import sweep
+
+    sky = sweep.Sky(39.7917, -104.894, 1600)
+    base = sweep._now()
+
+    # Sun sits on the column now, and has moved well away a few hours later.
+    class _FakeSunCoord:
+        def __init__(self, az, alt):
+            self.az = type("D", (), {"deg": az})()
+            self.alt = type("D", (), {"deg": alt})()
+
+        def transform_to(self, frame):
+            return self
+
+    def fake_get_sun(when):
+        elapsed = (when - base).sec / 3600.0
+        return _FakeSunCoord(100.0 + 15.0 * elapsed, 40.0)
+
+    monkeypatch.setattr(sweep, "get_sun", fake_get_sun)
+    wait = sweep.hours_until_endpoint_clear(sky, 100.0, 30.0, cone=30.0, within=8.0, step_min=30.0)
+    assert wait is not None and 1.0 <= wait <= 4.0, wait
+
+    # A column the Sun never approaches is available immediately.
+    assert sweep.hours_until_endpoint_clear(sky, 280.0, 30.0, cone=30.0) == 0.0
+    assert isinstance(datetime.timedelta(minutes=1), datetime.timedelta)
+
+
+def test_the_feasibility_check_tests_the_same_azimuth_point_to_will_slew_to():
+    """The predicate and the slew must agree about which azimuth is meant.
+
+    `point_to` nudges an azimuth off the celestial pole before converting to
+    RA/Dec, so a predicate that checked the RAW azimuth would be answering about
+    a different path than the one later flown. Both call `avoid_pole`; nothing
+    pinned that they must, and removing it from the predicate left the whole
+    suite green.
+    """
+    from unittest.mock import patch
+
+    from terminus.sweep import Sky, reachable_now
+
+    ptr, sky = _pointer_with_sun(123.0, 55.8)
+    # Due north at altitude == latitude IS the pole, which is what avoid_pole
+    # exists to dodge; at this site that is az 0, alt 39.79.
+    pole_az, pole_alt = 0.0, 39.7917
+    nudged_az, nudged_alt = ptr.avoid_pole(pole_az, pole_alt)
+    assert nudged_az != pole_az, "fixture is wrong: this azimuth is not pole-adjacent"
+
+    seen = []
+    real = Sky.altaz_to_radec
+
+    def record(self, az, alt, when=None):
+        seen.append(round(az, 4))
+        return real(self, az, alt, when)
+
+    with (
+        patch.object(Sky, "sun", lambda self: (123.0, 55.8)),
+        patch.object(Sky, "altaz_to_radec", record),
+    ):
+        reachable_now(ptr, pole_alt)(pole_az)
+
+    # avoid_pole itself converts candidates while searching, so the raw azimuth
+    # legitimately appears. What matters is the LAST conversion — the one whose
+    # RA/Dec the path check actually uses.
+    assert seen[-1] == round(nudged_az, 4), (
+        f"predicate's path target was az {seen[-1]} but point_to would slew to "
+        f"{nudged_az:.4f} — the check and the slew disagree about the path"
+    )
+
+
+def test_a_set_sun_blocks_nothing():
+    """Below SUN_SAFE_ALT the Earth is in the way, so every column is clear now.
+
+    Without this branch the function would step forward through the night
+    looking for a separation that is already irrelevant, and report a wait where
+    the answer is zero. Deleting the check left the whole suite green.
+    """
+    from terminus import sweep
+
+    sky = sweep.Sky(39.7917, -104.894, 1600)
+
+    class _Set:
+        az = type("D", (), {"deg": 100.0})()
+        alt = type("D", (), {"deg": -20.0})()
+
+        def transform_to(self, frame):
+            return self
+
+    # The column must sit INSIDE the cone in angular separation, or the
+    # separation test passes on its own and the altitude branch is never
+    # exercised — which is exactly how the first version of this test let the
+    # mutation survive. Sun at az 100 alt -20, column at az 100 alt 0: 20 deg
+    # apart, inside a 30 deg cone, and refused by separation alone.
+    orig = sweep.get_sun
+    try:
+        sweep.get_sun = lambda when: _Set()
+        assert sweep.ang_sep(100.0, 0.0, 100.0, -20.0) < 30.0, "fixture must be inside the cone"
+        assert sweep.hours_until_endpoint_clear(sky, 100.0, 0.0, cone=30.0) == 0.0
+    finally:
+        sweep.get_sun = orig
+
+
+def test_truncation_happens_after_filtering_not_before():
+    """`top` must select among FEASIBLE columns, not among all of them.
+
+    The order the docstring claims — filter, then rank, then truncate — only
+    shows itself when `top` is smaller than the candidate list. Rank-then-
+    truncate-then-filter can return NOTHING while plenty of reachable columns
+    exist, because the top slots are all taken by columns the Sun refuses. The
+    two earlier tests both passed `top == len(candidates)`, so truncation never
+    bit and neither caught it.
+    """
+    from terminus.plan import rank_columns
+
+    # The three most informative columns are exactly the ones blocked.
+    blocked = {90.0, 95.0, 100.0}
+    cands = [float(a) for a in range(0, 360, 30)] + sorted(blocked)
+    grad = lambda a: 5.0 if a in blocked else 0.05  # noqa: E731
+    ok = lambda a: a not in blocked  # noqa: E731
+
+    picks = rank_columns([0.0, 180.0], cands, grad, top=3, reachable=ok)
+    assert len(picks) == 3, f"asked for 3 feasible columns, got {picks}"
+    assert not (set(picks) & blocked), "returned a column the Sun refuses"

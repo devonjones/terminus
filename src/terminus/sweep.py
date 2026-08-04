@@ -343,6 +343,62 @@ def column_touches_sun(sky, az, alt_min, alt_max, cone):
     )
 
 
+def reachable_now(ptr, alt, cone=None):
+    """A predicate for `plan.next_column`: can the mount be sent to this azimuth?
+
+    Checks the whole SLEW PATH from where the mount currently is, not the
+    endpoint. That distinction is the entire point. Measured here with the Sun
+    at az 123.0 alt 55.8, planning a column at az 161.7: the endpoint sits 59.4
+    degrees away, comfortably outside a 30 degree cone, while the path passes
+    within 7.5. Ranking on endpoint separation would have chosen it.
+
+    The planner cannot decide this for itself — it is geometry plus a clock —
+    so it is injected. Note the answer expires: it is true of this moment and
+    this mount position, so build the predicate fresh each time you plan.
+    """
+    cone = ptr.cone if cone is None else cone
+    rd0 = ptr.sc.equ_coord()
+    if rd0 is None:
+        return lambda az: False  # cannot read pointing, so cannot promise a path
+
+    def ok(az):
+        try:
+            target = ptr.sky.altaz_to_radec(*ptr.avoid_pole(az, alt))
+        except Exception:
+            return False
+        return ptr.path_min_sep(rd0, target) >= cone
+
+    return ok
+
+
+def hours_until_endpoint_clear(sky, az, alt, cone, within=8.0, step_min=15.0):
+    """When does this column's ENDPOINT come out from behind the Sun?
+
+    Returns hours, or None if not within `within`. Named for what it measures
+    rather than for what a caller wants, because the two differ: "reachable"
+    would promise a slew will be allowed, and this cannot promise that.
+
+    A refused column is not permanently lost — the Sun moves about 15 degrees an
+    hour — and under an observing deadline the right move is sometimes to wait
+    rather than substitute a worse column. The planner cannot weigh that without
+    knowing the wait, so this reports it.
+
+    Deliberately an ENDPOINT test, unlike `reachable_now`, and only ever used to
+    report a wait: the path depends on where the mount will be at the time,
+    which is unknowable now. Treat the answer as "not before this", never as a
+    promise that the slew will be allowed.
+    """
+    t = 0.0
+    while t <= within * 60.0:
+        when = _now() + datetime.timedelta(minutes=t)
+        s = get_sun(when).transform_to(AltAz(obstime=when, location=sky.loc))
+        saz, salt = float(s.az.deg), float(s.alt.deg)
+        if salt < SUN_SAFE_ALT or ang_sep(az, alt, saz, salt) >= cone:
+            return t / 60.0
+        t += step_min
+    return None
+
+
 EDGE_MIN_STEP_FRAC = 0.25  # a step must also be this fraction of the sky reference
 EDGE_TOP_FRACTION = 0.9  # a higher split wins if within this fraction of the best
 MAX_POINTING_MISSES = 3  # consecutive non-arrivals before a sweep is abandoned

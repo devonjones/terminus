@@ -66,16 +66,43 @@ def information(azimuths, gradient_at, ridge=1e-6):
     return J.T @ J + ridge * np.eye(PARAMS)
 
 
-def next_column(measured, candidates, gradient_at, criterion="D"):
+def partition(candidates, reachable=None):
+    """Split candidates into (feasible, refused) by an injected predicate.
+
+    `reachable(az)` answers whether the mount may actually be sent there —
+    which this module deliberately cannot decide for itself. Feasibility is Sun
+    geometry, it changes with the clock, and it belongs to whatever owns the
+    ephemeris; `plan` stays a pure function of information.
+    """
+    if reachable is None:
+        return list(candidates), []
+    ok, refused = [], []
+    for c in candidates:
+        (ok if reachable(c) else refused).append(c)
+    return ok, refused
+
+
+def next_column(measured, candidates, gradient_at, criterion="D", reachable=None):
     """The candidate azimuth that most improves the orientation estimate.
 
     'D' maximises the determinant of the information matrix — the standard
     D-optimal choice, which shrinks the joint uncertainty of all parameters.
     'A' minimises the total parameter variance instead, which is more willing to
     spend a measurement fixing the single worst-determined parameter.
+
+    Unreachable candidates are removed BEFORE the criterion is applied, and the
+    order matters. Filtering afterwards yields the best infeasible column plus a
+    fallback; filtering first yields the best feasible CONFIGURATION, which is a
+    different and better answer — the columns are chosen jointly, so losing one
+    changes which others are worth having.
+
+    Returns (None, -inf) when nothing is reachable. That is a real state, not an
+    error: the Sun moves, and the right response is sometimes to wait rather
+    than to substitute a worse column.
     """
+    usable, _ = partition(candidates, reachable)
     best, best_score = None, -np.inf
-    for c in candidates:
+    for c in usable:
         M = information(list(measured) + [c], gradient_at)
         if criterion == "A":
             score = -float(np.trace(np.linalg.pinv(M)))
@@ -87,10 +114,15 @@ def next_column(measured, candidates, gradient_at, criterion="D"):
     return best, best_score
 
 
-def rank_columns(measured, candidates, gradient_at, criterion="D", top=5):
-    """Candidates ordered by how much each would help, best first."""
+def rank_columns(measured, candidates, gradient_at, criterion="D", top=5, reachable=None):
+    """Candidates ordered by how much each would help, best first.
+
+    Unreachable candidates are dropped before ranking, for the reason given in
+    `next_column`.
+    """
+    usable, _ = partition(candidates, reachable)
     scored = []
-    for c in candidates:
+    for c in usable:
         M = information(list(measured) + [c], gradient_at)
         if criterion == "A":
             s = -float(np.trace(np.linalg.pinv(M)))
