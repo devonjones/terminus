@@ -1240,3 +1240,100 @@ def test_cli_saves_the_partial_mask_and_still_fails(tmp_path):
     assert out.exists(), "the partial mask must be on disk before the exit"
     text = out.read_text()
     assert "12.0" in text and "18.0" in text, "measured columns must survive the abort"
+
+
+def test_a_skipped_column_is_recorded_once():
+    """`skipped` goes into the mask metadata, so duplicates are a real defect.
+
+    The earlier tests compared `set(skipped)` and a length bound, which let a
+    duplicated append survive untouched.
+    """
+    _, skipped, _ = _sweep_with_failures({90, 180})
+    assert skipped == sorted(skipped), "skipped should be recorded in sweep order"
+    assert len(skipped) == len(set(skipped)), f"duplicate entries in {skipped}"
+    assert set(skipped) == {90, 180}
+
+
+def test_the_refine_loop_also_survives_a_pointing_failure():
+    """Refinement is optional work on an already-measured mask.
+
+    Nothing in the suite set `az_refine_deg`, so the refine loop's handler — the
+    exact code this PR changed — never executed and could be narrowed back to
+    `except SunGuard` with every test still green.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, PointingError, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30,
+        "slew_step_deg": 5,
+        "az_step": 60,
+        "alt_min": 0,
+        "alt_max": 60,
+        "alt_tol": 2.5,
+        "clear_thresh": 0.6,
+        "az_refine_deg": 30,  # subdivide down to 30 deg
+    }
+    refined = []
+
+    def point_to(self, az, alt):
+        # Fail only at the midpoints refinement will try, never on the main grid.
+        if round(az) % 60 == 30:
+            refined.append(az)
+            raise PointingError(f"never arrived at ({az:.0f},{alt:.0f})")
+        return az, alt
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        # Refinement only subdivides where NEIGHBOURS DISAGREE by the threshold,
+        # so the columns must alternate; a uniform horizon never triggers it.
+        ptr.point_to(az, 30.0)
+        return (10.0 if az % 120 == 0 else 40.0), "edge", "tree", []
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Pointer, "point_to", point_to),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch("terminus.sweep.scan_horizon", fake_scan),
+    ):
+        mask, _, _ = run_sweep(
+            sc, sky, cfg, az_start=0, az_end=300, dry=False, log=lambda *a, **k: None
+        )
+    assert refined, "the refinement pass must have run for this test to mean anything"
+    assert len(mask) >= 6, "a refinement failure must not discard the main sweep"
+
+
+def test_rank_columns_orders_by_information_and_truncates():
+    """Ranking is separate logic from next_column and was untested."""
+    from terminus.plan import next_column, rank_columns
+
+    def grad(a):
+        return 5.0 if 95 <= a % 360 <= 105 else 0.02
+
+    cands = [40.0, 100.0, 220.0, 300.0, 150.0]
+    ranked = rank_columns([0.0, 180.0], cands, grad, top=3)
+    assert len(ranked) == 3
+    assert ranked[0] == next_column([0.0, 180.0], cands, grad)[0], "best must match next_column"
+    assert len(set(ranked)) == 3, "no candidate may be ranked twice"
+
+
+def test_solve_gains_equalises_a_dim_frame():
+    """A mis-metered frame darkens every overlap it touches, which the sky
+    classifier then reads as terrain. Silent: a wrong gain blends, not raises."""
+    import numpy as np
+
+    from terminus.mosaic import solve_gains
+
+    m = np.ones((4, 8), bool)
+    bright = np.full((4, 8, 3), 200.0, dtype=np.float32)
+    dim = np.full((4, 8, 3), 100.0, dtype=np.float32)  # same scene, half exposure
+    gains = solve_gains([(bright, m, 0, 0), (dim, m, 4, 0)])  # overlap on 4 columns
+    assert len(gains) == 2
+    ratio = (gains[1] * 100.0) / (gains[0] * 200.0)
+    assert 0.8 < ratio < 1.25, f"overlap still disagrees by {ratio:.2f}x after solving"
