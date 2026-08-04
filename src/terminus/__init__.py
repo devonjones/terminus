@@ -54,7 +54,6 @@ from .export import (
 from .horizon import Horizon
 from .mosaic import MosaicError, hugin_available, write_manifest
 from .night import fit_skyglow, mask_lights
-from .night import find_horizon as classify  # mutation: shadow sweep.classify
 from .orient import Fiducial
 from .plan import (
     as_fiducial,
