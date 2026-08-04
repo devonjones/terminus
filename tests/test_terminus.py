@@ -1577,3 +1577,101 @@ def test_a_failing_stop_view_never_costs_the_measurement(tmp_path, boom):
         cli.cmd_sweep(sc, cfg, args)  # must NOT raise
     assert out.exists(), "a failed stop_view must not cost the mask"
     assert "12.0" in out.read_text()
+
+
+# ---- public API surface ----------------------------------------------------
+def test_importing_terminus_does_not_pull_in_torch_or_transformers():
+    """The heavy optional stack must stay optional.
+
+    torch and transformers are installed in this dev environment, so absence
+    cannot be the test — a fresh interpreter is asked what it actually loaded.
+    Importing them eagerly would add seconds to every CLI invocation and make
+    the package uninstallable on a Pi that only ever runs the scope path.
+    """
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, terminus; "
+            "print(int(any(m == 'torch' or m.startswith('torch.') for m in sys.modules))); "
+            "print(int(any(m == 'transformers' for m in sys.modules)))",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    torch_loaded, transformers_loaded = out.stdout.split()
+    assert torch_loaded == "0", "importing terminus must not load torch"
+    assert transformers_loaded == "0", "importing terminus must not load transformers"
+
+
+def test_importing_terminus_does_not_shell_out():
+    """Hugin is optional and probing for it is not free.
+
+    `mosaic.hugin_available()` exists so a caller can ask; the import must not
+    ask on its behalf.
+    """
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess; "
+            "subprocess.run = lambda *a, **k: (_ for _ in ()).throw("
+            "AssertionError('terminus shelled out during import')); "
+            "import terminus; print('ok')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "ok" in out.stdout
+
+
+def test_photo_pipeline_is_reachable_from_the_package():
+    """The published method must not be absent from the package's own API.
+
+    Every one of these was previously importable only by full module path,
+    which is not a documented interface.
+    """
+    import terminus
+
+    for mod in ("skymask", "mosaic", "orient", "plan", "night"):
+        assert hasattr(terminus, mod), f"terminus.{mod} is not exported"
+        assert mod in terminus.__all__
+
+    # The entry points a photo-first user needs, module-qualified.
+    assert callable(terminus.mosaic.solve)
+    assert callable(terminus.mosaic.render)
+    assert callable(terminus.mosaic.composite)
+    assert callable(terminus.skymask.sky_mask)
+    assert callable(terminus.skymask.available)
+    assert callable(terminus.skymask.horizon_band)
+    assert callable(terminus.orient.fit)
+    assert callable(terminus.orient.from_mask)
+    assert callable(terminus.orient.residuals)
+    assert callable(terminus.night.find_horizon)
+
+
+def test_every_exported_name_actually_exists():
+    """A stale __all__ entry raises AttributeError on `from terminus import *`."""
+    import terminus
+
+    missing = [n for n in terminus.__all__ if not hasattr(terminus, n)]
+    assert not missing, f"__all__ names nothing: {missing}"
+
+
+def test_optional_backends_report_rather_than_raise():
+    """Both probes must answer on a machine missing either dependency."""
+    import terminus
+
+    assert isinstance(terminus.mosaic.hugin_available(), bool)
+    assert isinstance(terminus.skymask.available("segment"), bool)
+    assert isinstance(terminus.skymask.available("heuristic"), bool)
