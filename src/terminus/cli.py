@@ -284,7 +284,7 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
         classes = skymask.obstruction_classes(
             skymask.segment_classes(image), band["top"], valid=valid
         )
-    unc = skymask.type_uncertainty(classes, band["porosity"])
+    unc = skymask.type_uncertainty(classes, band["gap_fraction"])
 
     step = max(1, int(round(args.az_step * px_per_deg)))
     mask, clipped_n = {}, 0
@@ -299,7 +299,7 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
             "alt": round(alt, 2),
             "type": _type_name(int(classes[x])),
             "clipped": is_clipped,
-            "porosity": round(float(band["porosity"][x]), 3),
+            "gap_fraction": round(float(band["gap_fraction"][x]), 3),
             "uncertainty": round(float(unc[x]), 2),
         }
     if not mask:
