@@ -8,10 +8,9 @@
     "dataclass-decorator-reviewer",
     "migration-idempotency-reviewer",
     "homelab-values-reviewer",
-    "logging-reviewer",
-    "resource-leak-reviewer"
+    "logging-reviewer"
   ],
-  "notes": "terminus is a small pure-Python library + CLI that drives a Seestar S50 over TCP and produces horizon files. No threads, no database, no long-lived resources. The pack below replaces the disabled defaults with reviewers tuned to what this project can actually get wrong: pointing the telescope somewhere dangerous, coordinate/azimuth-convention bugs, leaking the interop key, breaking the exported file formats other tools depend on, accepting a failure as a measurement, and letting the prose drift away from the code."
+  "notes": "terminus is a small pure-Python library + CLI that drives a Seestar S50 over TCP and produces horizon files. No threads, no database, no long-lived resources. The pack below replaces the disabled defaults with reviewers tuned to what this project can actually get wrong: pointing the telescope somewhere dangerous, coordinate/azimuth-convention bugs, leaking the interop key, breaking the exported file formats other tools depend on, accepting a failure as a measurement while still surviving the night, and letting the prose drift away from the code."
 }
 ```
 
@@ -117,18 +116,41 @@ format regression breaks a user's planning silently.
 
 ## strategic-fragility-reviewer
 
-Adapted from the pfsrd2 parser's reviewer of the same name. Its principle —
-**wrong data is worse than no data** — is if anything sharper here, because a
-horizon mask is consumed unattended by a scheduler that will point a telescope
-using it.
+Adapted from the pfsrd2 parser's reviewer of the same name — **and the
+adaptation is the point, because the two projects want opposite things from a
+failure.**
 
-The recurring failure in this project is not a crash. It is a call that
+pfsrd2 is a large batch parser. Fail-fast is right there: one malformed record
+among thousands is invisible to the eye, so stopping at the first surprise is
+the only way anyone finds out. terminus is not that. It drives **hardware that
+is fragile by nature** — mounts stall near the pole, sockets drop on long runs,
+the video stream freezes, cloud drifts across a column, a goto occasionally does
+not arrive. Those are not surprises. They are the normal texture of a
+multi-hour unattended session, and a run that aborts on the first one collects
+nothing.
+
+**So the doctrine here splits along a line that pfsrd2 does not need:**
+
+| | Rule |
+|---|---|
+| **Interpretation** — turning an observation into a number | **Brittle.** Never record a value that is not evidenced. A call that returned without error is not proof it did anything. |
+| **Execution** — getting through the night | **Robust.** Retry, skip, degrade, continue. Losing thirty good columns because the thirty-first stalled is itself data loss. |
+
+The bridge between them, and the rule that makes both safe: **a thing that
+failed must be recorded as failed.** Skipped columns go into `skipped`. A
+column that hit its ceiling becomes a *bound*, not a value. A column that never
+departed the sky model is a non-result with a stated reason, and
+"blocked above the ceiling" and "open to the search floor" are opposite
+conclusions that must never collapse into each other. Robustness that quietly
+omits its failures is just silent corruption with better manners.
+
+**The recurring failure in this project is not a crash.** It is a call that
 **reports success while doing nothing**, whose return value is then recorded as
-a measurement. Every one of these actually happened:
+a measurement. Every one of these happened:
 
 - `scope_goto` reported "landed" with the arm closed and the mount stationary
-- `lock_exposure` returned `manual_exp: False` and sentinel values, and was
-  treated as locked
+- `lock_exposure` returned `manual_exp: False` and sentinel values, treated as
+  locked
 - the dew heater ignored `set_setting` entirely
 - the open-sky reference went stale across twilight (254 → 94.7) and was about
   to mark the whole western sky blocked
@@ -138,39 +160,44 @@ a measurement. Every one of these actually happened:
 **FLAG (P1) when a PR:**
 
 - Records a value into the mask, a profile, or a fiducial without evidence the
-  underlying operation actually happened. Any state-changing scope call must
-  verify its readback; a call that returns without error is not proof.
-- Swallows an exception on a path that produces a measurement, or substitutes a
-  default for a failed one. Returning `0`, `None`-as-zero, an empty mask, or the
-  previous column's value silently is worse than raising.
-- Catches broadly (`except Exception`) around instrument I/O without re-raising.
-- Widens an existing guard so that a genuine non-result becomes an ordinary
-  value — in particular, conflating "blocked above the ceiling" with "open to
-  the search floor". Those are opposite conclusions and must never collapse.
+  underlying operation actually happened. Every state-changing scope call must
+  verify its readback.
+- Turns a failure into a number: substituting a default, reusing the previous
+  column's value, or letting a caught exception fall through to a recorded
+  result.
+- Drops a failure from the record — skipping a column without appending it to
+  `skipped`, or discarding a partial sweep on abort.
+- Collapses a non-result into a value, in particular conflating "blocked above
+  the ceiling" with "open to the search floor".
 
 **FLAG (P2) when a PR:**
 
-- Adds a fallback that hides a structural problem rather than reporting it.
+- Makes the run *more* brittle without cause: aborting a whole sweep on a
+  transient, removing a retry, or narrowing a recovery path, where the failure
+  is one the hardware is known to produce. Say what is lost when it triggers.
+- Catches broadly around instrument I/O without re-raising *and* without
+  recording the failure.
 - Removes an `assert`/raise that pins an invariant, without saying what now
   enforces it.
 
-**Do NOT flag — these swallows are deliberate and correct.** The distinction
-this project draws is *whether anything is being measured at that moment*:
+**Do NOT flag — these are deliberate, and a fail-fast reading would break
+them.** The question is never "is it swallowing?" but **"does anything
+downstream still get judged on evidence?"**
 
-- the sky-reference seeding and mid-sweep refresh catch `PointingError`,
-  because seeding is a convenience, nothing is being measured, and a mount that
-  cannot point will fail the columns too, where the miss counter judges it on
-  evidence
-- the refine loop catches it, because refinement is optional work on an
-  already-measured mask
-- the scan loop skips a single failed column but aborts after
-  `MAX_POINTING_MISSES` consecutive ones, and carries the partial sweep out on
-  the exception so an abort does not discard the night
-- `cmd_sweep` reports a failed `stop_view` rather than raising, because the
+- the sky-reference seeding and mid-sweep refresh catch `PointingError`:
+  seeding is a convenience, nothing is being measured, and a mount that cannot
+  point will fail the columns too, where the miss counter judges it on evidence
+- the refine loop catches it: refinement is optional work on an already-measured
+  mask
+- the scan loop skips a single failed column, records it in `skipped`, and only
+  abandons the sweep after `MAX_POINTING_MISSES` *consecutive* failures —
+  carrying the partial result out on the exception so the night is not thrown
+  away
+- `capture_rgb` retries a repeated frame rather than raising
+- `cmd_sweep` reports a failed `stop_view` and continues, because the
   measurement outranks the cleanup
-
-If a PR changes any of those, the question is not "is it swallowing?" but "does
-anything downstream still get judged on evidence?"
+- a column that yields no edge becomes a bound or a stated non-result, and the
+  sweep moves on
 
 ---
 
@@ -341,6 +368,98 @@ replacement, and a brief reason if it isn't obvious.
 
 ---
 
+## external-process-reviewer
+
+From the pfsrd2 pack. terminus shells out constantly: **ffmpeg** for every frame
+capture, and seven **Hugin** binaries (`pto_gen`, `cpfind`, `cpclean`,
+`autooptimiser`, `nona`, `pano_modify`, `pano_trafo`) for registration. A hang or
+an unhelpful error here costs an observing session that cannot be repeated on
+demand.
+
+**FLAG (P1):** `shell=True` with any non-literal argument.
+
+**FLAG (P2) when a `subprocess` call:**
+
+- Has no `timeout=`. Nothing here may block forever — a sweep runs unattended for
+  hours and a wedged child process strands the whole run. `cpfind --multirow` on
+  a full ring legitimately takes minutes, so pick a bound generously, but pick
+  one.
+- Does not capture `stderr` on failure, leaving only "returned non-zero exit
+  status 1" when the tool had something useful to say.
+- Does not distinguish `TimeoutExpired` from `CalledProcessError` from
+  `FileNotFoundError`. Those mean "the tool is stuck", "the tool refused the
+  input", and "the tool is not installed" — three different messages to the
+  operator.
+- Uses `Popen` without a context manager.
+- Assumes a binary is present without a startup check.
+- Parses output without validating it.
+
+**Do NOT flag:**
+
+- `hugin_available()` / `require_hugin()` in `mosaic.py`. That is exactly the
+  presence check this reviewer wants, and it is deliberately a soft check: Hugin
+  is optional and the scope path must keep working without it.
+- The `-loglevel error` flag on ffmpeg; quietening a chatty tool is not the same
+  as discarding its errors.
+
+---
+
+## error-handling-reviewer
+
+From the pfsrd2 pack. Universal Python error-handling hygiene: exceptions that
+vanish, `return` inside `finally`, bare `except:`, and lost exception context.
+
+**Division of labour with `strategic-fragility-reviewer`, so the two do not
+double-report.** That reviewer asks a domain question — *does a failure end up
+recorded as a measurement?* This one asks a language question — *is the error
+handled in a way that preserves the investigation trail?* A `except OSError:
+pass` around a cleanup call is fine by the first and flagged by the second.
+
+**FLAG (P1):** silent swallowing (`except: pass`, or returning a default that
+masks the failure); `return` inside `finally`.
+
+**FLAG (P2):** generic `except Exception` with no re-raise; bare `except:`,
+which also eats `KeyboardInterrupt` — relevant here, because interrupting a
+running sweep with Ctrl-C is a normal operator action and must work.
+
+**FLAG (P3):** a raise inside an `except` that omits `from e`, discarding the
+original traceback.
+
+**Do NOT flag** the deliberate swallows listed under
+`strategic-fragility-reviewer`; they are argued there and are correct.
+
+---
+
+## resource-leak-reviewer
+
+**Re-enabled.** It was disabled on the grounds that terminus has "no long-lived
+resources", and that was simply wrong. It has:
+
+- a long-lived TCP control socket that reconnects mid-run
+- one temporary file per captured frame, and a sweep captures thousands
+- an RTSP scenery view that must be stopped, and which has already been observed
+  to freeze after hours and serve one stale frame while ten azimuths were
+  recorded as blocked
+- caches on the fit's hot path
+
+**FLAG (P2) when a PR:**
+
+- Opens a file without a context manager. `for line in open(path)` leaves the
+  handle to the garbage collector.
+- Creates a temporary file whose removal is not guaranteed on every path,
+  including the retry paths.
+- Adds `functools.lru_cache` with no `maxsize` where keys come from measured
+  data rather than a fixed set.
+- Leaves a socket, subprocess or view without a defined close path — including
+  on the error path, which is where it will actually matter.
+
+**Do NOT flag:** the deliberately long-lived `Seestar` socket. One control
+connection is a hard constraint of the device — it tolerates exactly one, and
+opening a second has broken live runs — so it is held for the session on purpose
+and reconnected rather than reopened per call.
+
+---
+
 ## test-coverage-reviewer
 
 The pure logic (coordinate transforms, classifier, horizon interpolation,
@@ -385,6 +504,9 @@ and exit conditions.
 | `strategic-fragility-reviewer` | `src/**/*.py` |
 | `complexity-reviewer` | `src/**/*.py` (never `tests/`) |
 | `clarity-reviewer` | `README.md`, docstrings/comments, `--help` text, the PR description |
+| `external-process-reviewer` | `src/terminus/mosaic.py`, `client.py` |
+| `error-handling-reviewer` | `src/**/*.py` |
+| `resource-leak-reviewer` | `src/**/*.py` |
 | `test-coverage-reviewer` | `src/**/*.py`, `tests/**/*.py` |
 
 Skip reviewers whose scope doesn't match the diff. A reviewer's silence means
