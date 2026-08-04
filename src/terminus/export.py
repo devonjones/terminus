@@ -52,7 +52,7 @@ def write_mask(path, mask, skipped, meta):
     # A photo-derived mask is in the panorama's own azimuth until `terminus
     # orient` solves the yaw, and saying otherwise in the header would invite a
     # planner to point at a horizon rotated by an unknown amount.
-    oriented = meta.get("oriented", True) if isinstance(meta, dict) else True
+    oriented = is_oriented(meta)
     columns = {az: _column(v) for az, v in mask.items()}
     extra = any(c.get(k) is not None for c in columns.values() for k in COLUMN_FIELDS)
     lines = [
@@ -61,7 +61,7 @@ def write_mask(path, mask, skipped, meta):
             "# azimuth/altitude are TRUE (polar-aligned); altitude = lowest clear sky."
             if oriented
             else "# !! UNORIENTED: azimuth is the panorama's own, NOT true north. Solve the\n"
-            "# !! orientation with `terminus orient` before any planner consumes this."
+            "# !! orientation before any planner consumes this."
         ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
     ]
@@ -183,13 +183,37 @@ def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=F
     return "\n".join(out) + "\n"
 
 
-def to_stellarium_txt(rows, tree_buffer=TREE_BUFFER_DEG):
-    # Stellarium polygonal landscape: same "az alt" list, ascending, no header needed.
+def to_stellarium_txt(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=False):
+    # Gated for the same reason as to_nina_hrz, and more urgently: the Stellarium
+    # format forbids comments, so an unoriented landscape cannot even carry a
+    # warning in the file. It is exported beside to_nina_hrz in __all__, and the
+    # first version of this guard covered to_nina_hrz and export_all but not
+    # this — two of the three call sites the finding had named.
+    require_oriented(meta, allow_unoriented)
     return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows, tree_buffer)) + "\n"
 
 
 class UnorientedMask(ValueError):
     """A mask still in the panorama's own azimuth was asked to be exported."""
+
+
+def is_oriented(meta):
+    """Is this mask's azimuth true north?
+
+    Absent means yes: a scope-measured mask has no `oriented` key and has always
+    been in true azimuth, so silence must keep meaning what it used to.
+
+    Strings and numbers are interpreted rather than compared by identity. The
+    mask is documented as hand-editable, so `oriented: 'false'` and `oriented: 0`
+    are things a person will actually write, and `meta.get("oriented") is False`
+    waves both straight through to a planner.
+    """
+    if not isinstance(meta, dict) or "oriented" not in meta:
+        return True
+    v = meta["oriented"]
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "no", "0", "off", "")
+    return bool(v)
 
 
 def require_oriented(meta, allow_unoriented=False):
@@ -204,13 +228,15 @@ def require_oriented(meta, allow_unoriented=False):
 
     The check lives here rather than in the CLI because `export_all` is the one
     place that has both the file and its meta. This is the same lesson as the
-    vegetation buffer: a guard that only exists in one caller is not a guard.
+    vegetation buffer: a guard that only exists in one caller is not a guard —
+    and every exporter must call it, not most of them.
     """
-    if isinstance(meta, dict) and meta.get("oriented") is False and not allow_unoriented:
+    if not is_oriented(meta) and not allow_unoriented:
         raise UnorientedMask(
             "this mask is UNORIENTED — its azimuth is the panorama's own, not true "
-            "north. Solve the orientation first (`terminus orient`), or pass "
-            "allow_unoriented=True if you know the azimuths are already true."
+            "north. Solve the orientation against telescope-measured columns first, "
+            "or pass --allow-unoriented (allow_unoriented=True) if you know the "
+            "azimuths are already true."
         )
 
 
@@ -227,7 +253,7 @@ def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriente
         # granted here and then refused one line later.
         f.write(to_nina_hrz(rows, meta, tree_buffer, allow_unoriented=True))
     with open(txt, "w") as f:
-        f.write(to_stellarium_txt(rows, tree_buffer))
+        f.write(to_stellarium_txt(rows, meta, tree_buffer, allow_unoriented=True))
     return hrz, txt
 
 

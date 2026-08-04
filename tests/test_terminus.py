@@ -1804,7 +1804,7 @@ def test_an_unoriented_mask_says_so_in_its_header(tmp_path):
     write_mask(str(p), {0: (10.0, "tree")}, [], {"oriented": False})
     head = p.read_text()
     assert "UNORIENTED" in head and "NOT true north" in head
-    assert "terminus orient" in head
+    assert "Solve the" in head and "orientation" in head
 
     q = tmp_path / "o.yaml"
     write_mask(str(q), {0: (10.0, "tree")}, [], {"lat": 40})
@@ -1983,3 +1983,62 @@ def test_a_scope_mask_gains_no_new_header(tmp_path):
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
     rich_head = [ln for ln in rich.read_text().splitlines() if ln.startswith("#")]
     assert any("clipped" in ln for ln in rich_head), "explain the fields that ARE present"
+
+
+def test_every_exporter_refuses_an_unoriented_mask(tmp_path):
+    """Not most of them. The first guard covered two of the three call sites.
+
+    `to_stellarium_txt` is the one that matters most: the format forbids
+    comments, so an unoriented landscape cannot even carry a warning inside the
+    file the way a .hrz header could.
+    """
+    import pytest
+
+    from terminus.export import (
+        UnorientedMask,
+        load_mask,
+        to_nina_hrz,
+        to_stellarium_txt,
+        write_mask,
+    )
+
+    p = tmp_path / "u.yaml"
+    write_mask(str(p), {0: (10.0, "tree"), 90: (20.0, "structure")}, [], {"oriented": False})
+    _, rows = load_mask(str(p))
+    unoriented = {"oriented": False}
+
+    with pytest.raises(UnorientedMask):
+        to_nina_hrz(rows, unoriented)
+    with pytest.raises(UnorientedMask):
+        to_stellarium_txt(rows, unoriented)
+
+    # Both still work when the mask is oriented, or when overridden.
+    assert to_nina_hrz(rows, {"lat": 40})
+    assert to_stellarium_txt(rows, {"lat": 40})
+    assert to_stellarium_txt(rows, unoriented, allow_unoriented=True)
+
+
+def test_the_oriented_flag_is_interpreted_not_identity_checked(tmp_path):
+    """The mask is documented as hand-editable, so people will write these.
+
+    `meta.get("oriented") is False` waves `oriented: 'false'` and `oriented: 0`
+    straight through to a planner, because neither is the False singleton.
+    """
+    import pytest
+
+    from terminus.export import UnorientedMask, export_all, is_oriented, write_mask
+
+    for value in (False, "false", "False", "no", 0, "0", "off"):
+        assert not is_oriented({"oriented": value}), f"{value!r} should read as unoriented"
+        p = tmp_path / f"m{hash(str(value))}.yaml"
+        write_mask(str(p), {0: (10.0, "tree")}, [], {"oriented": value})
+        with pytest.raises(UnorientedMask):
+            export_all(str(p), str(tmp_path / "o"))
+
+    for value in (True, "true", "yes", 1):
+        assert is_oriented({"oriented": value}), f"{value!r} should read as oriented"
+
+    # Absent means oriented: a scope mask has never carried the key.
+    assert is_oriented({"lat": 40})
+    assert is_oriented({})
+    assert is_oriented(None)

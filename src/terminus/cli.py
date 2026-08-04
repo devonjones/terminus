@@ -320,7 +320,10 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
         },
     )
     print(f"wrote {out}: {len(mask)} columns, {clipped_n} clipped")
-    print("NOTE: azimuth is the panorama's own, NOT true north — run `terminus orient`")
+    print(
+        "NOTE: azimuth is the panorama's own, NOT true north. It must be oriented\n"
+        "      against telescope-measured columns before a planner uses it."
+    )
     print("not exporting: an unoriented mask must not be handed to a planner")
 
 
