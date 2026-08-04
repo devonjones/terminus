@@ -2346,3 +2346,26 @@ def test_a_set_sun_blocks_nothing():
         assert sweep.hours_until_endpoint_clear(sky, 100.0, 0.0, cone=30.0) == 0.0
     finally:
         sweep.get_sun = orig
+
+
+def test_truncation_happens_after_filtering_not_before():
+    """`top` must select among FEASIBLE columns, not among all of them.
+
+    The order the docstring claims — filter, then rank, then truncate — only
+    shows itself when `top` is smaller than the candidate list. Rank-then-
+    truncate-then-filter can return NOTHING while plenty of reachable columns
+    exist, because the top slots are all taken by columns the Sun refuses. The
+    two earlier tests both passed `top == len(candidates)`, so truncation never
+    bit and neither caught it.
+    """
+    from terminus.plan import rank_columns
+
+    # The three most informative columns are exactly the ones blocked.
+    blocked = {90.0, 95.0, 100.0}
+    cands = [float(a) for a in range(0, 360, 30)] + sorted(blocked)
+    grad = lambda a: 5.0 if a in blocked else 0.05  # noqa: E731
+    ok = lambda a: a not in blocked  # noqa: E731
+
+    picks = rank_columns([0.0, 180.0], cands, grad, top=3, reachable=ok)
+    assert len(picks) == 3, f"asked for 3 feasible columns, got {picks}"
+    assert not (set(picks) & blocked), "returned a column the Sun refuses"
