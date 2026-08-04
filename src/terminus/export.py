@@ -6,7 +6,13 @@ Mask YAML (terminus's own durable artifact, hand-editable after review):
     horizon:
       0: {alt: 12.3, type: tree}
       5: {alt: 18.0, type: structure}
+      10: {alt: 60.0, type: tree, clipped: True, porosity: 0.4, uncertainty: 4.2}
       ...
+
+`alt` and `type` are always present. The rest appear only when a photo-derived
+mask supplies them, so a scope-measured mask is byte-for-byte what it always
+was. `clipped` marks a column whose obstruction ran off the top of the data — a
+lower bound recording where the frame was cropped, never a measurement.
 
 Exports:
   N.I.N.A.  .hrz   -- "az alt" per line, ascending azimuth, '#' comments
@@ -18,18 +24,58 @@ import datetime
 
 import yaml
 
+# Fields a column may carry beyond altitude and type. All optional, and all
+# written only when supplied, so a scope-measured mask looks exactly as it
+# always did and every existing reader keeps working.
+#
+#   clipped      the obstruction reached the top of the data. This records where
+#                the FRAME was cropped, not where the horizon is, and is never a
+#                measurement — a consumer must treat it as "at least this high".
+#   porosity     fraction of the band between first and top obstruction that is
+#                still sky. A wall is 0; a gappy canopy is high, and its single
+#                altitude misrepresents it in both directions.
+#   uncertainty  per-column altitude uncertainty in degrees, already widened for
+#                vegetation by type and porosity.
+COLUMN_FIELDS = ("clipped", "porosity", "uncertainty")
+
+
+def _column(value):
+    """Normalise a mask value to a dict. Accepts (alt, type) or a full record."""
+    if isinstance(value, dict):
+        return dict(value)
+    alt, typ = value
+    return {"alt": alt, "type": typ}
+
 
 def write_mask(path, mask, skipped, meta):
+    """Write the mask YAML. `mask` is {az: (alt, type)} or {az: {...}}."""
+    # A photo-derived mask is in the panorama's own azimuth until `terminus
+    # orient` solves the yaw, and saying otherwise in the header would invite a
+    # planner to point at a horizon rotated by an unknown amount.
+    oriented = meta.get("oriented", True) if isinstance(meta, dict) else True
     lines = [
         "# terminus horizon mask (Seestar S50, EQ mode, RA/Dec goto).",
-        "# azimuth/altitude are TRUE (polar-aligned); altitude = lowest clear sky.",
+        (
+            "# azimuth/altitude are TRUE (polar-aligned); altitude = lowest clear sky."
+            if oriented
+            else "# !! UNORIENTED: azimuth is the panorama's own, NOT true north. Solve the\n"
+            "# !! orientation with `terminus orient` before any planner consumes this."
+        ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
+        "# clipped: true = obstruction ran off the top of the data; a lower BOUND,",
+        "#          not a measurement. porosity: sky fraction within the canopy",
+        "#          band. uncertainty: degrees, already widened for vegetation.",
         f"meta: {meta}",
         "horizon:",
     ]
     for az in sorted(mask):
-        alt, typ = mask[az]
-        lines.append(f"  {az}: {{alt: {alt}, type: {typ}}}")
+        col = _column(mask[az])
+        parts = [f"alt: {col['alt']}", f"type: {col.get('type', '')}"]
+        for key in COLUMN_FIELDS:
+            if col.get(key) is not None:
+                v = col[key]
+                parts.append(f"{key}: {v!r}" if isinstance(v, bool) else f"{key}: {v}")
+        lines.append(f"  {az}: {{{', '.join(parts)}}}")
     if skipped:
         lines.append(f"# skipped azimuths (Sun): {sorted(skipped)}")
     with open(path, "w") as f:
@@ -37,17 +83,36 @@ def write_mask(path, mask, skipped, meta):
 
 
 def load_mask(path):
+    """(meta, [(az, alt, type)]) — the shape every exporter consumes.
+
+    Deliberately still three-tuples. The extra per-column fields are reachable
+    through `load_columns`; putting them here would change a contract that four
+    exporters and the Horizon class already depend on.
+    """
+    meta, cols = load_columns(path)
+    return meta, sorted((az, c["alt"], c.get("type", "")) for az, c in cols.items())
+
+
+def load_columns(path):
+    """(meta, {az: {alt, type, clipped?, porosity?, uncertainty?}}).
+
+    The full record, for consumers that must not treat a clipped column as a
+    measurement or must widen a target's margin by a column's uncertainty.
+    """
     with open(path) as f:
         doc = yaml.safe_load(f)
     horizon = doc.get("horizon") or {}
-    # {az: {alt, type}} -> sorted list of (az, alt, type)
-    rows = []
+    cols = {}
     for az, v in horizon.items():
         if isinstance(v, dict):
-            rows.append((int(az), float(v["alt"]), v.get("type", "")))
+            col = {"alt": float(v["alt"]), "type": v.get("type", "") or ""}
+            for key in COLUMN_FIELDS:
+                if v.get(key) is not None:
+                    col[key] = bool(v[key]) if key == "clipped" else float(v[key])
         else:  # bare "az: alt"
-            rows.append((int(az), float(v), ""))
-    return doc.get("meta", {}), sorted(rows)
+            col = {"alt": float(v), "type": ""}
+        cols[int(az)] = col
+    return doc.get("meta", {}), cols
 
 
 # Vegetation is not a hard edge and not a fixed one. Its boundary is a band
