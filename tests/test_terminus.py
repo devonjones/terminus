@@ -2078,3 +2078,39 @@ def test_a_typo_in_the_oriented_flag_blocks_export(tmp_path):
     with pytest.raises(ValueError, match="neither true nor false"):
         export_all(str(p), str(tmp_path / "out"))
     assert not (tmp_path / "out.hrz").exists()
+
+
+def test_an_unreadable_mask_flag_reaches_the_user_as_a_message(tmp_path, capsys):
+    """A typo must not produce a traceback while a valid refusal produces prose.
+
+    `main()` caught UnorientedMask but not the plain ValueError raised for an
+    unparseable flag, so `oriented: flase` — the easier of the two to fix —
+    was the one that dumped a stack trace.
+    """
+    import pytest
+
+    from terminus.cli import main
+    from terminus.export import MaskError, UnorientedMask
+
+    assert issubclass(UnorientedMask, MaskError), "the CLI catches the base"
+
+    p = tmp_path / "typo.yaml"
+    p.write_text("meta: {oriented: flase}\nhorizon:\n  0: {alt: 10.0, type: tree}\n")
+    with pytest.raises(SystemExit) as info:
+        main(["export", str(p)])
+    assert info.value.code == 1
+    assert "neither true nor false" in capsys.readouterr().err
+
+
+def test_write_mask_does_not_truncate_on_a_bad_flag(tmp_path):
+    """The flag is validated before the file is opened, so a failed write
+    leaves whatever was there rather than an empty file."""
+    import pytest
+
+    from terminus.export import MaskError, write_mask
+
+    p = tmp_path / "existing.yaml"
+    p.write_text("PRE-EXISTING\n")
+    with pytest.raises(MaskError):
+        write_mask(str(p), {0: (1.0, "tree")}, [], {"oriented": "flase"})
+    assert p.read_text() == "PRE-EXISTING\n"

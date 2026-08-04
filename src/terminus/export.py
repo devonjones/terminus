@@ -194,8 +194,23 @@ def to_stellarium_txt(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unorie
     return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows, tree_buffer)) + "\n"
 
 
-class UnorientedMask(ValueError):
-    """A mask still in the panorama's own azimuth was asked to be exported."""
+class MaskError(ValueError):
+    """Something is wrong with the mask file itself.
+
+    Subclasses ValueError so existing `except ValueError` callers keep working,
+    and gives the CLI one thing to catch: without it an unparseable flag reached
+    the user as a raw traceback while an unoriented mask got a clean message,
+    which is backwards — the typo is the one with an easy fix.
+    """
+
+
+class UnorientedMask(MaskError):
+    """A mask still in the panorama's own azimuth was asked to be exported.
+
+    Distinct from a plain MaskError so a caller can tell "this horizon is not in
+    true azimuth yet" from "I cannot read this file" — the first is a workflow
+    step, the second is a mistake.
+    """
 
 
 _TRUE = frozenset(("true", "yes", "y", "on", "1"))
@@ -229,7 +244,7 @@ def is_oriented(meta):
             return True
         if word in _FALSE:
             return False
-        raise ValueError(
+        raise MaskError(
             f"mask meta has oriented: {v!r}, which is neither true nor false. "
             f"Use one of {sorted(_TRUE)} or {sorted(_FALSE)} — guessing would risk "
             "exporting a horizon rotated by an unknown amount."

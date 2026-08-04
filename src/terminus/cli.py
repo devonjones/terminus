@@ -18,7 +18,7 @@ import time
 
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
-from .export import UnorientedMask, default_meta, export_all, write_mask
+from .export import MaskError, default_meta, export_all, write_mask
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     Pointer,
@@ -421,7 +421,7 @@ def main(argv=None):
         finally:
             if sc:
                 sc.close()
-    except (ConfigError, SeestarError, MosaicError, UnorientedMask) as e:
+    except (ConfigError, SeestarError, MosaicError, MaskError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
