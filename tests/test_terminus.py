@@ -3096,3 +3096,34 @@ def test_duplicate_azimuths_are_measured_once():
     ):
         run_sweep(sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[10, 370, 10.4, -350])
     assert seen == [10], f"expected one scan of az 10, got {seen}"
+
+
+def test_the_move_threshold_is_the_same_distance_in_every_direction():
+    """Comparing a DEGREE threshold to both lat and lon is not one distance.
+
+    A degree of longitude shrinks by cos(lat), so at 39.8 the same 0.0003 deg
+    is 33 m north-south and 26 m east-west — the east-west test was 23 per cent
+    tighter than intended, which is not what anyone means by "the same spot".
+    """
+    import math
+
+    from terminus.cli import MERGE_POSITION_TOLERANCE_M as tol
+
+    lat = 39.79
+    # A displacement just inside the tolerance must pass in BOTH directions,
+    # and one just outside must fail in both.
+    north_ok = (tol * 0.9) / 111320.0
+    east_ok = (tol * 0.9) / (111320.0 * math.cos(math.radians(lat)))
+    north_bad = (tol * 1.5) / 111320.0
+    east_bad = (tol * 1.5) / (111320.0 * math.cos(math.radians(lat)))
+    # East and north offsets of the same metre distance differ in degrees...
+    assert east_ok > north_ok, "longitude degrees are shorter at this latitude"
+    # ...and the guard must treat them as the same distance.
+    for dlat, dlon, should_pass in (
+        (north_ok, 0.0, True),
+        (0.0, east_ok, True),
+        (north_bad, 0.0, False),
+        (0.0, east_bad, False),
+    ):
+        d = math.hypot(dlat * 111320.0, dlon * 111320.0 * math.cos(math.radians(lat)))
+        assert (d <= tol) is should_pass, f"{d:.1f} m classified wrongly"

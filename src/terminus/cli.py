@@ -12,6 +12,7 @@ Global: --config PATH (default ./config.toml). sweep: --az-start --az-end --out
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -107,6 +108,12 @@ def cmd_classify(sc, cfg, args):
     sc.stop_view()
 
 
+# Loose on purpose: the mask rounds lat/lon to four decimals (~8 m by itself)
+# and a GPS fix wanders. This catches crossing the garden, not nudging the
+# tripod.
+MERGE_POSITION_TOLERANCE_M = 30.0
+
+
 def _check_mergeable(prior_meta, sky):
     """Refuse to merge two runs that do not describe the same sky.
 
@@ -120,10 +127,17 @@ def _check_mergeable(prior_meta, sky):
 
     Position: the horizon belongs to where the tripod stood. A 2 m fence at 5 m
     moves 11.9 degrees for 2 m of observer displacement, so merging across a
-    move is merging two different horizons. The check is deliberately loose
-    (about 30 m) because lat/lon in the mask is rounded to four decimals and a
-    GPS fix wanders; it catches moving to the far side of the garden, not
-    shuffling the tripod.
+    move is merging two different horizons.
+
+    The comparison is in METRES, not degrees. Comparing a degree threshold
+    against both lat and lon makes the longitude test 23 per cent tighter at
+    this latitude, because a degree of longitude shrinks by cos(lat) — 0.0003
+    deg is 33 m north-south and 26 m east-west at 39.8. That asymmetry is not
+    what anyone means by "the same spot".
+
+    The tolerance is deliberately loose: the mask rounds lat/lon to four
+    decimals (about 8 m on its own) and a GPS fix wanders, so this catches
+    crossing the garden rather than shuffling the tripod.
     """
     if not is_oriented(prior_meta):
         raise MaskError(
@@ -134,14 +148,17 @@ def _check_mergeable(prior_meta, sky):
         )
     plat, plon = prior_meta.get("lat"), prior_meta.get("lon")
     if plat is not None and plon is not None:
-        dlat = abs(float(plat) - sky.loc.lat.deg)
-        dlon = abs(float(plon) - sky.loc.lon.deg)
-        if max(dlat, dlon) > 0.0003:  # ~30 m
+        lat_now, lon_now = sky.loc.lat.deg, sky.loc.lon.deg
+        dnorth = (float(plat) - lat_now) * 111320.0
+        deast = (float(plon) - lon_now) * 111320.0 * math.cos(math.radians(lat_now))
+        moved = math.hypot(dnorth, deast)
+        if moved > MERGE_POSITION_TOLERANCE_M:
             raise MaskError(
                 f"refusing to merge: the existing mask was measured at {plat},{plon} and "
-                f"this run is at {sky.loc.lat.deg:.4f},{sky.loc.lon.deg:.4f}. The horizon "
-                "belongs to one position — a near obstruction shifts by degrees for a few "
-                "metres — so these are two different horizons. Write to a different --out."
+                f"this run is at {lat_now:.4f},{lon_now:.4f}, about {moved:.0f} m away. The "
+                "horizon belongs to one position — a near obstruction shifts by degrees for "
+                "a few metres — so these are two different horizons. Write to a different "
+                "--out."
             )
 
 
