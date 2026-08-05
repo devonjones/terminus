@@ -90,11 +90,12 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `I-06` Foliage moves between frames; rigid structure does not
 - `I-07` One control connection, and diagnostics read the log
 - `I-08` Do not carry an instrument's guess at a quantity it cannot measure
-- `I-09` Mount model and mechanical alignment are different quantities
+- `I-09` In EQ mode the frame comes from the mechanics, not from stored software state
 - `I-10` Driving the error at one sky position to zero is not alignment
 - `I-11` Check whether a sensor's geometry can express the quantity at all
 - `I-12` A fixed terrain edge is a free session-to-session pointing reference
 - `I-13` Per-axis tolerances are unsatisfiable at a coordinate singularity
+- `I-14` There is no still-image path for terrestrial frames; RTSP is not a choice
 
 **Safety**
 
@@ -106,6 +107,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `SAFE-06` Never design a workflow that requires a human to look at the Sun
 - `SAFE-07` A hazard that cannot reach the optics is not a hazard
 - `SAFE-08` A command that lies can also act later
+- `SAFE-09` Over-the-top Sun avoidance is unavailable near summer solar noon
 
 **Code, tests and the repo**
 
@@ -1035,21 +1037,36 @@ disagreements as "structure" while Devon, reading the photo labels, counted six 
 Once an instrument provably cannot determine a quantity, stop storing its guess at all — a
 plausible field is consumed downstream exactly like a measured one.
 
-### I-09 — Mount model and mechanical alignment are different quantities
+### I-09 — In EQ mode the frame comes from the mechanics, not from stored software state
 
-A power cycle wipes the mount's belief about where it is pointing; it does not touch the polar
-axis. After one, gotos to the Sun's ephemeris reported a 0.14° *goto residual* — the mount
-arriving where it was told — and showed no disc. Then 49 grid positions over ±1.65°, a 16-position
-altitude sweep passing within 0.42° of the Sun's altitude with the frame never changing, and a
-brightness hill-climb, all found nothing.
+**Corrected 2026-08-05.** This entry previously said a power cycle wipes the mount's model and
+prescribed re-syncing before any measurement. That is wrong for this hardware, and acting on it
+cost an observing session.
 
-The cause: after a power cycle the frame is arbitrary, so an "offset in RA/Dec" moved the tube in
-a direction unrelated to the sky. A 3.3° box was searched in the wrong coordinate system. The
-true model error was **8.150°**, and one `scope_sync` took it to **0.003°**.
+How the Seestar actually works in EQ mode, per Devon: *"the Seestar plate solves and then asks you
+to fix the problems, it expects in EQ that it's within one degree of the right angle and 1 degree
+of pointing north."* The wedge is physically aligned to the pole and RA/Dec follows from the
+encoders relative to a base assumed correct. **The plate solve is a check that tells the operator
+to adjust hardware — it is not a stored calibration.** So there is nothing to lose across a power
+cycle, and no re-sync is required before measuring.
 
-Precise commands in an unvalidated frame are precisely wrong, and the failure looks like "search
-harder". Validate the frame with one absolute fix before any search, and never read a goto
-residual as a pointing error.
+The evidence this entry was built on says so too, read properly. After a power cycle, gotos to the
+Sun's ephemeris found nothing and the true error measured **8.150°**. That was not a lost software
+model: the wedge was genuinely that far out, from the previous afternoon's adjustment loop (M-01).
+It **survived the reboot precisely because it was mechanical**.
+
+What still stands, and is the part worth keeping:
+
+- **Never read a goto residual as a pointing error.** The mount reported arriving within 0.14° of
+  where it was told while showing no disc at all. Landing on the commanded coordinates only proves
+  the mount executed the slew in its own frame; it says nothing about whether that frame matches
+  the sky. This trap was written down here and then walked into again a day later.
+- **Precise commands in an unvalidated frame are precisely wrong**, and the failure looks like
+  "search harder" — 49 grid positions over ±1.65°, a 16-position altitude sweep, and a brightness
+  hill-climb all found nothing, because the search box was in the wrong coordinate system.
+- **Check the mechanics, not the software.** When pointing is wrong, the question is whether the
+  wedge is within its tolerance, and the answer comes from a plate solve or an absolute sighting —
+  not from re-issuing a sync that nothing persists.
 
 ### I-10 — Driving the error at one sky position to zero is not alignment
 
@@ -1112,6 +1129,29 @@ altitude is the quantity being measured**, and 3° of azimuth is well inside the
 resolution.
 
 When you must perturb a target away from a singularity, perturb the axis you are not measuring.
+
+### I-14 — There is no still-image path for terrestrial frames; RTSP is not a choice
+
+Asked the reasonable question "why use video for a column when we only need one still?", the
+answer turns out to be that the device offers nothing else.
+
+There *is* a second imaging channel on **port 4800**, separate from RTSP on 4554: connect, send
+`{"id": 21, "method": "begin_streaming"}`, then read an 80-byte header (first 20 unpack as
+`>HHHIHHBBHH` → size, id, width, height) followed by exactly `size` bytes of raw uint16 —
+`w*h*6` for RGB16, `w*h*2` for Bayer GRBG16. Being a plain TCP transfer it would be strictly
+better on a lossy link, since loss costs latency and the frame still arrives, whereas one lost
+packet destroys an H.264 keyframe and ffmpeg emits nothing at all.
+
+**It does not work in scenery mode.** Tested live: the connection succeeds, `begin_streaming` is
+acknowledged (header id 21, size 4), and then no frames follow — a 60 s wait returned nothing.
+That matches the source: this channel serves the preview and stacking paths, which belong to star
+mode, while scenery publishes only through the RTSP encoder.
+
+So every robustness measure for column work has to be built around a video stream that fails
+all-or-nothing, which is what makes terminus-15 (stop_view does not reliably stop) and the
+frozen-frame case expensive rather than merely annoying. Worth knowing for plate solving, though:
+star mode *does* feed this channel, so a solve path could read frames here and be immune to the
+RTSP failure modes entirely.
 
 ---
 
@@ -1231,6 +1271,32 @@ Confirm a park or abort by position *over time*, not once. And log the power sta
 Devon's "telescope was at 6% power anyway, needs charging so I shut it off" is a plausible common
 cause for a class of impossible behaviour, and terminus reads battery state nowhere, though
 `seestar_alp` watches it for safe shutdown.
+
+### SAFE-09 — Over-the-top Sun avoidance is unavailable near summer solar noon
+
+`point_to` falls back to routing over a high waypoint when a direct slew would pass the Sun, on an
+assumption stated in its own comment: "the Sun is never at high altitude from a mid-latitude site."
+At 39.79°N in early August the Sun reaches **alt 67**. The candidate waypoint altitudes are
+`(min(85, max(alt,70)), 75, 65, 55)` — the last three sit at or below the Sun's own altitude — so
+every candidate is rejected and the whole strategy is unavailable for several hours a day, exactly
+when daylight column work happens.
+
+Measured with the same path sampler, then flown:
+
+| route | leg clearances (°) | |
+|---|---|---|
+| direct to (340,70) | 12.8 | refused |
+| (40,10) (0,12) (340,15) (340,40) (340,70) | 58.4 · 75.8 · 98.1 · 78.9 · 50.7 | **clear** |
+| (300,10) (320,20) (340,40) (340,70) | 58.6 · 99.4 · 78.9 · 50.7 | **clear** |
+
+**Going under works when going over cannot**, because the Sun's altitude bounds the problem from
+above but never from below. Two further notes: the low route needed three intermediate stops and
+the code tries exactly one; and my own pre-check computed separation for each *position* in the
+column, got a comfortable 54.2° minimum, and concluded "safe" — positions are not paths (SAFE-01).
+
+Report the strategy that failed, not just the refusal. "No Sun-safe path" gave no hint another
+route shape existed; "over-the-top routing needs the Sun below about 50°, it is at 57" is a
+decision the operator can act on.
 
 ---
 
