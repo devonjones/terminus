@@ -398,12 +398,99 @@ def cmd_sweep(sc, cfg, args):
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
-    hrz, txt = export_all(
-        args.mask,
-        os.path.splitext(args.mask)[0],
-        allow_unoriented=getattr(args, "allow_unoriented", False),
-    )
+    allow = getattr(args, "allow_unoriented", False)
+    base = os.path.splitext(args.mask)[0]
+    # The whole command is wrapped, not just the picture half. A read-only
+    # directory or a full disk is an ordinary thing to hit and reached the user
+    # as a traceback, while a mask with a typo'd flag got a clean sentence —
+    # backwards, since the path is the one with the obvious fix. Wrapping only
+    # the new exporters would have left `terminus export` alone still tracing
+    # back on exactly the same failure, which is the kind of half-fix that reads
+    # as done.
+    try:
+        _export(args, base, allow)
+    except OSError as e:
+        raise SeestarError(f"could not write the export beside {args.mask}: {e}") from e
+
+
+def _export(args, base, allow):
+    hrz, txt = export_all(args.mask, base, allow_unoriented=allow)
     print(f"wrote {hrz}\nwrote {txt}")
+    if not (args.skysafari or args.landscape):
+        # Checked here rather than in `_texture`, which this return would skip
+        # past. Silently ignoring --texture is the bad outcome: the person
+        # believes they rendered a photo-real horizon and got the plain .hrz
+        # they already had, with nothing said about it.
+        if args.texture or args.coverage:
+            raise SeestarError(
+                "--texture and --coverage only affect the pictures; "
+                "add --skysafari and/or --landscape"
+            )
+        return
+
+    from .export import load_mask
+    from .landscape import to_skysafari_png, write_landscape
+
+    meta, rows = load_mask(args.mask)
+    texture, coverage = _texture(args)
+    if args.skysafari:
+        png = to_skysafari_png(
+            rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
+            allow_unoriented=allow,
+        )  # fmt: skip
+        print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
+    if args.landscape:
+        d = write_landscape(
+            base + "_landscape", rows, meta, name=os.path.basename(base),
+            texture=texture, coverage=coverage, allow_unoriented=allow,
+        )  # fmt: skip
+        kind = "spherical" if texture is not None else "polygonal"
+        print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
+
+
+def _texture(args):
+    """The mosaic panorama and its coverage, or (None, None) for a silhouette.
+
+    Coverage is optional but strongly wanted with a texture: without it every
+    pixel below the horizon is drawn opaque, including the parts of the canvas
+    the phone never photographed, which turns a gap in the data into black
+    ground the viewer has no reason to doubt.
+    """
+    if not args.texture:
+        if args.coverage:
+            raise SeestarError("--coverage describes a --texture; pass one or neither")
+        return None, None
+    import numpy as np
+    from PIL import Image
+
+    # Lifted for the same reason as in `cmd_mosaic`: a full-sphere panorama is
+    # legitimately past Pillow's bomb threshold, and the file is the user's own
+    # mosaic rather than something fetched.
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(args.texture) as im:
+            texture = np.asarray(im.convert("RGB"))
+    except OSError as e:
+        # Covers a missing file, a directory, a truncated PNG and a file that is
+        # not an image at all — UnidentifiedImageError subclasses OSError.
+        raise SeestarError(f"could not read the texture {args.texture}: {e}") from e
+    if not args.coverage:
+        print(
+            "warning: --texture without --coverage; uncovered sky will be drawn "
+            "as ground. Pass the mosaic's .coverage.npy to show it as a gap.",
+            file=sys.stderr,
+        )
+        return texture, None
+    try:
+        coverage = np.load(args.coverage)
+    except (OSError, ValueError) as e:
+        raise SeestarError(f"could not read the coverage {args.coverage}: {e}") from e
+    if coverage.shape != texture.shape[:2]:
+        raise SeestarError(
+            f"coverage {coverage.shape} does not match texture {texture.shape[:2]}; "
+            "they must come from the same mosaic run"
+        )
+    return texture, coverage
 
 
 # ---- offline photo pipeline -----------------------------------------------
@@ -600,6 +687,12 @@ def main(argv=None):
     sw.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("export")
     ex.add_argument("mask")
+    ex.add_argument("--skysafari", action="store_true", help="also write a Sky Safari panorama PNG")
+    ex.add_argument(
+        "--landscape", action="store_true", help="also write a Stellarium landscape directory"
+    )
+    ex.add_argument("--texture", help="equirectangular panorama (the mosaic PNG) to draw")
+    ex.add_argument("--coverage", help="the mosaic's .coverage.npy, so gaps render as sky")
     ex.add_argument(
         "--allow-unoriented",
         action="store_true",

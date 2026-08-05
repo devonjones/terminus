@@ -3533,3 +3533,454 @@ def test_a_real_crossing_clears_the_photo_s_lower_bound_flag(tmp_path):
     assert cols[90]["gap_fraction"] == 0.4, "how gappy the canopy is did not change"
     assert cols[90]["uncertainty"] == 4.2, "nor how far it moves"
     assert cols[90]["type"] == "tree", "and the photo still knows what it is"
+
+
+# ---- picture exporters (terminus-1, terminus-26) --------------------------
+_LS_ROWS = [(0, 10.0, "structure"), (90, 30.0, "structure"), (180, 5.0, "structure"),
+            (270, 20.0, "structure")]  # fmt: skip
+_LS_META = {"lat": 39.79, "lon": -104.89, "measured": "2026-08-05 21:00"}
+
+
+def test_the_panorama_puts_north_at_the_left_edge_and_zenith_at_the_top():
+    """Sky Safari's convention, and getting it wrong is silently plausible.
+
+    North at the LEFT edge increasing east, zenith +90 at the TOP, horizon 0 at
+    the middle, nadir -90 at the bottom. A picture with the axes flipped still
+    looks like a horizon — it is just somebody else's.
+    """
+    from terminus.landscape import render
+
+    rgba = render(_LS_ROWS, (360, 180), tree_buffer=0)
+    alpha = rgba[..., 3]
+    # Column 90 has the HIGHEST horizon, so it must have the most opaque rows;
+    # column 180 the lowest, so the fewest. If x ran the other way these swap.
+    assert alpha[:, 90].sum() > alpha[:, 0].sum() > alpha[:, 180].sum()
+    # Zenith is transparent everywhere and nadir is opaque everywhere. If y ran
+    # the other way, both flip.
+    assert alpha[0].max() == 0, "nothing is opaque at the zenith"
+    assert alpha[-1].min() == 255, "everything is opaque at the nadir"
+    # And the boundary in a column sits at that column's measured altitude.
+    ground_rows = np.nonzero(alpha[:, 90])[0]
+    top_alt = 90.0 - (ground_rows[0] + 0.5) / 180 * 180.0
+    assert abs(top_alt - 30.0) < 1.0, f"az 90 boundary at {top_alt}, measured 30"
+
+
+def test_the_sky_is_transparent_because_alpha_is_the_horizon():
+    """Neither program reads a drawn line; opacity is the whole mechanism.
+
+    A silhouette painted onto an opaque background would import as a completely
+    blocked sky, which is a plausible thing to produce and a total failure.
+    """
+    from terminus.landscape import render
+
+    rgba = render(_LS_ROWS, (64, 32), tree_buffer=0)
+    assert rgba[..., 3].min() == 0, "some pixel must be fully transparent"
+    assert rgba[..., 3].max() == 255, "and some fully opaque"
+    assert set(np.unique(rgba[..., 3])) == {0, 255}, "no partial alpha to misread"
+
+
+def test_uncovered_panorama_shows_as_sky_not_as_invented_ground():
+    """The gap in the data must not become black terrain.
+
+    A phone panorama does not fill the full sphere. Where the mosaic has no
+    frames the pixel is zero, and drawing it opaque presents a hole in the
+    survey as a wall the viewer has no reason to doubt.
+    """
+    from terminus.landscape import render
+
+    texture = np.full((32, 64, 3), 90, np.uint8)
+    coverage = np.ones((32, 64))
+    coverage[:, 10:20] = 0  # the phone never pointed here
+    rgba = render(_LS_ROWS, (64, 32), texture=texture, coverage=coverage, tree_buffer=0)
+    assert rgba[:, 10:20, 3].max() == 0, "no coverage means no ground"
+    assert rgba[:, 30, 3].max() == 255, "covered columns still render ground"
+
+
+def test_the_picture_and_the_numbers_are_the_same_horizon(tmp_path):
+    """A landscape whose polygon disagrees with its texture is worse than neither.
+
+    Both must go through the same buffered pairs, so the vegetation margin the
+    .hrz applies is the margin the picture shows.
+    """
+    from terminus.export import TREE_BUFFER_DEG
+    from terminus.landscape import horizon_altitudes, write_landscape
+
+    rows = [(0, 10.0, "tree"), (90, 30.0, "structure"), (180, 5.0, "tree"), (270, 20.0, "tree")]
+    write_landscape(str(tmp_path / "ls"), rows, _LS_META)
+    txt = (tmp_path / "ls" / "horizon.txt").read_text()
+    pairs = {float(a): float(b) for a, b in (ln.split() for ln in txt.splitlines() if ln.strip())}
+    assert pairs[0.0] == 10.0 + TREE_BUFFER_DEG, "the polygon carries the vegetation margin"
+    alts = horizon_altitudes(rows, 360)
+    assert abs(alts[0] - pairs[0.0]) < 1e-6, "and the picture is drawn from the same numbers"
+
+
+def test_a_scope_only_mask_ships_a_polygonal_landscape_not_a_fake_photo(tmp_path):
+    """Without imagery there is nothing honest to put in maptex.
+
+    Declaring type=spherical with a rendered silhouette would claim a photograph
+    that does not exist.
+    """
+    from terminus.landscape import write_landscape
+
+    write_landscape(str(tmp_path / "ls"), _LS_ROWS, _LS_META)
+    ini = (tmp_path / "ls" / "landscape.ini").read_text()
+    assert "type = polygonal" in ini
+    assert "maptex" not in ini, "no texture was supplied, so none may be declared"
+    assert not (tmp_path / "ls" / "maptex.png").exists()
+    assert "polygonal_horizon_list = horizon.txt" in ini
+    assert "azDeg_altDeg" in ini, "the mode our .txt is actually written in"
+
+
+def test_both_stellarium_rotations_stay_zero_because_the_texture_is_pre_rotated(tmp_path):
+    """`angle_rotatez` turns the image; `polygonal_angle_rotatez` turns the polygon.
+
+    Stellarium's own `zero` landscape comments on why they are separate. Setting
+    either would turn the numbers away from the picture and destroy the property
+    that makes the package worth shipping — that a wrong yaw is visible as the
+    observer's own house in the wrong place. So the texture is rotated into true
+    azimuth here and both keys ship as zero.
+    """
+    from terminus.landscape import _rotate_east, write_landscape
+
+    texture = np.zeros((32, 64, 3), np.uint8)
+    texture[:, :8] = 200  # a bright marker at the panorama's own azimuth 0
+    write_landscape(str(tmp_path / "ls"), _LS_ROWS, dict(_LS_META, yaw=90.0), texture=texture)
+    ini = (tmp_path / "ls" / "landscape.ini").read_text()
+    assert "type = spherical" in ini
+    assert "angle_rotatez = 0" in ini and "polygonal_angle_rotatez = 0" in ini
+    assert "maptex_top = 90" in ini and "maptex_bottom = -90" in ini
+    # Derived from the convention, not restated from the implementation.
+    # `orient` defines yaw by phi = target_az - yaw, so a native column phi sits
+    # at TRUE azimuth phi + yaw. The marker is at native 0, so with yaw 90 it
+    # belongs at true azimuth 90 — a QUARTER of the way across a 64px image,
+    # x = 16. The opposite roll would put it at 48, which is true 270: still a
+    # horizon, just somebody else's, and indistinguishable by eye for a small
+    # yaw. This assertion is the only thing standing between the two.
+    rolled = _rotate_east(texture, 90.0)
+    assert rolled[0, 0, 0] == 0, "the marker no longer sits at true north"
+    assert rolled[0, 16, 0] == 200, "native 0 with yaw 90 is true 90, a quarter across"
+    assert rolled[0, 48, 0] == 0, "and emphatically not true 270"
+
+
+def test_a_panorama_of_an_unoriented_mask_is_refused(tmp_path):
+    """A PNG has nowhere to carry a warning, so it cannot be allowed to lie.
+
+    The text exporters at least ship a comment saying the azimuth is not true
+    north. A picture just shows the wrong horizon.
+    """
+    import pytest
+
+    from terminus.export import UnorientedMask
+    from terminus.landscape import to_skysafari_png, write_landscape
+
+    with pytest.raises(UnorientedMask):
+        to_skysafari_png(_LS_ROWS, str(tmp_path / "p.png"), {"oriented": False})
+    with pytest.raises(UnorientedMask):
+        write_landscape(str(tmp_path / "ls"), _LS_ROWS, {"oriented": False})
+
+
+def test_export_writes_the_pictures_only_when_asked(tmp_path):
+    """The default export is unchanged; the pictures are opt-in."""
+    from terminus.cli import main
+    from terminus.export import write_mask
+
+    mask = tmp_path / "h.yaml"
+    write_mask(str(mask), {az: (alt, t) for az, alt, t in _LS_ROWS}, [], _LS_META)
+    main(["export", str(mask)])
+    assert not (tmp_path / "h.skysafari.png").exists()
+    assert not (tmp_path / "h_landscape").exists()
+
+    main(["export", str(mask), "--skysafari", "--landscape"])
+    png = tmp_path / "h.skysafari.png"
+    assert png.exists()
+    from PIL import Image
+
+    img = Image.open(png)
+    assert img.mode == "RGBA", "Sky Safari reads the alpha channel"
+    assert img.size == (2048, 1024), "the vendor's documented panorama size"
+    assert (tmp_path / "h_landscape" / "landscape.ini").exists()
+    assert (tmp_path / "h_landscape" / "horizon.txt").exists()
+
+
+def test_a_landscape_invents_no_position_it_was_never_given(tmp_path):
+    """`latitude = 0, longitude = 0` is a claim, not a default.
+
+    It would move a Stellarium user to the Gulf of Guinea and tell them nothing
+    was wrong. A landscape with no [location] section simply leaves the observer
+    where they already are, which is the honest answer for a horizon whose site
+    we do not know.
+    """
+    from terminus.landscape import write_landscape
+
+    sited = tmp_path / "sited"
+    write_landscape(str(sited), _LS_ROWS, _LS_META)
+    ini = (sited / "landscape.ini").read_text()
+    assert "[location]" in ini and "latitude = 39.79" in ini and "longitude = -104.89" in ini
+
+    unsited = tmp_path / "unsited"
+    write_landscape(str(unsited), _LS_ROWS, {"measured": "2026-08-05"})
+    ini = (unsited / "landscape.ini").read_text()
+    assert "[location]" not in ini, "no position recorded means no position claimed"
+    assert "latitude" not in ini and "longitude" not in ini
+    # The rest of the file must still be a valid, complete landscape.
+    import configparser
+
+    cp = configparser.ConfigParser()
+    cp.read_string(ini)
+    assert cp["landscape"]["polygonal_horizon_list"] == "horizon.txt"
+
+
+def test_a_failed_render_leaves_no_half_written_landscape(tmp_path):
+    """Stellarium reads a partial directory as broken, not as absent.
+
+    horizon.txt was written before the texture was rendered, so a failure
+    partway left a landscape with no landscape.ini — presenting as a corrupt
+    install rather than as an error. A package that does not exist is a better
+    outcome than one that half does.
+    """
+    import pytest
+
+    from terminus.landscape import write_landscape
+
+    d = tmp_path / "ls"
+    with pytest.raises((IndexError, ValueError)):
+        write_landscape(str(d), _LS_ROWS, _LS_META, texture=np.zeros((4,), np.uint8))
+    assert not d.exists(), "nothing may be left behind when the render fails"
+
+    # And the normal path still produces all three files.
+    write_landscape(str(d), _LS_ROWS, _LS_META, texture=np.zeros((8, 16, 3), np.uint8))
+    assert {p.name for p in d.iterdir()} == {"landscape.ini", "horizon.txt", "maptex.png"}
+
+
+def _export_fails(capsys, argv, message):
+    """Run the CLI expecting a clean refusal: `error: ...` on stderr, exit 1."""
+    import pytest
+
+    from terminus.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 1, "a refusal must not look like success"
+    err = capsys.readouterr().err
+    assert message in err, f"expected {message!r} in stderr, got {err!r}"
+
+
+def _picture_mask(tmp_path):
+    from terminus.export import write_mask
+
+    mask = tmp_path / "h.yaml"
+    write_mask(str(mask), {az: (alt, t) for az, alt, t in _LS_ROWS}, [], _LS_META)
+    return str(mask)
+
+
+def test_the_export_explains_an_unreadable_texture_instead_of_tracing_back(tmp_path, capsys):
+    """A missing file is the most ordinary failure there is.
+
+    It reached the user as a raw traceback while a mask with a typo'd flag got a
+    clean sentence — backwards, since the file path is the one with the obvious
+    fix. UnidentifiedImageError subclasses OSError, so a file that is not an
+    image at all is covered by the same catch.
+    """
+    from PIL import Image
+
+    mask = _picture_mask(tmp_path)
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(tmp_path / "nope.png")],
+        "could not read the texture",
+    )
+
+    not_an_image = tmp_path / "notes.txt"
+    not_an_image.write_text("this is not a panorama")
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(not_an_image)],
+        "could not read the texture",
+    )
+
+    good = tmp_path / "t.png"
+    Image.fromarray(np.zeros((8, 16, 3), np.uint8)).save(good)
+    bad_cov = tmp_path / "c.npy"
+    bad_cov.write_bytes(b"not a numpy array")
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(good), "--coverage", str(bad_cov)],
+        "could not read the coverage",
+    )
+
+    # A coverage from a different run must not be silently stretched to fit.
+    wrong = tmp_path / "w.npy"
+    np.save(wrong, np.ones((4, 4)))
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(good), "--coverage", str(wrong)],
+        "does not match texture",
+    )
+
+
+def test_a_texture_with_nothing_to_draw_on_is_refused(tmp_path, capsys):
+    """Silently ignoring --texture is the bad outcome.
+
+    The person believes they rendered a photo-real horizon and got the plain
+    .hrz they already had, with nothing said about it. The check has to sit
+    before the early return, not inside the texture loader, because that return
+    is exactly what skips the loader.
+    """
+    from PIL import Image
+
+    mask = _picture_mask(tmp_path)
+    tex = tmp_path / "t.png"
+    Image.fromarray(np.zeros((8, 16, 3), np.uint8)).save(tex)
+
+    _export_fails(capsys, ["export", mask, "--texture", str(tex)], "add --skysafari")
+    _export_fails(capsys, ["export", mask, "--coverage", str(tex)], "add --skysafari")
+    # Coverage without a texture describes nothing.
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--coverage", str(tex)],
+        "pass one or neither",
+    )
+
+
+def test_the_missing_coverage_warning_reaches_stderr(tmp_path, capsys):
+    """Without coverage the uncovered canvas is drawn as ground.
+
+    That is a real loss of honesty, so it must be said out loud rather than left
+    for the viewer to discover as a black wall they have no reason to doubt.
+    """
+    from PIL import Image
+
+    from terminus.cli import main
+
+    mask = _picture_mask(tmp_path)
+    tex = tmp_path / "t.png"
+    Image.fromarray(np.full((16, 32, 3), 90, np.uint8)).save(tex)
+
+    main(["export", mask, "--landscape", "--texture", str(tex)])
+    err = capsys.readouterr().err
+    assert "--coverage" in err and "drawn" in err
+    assert (tmp_path / "h_landscape" / "maptex.png").exists(), "and it still produces the package"
+
+
+def test_an_allow_unoriented_landscape_says_so_where_a_person_will_read_it(tmp_path):
+    """A picture cannot carry a `#` comment, but a landscape browser shows a name.
+
+    Exporting an unoriented mask is a legitimate workflow — someone who set
+    north by hand — and the flag exists for it. But the azimuth is still not
+    true north, and the description line is the only part of the package a
+    person reliably sees.
+    """
+    from terminus.landscape import write_landscape
+
+    d = tmp_path / "ls"
+    write_landscape(str(d), _LS_ROWS, {"oriented": False, "lat": 1.0, "lon": 2.0},
+                    allow_unoriented=True)  # fmt: skip
+    ini = (d / "landscape.ini").read_text()
+    assert "UNORIENTED" in ini and "NOT true north" in ini
+
+    oriented = tmp_path / "ok"
+    write_landscape(str(oriented), _LS_ROWS, _LS_META)
+    assert "UNORIENTED" not in (oriented / "landscape.ini").read_text()
+    assert "POSITION-SPECIFIC" in (oriented / "landscape.ini").read_text()
+
+
+def test_a_mask_covering_part_of_the_circle_still_renders(tmp_path):
+    """A partial sweep is a normal intermediate state, not an error.
+
+    `_ascending_pairs` closes the wrap by repeating the first column at 0 and
+    360, so the gap is filled by interpolation rather than crashing. Whether
+    that is the RIGHT filling is a separate question — it is a straight line
+    across ground nobody measured — but it must not raise.
+    """
+    from terminus.landscape import horizon_altitudes, render
+
+    partial = [(10, 12.0, "structure"), (20, 15.0, "structure"), (30, 9.0, "structure")]
+    alts = horizon_altitudes(partial, 72)
+    assert np.isfinite(alts).all(), "every column must get a value"
+    assert abs(alts[2] - 12.0) < 1.0, "and a measured column keeps its own"
+    rgba = render(partial, (72, 36))
+    assert rgba.shape == (36, 72, 4)
+
+    single = [(90, 20.0, "structure")]
+    assert np.allclose(horizon_altitudes(single, 8), 20.0), "one column is a flat horizon"
+
+
+def test_a_failed_write_leaves_no_half_package_either(tmp_path, monkeypatch):
+    """Building before writing only protects against bad INPUT.
+
+    The writes can still fail — a full disk on the last of three — and that
+    leaves the same corrupt-looking directory the ordering exists to prevent,
+    just from I/O instead. So the writes are undone.
+    """
+    import pytest
+
+    from terminus import landscape
+
+    real = landscape._write
+
+    def fail_on_ini(path, text):
+        if path.endswith("landscape.ini"):
+            raise OSError(28, "No space left on device")
+        return real(path, text)
+
+    monkeypatch.setattr(landscape, "_write", fail_on_ini)
+    d = tmp_path / "ls"
+    with pytest.raises(OSError):
+        landscape.write_landscape(str(d), _LS_ROWS, _LS_META)
+    assert not d.exists(), "a directory we created must not survive a failed write"
+
+    # A directory the person already had is not ours to delete, but our own
+    # half-written files in it still are.
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    (theirs / "notes.txt").write_text("mine")
+    with pytest.raises(OSError):
+        landscape.write_landscape(str(theirs), _LS_ROWS, _LS_META)
+    assert theirs.exists() and (theirs / "notes.txt").exists(), "their files are untouched"
+    assert not (theirs / "horizon.txt").exists(), "ours are cleaned up"
+
+
+def test_re_exporting_without_a_texture_drops_the_old_one(tmp_path):
+    """A directory holding a picture its ini does not name lies about itself.
+
+    Stellarium reads only what landscape.ini references, so a stale maptex.png
+    is harmless to the program — and misleading to the person who opens the
+    folder and sees a photograph that is no longer part of the landscape.
+    """
+    from terminus.landscape import write_landscape
+
+    d = tmp_path / "ls"
+    write_landscape(str(d), _LS_ROWS, _LS_META, texture=np.zeros((8, 16, 3), np.uint8))
+    assert (d / "maptex.png").exists()
+
+    write_landscape(str(d), _LS_ROWS, _LS_META)  # same directory, no texture now
+    assert not (d / "maptex.png").exists(), "the old picture is not part of this landscape"
+    assert "type = polygonal" in (d / "landscape.ini").read_text()
+
+
+def test_an_unwritable_destination_is_explained_not_traced(tmp_path, capsys):
+    """A read-only directory is an ordinary thing to hit.
+
+    The round-1 wrap made it a sentence rather than a traceback, and nothing
+    was holding that in place — deleting the wrap left the whole suite green.
+
+    Writing the test moved the fix: the wrap covered only the picture exporters,
+    so plain `terminus export` still traced back on the identical failure. The
+    whole command is wrapped now.
+    """
+    import os
+    import stat
+
+    import pytest
+
+    mask = _picture_mask(tmp_path)
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit, so there is nothing to test")
+    mode = os.stat(tmp_path).st_mode
+    os.chmod(tmp_path, mode & ~stat.S_IWUSR)
+    try:
+        _export_fails(capsys, ["export", mask, "--skysafari"], "could not write the export")
+        # And the plain export, which the first version of the wrap missed.
+        _export_fails(capsys, ["export", mask], "could not write the export")
+    finally:
+        os.chmod(tmp_path, mode)
