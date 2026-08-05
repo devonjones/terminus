@@ -1705,7 +1705,7 @@ def test_segmentation_backend_tracks_the_imports_not_the_environment():
     """
     present = (
         "import sys, types\n"
-        "for n in ('torch', 'transformers'):\n"
+        "for n in ('torch', 'torchvision', 'transformers'):\n"
         "    sys.modules[n] = types.ModuleType(n)\n"
         "from terminus import skymask\n"
         "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
@@ -1714,11 +1714,12 @@ def test_segmentation_backend_tracks_the_imports_not_the_environment():
         "import sys\n"
         "class Block:\n"
         "    def find_spec(self, name, path=None, target=None):\n"
-        "        if name.split('.')[0] in ('torch', 'transformers'):\n"
+        "        if name.split('.')[0] in ('torch', 'torchvision', 'transformers'):\n"
         "            raise ImportError('blocked for test: ' + name)\n"
         "        return None\n"
         "sys.meta_path.insert(0, Block())\n"
-        "sys.modules.pop('torch', None); sys.modules.pop('transformers', None)\n"
+        "for n in ('torch', 'torchvision', 'transformers'):\n"
+        "    sys.modules.pop(n, None)\n"
         "from terminus import skymask\n"
         "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
     )
@@ -2621,3 +2622,53 @@ def test_a_second_lamp_column_is_not_mistaken_for_a_horizon():
     alt, detail = find_horizon(prof, sky_ref=20.7)
     assert alt is None, f"reported a horizon at {alt}; this column is a lamp in the dark"
     assert "blocked" in detail["reason"], detail
+
+
+def test_the_segment_backend_needs_all_three_libraries():
+    """Missing ANY of torch, torchvision or transformers must report False.
+
+    torchvision was unchecked, and it fails late: `SegformerImageProcessor`
+    raises at construction, not at import, with "requires the Torchvision
+    library but it was not found". So `available()` said yes and `sky_mask`
+    died — a check reporting success while the thing it vouches for does not
+    work, which is this project's recurring failure in a new place.
+
+    It matters most where it is least welcome: `sky_mask(backend='auto')`
+    consults this to choose, so a host with torch and no torchvision got a hard
+    crash exactly where the auto path exists to fall back to the numpy
+    heuristic. That is the Raspberry Pi.
+    """
+    for missing in ("torch", "torchvision", "transformers"):
+        body = (
+            "import sys, types\n"
+            "class Block:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            f"        if name.split('.')[0] == {missing!r}:\n"
+            "            raise ImportError('blocked for test')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, Block())\n"
+            "for n in ('torch', 'torchvision', 'transformers'):\n"
+            f"    if n != {missing!r}:\n"
+            "        sys.modules[n] = types.ModuleType(n)\n"
+            f"    else:\n"
+            "        sys.modules.pop(n, None)\n"
+            "from terminus import skymask\n"
+            "print(repr(skymask.available('segment')))\n"
+        )
+        got = eval(_in_clean_interpreter(body))
+        assert got is False, f"available('segment') said {got} with {missing} missing"
+
+
+def test_auto_falls_back_to_the_heuristic_rather_than_crashing(tmp_path):
+    """The auto path exists to degrade, so it must degrade."""
+    from unittest.mock import patch
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    with patch.object(skymask, "available", lambda backend="segment": backend == "heuristic"):
+        mask = skymask.sky_mask(img, backend="auto")
+    assert mask.shape == (16, 32), "auto must produce a mask, not raise"

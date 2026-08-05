@@ -53,11 +53,26 @@ _MODEL = "nvidia/segformer-b0-finetuned-ade-512-512"
 
 
 def available(backend="segment"):
-    """True if `backend` can run in this environment."""
+    """True if `backend` can actually run here, not merely if it looks installed.
+
+    torchvision is checked as well as torch and transformers, because
+    `SegformerImageProcessor` needs it and fails only at construction:
+
+        ImportError: SegformerImageProcessor requires the Torchvision library
+        but it was not found
+
+    Omitting it made this a check that reported success while the thing it
+    vouched for did not work — the project's recurring failure mode in a new
+    place. `sky_mask(backend='auto')` consults this to choose, so a host with
+    torch and no torchvision got a hard crash exactly where the auto path exists
+    to degrade to the numpy heuristic. That is the Raspberry Pi case, and it is
+    where a crash is least welcome.
+    """
     if backend == "heuristic":
         return True
     try:
         import torch  # noqa: F401
+        import torchvision  # noqa: F401
         import transformers  # noqa: F401
     except ImportError:
         return False
