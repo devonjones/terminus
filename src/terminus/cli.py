@@ -400,6 +400,20 @@ def cmd_sweep(sc, cfg, args):
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
     allow = getattr(args, "allow_unoriented", False)
     base = os.path.splitext(args.mask)[0]
+    # The whole command is wrapped, not just the picture half. A read-only
+    # directory or a full disk is an ordinary thing to hit and reached the user
+    # as a traceback, while a mask with a typo'd flag got a clean sentence —
+    # backwards, since the path is the one with the obvious fix. Wrapping only
+    # the new exporters would have left `terminus export` alone still tracing
+    # back on exactly the same failure, which is the kind of half-fix that reads
+    # as done.
+    try:
+        _export(args, base, allow)
+    except OSError as e:
+        raise SeestarError(f"could not write the export beside {args.mask}: {e}") from e
+
+
+def _export(args, base, allow):
     hrz, txt = export_all(args.mask, base, allow_unoriented=allow)
     print(f"wrote {hrz}\nwrote {txt}")
     if not (args.skysafari or args.landscape):
@@ -419,26 +433,19 @@ def cmd_export(sc, cfg, args):  # sc unused; export is offline
 
     meta, rows = load_mask(args.mask)
     texture, coverage = _texture(args)
-    # Every write below is wrapped: an unwritable directory or a full disk is an
-    # ordinary thing to hit and reached the user as a traceback, while a mask
-    # with a typo'd flag got a clean sentence. That is backwards — the one with
-    # the obvious fix should be the one that explains itself.
-    try:
-        if args.skysafari:
-            png = to_skysafari_png(
-                rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
-                allow_unoriented=allow,
-            )  # fmt: skip
-            print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
-        if args.landscape:
-            d = write_landscape(
-                base + "_landscape", rows, meta, name=os.path.basename(base),
-                texture=texture, coverage=coverage, allow_unoriented=allow,
-            )  # fmt: skip
-            kind = "spherical" if texture is not None else "polygonal"
-            print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
-    except OSError as e:
-        raise SeestarError(f"could not write the export beside {args.mask}: {e}") from e
+    if args.skysafari:
+        png = to_skysafari_png(
+            rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
+            allow_unoriented=allow,
+        )  # fmt: skip
+        print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
+    if args.landscape:
+        d = write_landscape(
+            base + "_landscape", rows, meta, name=os.path.basename(base),
+            texture=texture, coverage=coverage, allow_unoriented=allow,
+        )  # fmt: skip
+        kind = "spherical" if texture is not None else "polygonal"
+        print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
 
 
 def _texture(args):

@@ -342,13 +342,46 @@ def write_landscape(
             else ""
         ),
     )
-    os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, "horizon.txt"), "w") as f:
-        f.write(horizon)
-    if rgba is not None:
-        from PIL import Image
+    # Building first only protects against bad INPUT. The writes themselves can
+    # still fail — a full disk on the last of three — and that leaves exactly
+    # the corrupt-looking half-package this ordering exists to prevent, just
+    # from I/O instead. So the writes are undone on failure. Only files this
+    # call created are removed, and the directory only if this call made it: a
+    # landscape the person already had is not ours to delete.
+    existed = os.path.isdir(directory)
+    written = []
+    try:
+        os.makedirs(directory, exist_ok=True)
+        written.append(_write(os.path.join(directory, "horizon.txt"), horizon))
+        stale = os.path.join(directory, "maptex.png")
+        if rgba is not None:
+            from PIL import Image
 
-        Image.fromarray(rgba, "RGBA").save(os.path.join(directory, "maptex.png"))
-    with open(os.path.join(directory, "landscape.ini"), "w") as f:
-        f.write(ini)
+            Image.fromarray(rgba, "RGBA").save(stale)
+            written.append(stale)
+        elif os.path.exists(stale):
+            # Re-exporting without a texture over a previous spherical package.
+            # landscape.ini no longer names it, so Stellarium ignores it — but a
+            # directory holding a picture it does not reference is a directory
+            # that lies about itself to anyone who opens it.
+            os.remove(stale)
+        written.append(_write(os.path.join(directory, "landscape.ini"), ini))
+    except OSError:
+        for path in written:
+            try:
+                os.remove(path)
+            except OSError:
+                pass  # cleaning up a failure must not raise a second one
+        if not existed:
+            try:
+                os.rmdir(directory)
+            except OSError:
+                pass
+        raise
     return directory
+
+
+def _write(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+    return path

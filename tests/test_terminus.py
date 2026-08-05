@@ -3903,3 +3903,84 @@ def test_a_mask_covering_part_of_the_circle_still_renders(tmp_path):
 
     single = [(90, 20.0, "structure")]
     assert np.allclose(horizon_altitudes(single, 8), 20.0), "one column is a flat horizon"
+
+
+def test_a_failed_write_leaves_no_half_package_either(tmp_path, monkeypatch):
+    """Building before writing only protects against bad INPUT.
+
+    The writes can still fail — a full disk on the last of three — and that
+    leaves the same corrupt-looking directory the ordering exists to prevent,
+    just from I/O instead. So the writes are undone.
+    """
+    import pytest
+
+    from terminus import landscape
+
+    real = landscape._write
+
+    def fail_on_ini(path, text):
+        if path.endswith("landscape.ini"):
+            raise OSError(28, "No space left on device")
+        return real(path, text)
+
+    monkeypatch.setattr(landscape, "_write", fail_on_ini)
+    d = tmp_path / "ls"
+    with pytest.raises(OSError):
+        landscape.write_landscape(str(d), _LS_ROWS, _LS_META)
+    assert not d.exists(), "a directory we created must not survive a failed write"
+
+    # A directory the person already had is not ours to delete, but our own
+    # half-written files in it still are.
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    (theirs / "notes.txt").write_text("mine")
+    with pytest.raises(OSError):
+        landscape.write_landscape(str(theirs), _LS_ROWS, _LS_META)
+    assert theirs.exists() and (theirs / "notes.txt").exists(), "their files are untouched"
+    assert not (theirs / "horizon.txt").exists(), "ours are cleaned up"
+
+
+def test_re_exporting_without_a_texture_drops_the_old_one(tmp_path):
+    """A directory holding a picture its ini does not name lies about itself.
+
+    Stellarium reads only what landscape.ini references, so a stale maptex.png
+    is harmless to the program — and misleading to the person who opens the
+    folder and sees a photograph that is no longer part of the landscape.
+    """
+    from terminus.landscape import write_landscape
+
+    d = tmp_path / "ls"
+    write_landscape(str(d), _LS_ROWS, _LS_META, texture=np.zeros((8, 16, 3), np.uint8))
+    assert (d / "maptex.png").exists()
+
+    write_landscape(str(d), _LS_ROWS, _LS_META)  # same directory, no texture now
+    assert not (d / "maptex.png").exists(), "the old picture is not part of this landscape"
+    assert "type = polygonal" in (d / "landscape.ini").read_text()
+
+
+def test_an_unwritable_destination_is_explained_not_traced(tmp_path, capsys):
+    """A read-only directory is an ordinary thing to hit.
+
+    The round-1 wrap made it a sentence rather than a traceback, and nothing
+    was holding that in place — deleting the wrap left the whole suite green.
+
+    Writing the test moved the fix: the wrap covered only the picture exporters,
+    so plain `terminus export` still traced back on the identical failure. The
+    whole command is wrapped now.
+    """
+    import os
+    import stat
+
+    import pytest
+
+    mask = _picture_mask(tmp_path)
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit, so there is nothing to test")
+    mode = os.stat(tmp_path).st_mode
+    os.chmod(tmp_path, mode & ~stat.S_IWUSR)
+    try:
+        _export_fails(capsys, ["export", mask, "--skysafari"], "could not write the export")
+        # And the plain export, which the first version of the wrap missed.
+        _export_fails(capsys, ["export", mask], "could not write the export")
+    finally:
+        os.chmod(tmp_path, mode)
