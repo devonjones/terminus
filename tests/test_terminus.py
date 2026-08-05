@@ -1447,8 +1447,8 @@ def test_the_departure_threshold_sits_between_model_error_and_real_terrain():
     It used to assert that a drop to 0.55x the modelled sky is "still sky", which
     pinned MIN_DROP_FRAC at a factor of two. Two real columns then landed astride
     that line and neither survived it: az 60 cleared it by 0.004 and was thrown
-    away by the persistence check, and az 190 — a roofline visible by eye, thirty
-    sigma clear of the sky's own scatter — missed it by 0.018 and was never seen.
+    away by the persistence check, and az 190 — a roofline visible by eye, 53.6
+    sigma clear of the sky's own scatter — missed it by 0.019 and was never seen.
     A rule that a genuine roofline fails by one part in fifty is not measuring
     what it claims to.
 

@@ -79,7 +79,7 @@ DEPARTURE_SIGMA = 4.0
 #
 # THIS RETIRES MIN_DROP_FRAC AS THE DETECTOR. That was a factor of two, and two
 # real columns sat astride it: az 60 cleared it by 0.004 and was then discarded
-# by the persistence check, while az 190 missed it by 0.018 and was never seen
+# by the persistence check, while az 190 missed it by 0.019 and was never seen
 # at all. A rule that a genuine roofline fails by one part in fifty is not
 # measuring the thing it claims to measure. MIN_DROP_FRAC is kept only for
 # `mask_lights`-adjacent callers and for compatibility.
