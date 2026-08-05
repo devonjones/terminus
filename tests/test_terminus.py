@@ -3253,7 +3253,7 @@ def test_the_scope_does_not_name_an_obstruction_it_cannot_see():
     assert obstruction_type(0.0, 0.7) == "structure"
 
 
-def test_a_merged_mask_says_which_instrument_named_each_column():
+def test_a_merged_mask_says_which_instrument_named_each_column(tmp_path):
     """One `type` field, two instruments, and they are not equally able.
 
     The photo segments in focus and returns a real semantic class; the scope
@@ -3263,7 +3263,7 @@ def test_a_merged_mask_says_which_instrument_named_each_column():
     """
     from terminus.export import load_columns, write_mask
 
-    out = "/tmp/claude-1000/-mnt-c-Users-devon-Documents-M110/db3f057c-e8ed-46fc-94fb-b5c9cdaf72d8/scratchpad/src.yaml"
+    out = str(tmp_path / "src.yaml")
     write_mask(
         out,
         {
@@ -3278,4 +3278,5 @@ def test_a_merged_mask_says_which_instrument_named_each_column():
     assert cols[0]["type_source"] == "photo"
     assert cols[90]["type_source"] == "scope"
     assert cols[180].get("type_source") is None, "no type means no source to claim"
-    assert any("type_source" in ln for ln in open(out) if ln.startswith("#")), "and it is explained"
+    header = [ln for ln in (tmp_path / "src.yaml").read_text().splitlines() if ln.startswith("#")]
+    assert any("type_source" in ln for ln in header), "and the file explains what it means"
