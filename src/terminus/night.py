@@ -44,6 +44,25 @@ import numpy as np
 LAMP_FACTOR = 1.6  # brighter than the local sky model by this much is a light
 MIN_DROP_FRAC = 0.5  # departure from the sky model that counts as terrain
 SKY_FLOOR_FRAC = 0.5  # top of column must reach this fraction of the open-sky reference
+# ...and must not EXCEED this multiple of it. The floor test was one-sided, and
+# only ever caught a column too DIM at the top. A column too BRIGHT at the top is
+# just as certainly not sky: a floodlit wall, a lit sign, a neighbour's security
+# light filling the frame. Such a column reads 90 counts over dark ground, passes
+# every check that asks "is there sky up here", and gets a confident horizon
+# reported at the wall's own bottom edge — optimistic, which is the unsafe
+# direction.
+#
+# Three, from this module's own measurement rather than taste: skyglow brightens
+# by a factor of 3.2 from altitude 60 to 12, and that is the whole vertical range
+# a column spans. The reference is taken near the zenith, so a legitimate column
+# top sits between one and about two times it. Four and a bit, which the lit wall
+# reads, is not sky.
+#
+# WHAT THIS STILL CANNOT DO, stated because the gap is real: a lit surface within
+# three times the sky reference is indistinguishable from sky by brightness
+# alone. Separating those needs colour or texture, which this module does not
+# have — see terminus-37 for daylight sharpness, and the scope's own frames.
+SKY_CEIL_FACTOR = 3.0
 # Growing the sky region stops at the first sample that is not on the line, and
 # that test is NOT the detection threshold. MIN_DROP_FRAC is a factor of two,
 # deliberately decisive, and using it to grow let terrain in: az 190 drops from
@@ -186,11 +205,23 @@ def sky_model(profile, min_samples=4):
     prof = sorted(profile, key=lambda t: -t[0])
     if len(prof) < min_samples:
         return None, 0
-    kept = list(range(min_samples))
-    model = fit_skyglow(prof[:min_samples], top_frac=1.0)
+    # SEED WITHOUT LETTING ONE GLINT DECIDE. A satellite, an aircraft light or a
+    # bright planet in the topmost sample is enough to make the seed model
+    # nonsense, and `is_skyglow` then discards a column that was otherwise
+    # perfectly measurable — a non-result rather than a wrong one, but avoidable.
+    # So the seed is drawn from the top of the column excluding anything far
+    # brighter than its neighbours, using the same LAMP_FACTOR that marks a lamp
+    # everywhere else in this module.
+    window = prof[: min(len(prof), 2 * min_samples)]
+    level = float(np.median([lum for _, lum in window]))
+    seed = [i for i, (_, lum) in enumerate(window) if lum <= LAMP_FACTOR * level]
+    if len(seed) < min_samples:
+        seed = list(range(min_samples))  # nothing to choose between; take the top
+    kept = seed[:min_samples]
+    model = fit_skyglow([prof[i] for i in kept], top_frac=1.0)
     if model is None:
         return None, 0
-    for i in range(min_samples, len(prof)):
+    for i in range(kept[-1] + 1, len(prof)):
         alt, lum = prof[i]
         pred = model["slope"] * alt + model["intercept"]
         if pred <= 0:
@@ -266,6 +297,13 @@ def find_horizon(profile, sky_ref=None, min_drop_frac=MIN_DROP_FRAC):
     if sky_ref and top < SKY_FLOOR_FRAC * sky_ref:
         return None, {
             "reason": "blocked above the ceiling",
+            "top": top,
+            "sky_ref": float(sky_ref),
+            "model": model,
+        }
+    if sky_ref and top > SKY_CEIL_FACTOR * sky_ref:
+        return None, {
+            "reason": "the top of this column is lit, not sky: it outshines the open sky",
             "top": top,
             "sky_ref": float(sky_ref),
             "model": model,

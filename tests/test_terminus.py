@@ -4707,3 +4707,52 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
         prof = [(float(al), 60.0 * (al / 60.0) ** power) for al in np.arange(60, 9.9, -2)]
         alt, detail = find_horizon(prof)
         assert alt is None, f"dimming as alt^{power} produced a horizon at {alt}"
+
+
+def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
+    """The sky-floor test was one-sided and only caught a column too DIM on top.
+
+    A column too BRIGHT on top is just as certainly not sky: a floodlit wall, a
+    lit sign, a neighbour's security light filling the frame. Such a column
+    passes every check that asks "is there sky up here" and gets a confident
+    horizon reported at the wall's own bottom edge — which is optimistic, and
+    optimistic is the direction that starts an imaging run into a building.
+    """
+    from terminus.night import find_horizon
+
+    lit = [(a, 90.0) for a in (30, 29, 28, 27, 26, 25)] + [(a, 5.0) for a in range(24, 10, -1)]
+    alt, detail = find_horizon(lit, sky_ref=22.0)
+    assert alt is None, f"90 counts against a 22-count sky is a lit surface, got {alt}"
+    assert "lit, not sky" in detail["reason"]
+
+    # The floor test still works in the other direction, and an ordinary column
+    # whose top is legitimately brighter than a zenith reference still passes —
+    # skyglow does brighten toward the horizon, by a factor of about three.
+    ordinary = [(a, 30.0 + 0.4 * (60 - a)) for a in range(60, 20, -2)] + [
+        (a, 6.0) for a in range(18, 8, -2)
+    ]
+    alt, _ = find_horizon(ordinary, sky_ref=22.0)
+    assert alt is not None, "a column 1.4x the reference at its top is ordinary sky"
+
+
+def test_one_glint_at_the_top_does_not_discard_the_whole_column():
+    """A satellite, an aircraft light or a bright planet in the topmost sample.
+
+    The seed was the top four samples unconditionally, so one transient made the
+    seed model nonsense and `is_skyglow` then threw away a column that was
+    otherwise perfectly measurable. A non-result rather than a wrong one, but
+    the loss is avoidable and the doctrine is that execution should be robust.
+    """
+    from terminus.night import find_horizon
+
+    prof = _real_column("az60_coarse")
+    clean = find_horizon(prof)[0]
+    assert clean == 37.0, "precondition: the clean column still resolves"
+
+    for factor in (3.0, 5.0, 10.0):
+        glinted = [(prof[0][0], prof[0][1] * factor)] + prof[1:]
+        alt, detail = find_horizon(glinted)
+        assert alt == clean, (
+            f"a {factor}x glint in the top sample changed the answer to {alt} "
+            f"({detail['reason']})"
+        )
