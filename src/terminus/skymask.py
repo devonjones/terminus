@@ -46,6 +46,8 @@ fraction above the horizon line" is the phrasing both fields read without
 objection.
 """
 
+import warnings
+
 import numpy as np
 
 SKY_CLASS_ADE20K = 2
@@ -205,12 +207,44 @@ def segment_sky(image, tile=True):
 
 
 def sky_mask(image, backend="auto", **kw):
-    """Sky mask for a PIL image. backend: 'segment', 'heuristic', or 'auto'."""
+    """Sky mask for a PIL image. backend: 'segment', 'heuristic', or 'auto'.
+
+    'auto' promises to DEGRADE, so it degrades on a failure to RUN and not only
+    on a failure to import. `available()` can answer whether the libraries are
+    present and nothing more: the model still has to be built, and
+    `from_pretrained` reaches for the network or a local cache and raises on a
+    fresh or offline machine that has all three libraries installed. Probing
+    imports alone left auto crashing on precisely the host it exists to serve.
+
+    'segment' asked for EXPLICITLY still fails loudly. A caller naming the
+    backend wants that backend, and quietly handing back a measurably worse mask
+    is the failure this project keeps guarding against.
+
+    Pass `report=True` for `(mask, backend_used)`, so a caller can record which
+    one actually ran. A run that fell back produces a different horizon, and the
+    manifest should say so rather than leave it to be inferred.
+    """
+    report = kw.pop("report", False)
+    seg_kw = {k: v for k, v in kw.items() if k == "tile"}
+    heur_kw = {k: v for k, v in kw.items() if k != "tile"}
     if backend == "auto":
-        backend = "segment" if available("segment") else "heuristic"
+        if available("segment"):
+            try:
+                mask = segment_sky(image, **seg_kw)
+                return (mask, "segment") if report else mask
+            except Exception as e:  # absent weights, empty cache, version skew
+                warnings.warn(
+                    f"segmentation could not run ({type(e).__name__}: {e}); falling back "
+                    "to the colour heuristic, which is markedly worse",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        backend = "heuristic"
     if backend == "segment":
-        return segment_sky(image, **{k: v for k, v in kw.items() if k == "tile"})
-    return heuristic_sky(np.asarray(image.convert("RGB")), **kw)
+        mask = segment_sky(image, **seg_kw)
+        return (mask, "segment") if report else mask
+    mask = heuristic_sky(np.asarray(image.convert("RGB")), **heur_kw)
+    return (mask, "heuristic") if report else mask
 
 
 # ---- horizon from a sky mask ---------------------------------------------

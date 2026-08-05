@@ -2658,9 +2658,57 @@ def test_the_segment_backend_needs_all_three_libraries():
         got = eval(_in_clean_interpreter(body))
         assert got is False, f"available('segment') said {got} with {missing} missing"
 
+    # And the other direction, in the same test: with all three importable it
+    # must say True. Without this the test passes against `return False`.
+    present = (
+        "import sys, types\n"
+        "for n in ('torch', 'torchvision', 'transformers'):\n"
+        "    sys.modules[n] = types.ModuleType(n)\n"
+        "from terminus import skymask\n"
+        "print(repr(skymask.available('segment')))\n"
+    )
+    assert eval(_in_clean_interpreter(present)) is True
 
-def test_auto_falls_back_to_the_heuristic_rather_than_crashing(tmp_path):
-    """The auto path exists to degrade, so it must degrade."""
+
+def test_auto_degrades_when_the_model_cannot_be_built(tmp_path):
+    """`available()` cannot promise the model will RUN, only that libs import.
+
+    `from_pretrained` reaches for the network or a local cache and raises on a
+    fresh or offline machine with all three libraries installed. Checking
+    imports alone left auto crashing on precisely the host it exists to serve —
+    the same bug this ticket fixes, one layer deeper.
+
+    Patching `segment_sky` rather than `available` is deliberate: patching
+    `available` proves only that `heuristic_sky` does not crash, and a mutation
+    hardcoding auto to "heuristic" survived that version of this test.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    boom = OSError("we couldn't connect to huggingface.co")
+
+    with (
+        patch.object(skymask, "available", lambda backend="segment": True),
+        patch.object(skymask, "segment_sky", side_effect=boom),
+    ):
+        with pytest.warns(RuntimeWarning, match="falling back"):
+            mask, used = skymask.sky_mask(img, backend="auto", report=True)
+        assert used == "heuristic", "auto must fall back, and say which ran"
+        assert mask.shape == (16, 32)
+
+        # But an EXPLICIT request must still fail loudly rather than degrade.
+        with pytest.raises(OSError):
+            skymask.sky_mask(img, backend="segment")
+
+
+def test_auto_reports_which_backend_actually_ran():
+    """A run that fell back produces a different horizon; the caller must know."""
     from unittest.mock import patch
 
     import numpy as np
@@ -2669,6 +2717,7 @@ def test_auto_falls_back_to_the_heuristic_rather_than_crashing(tmp_path):
     from terminus import skymask
 
     img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
-    with patch.object(skymask, "available", lambda backend="segment": backend == "heuristic"):
-        mask = skymask.sky_mask(img, backend="auto")
-    assert mask.shape == (16, 32), "auto must produce a mask, not raise"
+    with patch.object(skymask, "available", lambda backend="segment": False):
+        mask, used = skymask.sky_mask(img, backend="auto", report=True)
+    assert used == "heuristic"
+    assert skymask.sky_mask(img, backend="auto").shape == mask.shape, "report is opt-in"
