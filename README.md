@@ -2,8 +2,8 @@
 
 *terminus* (Latin: boundary, limit) measures the **local horizon** at your
 observing site — the real skyline of rooftops, fences, and trees that decides
-what you can actually image — and exports it for planning tools like **N.I.N.A.**
-and **Stellarium**, or queries it directly as a library so a scheduler can ask
+what you can actually image — and exports it for planning tools like **N.I.N.A.**,
+**Stellarium** and **Sky Safari**, or queries it directly as a library so a scheduler can ask
 *"is this target clear of my horizon right now?"*
 
 The horizon comes from **photographs**. A [Seestar S50](https://www.seestar.com/)
@@ -177,7 +177,29 @@ terminus point 75 45               # slew to az 75 / alt 45 (Sun-guarded), verif
 terminus classify                  # sky / vegetation / structure at current pointing
 terminus sweep                     # full sweep -> horizon_mask.yaml + .hrz + .txt
 terminus export horizon_mask.yaml  # re-export a mask without re-sweeping
+
+# pictures, not just numbers: a Sky Safari panorama and a Stellarium landscape
+terminus export horizon_mask.yaml --skysafari --landscape
+# ...and with the panorama itself as the texture, gaps shown as sky
+terminus export horizon_mask.yaml --landscape \
+    --texture pano.png --coverage pano.coverage.npy
 ```
+
+`--skysafari` writes a 2048x1024 RGBA PNG in Sky Safari's panorama convention —
+north at the left edge, zenith at the top, and **alpha as the horizon**, since
+that is what the app actually reads. Load it under *Settings -> Horizon & Sky ->
+Show Horizon & Sky as Panoramic Image*.
+
+`--landscape` writes a Stellarium landscape directory: `landscape.ini`,
+`horizon.txt` and, with `--texture`, `maptex.png`. Without imagery it is
+`type=polygonal`, because declaring a photograph that does not exist would be a
+lie; with imagery it is `type=spherical` and ships the measured polygon
+alongside the picture so the numbers and the image agree. Copy the directory
+into Stellarium's `landscapes/` folder.
+
+Where the panorama has no coverage the pixel is transparent, so the program
+draws sky. A gap in the survey is not black ground, and presenting it as such
+would give the viewer a wall to trust that nobody ever photographed.
 
 Review the `*_frames/` images, correct any misjudged rows in the mask by hand,
 then `terminus export` again.

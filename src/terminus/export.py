@@ -26,6 +26,10 @@ Exports:
   N.I.N.A.  .hrz   -- "az alt" per line, ascending azimuth, '#' comments
   Stellarium .txt  -- same content (referenced from a landscape.ini)
 Both conventions: azimuth 0 = true north, increasing toward east; altitude deg.
+
+The picture exporters — a Sky Safari panorama and a complete Stellarium
+landscape — live in `landscape.py`. They route through `_ascending_pairs` here,
+so the image and the numbers beside it are one horizon rather than two.
 """
 
 import datetime

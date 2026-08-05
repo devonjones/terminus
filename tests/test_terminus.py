@@ -3533,3 +3533,164 @@ def test_a_real_crossing_clears_the_photo_s_lower_bound_flag(tmp_path):
     assert cols[90]["gap_fraction"] == 0.4, "how gappy the canopy is did not change"
     assert cols[90]["uncertainty"] == 4.2, "nor how far it moves"
     assert cols[90]["type"] == "tree", "and the photo still knows what it is"
+
+
+# ---- picture exporters (terminus-1, terminus-26) --------------------------
+_LS_ROWS = [(0, 10.0, "structure"), (90, 30.0, "structure"), (180, 5.0, "structure"),
+            (270, 20.0, "structure")]  # fmt: skip
+_LS_META = {"lat": 39.79, "lon": -104.89, "measured": "2026-08-05 21:00"}
+
+
+def test_the_panorama_puts_north_at_the_left_edge_and_zenith_at_the_top():
+    """Sky Safari's convention, and getting it wrong is silently plausible.
+
+    North at the LEFT edge increasing east, zenith +90 at the TOP, horizon 0 at
+    the middle, nadir -90 at the bottom. A picture with the axes flipped still
+    looks like a horizon — it is just somebody else's.
+    """
+    from terminus.landscape import render
+
+    rgba = render(_LS_ROWS, (360, 180), tree_buffer=0)
+    alpha = rgba[..., 3]
+    # Column 90 has the HIGHEST horizon, so it must have the most opaque rows;
+    # column 180 the lowest, so the fewest. If x ran the other way these swap.
+    assert alpha[:, 90].sum() > alpha[:, 0].sum() > alpha[:, 180].sum()
+    # Zenith is transparent everywhere and nadir is opaque everywhere. If y ran
+    # the other way, both flip.
+    assert alpha[0].max() == 0, "nothing is opaque at the zenith"
+    assert alpha[-1].min() == 255, "everything is opaque at the nadir"
+    # And the boundary in a column sits at that column's measured altitude.
+    ground_rows = np.nonzero(alpha[:, 90])[0]
+    top_alt = 90.0 - (ground_rows[0] + 0.5) / 180 * 180.0
+    assert abs(top_alt - 30.0) < 1.0, f"az 90 boundary at {top_alt}, measured 30"
+
+
+def test_the_sky_is_transparent_because_alpha_is_the_horizon():
+    """Neither program reads a drawn line; opacity is the whole mechanism.
+
+    A silhouette painted onto an opaque background would import as a completely
+    blocked sky, which is a plausible thing to produce and a total failure.
+    """
+    from terminus.landscape import render
+
+    rgba = render(_LS_ROWS, (64, 32), tree_buffer=0)
+    assert rgba[..., 3].min() == 0, "some pixel must be fully transparent"
+    assert rgba[..., 3].max() == 255, "and some fully opaque"
+    assert set(np.unique(rgba[..., 3])) == {0, 255}, "no partial alpha to misread"
+
+
+def test_uncovered_panorama_shows_as_sky_not_as_invented_ground():
+    """The gap in the data must not become black terrain.
+
+    A phone panorama does not fill the full sphere. Where the mosaic has no
+    frames the pixel is zero, and drawing it opaque presents a hole in the
+    survey as a wall the viewer has no reason to doubt.
+    """
+    from terminus.landscape import render
+
+    texture = np.full((32, 64, 3), 90, np.uint8)
+    coverage = np.ones((32, 64))
+    coverage[:, 10:20] = 0  # the phone never pointed here
+    rgba = render(_LS_ROWS, (64, 32), texture=texture, coverage=coverage, tree_buffer=0)
+    assert rgba[:, 10:20, 3].max() == 0, "no coverage means no ground"
+    assert rgba[:, 30, 3].max() == 255, "covered columns still render ground"
+
+
+def test_the_picture_and_the_numbers_are_the_same_horizon(tmp_path):
+    """A landscape whose polygon disagrees with its texture is worse than neither.
+
+    Both must go through the same buffered pairs, so the vegetation margin the
+    .hrz applies is the margin the picture shows.
+    """
+    from terminus.export import TREE_BUFFER_DEG
+    from terminus.landscape import horizon_altitudes, write_landscape
+
+    rows = [(0, 10.0, "tree"), (90, 30.0, "structure"), (180, 5.0, "tree"), (270, 20.0, "tree")]
+    write_landscape(str(tmp_path / "ls"), rows, _LS_META)
+    txt = (tmp_path / "ls" / "horizon.txt").read_text()
+    pairs = {float(a): float(b) for a, b in (ln.split() for ln in txt.splitlines() if ln.strip())}
+    assert pairs[0.0] == 10.0 + TREE_BUFFER_DEG, "the polygon carries the vegetation margin"
+    alts = horizon_altitudes(rows, 360)
+    assert abs(alts[0] - pairs[0.0]) < 1e-6, "and the picture is drawn from the same numbers"
+
+
+def test_a_scope_only_mask_ships_a_polygonal_landscape_not_a_fake_photo(tmp_path):
+    """Without imagery there is nothing honest to put in maptex.
+
+    Declaring type=spherical with a rendered silhouette would claim a photograph
+    that does not exist.
+    """
+    from terminus.landscape import write_landscape
+
+    write_landscape(str(tmp_path / "ls"), _LS_ROWS, _LS_META)
+    ini = (tmp_path / "ls" / "landscape.ini").read_text()
+    assert "type = polygonal" in ini
+    assert "maptex" not in ini, "no texture was supplied, so none may be declared"
+    assert not (tmp_path / "ls" / "maptex.png").exists()
+    assert "polygonal_horizon_list = horizon.txt" in ini
+    assert "azDeg_altDeg" in ini, "the mode our .txt is actually written in"
+
+
+def test_both_stellarium_rotations_stay_zero_because_the_texture_is_pre_rotated(tmp_path):
+    """`angle_rotatez` turns the image; `polygonal_angle_rotatez` turns the polygon.
+
+    Stellarium's own `zero` landscape comments on why they are separate. Setting
+    either would turn the numbers away from the picture and destroy the property
+    that makes the package worth shipping — that a wrong yaw is visible as the
+    observer's own house in the wrong place. So the texture is rotated into true
+    azimuth here and both keys ship as zero.
+    """
+    from terminus.landscape import _rotate_east, write_landscape
+
+    texture = np.zeros((32, 64, 3), np.uint8)
+    texture[:, :8] = 200  # a bright marker at the panorama's own azimuth 0
+    write_landscape(str(tmp_path / "ls"), _LS_ROWS, dict(_LS_META, yaw=90.0), texture=texture)
+    ini = (tmp_path / "ls" / "landscape.ini").read_text()
+    assert "type = spherical" in ini
+    assert "angle_rotatez = 0" in ini and "polygonal_angle_rotatez = 0" in ini
+    assert "maptex_top = 90" in ini and "maptex_bottom = -90" in ini
+    # A 90 degree yaw moves the marker a quarter of the way round, westward in
+    # image space, because the panorama's 0 IS true 90.
+    rolled = _rotate_east(texture, 90.0)
+    assert rolled[0, 0, 0] == 0, "the marker no longer sits at true north"
+    assert rolled[0, 64 - 16, 0] == 200, "it sits three quarters across, at true 270"
+
+
+def test_a_panorama_of_an_unoriented_mask_is_refused(tmp_path):
+    """A PNG has nowhere to carry a warning, so it cannot be allowed to lie.
+
+    The text exporters at least ship a comment saying the azimuth is not true
+    north. A picture just shows the wrong horizon.
+    """
+    import pytest
+
+    from terminus.export import UnorientedMask
+    from terminus.landscape import to_skysafari_png, write_landscape
+
+    with pytest.raises(UnorientedMask):
+        to_skysafari_png(_LS_ROWS, str(tmp_path / "p.png"), {"oriented": False})
+    with pytest.raises(UnorientedMask):
+        write_landscape(str(tmp_path / "ls"), _LS_ROWS, {"oriented": False})
+
+
+def test_export_writes_the_pictures_only_when_asked(tmp_path):
+    """The default export is unchanged; the pictures are opt-in."""
+    from terminus.cli import main
+    from terminus.export import write_mask
+
+    mask = tmp_path / "h.yaml"
+    write_mask(str(mask), {az: (alt, t) for az, alt, t in _LS_ROWS}, [], _LS_META)
+    main(["export", str(mask)])
+    assert not (tmp_path / "h.skysafari.png").exists()
+    assert not (tmp_path / "h_landscape").exists()
+
+    main(["export", str(mask), "--skysafari", "--landscape"])
+    png = tmp_path / "h.skysafari.png"
+    assert png.exists()
+    from PIL import Image
+
+    img = Image.open(png)
+    assert img.mode == "RGBA", "Sky Safari reads the alpha channel"
+    assert img.size == (2048, 1024), "the vendor's documented panorama size"
+    assert (tmp_path / "h_landscape" / "landscape.ini").exists()
+    assert (tmp_path / "h_landscape" / "horizon.txt").exists()

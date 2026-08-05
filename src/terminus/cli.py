@@ -398,12 +398,62 @@ def cmd_sweep(sc, cfg, args):
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
-    hrz, txt = export_all(
-        args.mask,
-        os.path.splitext(args.mask)[0],
-        allow_unoriented=getattr(args, "allow_unoriented", False),
-    )
+    allow = getattr(args, "allow_unoriented", False)
+    base = os.path.splitext(args.mask)[0]
+    hrz, txt = export_all(args.mask, base, allow_unoriented=allow)
     print(f"wrote {hrz}\nwrote {txt}")
+    if not (args.skysafari or args.landscape):
+        return
+
+    from .export import load_mask
+    from .landscape import to_skysafari_png, write_landscape
+
+    meta, rows = load_mask(args.mask)
+    texture, coverage = _texture(args)
+    if args.skysafari:
+        png = to_skysafari_png(
+            rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
+            allow_unoriented=allow,
+        )  # fmt: skip
+        print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
+    if args.landscape:
+        d = write_landscape(
+            base + "_landscape", rows, meta, name=os.path.basename(base),
+            texture=texture, coverage=coverage, allow_unoriented=allow,
+        )  # fmt: skip
+        kind = "spherical" if texture is not None else "polygonal"
+        print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
+
+
+def _texture(args):
+    """The mosaic panorama and its coverage, or (None, None) for a silhouette.
+
+    Coverage is optional but strongly wanted with a texture: without it every
+    pixel below the horizon is drawn opaque, including the parts of the canvas
+    the phone never photographed, which turns a gap in the data into black
+    ground the viewer has no reason to doubt.
+    """
+    if not args.texture:
+        return None, None
+    import numpy as np
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    texture = np.asarray(Image.open(args.texture).convert("RGB"))
+    if not args.coverage:
+        print(
+            "warning: --texture without --coverage; uncovered sky will be drawn "
+            "as ground. Pass the mosaic's .coverage.npy to show it as a gap.",
+            file=sys.stderr,
+        )
+        return texture, None
+    coverage = np.load(args.coverage)
+    if coverage.shape != texture.shape[:2]:
+        raise SeestarError(
+            f"coverage {coverage.shape} does not match texture {texture.shape[:2]}; "
+            "they must come from the same mosaic run"
+        )
+    return texture, coverage
 
 
 # ---- offline photo pipeline -----------------------------------------------
@@ -600,6 +650,12 @@ def main(argv=None):
     sw.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("export")
     ex.add_argument("mask")
+    ex.add_argument("--skysafari", action="store_true", help="also write a Sky Safari panorama PNG")
+    ex.add_argument(
+        "--landscape", action="store_true", help="also write a Stellarium landscape directory"
+    )
+    ex.add_argument("--texture", help="equirectangular panorama (the mosaic PNG) to draw")
+    ex.add_argument("--coverage", help="the mosaic's .coverage.npy, so gaps render as sky")
     ex.add_argument(
         "--allow-unoriented",
         action="store_true",
