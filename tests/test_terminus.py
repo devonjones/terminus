@@ -1985,6 +1985,14 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
         "clipped" in ln or "gap_fraction" in ln for ln in head
     ), "a scope mask must not explain fields it does not carry"
     assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
+    # The count is still asserted. Dropping it for substring checks alone lost
+    # the ability to catch unrelated header bloat, which is what this test was
+    # originally for — a header that grows quietly is how the photo-field lines
+    # ended up on scope masks in the first place. Adding a universal note is
+    # legitimate and should require deliberately updating this number.
+    # 8 = 3 original + 4 position note + 1 "skipped azimuths", which this
+    # fixture triggers by passing [180].
+    assert len(head) == 8, f"header changed size; update deliberately, got {len(head)}"
 
     rich = tmp_path / "photo.yaml"
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
@@ -2837,7 +2845,7 @@ def test_every_mask_and_export_says_the_horizon_is_position_specific(tmp_path):
     hrz, txt = export_all(str(p), str(tmp_path / "out"))
     hrz_text = open(hrz).read()
     assert "Measured from one spot" in hrz_text
-    assert "moves a few metres" in hrz_text
+    assert "toward or away" in hrz_text.lower(), "the .hrz must name the direction that matters"
 
     # Stellarium stays comment-free, which the format requires.
     assert all(not ln.startswith("#") for ln in open(txt).read().splitlines())

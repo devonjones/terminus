@@ -91,18 +91,24 @@ as a hint, not a measurement.
 - A **`Horizon`** class for planners: `altitude_at(az)`, `is_above(az, alt)`,
   `is_visible(ra, dec, sky)`.
 
-**The horizon is specific to where the tripod stood**, and how specific depends
-entirely on distance:
+**The horizon is specific to where the tripod stood**, and what matters most is
+moving *toward or away from* a near obstruction, not sideways past it:
 
-| obstruction | move 2 m sideways | move 2 m closer |
-|---|---|---|
-| 2 m fence at 5 m | 1.4° | **11.9°** |
-| 100 m ridge at 2 km | ~0° | 0.003° |
+| moving 2 m, against a 2 m fence 5 m away | change |
+|---|---|
+| **toward or away** | **11.9°** |
+| along the fence (perpendicular distance unchanged) | 0° |
+| past a narrow obstruction — a post, a chimney | 1.4° |
 
-So a distant skyline does not care where you stand and a near one cares a great
-deal — and the error is largest exactly where the horizon is highest, because
-the tall obstructions are the near ones. Measure from where you observe, and
-re-measure if you move. This is geometry rather than something measured here.
+A 100 m ridge 2 km out moves 0.003° for the same 2 m, so distance is the whole
+story. The error is largest exactly where the horizon is highest, because the
+tall obstructions are the near ones. Measure from where you observe, and
+re-measure if you move — especially if you move nearer or further, which is the
+case that bites.
+
+This is geometry, not something measured here. Note also that the mask and the
+`.hrz` carry this warning in their headers but the Stellarium `.txt` cannot:
+that format forbids comments.
 
 Anything classified as vegetation is exported with a **3° safety margin** added,
 applied at a single choke point every exporter routes through. A tree has gaps

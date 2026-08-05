@@ -70,9 +70,10 @@ def write_mask(path, mask, skipped, meta):
             "# !! orientation before any planner consumes this."
         ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
-        "# POSITION-SPECIFIC: this is the horizon from where the tripod stood. A",
-        "#   near obstruction moves by degrees for a few metres of observer",
-        "#   displacement; a distant ridge does not. Re-measure if you move.",
+        "# POSITION-SPECIFIC: the horizon from where the tripod stood. Moving a",
+        "#   couple of metres TOWARD OR AWAY from a near obstruction shifts it by",
+        "#   degrees (a 2 m fence at 5 m: 11.9); moving along it, barely at all. A",
+        "#   distant ridge does not care. Re-measure if you move nearer or further.",
     ]
     # Only explain the photo-derived fields when the file actually carries them,
     # so a scope-measured mask is byte-for-byte what it always was.
@@ -186,8 +187,9 @@ def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=F
     pairs = _ascending_pairs(rows, tree_buffer)
     out = [
         "# terminus horizon for N.I.N.A. (az alt), true-north azimuth.",
-        "# Measured from one spot. A near obstruction shifts by degrees if the",
-        "# observer moves a few metres; a distant ridge barely moves.",
+        "# Measured from one spot. Moving toward or away from a NEAR obstruction",
+        "# shifts it by degrees (2 m fence at 5 m, 2 m closer: 11.9); moving along",
+        "# it barely matters, and a distant ridge does not care at all.",
     ]
     if tree_buffer:
         out.append(f"# vegetation columns raised {tree_buffer:g} deg (seasonal, gappy)")
