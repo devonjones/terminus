@@ -40,6 +40,15 @@ def photo_sample(rows):
     point, so it has to answer between the mask's columns and it has to be
     continuous at 0/360 — a discontinuity there would put a false cliff at north
     and drag the yaw toward it.
+
+    A PARTIAL MASK IS BRIDGED, NOT REFUSED, and the bridge is not a measurement.
+    A mask covering az 70-250 interpolates a straight line across the 110 degrees
+    nobody photographed, because `np.interp` cannot distinguish a gap from a flat
+    stretch. That is deliberate — a partial sweep is a normal intermediate state
+    and the fit only ever reads the sample AT measured columns, so the invented
+    stretch is not what the yaw is solved against. It becomes wrong only if a
+    fiducial lands inside the gap, which is the caller's business to avoid; the
+    same bridging is what `Horizon` has always done.
     """
     pts = sorted((float(az), float(alt)) for az, alt, *_ in rows)
     if not pts:

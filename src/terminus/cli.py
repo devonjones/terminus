@@ -652,6 +652,18 @@ def _scope_measure(sc, cfg, args):
         return {"alt": alt, "snr": None}, sw["alt_max"], args.uncertainty
 
     def reachable(az):
+        """Is this column worth PLANNING for? Endpoint geometry, not the slew.
+
+        Deliberately the weaker `column_touches_sun` rather than sweep's
+        path-aware `reachable_now`. This predicate only decides which candidates
+        the D-optimality criterion gets to choose between, and the real slew is
+        still refused by `Pointer.point_to`, which checks every waypoint. Using
+        the path-aware test here would additionally depend on where the tube
+        currently IS, so the candidate set would change with the order columns
+        happened to be measured in — a planner whose answer depends on its own
+        history is harder to reason about than one that occasionally proposes a
+        column the mount then declines.
+        """
         return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
 
     def should_stop():
