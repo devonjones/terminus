@@ -54,6 +54,7 @@ from .export import (
     export_all,
     load_mask,
     to_nina_hrz,
+    to_pvsyst_hor,
     to_stellarium_txt,
     write_mask,
 )
@@ -115,6 +116,7 @@ __all__ = [
     "load_mask",
     "render",
     "to_nina_hrz",
+    "to_pvsyst_hor",
     "to_skysafari_png",
     "to_stellarium_txt",
     "load_config",

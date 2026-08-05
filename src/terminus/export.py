@@ -25,6 +25,7 @@ a different statement from `open` and must not be read as one.
 Exports:
   N.I.N.A.  .hrz   -- "az alt" per line, ascending azimuth, '#' comments
   Stellarium .txt  -- same content (referenced from a landscape.ini)
+  PVsyst   .HOR    -- "az height" per line, free-text comment header
 Both conventions: azimuth 0 = true north, increasing toward east; altitude deg.
 
 The picture exporters — a Sky Safari panorama and a complete Stellarium
@@ -33,6 +34,7 @@ so the image and the numbers beside it are one horizon rather than two.
 """
 
 import datetime
+import math
 
 import yaml
 
@@ -216,6 +218,20 @@ def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
     pairs = [(az, alt) for az, alt, _ in rows]
     if not pairs:
         raise ValueError("mask has no horizon points")
+    # Checked here because this is where every exporter passes. A hand-edited
+    # `alt: nan` loads without complaint — `float("nan")` is a valid float — and
+    # then each format writes it out in its own way for someone else's parser to
+    # mishandle. PVsyst is the sharp case: it treats any line containing text as
+    # a comment, so `180 nan` is silently DROPPED and the profile comes back one
+    # column short with nothing said. Refusing here is the difference between an
+    # error and a quietly incomplete horizon.
+    bad = [az for az, alt in pairs if not math.isfinite(alt)]
+    if bad:
+        raise MaskError(
+            f"columns {bad} have a non-finite altitude. A horizon file is consumed by "
+            "other software that will either reject it or, worse, drop the column and "
+            "carry on. Fix or remove those columns in the mask."
+        )
     if pairs[0][0] != 0:
         pairs.insert(0, (0, pairs[0][1]))
     if pairs[-1][0] != 360:
@@ -252,6 +268,51 @@ def to_stellarium_txt(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unorie
     # this — two of the three call sites the finding had named.
     require_oriented(meta, allow_unoriented)
     return "\n".join(f"{az} {alt:g}" for az, alt in _ascending_pairs(rows, tree_buffer)) + "\n"
+
+
+def to_pvsyst_hor(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=False):
+    """Horizon profile for PVsyst and other solar-siting tools (.HOR).
+
+    An honest nod as much as a feature: the solar industry was doing this
+    commercially twenty years before this repo existed. The Solmetric SunEye
+    210 — calibrated fisheye, compass, tilt sensor, GPS — has produced horizon
+    altitude per degree of azimuth and exported it as .HOR since the 2000s. If
+    terminus can hand a mask to that ecosystem it costs a dozen lines, and
+    refusing to would be pretending the field started here.
+
+    FORMAT, from PVsyst's own import documentation: text or CSV, one line per
+    point, azimuth and height in degrees, columns separated by comma, semicolon,
+    tab or space. "All lines containing text are considered comment lines", so
+    the header needs no marker character — and a comment carrying latitude and
+    longitude is read as the profile's metadata rather than discarded.
+
+    AZIMUTH IS THE THING TO GET RIGHT, and it is not fixed by the format.
+    PVsyst's import dialog asks for the rotation direction and the north azimuth
+    angle, because its own internal convention is not ours. This writes OUR
+    convention — 0 = true north, increasing clockwise toward east — and says so
+    in the header, so the person setting that dialog has the answer in front of
+    them instead of guessing and getting a mirrored horizon that still looks
+    plausible.
+    """
+    require_oriented(meta, allow_unoriented)
+    pairs = _ascending_pairs(rows, tree_buffer)
+    out = [
+        "Horizon profile measured with terminus.",
+        "Azimuth 0 = true north, increasing clockwise toward east; height in degrees.",
+        "On import set direction of rotation Clockwise and north azimuth angle 0.",
+    ]
+    if meta and meta.get("lat") is not None and meta.get("lon") is not None:
+        # PVsyst reads a latitude/longitude comment as the profile's metadata.
+        out.append(f"Latitude {meta['lat']}, Longitude {meta['lon']}")
+    if tree_buffer:
+        out.append(f"Vegetation columns raised {tree_buffer:g} degrees (seasonal, gappy).")
+    # Fixed decimals, never %g. `format(1e-05, "g")` is "1e-05", which contains
+    # a letter, which makes it a COMMENT to PVsyst rather than a malformed
+    # number — the column vanishes instead of erroring. Two places rely on this:
+    # `_ascending_pairs` refuses non-finite altitudes, and this refuses
+    # scientific notation for the finite ones.
+    out += [f"{az} {alt:.2f}" for az, alt in pairs]
+    return "\n".join(out) + "\n"
 
 
 class MaskError(ValueError):

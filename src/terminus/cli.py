@@ -414,8 +414,18 @@ def cmd_export(sc, cfg, args):  # sc unused; export is offline
 
 
 def _export(args, base, allow):
+    from .export import load_mask
+
     hrz, txt = export_all(args.mask, base, allow_unoriented=allow)
     print(f"wrote {hrz}\nwrote {txt}")
+    if args.pvsyst:
+        from .export import to_pvsyst_hor
+
+        meta, rows = load_mask(args.mask)
+        hor = base + ".HOR"
+        with open(hor, "w") as f:
+            f.write(to_pvsyst_hor(rows, meta, allow_unoriented=allow))
+        print(f"wrote {hor} (set rotation Clockwise, north azimuth 0 on import)")
     if not (args.skysafari or args.landscape):
         # Checked here rather than in `_texture`, which this return would skip
         # past. Silently ignoring --texture is the bad outcome: the person
@@ -428,7 +438,6 @@ def _export(args, base, allow):
             )
         return
 
-    from .export import load_mask
     from .landscape import to_skysafari_png, write_landscape
 
     meta, rows = load_mask(args.mask)
@@ -688,6 +697,7 @@ def main(argv=None):
     ex = sub.add_parser("export")
     ex.add_argument("mask")
     ex.add_argument("--skysafari", action="store_true", help="also write a Sky Safari panorama PNG")
+    ex.add_argument("--pvsyst", action="store_true", help="also write a PVsyst .HOR solar profile")
     ex.add_argument(
         "--landscape", action="store_true", help="also write a Stellarium landscape directory"
     )
