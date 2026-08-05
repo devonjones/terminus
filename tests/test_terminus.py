@@ -2369,3 +2369,222 @@ def test_truncation_happens_after_filtering_not_before():
     picks = rank_columns([0.0, 180.0], cands, grad, top=3, reachable=ok)
     assert len(picks) == 3, f"asked for 3 feasible columns, got {picks}"
     assert not (set(picks) & blocked), "returned a column the Sun refuses"
+
+
+# ---- type-weighted fiducials (terminus-36) ---------------------------------
+def test_vegetation_and_structure_move_the_fit_by_different_amounts():
+    """The whole point: identical SNR and identical error must NOT count equally.
+
+    SNR says how well an edge was DETECTED; type says how well the thing
+    detected STAYS PUT between the photograph and the measurement. A crisp
+    canopy edge scores excellently on the first and badly on the second, and
+    before this the fit trusted it exactly as much as a roofline.
+
+    Two otherwise identical fiducials carry the same wrong altitude. The one
+    labelled vegetation must drag the solved yaw less far than the one labelled
+    structure.
+    """
+    from terminus.orient import Fiducial, fit
+    from terminus.plan import as_fiducial
+
+    truth = 40.0
+    good = _place(_skyline, truth, 0.0, 0.0, 0.0, step=30.0)
+
+    def solve(uncertainty):
+        fids = list(good[:-1])
+        bad_az = good[-1].az
+        # Same SNR, same 8-degree error; only the type prior differs.
+        f = as_fiducial(
+            bad_az,
+            {"alt": good[-1].alt + 8.0, "snr": 8.0},
+            90.0,
+            Fiducial,
+            uncertainty=uncertainty,
+            photo_type="tree" if uncertainty and uncertainty > 2 else "structure",
+        )
+        fids.append(f)
+        return fit(fids, _skyline, yaw_step=1.0, tilt_step=5.0, robust=False)["yaw"]
+
+    pull_structure = abs(((solve(1.0) - truth + 180) % 360) - 180)
+    pull_vegetation = abs(((solve(3.0) - truth + 180) % 360) - 180)
+    assert pull_vegetation < pull_structure, (
+        f"a vegetation column pulled the fit {pull_vegetation:.2f} deg and a structure "
+        f"column {pull_structure:.2f} — the type prior is not reaching the fit"
+    )
+
+
+def test_the_two_type_sources_are_recorded_separately():
+    """Photo and scope can disagree, and the disagreement is the signal.
+
+    Merging them into one field destroys the only evidence that either is
+    wrong, so `Fiducial` keeps both and neither defaults from the other.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    f = as_fiducial(
+        10.0,
+        {"alt": 20.0, "snr": 8.0},
+        60.0,
+        Fiducial,
+        photo_type="tree",
+        scope_type="structure",
+    )
+    assert f.photo_type == "tree" and f.scope_type == "structure"
+
+    only_photo = as_fiducial(10.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, photo_type="tree")
+    assert only_photo.scope_type is None, "an absent scope type must not inherit the photo's"
+
+
+def test_detection_and_movement_are_kept_as_separate_numbers():
+    """SNR and type answer different questions, so they are stored separately.
+
+    `weight` is how well the edge was DETECTED. `sigma` is how far the thing
+    detected may MOVE. Folding the second into the first looks equivalent and is
+    not — see `test_sigma_standardises_the_residual_before_the_robust_loss`.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    canopy = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=3.0)
+    wall = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=1.0)
+    noisy_wall = as_fiducial(0.0, {"alt": 20.0, "snr": 1.0}, 60.0, Fiducial, uncertainty=1.0)
+
+    # Detection quality is identical for the first two; only movement differs.
+    assert canopy.weight == wall.weight == pytest.approx(1.0)
+    assert canopy.sigma == pytest.approx(3.0) and wall.sigma == pytest.approx(1.0)
+    # And a badly detected wall is still badly detected, independently.
+    assert noisy_wall.weight < wall.weight and noisy_wall.sigma == pytest.approx(1.0)
+
+
+def test_sigma_standardises_the_residual_before_the_robust_loss():
+    """Scaling the loss and scaling the residual are NOT the same under Huber.
+
+    `delta` is a threshold on the residual, so a column allowed to move 3
+    degrees must have its residual measured in units of that 3 degrees. The
+    earlier implementation multiplied the finished loss by 1/sigma^2, which is
+    inverse-variance weighting only while residuals stay inside the quadratic
+    core. At r=10, sigma=3, delta=4 the two differ by 36 per cent — precisely
+    the regime, a large residual on a high-sigma vegetation column, that this
+    weighting exists to handle.
+    """
+    from terminus.orient import _huber
+
+    r, sigma, delta = 10.0, 3.0, 4.0
+    standardised = float(_huber(np.array([r / sigma]), delta)[0])
+    scaled_loss = float(_huber(np.array([r]), delta)[0]) / sigma**2
+    assert standardised == pytest.approx(5.5556, abs=1e-3)
+    assert scaled_loss == pytest.approx(3.5556, abs=1e-3)
+    assert standardised > scaled_loss, "the wrong form under-penalises a far-off column"
+
+    # Inside the core they agree exactly, which is why this hid.
+    small = 2.0
+    assert float(_huber(np.array([small / sigma]), delta)[0]) == pytest.approx(
+        float(_huber(np.array([small]), delta)[0]) / sigma**2
+    )
+
+
+def test_a_bound_column_carries_its_sigma_too():
+    """Both bound paths must agree. One hard-coded weight=1.0 and skipped type.
+
+    A column that hit its ceiling and one whose edge landed at the ceiling are
+    the same kind of statement, and were getting sigmas differing by 9x
+    depending only on which branch produced them.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    no_edge = as_fiducial(0.0, None, 60.0, Fiducial, uncertainty=3.0, photo_type="tree")
+    at_ceiling = as_fiducial(
+        0.0, {"alt": 60.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=3.0, photo_type="tree"
+    )
+    assert no_edge.bound and at_ceiling.bound
+    assert no_edge.sigma == at_ceiling.sigma == pytest.approx(3.0)
+    assert no_edge.photo_type == at_ceiling.photo_type == "tree"
+
+
+def test_zero_uncertainty_is_a_value_not_a_missing_one():
+    """`if uncertainty:` read 0.0 as "unknown", silently downgrading it.
+
+    Zero means perfectly certain. It is clamped rather than taken literally,
+    because a sigma of zero is a division by zero dressed as infinite
+    confidence, and nothing has earned that.
+    """
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    certain = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=0.0)
+    unknown = as_fiducial(0.0, {"alt": 20.0, "snr": 8.0}, 60.0, Fiducial, uncertainty=None)
+    assert certain.sigma < unknown.sigma, "0 must not be read as 'no information'"
+    assert certain.sigma > 0.0, "a zero sigma would divide by zero in the fit"
+
+
+def test_an_untyped_column_weighs_exactly_as_before():
+    """No type known must mean no change, or every existing mask shifts."""
+    from terminus.orient import Fiducial
+    from terminus.plan import as_fiducial
+
+    for snr in (1.0, 4.0, 8.0, 20.0):
+        f = as_fiducial(0.0, {"alt": 20.0, "snr": snr}, 60.0, Fiducial)
+        assert f.weight == pytest.approx(min(1.0, snr / 8.0))
+
+
+def test_the_fit_objective_standardises_rather_than_scaling():
+    """Pins the order INSIDE the cost the fit actually minimises.
+
+    The Huber property was tested in isolation, which left the fit free to use
+    the wrong form: reverting `objective` to scale the finished loss by
+    1/sigma^2 passed all 123 tests. The invariant has to be asserted where it is
+    applied, not where it is true in the abstract.
+    """
+    import numpy as np
+
+    from terminus.orient import objective
+
+    r, sigma, delta = np.array([10.0]), np.array([3.0]), 4.0
+    w = np.array([1.0])
+    standardised = objective(r, w, sigma, delta=delta)
+    wrong = float(__import__("terminus.orient", fromlist=["_huber"])._huber(r, delta)[0]) / 9.0
+
+    assert standardised == pytest.approx(5.5556, abs=1e-3)
+    assert wrong == pytest.approx(3.5556, abs=1e-3)
+    assert standardised > wrong, "the fit is under-penalising far-off high-sigma columns"
+
+    # A sigma of 1 must leave the cost exactly as it was before sigma existed.
+    assert objective(r, w, np.array([1.0]), delta=delta) == pytest.approx(
+        float(__import__("terminus.orient", fromlist=["_huber"])._huber(r, delta)[0])
+    )
+
+
+def test_no_column_can_buy_control_of_the_fit_with_a_tiny_sigma():
+    """A sigma floor of epsilon is a numerical guard, not a physical one.
+
+    Standardising divides by sigma, so a vanishing sigma multiplies that
+    column's residual without limit and the solver will sacrifice every other
+    column to satisfy it. Measured at sigma 1e-6: a half-degree residual scored
+    399998 against 0.1 for the alternative. That is the failure this module's
+    own docstring forbids — one bad fiducial tipping the whole sphere.
+
+    The floor is the resolution of the data instead: the mosaic resolves about
+    0.1 degree per column, so nothing may claim to be more certain than that.
+    """
+    import numpy as np
+
+    from terminus.orient import Fiducial, objective
+    from terminus.plan import MIN_SIGMA_DEG, _sigma
+
+    assert _sigma(0.0) == MIN_SIGMA_DEG
+    assert _sigma(1e-9) == MIN_SIGMA_DEG
+    assert MIN_SIGMA_DEG >= 0.05, "a floor this low stops division by zero and nothing else"
+
+    # Four ordinary columns against one hyper-confident one: the confident
+    # column must not be able to outvote them by orders of magnitude.
+    f = Fiducial(0.0, 20.0, sigma=_sigma(0.0))
+    ordinary = np.array([1.0, 1.0, 1.0, 1.0])
+    lone = np.array([0.5])
+    cost_of_ignoring_the_lone_column = objective(lone, np.array([1.0]), np.array([f.sigma]))
+    cost_of_ignoring_four = objective(ordinary, np.ones(4), np.ones(4))
+    assert cost_of_ignoring_the_lone_column < 1e3 * cost_of_ignoring_four, (
+        "one column can still dominate: it scores "
+        f"{cost_of_ignoring_the_lone_column:.1f} against {cost_of_ignoring_four:.1f}"
+    )

@@ -176,7 +176,34 @@ def residual_targets(residuals, top=3, min_abs=3.0):
     return [az for _, az in bad[:top]]
 
 
-def as_fiducial(az, edge, ceiling, Fiducial):
+# No column is more certain than the data it was read from. The photo mosaic
+# resolves about 0.1 degree per column and the scope's own step is coarser, so a
+# sigma below this is claiming precision neither instrument delivered.
+#
+# The floor is physical, not numerical, and that distinction matters. An epsilon
+# floor (1e-6) is enough to stop a division by zero and nowhere near enough to
+# stop the fit being captured: sigma 1e-6 with a half-degree residual scores
+# 399998 against 0.1 for the alternative, so the solver will sacrifice four good
+# columns to satisfy that one. Which is precisely what this module's own
+# docstring says must not happen — one bad fiducial tipping the whole sphere.
+MIN_SIGMA_DEG = 0.1
+
+
+def _sigma(uncertainty):
+    """Degrees this column's boundary may move. 1.0 when unknown.
+
+    Tested with `is None` rather than truthiness: 0.0 is a real value meaning
+    "as certain as this instrument gets", and reading it as "unknown" would be a
+    silent downgrade. It is floored at MIN_SIGMA_DEG rather than at an epsilon,
+    because nothing is perfectly certain and a sigma small enough to dominate
+    every other column is a claim no measurement here has earned.
+    """
+    if uncertainty is None:
+        return 1.0
+    return max(float(uncertainty), MIN_SIGMA_DEG)
+
+
+def as_fiducial(az, edge, ceiling, Fiducial, uncertainty=None, photo_type=None, scope_type=None):
     """Turn a column measurement into a fiducial, keeping blocked columns.
 
     A column whose horizon lies above the search ceiling yields no edge. It must
@@ -185,9 +212,46 @@ def as_fiducial(az, edge, ceiling, Fiducial):
     cannot tell an unmeasured azimuth from an obstructed one.
 
     `edge` is None when nothing was found, otherwise {'alt', 'snr'}.
+
+    `uncertainty` is the column's altitude uncertainty in degrees, as
+    `skymask.type_uncertainty` computes it and as the mask carries it: about 1
+    degree for solid structure, 3 for vegetation, widened by the gap fraction.
+    It becomes the fiducial's `sigma`, which STANDARDISES the residual before
+    the robust loss — a separate thing from `weight`, which carries detection
+    quality from SNR. The two measure different questions: SNR says how well
+    this edge was DETECTED, type says how well the thing detected STAYS PUT
+    between the photograph and the measurement. A crisp canopy edge scores
+    excellently on the first and badly on the second, and a fit knowing only the
+    first will trust it as much as a roofline.
+
+    The 1 and 3 degree priors are a claim about how far foliage moves, not a
+    tuning knob. If they are wrong the fix is to measure how far the foliage
+    actually moved between two captures, not to adjust them until a fit looks
+    better.
+
+    `photo_type` and `scope_type` are recorded separately and neither is merged
+    into the other; see `Fiducial`.
     """
     if edge is None:
-        return Fiducial(az, ceiling, ceiling=ceiling, bound=True, weight=1.0)
+        return Fiducial(
+            az,
+            ceiling,
+            ceiling=ceiling,
+            bound=True,
+            weight=1.0,
+            sigma=_sigma(uncertainty),
+            photo_type=photo_type,
+            scope_type=scope_type,
+        )
     bound = edge["alt"] >= ceiling - 1e-6
     weight = 1.0 if bound else min(1.0, (edge.get("snr") or 1.0) / 8.0)
-    return Fiducial(az, edge["alt"], ceiling=ceiling, bound=bound, weight=weight)
+    return Fiducial(
+        az,
+        edge["alt"],
+        ceiling=ceiling,
+        bound=bound,
+        weight=weight,
+        sigma=_sigma(uncertainty),
+        photo_type=photo_type,
+        scope_type=scope_type,
+    )

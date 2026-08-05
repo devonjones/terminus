@@ -35,19 +35,60 @@ import numpy as np
 class Fiducial:
     """One telescope-measured column.
 
-    alt      measured altitude, or the ceiling if the column was capped
-    ceiling  the altitude ceiling this column was scanned with
-    bound    True if the scan hit its ceiling (alt is a lower bound)
+    alt         measured altitude, or the ceiling if the column was capped
+    ceiling     the altitude ceiling this column was scanned with
+    bound       True if the scan hit its ceiling (alt is a lower bound)
+    weight      how well this edge was DETECTED (from SNR)
+    sigma       how far the thing detected may MOVE, in degrees, from its type
+    photo_type  obstruction type from the panorama segmentation, or None
+    scope_type  obstruction type from the telescope's own frame, or None
+
+    `weight` and `sigma` are deliberately separate numbers rather than one
+    combined weight. Sigma STANDARDISES the residual before the robust loss;
+    weight scales the loss afterwards. Folding sigma into weight looks
+    equivalent and is not: Huber's `delta` is a threshold on the residual, so
+    multiplying the loss by 1/sigma^2 is inverse-variance weighting only while
+    residuals stay inside the quadratic core. Past delta the two diverge — at a
+    10 degree residual with sigma 3 and delta 4 they differ by 36% — and that is
+    exactly the regime, large residuals on high-sigma vegetation columns, this
+    weighting exists to handle.
+
+    The two type sources are kept SEPARATE rather than merged into one field.
+    They can disagree, and the disagreement is itself informative — averaging it
+    away destroys the only signal that either is wrong. Today only `photo_type`
+    is populated; `scope_type` arrives once the scope can autofocus on the edge.
     """
 
-    __slots__ = ("az", "alt", "ceiling", "bound", "weight")
+    __slots__ = (
+        "az",
+        "alt",
+        "ceiling",
+        "bound",
+        "weight",
+        "sigma",
+        "photo_type",
+        "scope_type",
+    )
 
-    def __init__(self, az, alt, ceiling=None, bound=False, weight=1.0):
+    def __init__(
+        self,
+        az,
+        alt,
+        ceiling=None,
+        bound=False,
+        weight=1.0,
+        sigma=1.0,
+        photo_type=None,
+        scope_type=None,
+    ):
         self.az = float(az)
         self.alt = float(alt)
         self.ceiling = float(ceiling) if ceiling is not None else None
         self.bound = bool(bound)
         self.weight = float(weight)
+        self.sigma = float(sigma) if sigma else 1.0
+        self.photo_type = photo_type
+        self.scope_type = scope_type
 
     def headroom(self):
         """Gap between the result and its own ceiling.
@@ -244,6 +285,26 @@ def _huber(res, delta):
     return np.where(a <= delta, 0.5 * res**2, delta * (a - 0.5 * delta))
 
 
+def objective(residuals, weights, sigmas, delta=4.0, robust=True):
+    """Weighted robust cost. Sigma standardises the residual BEFORE the loss.
+
+    That order is the whole point and is easy to get wrong. `delta` is a
+    threshold on the residual, so a column allowed to move 3 degrees must have
+    its residual measured in units of those 3 degrees. Multiplying the finished
+    loss by 1/sigma^2 instead is inverse-variance weighting only while residuals
+    stay inside Huber's quadratic core; past delta the two diverge, and at a 10
+    degree residual with sigma 3 and delta 4 they differ by 36 per cent —
+    exactly the regime this weighting exists to handle.
+
+    Lives at module level rather than inside `fit` so the invariant is reachable
+    by a test. It was not, and reverting to the wrong form passed the suite.
+    """
+    z = np.asarray(residuals, dtype=float) / np.asarray(sigmas, dtype=float)
+    loss = _huber(z, delta) if robust else 0.5 * z**2
+    w = np.asarray(weights, dtype=float)
+    return float((w * loss).sum() / w.sum())
+
+
 def fit(
     fids,
     sample,
@@ -269,15 +330,14 @@ def fit(
         raise ValueError(f"need at least 4 usable fiducials, have {len(used)}")
 
     weights = np.array([f.weight for f in used])
+    sigmas = np.array([f.sigma for f in used])
 
     def cost_from(photo, p):
         r = score(used, photo, p)
         ok = np.isfinite(r)
         if ok.sum() < 4:
             return math.inf, 0
-        w = weights[ok]
-        loss = _huber(r[ok], delta) if robust else 0.5 * r[ok] ** 2
-        return float((w * loss).sum() / w.sum()), int(ok.sum())
+        return objective(r[ok], weights[ok], sigmas[ok], delta, robust), int(ok.sum())
 
     def cost(y, p, tm, td):
         return cost_from(predict(used, sample, y, tm, td), p)
