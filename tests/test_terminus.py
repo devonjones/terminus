@@ -5097,3 +5097,49 @@ def test_the_sun_deadline_reads_the_sun_each_time_it_is_asked():
     assert reads["n"] == 3, "the Sun must be re-read every time, not cached"
 
     assert _sun_deadline(SimpleNamespace(sun=sun), None) is None, "no cutoff, no check"
+
+
+def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
+    """Found 2026-08-05 17:46, with the scope set up and about to sweep.
+
+    `column_touches_sun` tested `alt_min` and `alt_max` only. The Sun spends
+    most of the day at a middling altitude, which is the MIDDLE of a 0-60
+    column, so both ends can be clear while the scan passes straight through it.
+    With the Sun at az 271 alt 25.5, az 250 and az 290 were reported safe and
+    come within 19.1 and 16.9 degrees of it.
+
+    The same mistake this module's docstring warns about for slew paths, in the
+    function that decides which columns to attempt at all. `Pointer.point_to`
+    refused the individual slews so nothing was in danger — but the planner
+    proposed columns the mount would abandon partway up, wasting the observing
+    time it exists to save.
+    """
+    from terminus.sweep import ang_sep, column_touches_sun
+
+    class FixedSky:
+        """The Sun parked mid-column, which is where it lives most of the day."""
+
+        @staticmethod
+        def sun():
+            return 271.0, 25.5
+
+    sky = FixedSky()
+    for az in range(0, 360, 5):
+        closest = min(ang_sep(az, alt / 2.0, 271.0, 25.5) for alt in range(0, 121))
+        assert column_touches_sun(sky, az, 0, 60, 30) == (
+            closest < 30
+        ), f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
+
+    # The two that were wrong, named so a regression is unmistakable.
+    assert column_touches_sun(sky, 250, 0, 60, 30), "az 250 passes 19.1 deg from the Sun"
+    assert column_touches_sun(sky, 290, 0, 60, 30), "az 290 passes 16.9 deg from the Sun"
+    # A column genuinely clear of it is still allowed.
+    assert not column_touches_sun(sky, 90, 0, 60, 30), "the anti-Sun column is safe"
+
+    # And a Sun below the horizon blocks nothing, whatever the geometry says.
+    class NightSky:
+        @staticmethod
+        def sun():
+            return 271.0, -20.0
+
+    assert not column_touches_sun(NightSky(), 271, 0, 60, 30)

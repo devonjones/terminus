@@ -361,13 +361,31 @@ class Pointer:
 
 
 # ---- horizon search -------------------------------------------------------
+COLUMN_STEP_DEG = 1.0  # altitude spacing when testing a column against the Sun
+
+
 def column_touches_sun(sky, az, alt_min, alt_max, cone):
+    """Does any part of this column come within `cone` of the Sun?
+
+    THE WHOLE COLUMN, not its endpoints. Checking only alt_min and alt_max is
+    the same mistake this module's docstring warns about for slew paths, and it
+    fails in exactly the same way: the Sun spends most of the day at a middling
+    altitude, which is the MIDDLE of a 0-60 column, so both ends can be clear
+    while the scan passes straight through it.
+
+    Measured 2026-08-05 17:46 with the Sun at az 271 alt 25.5: az 250 and az 290
+    were both reported safe, and both come within 19 and 17 degrees of it at alt
+    25. `Pointer.point_to` refused the individual slews, so nothing was ever in
+    danger — but the planner proposed columns the mount would then abandon
+    partway up, which wastes the observing time this planner exists to save.
+    """
     saz, salt = sky.sun()
     if salt < SUN_SAFE_ALT:
         return False
-    return (
-        ang_sep(az, max(alt_min, 0.0), saz, salt) < cone or ang_sep(az, alt_max, saz, salt) < cone
-    )
+    lo = max(alt_min, 0.0)
+    hi = max(alt_max, lo)
+    steps = max(1, int(math.ceil((hi - lo) / COLUMN_STEP_DEG)))
+    return any(ang_sep(az, lo + (hi - lo) * i / steps, saz, salt) < cone for i in range(steps + 1))
 
 
 def reachable_now(ptr, alt, cone=None):
