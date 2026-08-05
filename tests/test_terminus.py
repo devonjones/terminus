@@ -4062,3 +4062,52 @@ def test_export_writes_the_hor_only_when_asked(tmp_path, capsys):
     assert hor.exists()
     assert "Clockwise" in hor.read_text()
     assert "north azimuth 0 on import" in capsys.readouterr().out
+
+
+def test_a_non_finite_altitude_is_refused_by_every_exporter():
+    """`alt: nan` loads without complaint, because float("nan") is a valid float.
+
+    PVsyst is the sharp case and the reason this is checked at all: it treats
+    any line containing text as a comment, so `180 nan` is not a malformed
+    number, it is a COMMENT. The column vanishes and the profile comes back one
+    short with nothing said. Checked in `_ascending_pairs` because that is where
+    every exporter passes.
+    """
+    import pytest
+
+    from terminus.export import MaskError, to_nina_hrz, to_pvsyst_hor, to_stellarium_txt
+    from terminus.landscape import horizon_altitudes
+
+    rows = [(0, 10.0, "structure"), (180, float("nan"), "structure")]
+    meta = {"lat": 1, "lon": 2}
+    for call in (
+        lambda: to_pvsyst_hor(rows, meta),
+        lambda: to_nina_hrz(rows, meta),
+        lambda: to_stellarium_txt(rows, meta),
+        lambda: horizon_altitudes(rows, 64),
+    ):
+        with pytest.raises(MaskError, match="non-finite"):
+            call()
+    # Infinity is the same class of mistake and names the column too.
+    with pytest.raises(MaskError, match=r"\[180\]"):
+        to_pvsyst_hor([(0, 10.0, "structure"), (180, float("inf"), "structure")], meta)
+
+
+def test_the_hor_never_writes_a_number_in_scientific_notation():
+    """`format(1e-05, "g")` is "1e-05" — a letter, so PVsyst reads it as a comment.
+
+    Not a parse error the user would see: the column is silently dropped. A
+    hair-thin altitude is implausible from a real sweep and entirely plausible
+    from a hand-edited mask, which is exactly the file this format invites
+    people to edit.
+    """
+    from terminus.export import to_pvsyst_hor
+
+    rows = [(0, 1e-05, "structure"), (90, 0.0000123, "structure"), (180, 12.5, "structure")]
+    text = to_pvsyst_hor(rows, {"lat": 1, "lon": 2}, tree_buffer=0)
+    data = [ln for ln in text.splitlines() if ln and not any(c.isalpha() for c in ln)]
+    assert len(data) == 4, "every column must survive as data, not become a comment"
+    assert "e-" not in text and "e+" not in text
+    for ln in data:
+        az, alt = ln.split()
+        float(az), float(alt)

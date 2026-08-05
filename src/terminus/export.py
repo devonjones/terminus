@@ -34,6 +34,7 @@ so the image and the numbers beside it are one horizon rather than two.
 """
 
 import datetime
+import math
 
 import yaml
 
@@ -217,6 +218,20 @@ def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
     pairs = [(az, alt) for az, alt, _ in rows]
     if not pairs:
         raise ValueError("mask has no horizon points")
+    # Checked here because this is where every exporter passes. A hand-edited
+    # `alt: nan` loads without complaint — `float("nan")` is a valid float — and
+    # then each format writes it out in its own way for someone else's parser to
+    # mishandle. PVsyst is the sharp case: it treats any line containing text as
+    # a comment, so `180 nan` is silently DROPPED and the profile comes back one
+    # column short with nothing said. Refusing here is the difference between an
+    # error and a quietly incomplete horizon.
+    bad = [az for az, alt in pairs if not math.isfinite(alt)]
+    if bad:
+        raise MaskError(
+            f"columns {bad} have a non-finite altitude. A horizon file is consumed by "
+            "other software that will either reject it or, worse, drop the column and "
+            "carry on. Fix or remove those columns in the mask."
+        )
     if pairs[0][0] != 0:
         pairs.insert(0, (0, pairs[0][1]))
     if pairs[-1][0] != 360:
@@ -291,7 +306,12 @@ def to_pvsyst_hor(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented
         out.append(f"Latitude {meta['lat']}, Longitude {meta['lon']}")
     if tree_buffer:
         out.append(f"Vegetation columns raised {tree_buffer:g} degrees (seasonal, gappy).")
-    out += [f"{az} {alt:g}" for az, alt in pairs]
+    # Fixed decimals, never %g. `format(1e-05, "g")` is "1e-05", which contains
+    # a letter, which makes it a COMMENT to PVsyst rather than a malformed
+    # number — the column vanishes instead of erroring. Two places rely on this:
+    # `_ascending_pairs` refuses non-finite altitudes, and this refuses
+    # scientific notation for the finite ones.
+    out += [f"{az} {alt:.2f}" for az, alt in pairs]
     return "\n".join(out) + "\n"
 
 
