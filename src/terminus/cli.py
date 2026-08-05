@@ -29,6 +29,7 @@ from .export import (
 )
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
+    MAX_POINTING_MISSES,
     Pointer,
     PointingError,
     Sky,
@@ -38,6 +39,7 @@ from .sweep import (
     obstruction_type,
     run_sweep,
     scan_horizon,
+    sky_reference,
 )
 
 
@@ -523,10 +525,10 @@ def cmd_orient(sc, cfg, args):
     if args.replay:
         with open(args.replay) as f:
             measure = guide.replay(json.load(f), uncertainty=args.uncertainty)
-        reachable = None
+        reachable = should_stop = None
         print(f"replaying {args.replay}: no telescope, no sky")
     else:
-        measure, reachable = _scope_measure(sc, cfg, args)
+        measure, reachable, should_stop = _scope_measure(sc, cfg, args)
 
     solution, steps = guide.run(
         rows,
@@ -536,6 +538,7 @@ def cmd_orient(sc, cfg, args):
         window=args.window,
         yaw_tol=args.yaw_tol,
         reachable=reachable,
+        should_stop=should_stop,
         min_headroom=args.min_headroom,
     )
     if solution is None:
@@ -595,25 +598,86 @@ def _scope_measure(sc, cfg, args):
     sky = _sky(sc, cfg)
     sw = cfg["sweep"]
     ptr = Pointer(sc, sky, sw["sun_cone_deg"], sw["slew_step_deg"], args.dry_run)
+    state = {"sky_ref": None, "misses": 0}
+
+    # Seeded before the first column, exactly as run_sweep does. Without it
+    # scan_horizon returns "no_reference" for EVERY column — it cannot tell dark
+    # terrain from a dim sky with nothing to compare against — and an
+    # inconclusive column that was then recorded as a bound would feed the fit a
+    # measurement nobody made.
+    if not args.dry_run:
+        try:
+            saz, _ = sky.sun()
+            ptr.point_to((saz + 180.0) % 360.0, 75.0)
+            state["sky_ref"] = sky_reference(sc.capture_rgb(warmup=0.3))
+            print(f"sky reference: {state['sky_ref']:.1f}")
+        except (SunGuard, PointingError, OSError) as e:
+            print(f"could not seed the sky reference ({e}); columns will be inconclusive",
+                  file=sys.stderr)  # fmt: skip
 
     def measure(az):
         try:
-            alt, status, _typ, _profile = scan_horizon(
+            alt, status, _typ, profile = scan_horizon(
                 ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
-                sw["alt_tol"], None, repeats=sw.get("samples_per_point", 1),
+                sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
                 sun_alt=sky.sun()[1],
             )  # fmt: skip
-        except (SunGuard, PointingError) as e:
-            print(f"az {az:3d}: not attempted ({e})", file=sys.stderr)
+        except SunGuard as e:
+            print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
             return None
-        if status.startswith("open"):
+        except PointingError as e:
+            state["misses"] += 1
+            print(f"az {az:3d}: did not arrive ({e})", file=sys.stderr)
+            if state["misses"] >= MAX_POINTING_MISSES:
+                raise SeestarError(
+                    f"{state['misses']} slews in a row did not arrive. A mount that cannot "
+                    "point will fail every remaining column too, and skipping them one by "
+                    "one would spend the night proving it. Check the arm is open and the "
+                    "mount is tracking."
+                ) from e
+            return None
+        state["misses"] = 0
+        if profile:
+            peak = max(lum for _, lum in profile)
+            state["sky_ref"] = peak if state["sky_ref"] is None else max(state["sky_ref"], peak)
+        if status in ("no_reference", "inconclusive"):
+            # The column was pointed at and photographed, and the result does not
+            # say where the horizon is. Recording that as a bound would turn "I
+            # could not tell" into "it is at least 60 degrees" — an unevidenced
+            # value in a file the fit trusts. Not attempted is the honest shape.
+            print(f"az {az:3d}: {status}", file=sys.stderr)
+            return None
+        if status == "blocked_above":
             return None, sw["alt_max"], args.uncertainty
         return {"alt": alt, "snr": None}, sw["alt_max"], args.uncertainty
 
     def reachable(az):
         return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
 
-    return measure, reachable
+    def should_stop():
+        """Stop before a column that would run past the observing window.
+
+        terminus-17: the cutoff was enforced by the caller, before launch, and a
+        run overran by fourteen minutes because each column took longer than
+        estimated — the sky brightened toward dawn, more columns resolved, and
+        the run slowed exactly as the deadline approached. A caller starting an
+        N-column run cannot know how long N columns take, and the estimate
+        degrades in the direction that matters. So it is checked here, before
+        each column, where the answer is current.
+        """
+        if args.stop_above_sun_alt is None:
+            return False
+        _, alt = sky.sun()
+        if alt >= args.stop_above_sun_alt:
+            print(
+                f"stopping: the Sun is at {alt:.1f} deg, at or above the "
+                f"{args.stop_above_sun_alt:g} deg cutoff for this run",
+                file=sys.stderr,
+            )
+            return True
+        return False
+
+    return measure, reachable, should_stop
 
 
 # ---- offline photo pipeline -----------------------------------------------
@@ -853,6 +917,13 @@ def main(argv=None):
         type=float,
         default=None,
         help="drop columns whose edge sits this close to their own search ceiling",
+    )
+    orp.add_argument(
+        "--stop-above-sun-alt",
+        type=float,
+        default=None,
+        help="stop before any column once the Sun reaches this altitude, checked "
+        "inside the loop (try -18 for astronomical twilight)",
     )
     orp.add_argument("--dry-run", action="store_true")
 

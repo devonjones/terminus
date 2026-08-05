@@ -4305,3 +4305,106 @@ def test_orienting_a_mask_is_not_a_relabelling_when_there_is_tilt():
         # 0.01 because the mask stores two decimals, not because the maths is
         # approximate — with no tilt this is exactly a relabelling.
         assert abs(alt - naive[(az - 30) % 360]) < 0.01
+
+
+def test_an_inconclusive_column_is_not_recorded_as_a_bound(tmp_path):
+    """ "I could not tell" and "it is at least 60 degrees" are different claims.
+
+    `scan_horizon` returns `no_reference` when it has no open-sky brightness to
+    compare against, and `inconclusive` when the column neither resolved nor
+    read as blocked. Both were being turned into a confident bound at the search
+    ceiling, which the fit then trusts one-sidedly — an unevidenced value in a
+    file other software consumes, and it happened on EVERY column when the sky
+    reference failed to seed.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 0.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
+
+    verdicts = {
+        "no_reference": None,
+        "inconclusive": None,
+        "blocked_above": "bound",
+        "edge(rel 0.42)": "edge",
+    }
+    for status, want in verdicts.items():
+        with patch.object(cli, "scan_horizon", return_value=(60.0 if want != "edge" else 22.0,
+                                                             status, "", [])):  # fmt: skip
+            measure, _reachable, _stop = cli._scope_measure(sc, cfg, args)
+            got = measure(90)
+        if want is None:
+            assert got is None, f"{status}: must be 'not attempted', got {got}"
+        elif want == "bound":
+            assert got == (None, 60, None) or got[0] is None, f"{status} is a bound"
+        else:
+            assert got[0] is not None and got[0]["alt"] == 22.0, f"{status} is a measurement"
+
+
+def test_a_mount_that_cannot_point_gives_up_instead_of_trying_every_column():
+    """`run_sweep` counts consecutive misses; this loop had no equivalent.
+
+    A dead mount would be retried on every remaining candidate — thirty-six
+    no-ops — before the run reported "fewer than four columns". Skipping one
+    column that will not arrive is right; spending the night proving the mount
+    is broken is not.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.sweep import MAX_POINTING_MISSES, PointingError
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 0.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
+
+    with patch.object(cli, "scan_horizon", side_effect=PointingError("arm closed")):
+        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        for i in range(MAX_POINTING_MISSES - 1):
+            assert measure(10 * i) is None, "one miss is a skip, not a verdict on the mount"
+        with pytest.raises(cli.SeestarError, match="did not arrive"):
+            measure(999)
+
+
+def test_the_loop_can_be_stopped_by_a_deadline_it_checks_itself():
+    """terminus-17: the cutoff was enforced by the caller, before launch.
+
+    A run overran by fourteen minutes because each column took longer than
+    estimated — the sky brightened toward dawn, more columns resolved, and it
+    slowed exactly as the deadline approached. A caller starting an N-column run
+    cannot know how long N columns take.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 12.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 6  # the window closes partway through
+
+    solution, steps = guide.run(
+        rows, _truth_measure(rows, truth), max_columns=20, should_stop=should_stop,
+        log=lambda *a, **k: None, fit_kw=_COARSE,
+    )  # fmt: skip
+    assert any(s.note == "stopped early" for s in steps)
+    measured = [s for s in steps if s.fiducial is not None]
+    assert len(measured) < 20, "the deadline, not the budget, ended this run"

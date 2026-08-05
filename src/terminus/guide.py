@@ -120,6 +120,7 @@ def run(
     window=3,
     yaw_tol=1.0,
     reachable=None,
+    should_stop=None,
     log=print,
     min_headroom=None,
     fit_kw=None,
@@ -144,6 +145,14 @@ def run(
     Returns `solution=None` when fewer than four columns were measured, which the
     fit needs. That is a real outcome of a short or unlucky run, not an error.
 
+    `should_stop()` is checked BEFORE each column and ends the run cleanly when
+    it answers True. It exists so an observing-window deadline can be enforced
+    where the answer is current, rather than by a caller before launch: a caller
+    starting an N-column run cannot know how long N columns take, and the
+    estimate degrades in the direction that matters (see terminus-17, where a
+    run overran because the sky brightened, more columns resolved, and it slowed
+    exactly as the deadline approached).
+
     `fit_kw` passes grid settings through to `orient.fit`. The default grid is
     the accurate one and costs tens of seconds per refit — cheap next to the
     minutes a column takes to measure, and far too slow for a test suite, which
@@ -161,6 +170,9 @@ def run(
     solution = None
 
     while len(measured) < max_columns:
+        if should_stop is not None and should_stop():
+            steps.append(Step(None, note="stopped early"))
+            break
         if queue:
             az = queue.pop(0)
         else:
