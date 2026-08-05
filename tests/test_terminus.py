@@ -728,7 +728,15 @@ def test_night_finds_horizon_under_a_skyglow_gradient():
 
 
 def test_night_ignores_a_streetlight_inside_terrain():
-    """Real column az 340: blocked throughout, with a lamp at 12.5-15."""
+    """Real column az 340: blocked throughout, with a lamp at 12.5-15.
+
+    Transcribed from captures/2026-08-04-averaged/scan/, whose frame names carry
+    the measured luminance. There is a SECOND, independent run of this same
+    azimuth from 2026-08-03 in the terminus-14 test below, and the two differ by
+    up to 5 counts — different nights, not a disagreement. Labelled here because
+    a reviewer read them as two transcriptions of one frame and was right to
+    ask; two runs agreeing on the conclusion is worth more than one.
+    """
     from terminus.night import find_horizon
 
     prof = [
@@ -4894,6 +4902,13 @@ def test_from_mask_reads_every_mask_this_repo_has_ever_written():
     # A column with no altitude is not a measurement at all.
     assert from_mask({0: {"type": "tree"}}) == []
 
+    # `clipped` is the PHOTO's way of saying the same thing a scope bound says:
+    # the obstruction ran off the top of the frame, so the altitude beside it is
+    # a lower bound. Read as a confirmed exact edge it is the same mistake this
+    # function exists to stop making, one instrument over.
+    clipped = from_mask({0: {"alt": 60.0, "type": "tree", "clipped": True}}, ceiling=60.0)
+    assert [f.bound for f in clipped] == [True], "a clipped photo column is a bound"
+
 
 def test_bound_survives_a_round_trip_through_the_mask_file():
     """A one-sided constraint the file cannot express is a constraint that is lost.
@@ -4933,11 +4948,18 @@ def test_a_lamp_inside_terrain_is_not_read_as_a_horizon():
     noise estimate produced was the lamp's lower edge.
 
     Both detectors are asked, because the disagreement between them is what made
-    this ambiguous at the time.
+    this ambiguous at the time. And az 340 was measured on two separate nights;
+    both runs are in this file, they differ by up to 5 counts, and both are
+    refused. That is the strongest form the answer comes in.
     """
     from terminus.night import find_horizon
     from terminus.sweep import find_edge
 
+    # captures/2026-08-03-night-targeted/scan/, luminance from the frame names.
+    # A SECOND run of az 340 from 2026-08-04 is used by
+    # test_night_ignores_a_streetlight_inside_terrain above; the two differ by up
+    # to 5 counts because they are different nights, and both show the same lamp
+    # signature and are both refused. Independent confirmation, not a conflict.
     columns = {
         340: [(60, 5.7), (50, 6.0), (45, 8.7), (40, 7.0), (35, 6.0), (30, 6.3), (25, 6.0),
               (20, 7.7), (17.5, 11.0), (15, 50.7), (12.5, 53.3), (10, 27.7), (7.5, 8.0),

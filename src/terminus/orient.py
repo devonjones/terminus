@@ -139,7 +139,16 @@ def from_mask(mask, ceiling=None):
             # A failed measurement carries no information at all: it is neither
             # an edge nor a bound, and must not enter the fit as either.
             continue
-        bound = bool(entry.get("bound", False)) or typ.startswith("blocked")
+        # `clipped` is the PHOTO's version of the same statement — the
+        # obstruction ran off the top of the frame, so the altitude beside it is
+        # a lower bound. Two instruments, one meaning, and the fit needs to score
+        # both one-sidedly. Reading a clipped column as a confirmed exact edge
+        # was the same mistake this function exists to stop making.
+        bound = (
+            bool(entry.get("bound", False))
+            or bool(entry.get("clipped", False))
+            or typ.startswith("blocked")
+        )
         out.append(Fiducial(az, alt, ceil, bound=bound))
     return out
 

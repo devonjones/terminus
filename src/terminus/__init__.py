@@ -15,7 +15,7 @@ Three sides. The photographs are the mask; the telescope calibrates them.
   looks small:
     from terminus import orient, plan
     az, _ = plan.next_column(done, cands, grad)
-    fid   = plan.as_fiducial(az, edge, ceiling, orient.Fiducial)
+    fids.append(plan.as_fiducial(az, edge, ceiling, orient.Fiducial))
     sol   = orient.fit(fids, sample)
     ok, spread = plan.is_stable(history)
 
