@@ -2904,7 +2904,14 @@ def test_an_explicit_sweep_merges_rather_than_replaces(tmp_path, monkeypatch):
     from terminus.export import load_columns, write_mask
 
     out = tmp_path / "h.yaml"
-    write_mask(str(out), {0: (10.0, "tree"), 90: (20.0, "structure"), 180: (5.0, "tree")}, [], {})
+    # lat/lon as a real sweep writes them: `default_meta` always stamps the site,
+    # and a prior mask without one is now refused rather than merged blind.
+    write_mask(
+        str(out),
+        {0: (10.0, "tree"), 90: (20.0, "structure"), 180: (5.0, "tree")},
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
 
     sc = MagicMock()
     sc.is_eq_mode.return_value = True
@@ -3127,3 +3134,51 @@ def test_the_move_threshold_is_the_same_distance_in_every_direction():
     ):
         d = math.hypot(dlat * 111320.0, dlon * 111320.0 * math.cos(math.radians(lat)))
         assert (d <= tol) is should_pass, f"{d:.1f} m classified wrongly"
+
+
+def test_refuses_to_merge_into_a_mask_that_never_said_where_it_stood(tmp_path):
+    """An absent position is not a matching position.
+
+    The position guard only fired when the prior mask carried lat/lon, so a mask
+    without them merged silently — and the merged file was positionless too, so
+    every later patch skipped the check as well. The hole propagated itself.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import MaskError, write_mask
+
+    out = tmp_path / "nowhere.yaml"
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"oriented": True})
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with pytest.raises(MaskError, match="no lat/lon"):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+
+def test_a_hand_edited_skipped_az_fails_loudly_instead_of_scrambling():
+    """`skipped_az: "190"` iterates to the characters 1, 9, 0.
+
+    Three wrong columns recorded as skipped, no error. A bare `190` is a fair
+    shorthand and is accepted; a string is the case that must be refused,
+    because the silent answer is wrong rather than absent.
+    """
+    import pytest
+
+    from terminus import cli
+    from terminus.export import MaskError
+
+    assert cli._az_list(190, "skipped_az") == {190}
+    assert cli._az_list([190, 195], "skipped_az") == {190, 195}
+    assert cli._az_list(None, "skipped_az") == set()
+    with pytest.raises(MaskError, match="list of azimuths"):
+        cli._az_list("190", "skipped_az")
+    with pytest.raises(MaskError, match="non-numeric"):
+        cli._az_list(["north"], "skipped_az")
+    # And the merge path routes through it rather than round the side.
+    meta = cli._merge_meta(
+        {"skipped_az": 190, "measured": "2026-08-01"}, {"measured": "2026-08-04"}, [90], []
+    )
+    assert meta["skipped_az"] == [190], "a bare int is one column, not three digits"

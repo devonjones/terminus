@@ -138,6 +138,11 @@ def _check_mergeable(prior_meta, sky):
     The tolerance is deliberately loose: the mask rounds lat/lon to four
     decimals (about 8 m on its own) and a GPS fix wanders, so this catches
     crossing the garden rather than shuffling the tripod.
+
+    A mask with NO recorded position is refused rather than waved through. An
+    absent value is not agreement, and passing it would be self-perpetuating —
+    the merged file would still carry no position, so every later patch would
+    skip the check as well.
     """
     if not is_oriented(prior_meta):
         raise MaskError(
@@ -147,19 +152,54 @@ def _check_mergeable(prior_meta, sky):
             "orientation first, or write to a different --out."
         )
     plat, plon = prior_meta.get("lat"), prior_meta.get("lon")
-    if plat is not None and plon is not None:
-        lat_now, lon_now = sky.loc.lat.deg, sky.loc.lon.deg
-        dnorth = (float(plat) - lat_now) * 111320.0
-        deast = (float(plon) - lon_now) * 111320.0 * math.cos(math.radians(lat_now))
-        moved = math.hypot(dnorth, deast)
-        if moved > MERGE_POSITION_TOLERANCE_M:
-            raise MaskError(
-                f"refusing to merge: the existing mask was measured at {plat},{plon} and "
-                f"this run is at {lat_now:.4f},{lon_now:.4f}, about {moved:.0f} m away. The "
-                "horizon belongs to one position — a near obstruction shifts by degrees for "
-                "a few metres — so these are two different horizons. Write to a different "
-                "--out."
-            )
+    if plat is None or plon is None:
+        # No position recorded is not "the position matches". A mask that never
+        # said where it stood cannot be checked against this run, and merging
+        # anyway would leave the merged file just as positionless — so the hole
+        # never closes and every later patch skips the check too.
+        raise MaskError(
+            "refusing to merge: the existing mask records no lat/lon, so there is no "
+            "way to tell whether it was measured from this spot. A near obstruction "
+            "shifts by degrees for a few metres. If you know it was the same position, "
+            "add lat and lon to the mask header and re-run; otherwise write to a "
+            "different --out."
+        )
+    lat_now, lon_now = sky.loc.lat.deg, sky.loc.lon.deg
+    dnorth = (float(plat) - lat_now) * 111320.0
+    deast = (float(plon) - lon_now) * 111320.0 * math.cos(math.radians(lat_now))
+    moved = math.hypot(dnorth, deast)
+    if moved > MERGE_POSITION_TOLERANCE_M:
+        raise MaskError(
+            f"refusing to merge: the existing mask was measured at {plat},{plon} and "
+            f"this run is at {lat_now:.4f},{lon_now:.4f}, about {moved:.0f} m away. The "
+            "horizon belongs to one position — a near obstruction shifts by degrees for "
+            "a few metres — so these are two different horizons. Write to a different "
+            "--out."
+        )
+
+
+def _az_list(value, field):
+    """Azimuths from a meta field a human may have hand-edited.
+
+    A bare `skipped_az: 190` is a reasonable shorthand to write and is accepted.
+    A string is not: iterating "190" yields the characters, so `int(a) for a in
+    ...` quietly produces {1, 9, 0} — three wrong columns rather than an error.
+    That is the failure worth being loud about, so it raises MaskError with the
+    correction rather than a bare TypeError from somewhere deeper.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {int(value)}
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+        raise MaskError(
+            f"the mask's {field} is {value!r}; it must be a list of azimuths "
+            f"(for example {field}: [190, 195]) or a single number."
+        )
+    try:
+        return {int(a) for a in value}
+    except (TypeError, ValueError) as exc:
+        raise MaskError(f"the mask's {field} contains a non-numeric azimuth: {value!r}") from exc
 
 
 def _merge_meta(prior_meta, fresh, measured, skipped):
@@ -176,12 +216,12 @@ def _merge_meta(prior_meta, fresh, measured, skipped):
     is a false record.
     """
     meta = dict(prior_meta)
-    prior_skipped = {int(a) for a in (prior_meta.get("skipped_az") or [])}
+    prior_skipped = _az_list(prior_meta.get("skipped_az"), "skipped_az")
     meta["skipped_az"] = sorted((prior_skipped | set(skipped)) - set(measured))
     meta["measured"] = prior_meta.get("measured", fresh["measured"])
     meta["patched"] = sorted(set(prior_meta.get("patched") or []) | {fresh["measured"]})
     meta["patched_columns"] = sorted(
-        set(prior_meta.get("patched_columns") or []) | {int(a) for a in measured}
+        _az_list(prior_meta.get("patched_columns"), "patched_columns") | {int(a) for a in measured}
     )
     return meta
 
