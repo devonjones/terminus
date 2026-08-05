@@ -3,13 +3,21 @@
 
 Three sides. The photographs are the mask; the telescope calibrates them.
 
-  Calibrating (needs the scope) — a handful of measured columns fix the three
-  parameters that place a photo-derived horizon on the sky:
+  Calibrating — a handful of measured columns fix the three parameters that
+  place a photo-derived horizon on the sky. `terminus orient` runs this, and
+  `--replay` runs it against a night already measured, with no scope:
+    from terminus import guided_orient, replay
+    sol, steps = guided_orient(rows, replay(profiles))   # or a live measure()
+    sol["yaw"], sol["pitch"], sol["tilt_mag"]            # and whether it settled
+
+  The pieces, if you want the loop yourself — plan a column by information gain,
+  measure it, refit, and stop when the yaw holds still rather than when the RMS
+  looks small:
     from terminus import orient, plan
-    fids = orient.from_mask(measured)          # capped columns become BOUNDS
-    az, _ = plan.next_column(done, cands, grad)  # by information gain
-    sol  = orient.fit(fids, sample)            # yaw, pitch, tilt
-    ok, spread = plan.is_stable(history)       # stop on stability, not on RMS
+    az, _ = plan.next_column(done, cands, grad)
+    fids.append(plan.as_fiducial(az, edge, ceiling, orient.Fiducial))
+    sol   = orient.fit(fids, sample)
+    ok, spread = plan.is_stable(history)
 
   Building the mask from photographs (no scope, no network):
     from terminus import mosaic, skymask

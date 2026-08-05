@@ -108,18 +108,48 @@ class Fiducial:
 
 
 def from_mask(mask, ceiling=None):
-    """Build fiducials from a terminus mask dict ({az: {alt, type}})."""
+    """Build fiducials from a mask dict ({az: {alt, type, bound?}}).
+
+    THE MASK MUST SAY WHICH COLUMNS ARE BOUNDS, and for a long time it did so by
+    accident. This function matched `type == "edge"` and `type.startswith
+    ("blocked")`, which was the mask vocabulary of 2026-08-02 — `blocked>35`
+    literally encoded "the horizon is above the 35 degree ceiling". When the
+    vocabulary became tree/structure/open, that encoding went with it, and this
+    function silently returned ZERO fiducials for every mask written since.
+    Nothing failed: an empty list is a legal result, and the only caller was the
+    worked example in the package docstring, so the documented way in returned
+    nothing and said nothing.
+
+    A bound is now an explicit `bound: true` on the column, which is what it
+    should always have been — boundedness is a property of the measurement, not
+    a spelling of its type. Masks in the old vocabulary are still read, because
+    they exist on disk and their `blocked...` types are real information.
+
+    An untyped, unbounded column is an ordinary measurement. A column with no
+    `alt` at all is not a measurement and is skipped.
+    """
     out = []
     for az, entry in mask.items():
-        typ = entry.get("type", "")
+        if entry.get("alt") is None:
+            continue
+        typ = str(entry.get("type", "") or "")
         alt = float(entry["alt"])
         ceil = float(entry.get("ceiling", ceiling)) if (entry.get("ceiling") or ceiling) else None
-        if typ == "edge":
-            out.append(Fiducial(az, alt, ceil, bound=False))
-        elif typ.startswith("blocked"):
-            out.append(Fiducial(az, alt, ceil, bound=True))
-        # 'unknown' is a failed measurement, not a bound: it carries no
-        # information at all and must not enter the fit.
+        if typ == "unknown":
+            # A failed measurement carries no information at all: it is neither
+            # an edge nor a bound, and must not enter the fit as either.
+            continue
+        # `clipped` is the PHOTO's version of the same statement — the
+        # obstruction ran off the top of the frame, so the altitude beside it is
+        # a lower bound. Two instruments, one meaning, and the fit needs to score
+        # both one-sidedly. Reading a clipped column as a confirmed exact edge
+        # was the same mistake this function exists to stop making.
+        bound = (
+            bool(entry.get("bound", False))
+            or bool(entry.get("clipped", False))
+            or typ.startswith("blocked")
+        )
+        out.append(Fiducial(az, alt, ceil, bound=bound))
     return out
 
 
