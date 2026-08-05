@@ -4628,9 +4628,9 @@ def test_deep_terrain_never_scores_as_perfect_sky():
 
 
 def test_a_roofline_thirty_sigma_clear_is_not_missed_by_one_part_in_fifty():
-    """az 190 drops 62.9 -> 32.7, a ratio of 0.518 against a 0.5 rule.
+    """az 190 falls 62.88 -> 32.66, a ratio of 0.519 against a 0.5 rule.
 
-    A genuine roofline, thirty sigma clear of the sky's own scatter, rejected by
+    A genuine roofline, 53.6 sigma clear of the sky's own scatter, rejected by
     one part in fifty. That is the mirror of az 60 clearing the same rule by
     0.004 and being discarded by the persistence check — the ratio simply is not
     the instrument.
@@ -4703,10 +4703,21 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
     # The other direction is not what skyglow does, but the failure mode there
     # must still not be a fabricated horizon. Strong dimming toward the horizon
     # refuses outright rather than answering.
+    # Asserting the REASON, not just the absence of a number. The docstring used
+    # to claim these all refuse with "no usable sky model"; the shallow ones
+    # report "open" instead, and a test that only checked `alt is None` could not
+    # tell the difference — so the claim drifted from the behaviour undetected.
+    reasons = {}
     for power in (0.5, 1.5, 3.0):
         prof = [(float(al), 60.0 * (al / 60.0) ** power) for al in np.arange(60, 9.9, -2)]
         alt, detail = find_horizon(prof)
         assert alt is None, f"dimming as alt^{power} produced a horizon at {alt}"
+        reasons[power] = detail["reason"]
+    assert "open" in reasons[0.5], f"shallow dimming reads as open, got {reasons[0.5]!r}"
+    for power in (1.5, 3.0):
+        assert (
+            "no usable sky model" in reasons[power]
+        ), f"steep dimming must refuse outright, got {reasons[power]!r}"
 
 
 def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
@@ -4735,6 +4746,28 @@ def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
     assert alt is not None, "a column 1.4x the reference at its top is ordinary sky"
 
 
+def test_a_steeply_graded_column_is_not_mistaken_for_a_glint():
+    """The first glint screen compared each sample to the top-of-column MEDIAN.
+
+    On a steeply graded column the highest samples are legitimately far brighter
+    than the median beneath them, so that screen threw away the genuine top and
+    seeded the fit to the bottom of the column — the opposite of what it was
+    written to protect. A glint is a spike above its NEIGHBOURS, which is local
+    and survives any gradient.
+    """
+    from terminus.night import sky_model
+
+    steep = [(60.0, 100.0), (58.0, 80.0), (56.0, 60.0), (54.0, 40.0), (52.0, 20.0)]
+    model, n_top = sky_model(steep + [(float(a), 4.0) for a in (50, 48, 46)])
+    # The model must pass through the TOP of the column. A positive slope alone
+    # is not enough to prove that — the median screen also produced one, fitted
+    # to the tail — so this checks where the line actually sits.
+    assert (
+        abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0
+    ), "the fit must pass near the topmost sample, not the flat tail beneath it"
+    assert n_top >= 4
+
+
 def test_one_glint_at_the_top_does_not_discard_the_whole_column():
     """A satellite, an aircraft light or a bright planet in the topmost sample.
 
@@ -4756,3 +4789,70 @@ def test_one_glint_at_the_top_does_not_discard_the_whole_column():
             f"a {factor}x glint in the top sample changed the answer to {alt} "
             f"({detail['reason']})"
         )
+
+
+def test_every_refusal_path_is_exercised_not_merely_written():
+    """Guards nothing exercises are guards nobody knows are there.
+
+    Mutating the `j < 0` step-back to return a confident altitude instead of
+    refusing left the whole suite green — a fabricated horizon, silently, which
+    is precisely what this change exists to prevent. Chasing that down turned up
+    something more useful than a test: see the note at the end.
+    """
+    import numpy as np
+
+    from terminus.night import find_horizon, is_skyglow, sky_model
+
+    # `is_skyglow` False: a model predicting negative brightness over the range
+    # it would be applied to. These are az 60's actual broken coefficients.
+    assert not is_skyglow({"slope": 4.244, "intercept": -55.115}, 3.0)
+    assert is_skyglow({"slope": -0.559, "intercept": 178.16}, 3.0)
+    steep = [(float(a), 60.0 * (a / 60.0) ** 3) for a in np.arange(60, 9.9, -2)]
+    alt, detail = find_horizon(steep)
+    assert alt is None and "no usable sky model" in detail["reason"]
+
+    # THE `pred <= 0` BREAK IN GROWTH CANNOT CHANGE AN OUTCOME, which I only
+    # established by trying to test it. Where the model predicts non-positive
+    # brightness, any real sample is brighter than the prediction, so the
+    # lamp branch one line below catches it and steps over instead. And pred is
+    # linear, so once it has gone non-positive going down it stays there — every
+    # remaining sample takes the same branch. Break or continue, `kept` ends up
+    # identical. It stays as a statement of intent; it is not load-bearing.
+    plunge = [(60.0, 100.0), (58.0, 80.0), (56.0, 60.0), (54.0, 40.0), (52.0, 20.0)] + [
+        (float(a), 4.0) for a in np.arange(50, 9.9, -2)
+    ]
+    model, n_top = sky_model(plunge)
+    assert n_top < len(plunge), "growth stops rather than swallowing the tail"
+    assert model["slope"] * 10.0 + model["intercept"] <= 0, "precondition: it does go negative"
+    assert find_horizon(plunge)[0] is None, "and the column is then refused, not guessed"
+
+    # THE `j < 0` GUARD IS NOT REACHED BY ANY INPUT I COULD BUILD, and that is
+    # worth recording rather than faking. It needs every sample above the
+    # departure to be a lamp — but `sky_model` fits the model TO those samples,
+    # so they cannot sit far above their own prediction, which is what
+    # `mask_lights` requires. A column whose top really is that bright trips the
+    # SKY_CEIL_FACTOR test several lines earlier instead. The guard stays as
+    # defence in depth, because `mask_lights` and the seed are independently
+    # changeable, but nobody should believe it is covered.
+    lamps = [(60.0, 300.0), (58.0, 310.0), (56.0, 305.0), (54.0, 308.0)] + [
+        (float(a), 4.0) for a in np.arange(52, 9.9, -2)
+    ]
+    alt, detail = find_horizon(lamps, sky_ref=100.0)
+    assert alt is None, f"no clear sky to report, got {alt}"
+    assert "lit, not sky" in detail["reason"], "caught by the ceiling test, not the step-back"
+
+
+def test_a_lamp_is_stepped_over_during_growth_not_stopped_at():
+    """`continue` and `break` give the same answer here, and different models.
+
+    Sky usually continues below a lamp, and it is still sky. Stopping at one
+    throws away every sample beneath it, so the gradient is fitted to a shorter
+    baseline than the column actually offers — which matters most on the columns
+    where a lamp sits high and the real sky runs well below it.
+    """
+    from terminus.night import sky_model
+
+    sky = [(float(a), 40.0 - 0.2 * a) for a in range(60, 20, -2)]
+    with_lamp = sky[:5] + [(50.0, 400.0)] + sky[5:]
+    _model, n_over = sky_model(with_lamp)
+    assert n_over > 6, f"growth must continue past the lamp, only reached {n_over}"

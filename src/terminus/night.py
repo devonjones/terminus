@@ -66,10 +66,10 @@ SKY_CEIL_FACTOR = 3.0
 # Growing the sky region stops at the first sample that is not on the line, and
 # that test is NOT the detection threshold. MIN_DROP_FRAC is a factor of two,
 # deliberately decisive, and using it to grow let terrain in: az 190 drops from
-# 62.9 to 32.7, a ratio of 0.505, which clears a 0.5 test by one part in two
-# hundred and then poisons the fit it was supposed to stop. Terrain is a STEP,
-# so the natural scale is the scatter of the sky already established — the same
-# drop is thirty sigma. The relative floor keeps a chance-flat opening quartet
+# 62.88 to 32.66, a ratio of 0.519, which clears a 0.5 test by one part in
+# fifty and then poisons the fit it was supposed to stop. Terrain is a STEP, so
+# the natural scale is the scatter of the sky already established — against
+# that, the same sample sits 53.6 sigma below the model. The relative floor keeps a chance-flat opening quartet
 # from having near-zero scatter and stopping growth on the first ripple.
 DEPARTURE_SIGMA = 4.0
 # A quarter. Chosen to sit clearly between two measurements, not tuned to taste:
@@ -88,7 +88,8 @@ MIN_DIP_FRAC = 0.25
 # That gradient is about a count per degree — one column measured 22 counts at
 # altitude 60 rising to 71 at 12 — against a scatter of one to six counts. Over
 # a narrow window there is nothing to measure: a 3.5 degree refinement scan at
-# az 190 gives 3.5 counts of gradient against 5.9 of scatter, so "sky" cannot be
+# az 190 has 5.88 counts of scatter about a line fitted through the whole of it
+# — more than any gradient a window that short could hold — so "sky" cannot be
 # established and every sample looks equally like it.
 #
 # The failure that makes this worth refusing rather than attempting: that column
@@ -105,8 +106,8 @@ def departed(lum, pred, scatter):
     at different points, so they must not use different tests — and they did.
     Growth used MIN_DROP_FRAC, a factor of two, which let terrain in; detection
     used it too, and missed real steps by fractions of a per cent. Az 190 falls
-    from 62.9 to 32.7, a ratio of 0.518 against a 0.5 rule: a genuine roofline,
-    thirty sigma clear of the sky's own scatter, rejected by one part in fifty.
+    from 62.88 to 32.66, a ratio of 0.519 against a 0.5 rule: a genuine roofline,
+    53.6 sigma clear of the sky's own scatter, rejected by one part in fifty.
     Az 60 was the mirror image, clearing the same rule by 0.004 and then being
     thrown away by the persistence check.
 
@@ -205,16 +206,22 @@ def sky_model(profile, min_samples=4):
     prof = sorted(profile, key=lambda t: -t[0])
     if len(prof) < min_samples:
         return None, 0
+
     # SEED WITHOUT LETTING ONE GLINT DECIDE. A satellite, an aircraft light or a
     # bright planet in the topmost sample is enough to make the seed model
     # nonsense, and `is_skyglow` then discards a column that was otherwise
     # perfectly measurable — a non-result rather than a wrong one, but avoidable.
-    # So the seed is drawn from the top of the column excluding anything far
-    # brighter than its neighbours, using the same LAMP_FACTOR that marks a lamp
-    # everywhere else in this module.
-    window = prof[: min(len(prof), 2 * min_samples)]
-    level = float(np.median([lum for _, lum in window]))
-    seed = [i for i, (_, lum) in enumerate(window) if lum <= LAMP_FACTOR * level]
+    #
+    # A glint is a SPIKE ABOVE ITS NEIGHBOURS, which is a local test, and it has
+    # to be: screening against the median of the top of the column instead threw
+    # away the genuine top of a steeply graded one, where the highest samples are
+    # legitimately far brighter than the median beneath them. That seeded the fit
+    # to the wrong end of the column entirely.
+    def _is_glint(i):
+        neighbours = [prof[j][1] for j in (i - 1, i + 1) if 0 <= j < len(prof)]
+        return bool(neighbours) and prof[i][1] > LAMP_FACTOR * max(neighbours)
+
+    seed = [i for i in range(min(len(prof), 2 * min_samples)) if not _is_glint(i)]
     if len(seed) < min_samples:
         seed = list(range(min_samples))  # nothing to choose between; take the top
     kept = seed[:min_samples]
