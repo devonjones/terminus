@@ -2723,14 +2723,19 @@ def test_auto_reports_which_backend_actually_ran():
     assert skymask.sky_mask(img, backend="auto").shape == mask.shape, "report is opt-in"
 
 
-def test_a_programming_error_is_not_degraded_into_a_worse_mask():
-    """`auto` degrades on a missing model, not on a bug in this package.
+def test_a_fallback_is_recorded_rather_than_guessed_at_by_exception_type():
+    """Any failure to run degrades, and the caller is told which backend ran.
 
-    A TypeError from a bad kwarg or a changed signature is not an environmental
-    problem, and catching it would hand back a heuristic mask while reporting
-    success — the exact failure this module guards against, reintroduced by the
-    guard against it. Nothing consumes `report=True` yet, so such a bug could sit
-    behind an unread warning indefinitely.
+    An earlier version let TypeError, AttributeError and NameError propagate, on
+    the theory that those mean a bug here rather than a missing model. That does
+    not survive contact: this module calls the transformers API directly, so a
+    version skew — squarely environmental — surfaces as TypeError and would have
+    made `auto` fatal on a dependency upgrade, breaking the one promise `auto`
+    makes.
+
+    Exception type cannot separate "the environment is short something" from "we
+    have a bug". What can is recording which backend actually ran, so a silent
+    downgrade becomes a stated one.
     """
     from unittest.mock import patch
 
@@ -2742,15 +2747,48 @@ def test_a_programming_error_is_not_degraded_into_a_worse_mask():
 
     img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
     with patch.object(skymask, "available", lambda backend="segment": True):
-        # Environmental: degrade.
-        with patch.object(skymask, "segment_sky", side_effect=OSError("no cached weights")):
-            with pytest.warns(RuntimeWarning):
-                assert skymask.sky_mask(img, backend="auto", report=True)[1] == "heuristic"
-        # A bug: propagate.
-        for bug in (TypeError("bad kwarg"), AttributeError("gone"), NameError("typo")):
-            with patch.object(skymask, "segment_sky", side_effect=bug):
-                with pytest.raises(type(bug)):
-                    skymask.sky_mask(img, backend="auto")
+        for failure in (
+            OSError("we couldn't connect to huggingface.co"),
+            TypeError("unexpected keyword 'reduce_labels'"),  # a version skew
+            RuntimeError("model is on the wrong device"),
+        ):
+            with patch.object(skymask, "segment_sky", side_effect=failure):
+                with pytest.warns(RuntimeWarning, match="falling back"):
+                    mask, used = skymask.sky_mask(img, backend="auto", report=True)
+                assert used == "heuristic", f"{type(failure).__name__} must degrade, not crash"
+                assert mask.shape == (16, 32)
+
+        # An EXPLICIT request still fails loudly, whatever the cause.
+        with patch.object(skymask, "segment_sky", side_effect=TypeError("x")):
+            with pytest.raises(TypeError):
+                skymask.sky_mask(img, backend="segment")
+
+
+def test_the_mask_records_the_backend_that_ran_not_the_one_requested(tmp_path):
+    """A mask claiming `segment` that the heuristic produced is a false record.
+
+    `cmd_skymask` resolved the backend before calling and wrote that into the
+    meta, so an internal fallback would have been recorded as a segment run —
+    and the segmentation-only type pass would then have run against a heuristic
+    mask.
+    """
+    from unittest.mock import patch
+
+    from terminus.cli import main
+    from terminus.export import load_columns
+
+    pano = tmp_path / "p.png"
+    _synthetic_panorama(str(pano))
+    from terminus import skymask
+
+    with (
+        patch.object(skymask, "available", lambda backend="segment": True),
+        patch.object(skymask, "segment_sky", side_effect=OSError("no weights")),
+    ):
+        main(["skymask", str(pano), "--backend", "auto", "--az-step", "30"])
+
+    meta, _ = load_columns(str(tmp_path / "p_mask.yaml"))
+    assert meta["backend"] == "heuristic", "the mask must record what actually ran"
 
 
 def test_tile_is_rejected_by_the_heuristic_rather_than_dropped():

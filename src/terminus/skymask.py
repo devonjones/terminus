@@ -220,9 +220,20 @@ def sky_mask(image, backend="auto", **kw):
     backend wants that backend, and quietly handing back a measurably worse mask
     is the failure this project keeps guarding against.
 
-    Pass `report=True` for `(mask, backend_used)`, so a caller can record which
-    one actually ran. A run that fell back produces a different horizon, and the
-    manifest should say so rather than leave it to be inferred.
+    Pass `report=True` for `(mask, backend_used)`. This is not a convenience:
+    a run that fell back produces a measurably different horizon, and without it
+    the caller records the backend it ASKED for. `cmd_skymask` did exactly that
+    and would have written `backend: segment` into a mask the heuristic
+    produced — a durable artifact stating something false about how it was made.
+
+    Note the catch is deliberately broad. An earlier version let TypeError,
+    AttributeError and NameError through on the theory that those indicate a bug
+    here rather than a missing model. That does not survive contact: this module
+    calls the transformers API directly, so a version skew — which is squarely
+    an environmental failure and named as one above — surfaces as TypeError and
+    would have made `auto` fatal on a dependency upgrade. Exception type cannot
+    separate the two. What can is recording which backend ran and making the
+    caller state it, which is what `report` is for.
     """
     report = kw.pop("report", False)
     seg_kw = {k: v for k, v in kw.items() if k == "tile"}
@@ -237,13 +248,6 @@ def sky_mask(image, backend="auto", **kw):
             try:
                 mask = segment_sky(image, **seg_kw)
                 return (mask, "segment") if report else mask
-            except (TypeError, AttributeError, NameError):
-                # A bug in this package, not a missing model. Degrading here
-                # would hide a broken segmentation path behind a warning nobody
-                # reads, and hand back a measurably worse mask while reporting
-                # success — the failure this whole module keeps guarding
-                # against, reintroduced by the guard against it.
-                raise
             except Exception as e:  # absent weights, empty cache, version skew
                 warnings.warn(
                     f"segmentation could not run ({type(e).__name__}: {e}); falling back "
