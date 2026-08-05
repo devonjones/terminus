@@ -3182,3 +3182,48 @@ def test_a_hand_edited_skipped_az_fails_loudly_instead_of_scrambling():
         {"skipped_az": 190, "measured": "2026-08-01"}, {"measured": "2026-08-04"}, [90], []
     )
     assert meta["skipped_az"] == [190], "a bare int is one column, not three digits"
+
+
+def test_a_column_skipped_this_time_does_not_erase_what_was_measured_before():
+    """The meta must not contradict the data it describes.
+
+    Measure az 190 in one patch; re-request it in the next and have the Sun
+    block it. Subtracting only THIS run's measurements put 190 back on
+    `skipped_az` while `horizon:` still carried its altitude from before — the
+    header said the column was never measured while the file held the number.
+    """
+    from terminus import cli
+
+    prior = {"skipped_az": [], "measured": "2026-08-01"}
+    # Patch 2: nothing measured, 190 skipped, but 190 is already in the mask.
+    meta = cli._merge_meta(
+        prior,
+        {"measured": "2026-08-04"},
+        measured=set(),
+        skipped=[190],
+        present={0, 90, 190},
+    )
+    assert meta["skipped_az"] == [], "a column the mask holds is not a skipped column"
+    # A genuinely absent column still records the skip and the reason for it.
+    meta = cli._merge_meta(
+        prior, {"measured": "2026-08-04"}, measured=set(), skipped=[195], present={0, 90}
+    )
+    assert meta["skipped_az"] == [195]
+
+
+def test_the_move_check_wraps_around_the_antimeridian():
+    """Two metres apart at 179.9999 and -179.9999, not most of the way round.
+
+    An unwrapped subtraction makes that 360 degrees of longitude, which at any
+    latitude is tens of thousands of kilometres, so the guard refuses a merge
+    for someone whose only mistake was where they live.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus import cli
+
+    sky = MagicMock()
+    sky.loc.lat.deg = -16.5
+    sky.loc.lon.deg = -179.9999
+    # Raises MaskError if the wrap is missing; the point is that it does not.
+    cli._check_mergeable({"oriented": True, "lat": -16.5, "lon": 179.9999}, sky)

@@ -166,7 +166,12 @@ def _check_mergeable(prior_meta, sky):
         )
     lat_now, lon_now = sky.loc.lat.deg, sky.loc.lon.deg
     dnorth = (float(plat) - lat_now) * 111320.0
-    deast = (float(plon) - lon_now) * 111320.0 * math.cos(math.radians(lat_now))
+    # Wrapped, or two points 2 m apart either side of the antimeridian read as
+    # 39,466 km and a legitimate merge is refused. It fails closed rather than
+    # corrupting anything, but the person it fails for cannot do much about
+    # their longitude.
+    dlon = ((float(plon) - lon_now + 180.0) % 360.0) - 180.0
+    deast = dlon * 111320.0 * math.cos(math.radians(lat_now))
     moved = math.hypot(dnorth, deast)
     if moved > MERGE_POSITION_TOLERANCE_M:
         raise MaskError(
@@ -202,7 +207,7 @@ def _az_list(value, field):
         raise MaskError(f"the mask's {field} contains a non-numeric azimuth: {value!r}") from exc
 
 
-def _merge_meta(prior_meta, fresh, measured, skipped):
+def _merge_meta(prior_meta, fresh, measured, skipped, present=None):
     """Meta for a merged mask, which describes BOTH runs.
 
     `dict.update` was wrong: it let a two-column patch overwrite the whole file's
@@ -210,14 +215,22 @@ def _merge_meta(prior_meta, fresh, measured, skipped):
     with `[]`, so those columns stayed absent from the mask with the record of
     WHY they were missing destroyed.
 
-    Skips are unioned, minus anything this run actually measured. The original
-    measurement date is kept and the patch date recorded separately, because a
-    mask whose `measured` reads today when most of its columns are from Tuesday
-    is a false record.
+    Skips are unioned, minus every column the merged mask actually HOLDS —
+    `present`, not just the columns this run measured. Subtracting only this
+    run's measurements let a column be listed as skipped while its altitude sat
+    in the file: measure az 190 in one patch, re-request it in the next and have
+    the Sun block it, and `skipped_az` said 190 was never measured while
+    `horizon:` still carried it from before. The meta then contradicts the data
+    it describes. Nothing skipped this time erases what was already measured.
+
+    The original measurement date is kept and the patch date recorded
+    separately, because a mask whose `measured` reads today when most of its
+    columns are from Tuesday is a false record.
     """
     meta = dict(prior_meta)
+    have = set(measured) if present is None else set(present)
     prior_skipped = _az_list(prior_meta.get("skipped_az"), "skipped_az")
-    meta["skipped_az"] = sorted((prior_skipped | set(skipped)) - set(measured))
+    meta["skipped_az"] = sorted((prior_skipped | set(skipped)) - have)
     meta["measured"] = prior_meta.get("measured", fresh["measured"])
     meta["patched"] = sorted(set(prior_meta.get("patched") or []) | {fresh["measured"]})
     meta["patched_columns"] = sorted(
@@ -310,7 +323,9 @@ def cmd_sweep(sc, cfg, args):
     if prior:
         merged = dict(prior)
         merged.update(mask)  # freshly measured columns win
-        meta = _merge_meta(prior_meta, fresh, measured=set(mask), skipped=skipped)
+        meta = _merge_meta(
+            prior_meta, fresh, measured=set(mask), skipped=skipped, present=set(merged)
+        )
         print(f"wrote {len(mask)} measured, {len(merged) - len(mask)} preserved")
         mask = merged
     else:
