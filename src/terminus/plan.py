@@ -176,17 +176,31 @@ def residual_targets(residuals, top=3, min_abs=3.0):
     return [az for _, az in bad[:top]]
 
 
+# No column is more certain than the data it was read from. The photo mosaic
+# resolves about 0.1 degree per column and the scope's own step is coarser, so a
+# sigma below this is claiming precision neither instrument delivered.
+#
+# The floor is physical, not numerical, and that distinction matters. An epsilon
+# floor (1e-6) is enough to stop a division by zero and nowhere near enough to
+# stop the fit being captured: sigma 1e-6 with a half-degree residual scores
+# 399998 against 0.1 for the alternative, so the solver will sacrifice four good
+# columns to satisfy that one. Which is precisely what this module's own
+# docstring says must not happen — one bad fiducial tipping the whole sphere.
+MIN_SIGMA_DEG = 0.1
+
+
 def _sigma(uncertainty):
     """Degrees this column's boundary may move. 1.0 when unknown.
 
     Tested with `is None` rather than truthiness: 0.0 is a real value meaning
-    "perfectly certain", and reading it as "unknown" would be a silent
-    downgrade. It is clamped away from zero because a zero sigma is a division
-    by zero dressed as infinite confidence, which nothing has earned.
+    "as certain as this instrument gets", and reading it as "unknown" would be a
+    silent downgrade. It is floored at MIN_SIGMA_DEG rather than at an epsilon,
+    because nothing is perfectly certain and a sigma small enough to dominate
+    every other column is a claim no measurement here has earned.
     """
     if uncertainty is None:
         return 1.0
-    return max(float(uncertainty), 1e-6)
+    return max(float(uncertainty), MIN_SIGMA_DEG)
 
 
 def as_fiducial(az, edge, ceiling, Fiducial, uncertainty=None, photo_type=None, scope_type=None):
@@ -202,12 +216,13 @@ def as_fiducial(az, edge, ceiling, Fiducial, uncertainty=None, photo_type=None, 
     `uncertainty` is the column's altitude uncertainty in degrees, as
     `skymask.type_uncertainty` computes it and as the mask carries it: about 1
     degree for solid structure, 3 for vegetation, widened by the gap fraction.
-    It enters the weight as 1/sigma^2 and MULTIPLIES the SNR term rather than
-    replacing it, because the two measure different things. SNR says how well
-    this edge was DETECTED. Type says how well the thing detected STAYS PUT
-    between the photograph and the measurement — a crisp canopy edge can score
-    excellently on the first and badly on the second, and a fit that only knows
-    the first will trust it as much as a roofline.
+    It becomes the fiducial's `sigma`, which STANDARDISES the residual before
+    the robust loss — a separate thing from `weight`, which carries detection
+    quality from SNR. The two measure different questions: SNR says how well
+    this edge was DETECTED, type says how well the thing detected STAYS PUT
+    between the photograph and the measurement. A crisp canopy edge scores
+    excellently on the first and badly on the second, and a fit knowing only the
+    first will trust it as much as a roofline.
 
     The 1 and 3 degree priors are a claim about how far foliage moves, not a
     tuning knob. If they are wrong the fix is to measure how far the foliage

@@ -2554,3 +2554,37 @@ def test_the_fit_objective_standardises_rather_than_scaling():
     assert objective(r, w, np.array([1.0]), delta=delta) == pytest.approx(
         float(__import__("terminus.orient", fromlist=["_huber"])._huber(r, delta)[0])
     )
+
+
+def test_no_column_can_buy_control_of_the_fit_with_a_tiny_sigma():
+    """A sigma floor of epsilon is a numerical guard, not a physical one.
+
+    Standardising divides by sigma, so a vanishing sigma multiplies that
+    column's residual without limit and the solver will sacrifice every other
+    column to satisfy it. Measured at sigma 1e-6: a half-degree residual scored
+    399998 against 0.1 for the alternative. That is the failure this module's
+    own docstring forbids — one bad fiducial tipping the whole sphere.
+
+    The floor is the resolution of the data instead: the mosaic resolves about
+    0.1 degree per column, so nothing may claim to be more certain than that.
+    """
+    import numpy as np
+
+    from terminus.orient import Fiducial, objective
+    from terminus.plan import MIN_SIGMA_DEG, _sigma
+
+    assert _sigma(0.0) == MIN_SIGMA_DEG
+    assert _sigma(1e-9) == MIN_SIGMA_DEG
+    assert MIN_SIGMA_DEG >= 0.05, "a floor this low stops division by zero and nothing else"
+
+    # Four ordinary columns against one hyper-confident one: the confident
+    # column must not be able to outvote them by orders of magnitude.
+    f = Fiducial(0.0, 20.0, sigma=_sigma(0.0))
+    ordinary = np.array([1.0, 1.0, 1.0, 1.0])
+    lone = np.array([0.5])
+    cost_of_ignoring_the_lone_column = objective(lone, np.array([1.0]), np.array([f.sigma]))
+    cost_of_ignoring_four = objective(ordinary, np.ones(4), np.ones(4))
+    assert cost_of_ignoring_the_lone_column < 1e3 * cost_of_ignoring_four, (
+        "one column can still dominate: it scores "
+        f"{cost_of_ignoring_the_lone_column:.1f} against {cost_of_ignoring_four:.1f}"
+    )
