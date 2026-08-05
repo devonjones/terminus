@@ -12,13 +12,21 @@ Global: --config PATH (default ./config.toml). sweep: --az-start --az-end --out
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
-from .export import MaskError, default_meta, export_all, write_mask
+from .export import (
+    MaskError,
+    default_meta,
+    export_all,
+    is_oriented,
+    load_columns,
+    write_mask,
+)
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     Pointer,
@@ -100,6 +108,137 @@ def cmd_classify(sc, cfg, args):
     sc.stop_view()
 
 
+# Loose on purpose: the mask rounds lat/lon to four decimals (~8 m by itself)
+# and a GPS fix wanders. This catches crossing the garden, not nudging the
+# tripod.
+MERGE_POSITION_TOLERANCE_M = 30.0
+
+
+def _check_mergeable(prior_meta, sky):
+    """Refuse to merge two runs that do not describe the same sky.
+
+    A merge silently mixes runs, and the mask is a durable artifact other tools
+    consume, so the mixing has to be checked rather than assumed.
+
+    Orientation: a photo-derived mask is in the panorama's own azimuth until the
+    orientation is solved. Merging true-north scope columns into it produces a
+    file where some columns are true and some are not, with nothing to say
+    which — and the header still claims one frame for all of them.
+
+    Position: the horizon belongs to where the tripod stood. A 2 m fence at 5 m
+    moves 11.9 degrees for 2 m of observer displacement, so merging across a
+    move is merging two different horizons.
+
+    The comparison is in METRES, not degrees. Comparing a degree threshold
+    against both lat and lon makes the longitude test 23 per cent tighter at
+    this latitude, because a degree of longitude shrinks by cos(lat) — 0.0003
+    deg is 33 m north-south and 26 m east-west at 39.8. That asymmetry is not
+    what anyone means by "the same spot".
+
+    The tolerance is deliberately loose: the mask rounds lat/lon to four
+    decimals (about 8 m on its own) and a GPS fix wanders, so this catches
+    crossing the garden rather than shuffling the tripod.
+
+    A mask with NO recorded position is refused rather than waved through. An
+    absent value is not agreement, and passing it would be self-perpetuating —
+    the merged file would still carry no position, so every later patch would
+    skip the check as well.
+    """
+    if not is_oriented(prior_meta):
+        raise MaskError(
+            "refusing to merge: the existing mask is UNORIENTED (its azimuth is the "
+            "panorama's own) and the scope measures in true azimuth. Merging would "
+            "produce a mask that is partly one frame and partly the other. Solve the "
+            "orientation first, or write to a different --out."
+        )
+    plat, plon = prior_meta.get("lat"), prior_meta.get("lon")
+    if plat is None or plon is None:
+        # No position recorded is not "the position matches". A mask that never
+        # said where it stood cannot be checked against this run, and merging
+        # anyway would leave the merged file just as positionless — so the hole
+        # never closes and every later patch skips the check too.
+        raise MaskError(
+            "refusing to merge: the existing mask records no lat/lon, so there is no "
+            "way to tell whether it was measured from this spot. A near obstruction "
+            "shifts by degrees for a few metres. If you know it was the same position, "
+            "add lat and lon to the mask header and re-run; otherwise write to a "
+            "different --out."
+        )
+    lat_now, lon_now = sky.loc.lat.deg, sky.loc.lon.deg
+    dnorth = (float(plat) - lat_now) * 111320.0
+    # Wrapped, or two points 2 m apart either side of the antimeridian read as
+    # 39,466 km and a legitimate merge is refused. It fails closed rather than
+    # corrupting anything, but the person it fails for cannot do much about
+    # their longitude.
+    dlon = ((float(plon) - lon_now + 180.0) % 360.0) - 180.0
+    deast = dlon * 111320.0 * math.cos(math.radians(lat_now))
+    moved = math.hypot(dnorth, deast)
+    if moved > MERGE_POSITION_TOLERANCE_M:
+        raise MaskError(
+            f"refusing to merge: the existing mask was measured at {plat},{plon} and "
+            f"this run is at {lat_now:.4f},{lon_now:.4f}, about {moved:.0f} m away. The "
+            "horizon belongs to one position — a near obstruction shifts by degrees for "
+            "a few metres — so these are two different horizons. Write to a different "
+            "--out."
+        )
+
+
+def _az_list(value, field):
+    """Azimuths from a meta field a human may have hand-edited.
+
+    A bare `skipped_az: 190` is a reasonable shorthand to write and is accepted.
+    A string is not: iterating "190" yields the characters, so `int(a) for a in
+    ...` quietly produces {1, 9, 0} — three wrong columns rather than an error.
+    That is the failure worth being loud about, so it raises MaskError with the
+    correction rather than a bare TypeError from somewhere deeper.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {int(value)}
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+        raise MaskError(
+            f"the mask's {field} is {value!r}; it must be a list of azimuths "
+            f"(for example {field}: [190, 195]) or a single number."
+        )
+    try:
+        return {int(a) for a in value}
+    except (TypeError, ValueError) as exc:
+        raise MaskError(f"the mask's {field} contains a non-numeric azimuth: {value!r}") from exc
+
+
+def _merge_meta(prior_meta, fresh, measured, skipped, present=None):
+    """Meta for a merged mask, which describes BOTH runs.
+
+    `dict.update` was wrong: it let a two-column patch overwrite the whole file's
+    description. A patch that skipped nothing replaced `skipped_az: [190, 195]`
+    with `[]`, so those columns stayed absent from the mask with the record of
+    WHY they were missing destroyed.
+
+    Skips are unioned, minus every column the merged mask actually HOLDS —
+    `present`, not just the columns this run measured. Subtracting only this
+    run's measurements let a column be listed as skipped while its altitude sat
+    in the file: measure az 190 in one patch, re-request it in the next and have
+    the Sun block it, and `skipped_az` said 190 was never measured while
+    `horizon:` still carried it from before. The meta then contradicts the data
+    it describes. Nothing skipped this time erases what was already measured.
+
+    The original measurement date is kept and the patch date recorded
+    separately, because a mask whose `measured` reads today when most of its
+    columns are from Tuesday is a false record.
+    """
+    meta = dict(prior_meta)
+    have = set(measured) if present is None else set(present)
+    prior_skipped = _az_list(prior_meta.get("skipped_az"), "skipped_az")
+    meta["skipped_az"] = sorted((prior_skipped | set(skipped)) - have)
+    meta["measured"] = prior_meta.get("measured", fresh["measured"])
+    meta["patched"] = sorted(set(prior_meta.get("patched") or []) | {fresh["measured"]})
+    meta["patched_columns"] = sorted(
+        _az_list(prior_meta.get("patched_columns"), "patched_columns") | {int(a) for a in measured}
+    )
+    return meta
+
+
 def cmd_sweep(sc, cfg, args):
     if not sc.is_eq_mode() and not args.dry_run:
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
@@ -115,10 +254,37 @@ def cmd_sweep(sc, cfg, args):
         print(f"exposure locked: {locked}")
         sc.start_view("scenery")
         time.sleep(3)
+    # getattr, matching cmd_export: several tests build an args namespace by
+    # hand, and a new flag should not break tests of unrelated behaviour.
+    requested = getattr(args, "azimuths", None)
+    azimuths = None
+    if requested:
+        azimuths = [float(a) for a in requested.replace(" ", "").split(",") if a]
+        if not azimuths:
+            raise SeestarError("--azimuths was given but parsed to nothing")
+        print(f"measuring {len(azimuths)} explicit columns: {sorted(azimuths)}")
+
+    # Merge, never replace. A targeted re-measure of four columns must not
+    # discard the thirty that were already good — that is the whole point of
+    # measuring a list rather than a range.
+    prior, prior_meta = {}, {}
+    if azimuths and os.path.exists(out):
+        prior_meta, prior_cols = load_columns(out)
+        _check_mergeable(prior_meta, sky)
+        prior = dict(prior_cols)
+        print(f"merging into {out} ({len(prior)} existing columns)")
+
     aborted = None
     try:
         mask, skipped, profiles = run_sweep(
-            sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
+            sc,
+            sky,
+            cfg["sweep"],
+            args.az_start,
+            args.az_end,
+            save_dir=frames,
+            dry=args.dry_run,
+            azimuths=azimuths,
         )
     except PointingError as e:
         # A sweep runs for hours. Losing every column already measured because
@@ -153,9 +319,18 @@ def cmd_sweep(sc, cfg, args):
         print(f"wrote {prof_path} (raw column brightness profiles)")
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
-    write_mask(
-        out, mask, skipped, default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
-    )
+    fresh = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+    if prior:
+        merged = dict(prior)
+        merged.update(mask)  # freshly measured columns win
+        meta = _merge_meta(
+            prior_meta, fresh, measured=set(mask), skipped=skipped, present=set(merged)
+        )
+        print(f"wrote {len(mask)} measured, {len(merged) - len(mask)} preserved")
+        mask = merged
+    else:
+        meta = fresh
+    write_mask(out, mask, skipped, meta)
     print(
         f"\nwrote {out} ({len(mask)} azimuths, {len(skipped)} skipped); review frames in {frames}/"
     )
@@ -358,6 +533,12 @@ def main(argv=None):
     sw.add_argument("--az-end", type=float, default=350)
     sw.add_argument("--out", default=None)
     sw.add_argument("--frames", default=None)
+    sw.add_argument(
+        "--azimuths",
+        default=None,
+        help="comma list of azimuths to measure instead of a range; "
+        "merges into --out if it exists",
+    )
     sw.add_argument("--no-export", action="store_true")
     sw.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("export")

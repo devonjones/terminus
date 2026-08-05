@@ -2849,3 +2849,381 @@ def test_every_mask_and_export_says_the_horizon_is_position_specific(tmp_path):
 
     # Stellarium stays comment-free, which the format requires.
     assert all(not ln.startswith("#") for ln in open(txt).read().splitlines())
+
+
+# ---- sweep --azimuths (terminus-5) -----------------------------------------
+def test_run_sweep_scans_an_explicit_list_not_a_grid():
+    """The planner produces interesting columns, not a range.
+
+    Re-measuring the handful that came back unresolved should not cost a whole
+    circle, which is the only thing a uniform az_start/az_end walk can do.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    seen = []
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        seen.append(az)
+        return 20.0, "edge", "tree", []
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch("terminus.sweep.scan_horizon", fake_scan),
+    ):
+        mask, _, _ = run_sweep(
+            sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[55, 57, 82, 172]
+        )
+    assert seen == [55, 57, 82, 172], f"scanned {seen}"
+    assert sorted(mask) == [55, 57, 82, 172]
+
+
+def test_an_explicit_sweep_merges_rather_than_replaces(tmp_path, monkeypatch):
+    """Re-measuring four columns must not discard the thirty already good.
+
+    Replacing would make a targeted re-measure strictly worse than not running
+    it — the mask would come back shorter than it went in.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    # lat/lon as a real sweep writes them: `default_meta` always stamps the site,
+    # and a prior mask without one is now refused rather than merged blind.
+    write_mask(
+        str(out),
+        {0: (10.0, "tree"), 90: (20.0, "structure"), 180: (5.0, "tree")},
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {"az_step": 5, "alt_min": 0, "alt_max": 60, "sun_cone_deg": 30,
+                  "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+        no_export=True, azimuths="90,270",
+    )  # fmt: skip
+
+    with patch.object(
+        cli, "run_sweep", return_value=({90: (33.0, "tree"), 270: (7.0, "tree")}, [], {})
+    ):
+        cli.cmd_sweep(sc, cfg, args)
+
+    _, cols = load_columns(str(out))
+    assert sorted(cols) == [0, 90, 180, 270], "columns not re-measured must survive"
+    assert cols[90]["alt"] == 33.0, "a re-measured column must be replaced by the new value"
+    assert cols[0]["alt"] == 10.0 and cols[180]["alt"] == 5.0, "untouched columns preserved"
+
+
+def test_a_full_sweep_still_replaces(tmp_path):
+    """Merging is for --azimuths only. A full circle is a fresh measurement."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(str(out), {0: (10.0, "tree"), 90: (20.0, "structure")}, [], {})
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {"az_step": 5, "alt_min": 0, "alt_max": 60, "sun_cone_deg": 30,
+                  "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+        no_export=True, azimuths=None,
+    )  # fmt: skip
+    with patch.object(cli, "run_sweep", return_value=({45: (12.0, "tree")}, [], {})):
+        cli.cmd_sweep(sc, cfg, args)
+    _, cols = load_columns(str(out))
+    assert sorted(cols) == [45], "a full sweep writes what it measured"
+
+
+def _sweep_args(out, azimuths=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+        no_export=True, azimuths=azimuths,
+    )  # fmt: skip
+
+
+_SWEEP_CFG = {
+    "site": {"lat": 39.79, "lon": -104.89},
+    "sweep": {"az_step": 5, "alt_min": 0, "alt_max": 60, "sun_cone_deg": 30, "clear_thresh": 0.6},
+}
+
+
+def test_refuses_to_merge_scope_columns_into_an_unoriented_mask(tmp_path):
+    """Two coordinate frames in one file, with nothing to say which is which.
+
+    A photo mask is in the panorama's own azimuth until the orientation is
+    solved. Merging true-north scope columns into it leaves some columns true
+    and some not, under a header claiming one frame for all of them.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import MaskError, write_mask
+
+    out = tmp_path / "photo.yaml"
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with pytest.raises(MaskError, match="UNORIENTED"):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90,270"))
+
+
+def test_refuses_to_merge_across_a_move(tmp_path):
+    """The horizon belongs to one spot, and terminus-44 measured how sharply.
+
+    A 2 m fence at 5 m shifts 11.9 degrees for 2 m of observer displacement, so
+    merging a run from the far side of the garden mixes two different horizons.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import MaskError, write_mask
+
+    out = tmp_path / "elsewhere.yaml"
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"lat": 39.80, "lon": -104.89})
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with pytest.raises(MaskError, match="one position"):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+
+def test_a_patch_does_not_erase_the_record_of_skipped_columns(tmp_path):
+    """`dict.update` let a two-column patch describe the whole file.
+
+    A base sweep that skipped 190 and 195 for the Sun, patched by a run that
+    skipped nothing, had `skipped_az` overwritten to [] — while 190 and 195
+    stayed absent from the mask. The columns were still missing and the reason
+    was gone.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {0: (10.0, "tree"), 90: (20.0, "structure")},
+        [190, 195],
+        {"lat": 39.79, "lon": -104.89, "measured": "2026-08-01 21:00", "skipped_az": [190, 195]},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with patch.object(cli, "run_sweep", return_value=({90: (33.0, "tree")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    meta, cols = load_columns(str(out))
+    assert meta["skipped_az"] == [190, 195], "the reason those columns are missing must survive"
+    assert meta["measured"] == "2026-08-01 21:00", "most columns are still from the original run"
+    assert meta["patched"], "and the patch must be recorded rather than hidden"
+    assert 90 in meta["patched_columns"]
+    assert cols[90]["alt"] == 33.0
+
+
+def test_a_measured_column_leaves_the_skipped_list(tmp_path):
+    """Re-measuring a previously skipped column must clear it from the record."""
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(str(out), {0: (10.0, "tree")}, [190], {"lat": 39.79, "lon": -104.89,
+                                                      "skipped_az": [190]})  # fmt: skip
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with patch.object(cli, "run_sweep", return_value=({190: (12.0, "tree")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "190"))
+    meta, cols = load_columns(str(out))
+    assert meta["skipped_az"] == [], "190 was measured this time; it is no longer skipped"
+    assert cols[190]["alt"] == 12.0
+
+
+def test_duplicate_azimuths_are_measured_once():
+    """370 and 10 are the same column; asking for both must not scan twice."""
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    seen = []
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        seen.append(az)
+        return 20.0, "edge", "tree", []
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch("terminus.sweep.scan_horizon", fake_scan),
+    ):
+        run_sweep(sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[10, 370, 10.4, -350])
+    assert seen == [10], f"expected one scan of az 10, got {seen}"
+
+
+def test_the_move_threshold_is_the_same_distance_in_every_direction():
+    """Comparing a DEGREE threshold to both lat and lon is not one distance.
+
+    A degree of longitude shrinks by cos(lat), so at 39.8 the same 0.0003 deg
+    is 33 m north-south and 26 m east-west — the east-west test was 23 per cent
+    tighter than intended, which is not what anyone means by "the same spot".
+    """
+    import math
+
+    from terminus.cli import MERGE_POSITION_TOLERANCE_M as tol
+
+    lat = 39.79
+    # A displacement just inside the tolerance must pass in BOTH directions,
+    # and one just outside must fail in both.
+    north_ok = (tol * 0.9) / 111320.0
+    east_ok = (tol * 0.9) / (111320.0 * math.cos(math.radians(lat)))
+    north_bad = (tol * 1.5) / 111320.0
+    east_bad = (tol * 1.5) / (111320.0 * math.cos(math.radians(lat)))
+    # East and north offsets of the same metre distance differ in degrees...
+    assert east_ok > north_ok, "longitude degrees are shorter at this latitude"
+    # ...and the guard must treat them as the same distance.
+    for dlat, dlon, should_pass in (
+        (north_ok, 0.0, True),
+        (0.0, east_ok, True),
+        (north_bad, 0.0, False),
+        (0.0, east_bad, False),
+    ):
+        d = math.hypot(dlat * 111320.0, dlon * 111320.0 * math.cos(math.radians(lat)))
+        assert (d <= tol) is should_pass, f"{d:.1f} m classified wrongly"
+
+
+def test_refuses_to_merge_into_a_mask_that_never_said_where_it_stood(tmp_path):
+    """An absent position is not a matching position.
+
+    The position guard only fired when the prior mask carried lat/lon, so a mask
+    without them merged silently — and the merged file was positionless too, so
+    every later patch skipped the check as well. The hole propagated itself.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import MaskError, write_mask
+
+    out = tmp_path / "nowhere.yaml"
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"oriented": True})
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with pytest.raises(MaskError, match="no lat/lon"):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+
+def test_a_hand_edited_skipped_az_fails_loudly_instead_of_scrambling():
+    """`skipped_az: "190"` iterates to the characters 1, 9, 0.
+
+    Three wrong columns recorded as skipped, no error. A bare `190` is a fair
+    shorthand and is accepted; a string is the case that must be refused,
+    because the silent answer is wrong rather than absent.
+    """
+    import pytest
+
+    from terminus import cli
+    from terminus.export import MaskError
+
+    assert cli._az_list(190, "skipped_az") == {190}
+    assert cli._az_list([190, 195], "skipped_az") == {190, 195}
+    assert cli._az_list(None, "skipped_az") == set()
+    with pytest.raises(MaskError, match="list of azimuths"):
+        cli._az_list("190", "skipped_az")
+    with pytest.raises(MaskError, match="non-numeric"):
+        cli._az_list(["north"], "skipped_az")
+    # And the merge path routes through it rather than round the side.
+    meta = cli._merge_meta(
+        {"skipped_az": 190, "measured": "2026-08-01"}, {"measured": "2026-08-04"}, [90], []
+    )
+    assert meta["skipped_az"] == [190], "a bare int is one column, not three digits"
+
+
+def test_a_column_skipped_this_time_does_not_erase_what_was_measured_before():
+    """The meta must not contradict the data it describes.
+
+    Measure az 190 in one patch; re-request it in the next and have the Sun
+    block it. Subtracting only THIS run's measurements put 190 back on
+    `skipped_az` while `horizon:` still carried its altitude from before — the
+    header said the column was never measured while the file held the number.
+    """
+    from terminus import cli
+
+    prior = {"skipped_az": [], "measured": "2026-08-01"}
+    # Patch 2: nothing measured, 190 skipped, but 190 is already in the mask.
+    meta = cli._merge_meta(
+        prior,
+        {"measured": "2026-08-04"},
+        measured=set(),
+        skipped=[190],
+        present={0, 90, 190},
+    )
+    assert meta["skipped_az"] == [], "a column the mask holds is not a skipped column"
+    # A genuinely absent column still records the skip and the reason for it.
+    meta = cli._merge_meta(
+        prior, {"measured": "2026-08-04"}, measured=set(), skipped=[195], present={0, 90}
+    )
+    assert meta["skipped_az"] == [195]
+
+
+def test_the_move_check_wraps_around_the_antimeridian():
+    """Two metres apart at 179.9999 and -179.9999, not most of the way round.
+
+    An unwrapped subtraction makes that 360 degrees of longitude, which at any
+    latitude is tens of thousands of kilometres, so the guard refuses a merge
+    for someone whose only mistake was where they live.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus import cli
+
+    sky = MagicMock()
+    sky.loc.lat.deg = -16.5
+    sky.loc.lon.deg = -179.9999
+    # Raises MaskError if the wrap is missing; the point is that it does not.
+    cli._check_mergeable({"oriented": True, "lat": -16.5, "lon": 179.9999}, sky)
