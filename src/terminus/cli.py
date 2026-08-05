@@ -1001,7 +1001,13 @@ def main(argv=None):
         help="stop before any column once the Sun reaches this altitude, checked "
         "inside the loop (try -18 for astronomical twilight)",
     )
-    orp.add_argument("--dry-run", action="store_true")
+    orp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="rehearse the POINTING only. It cannot measure — every column reports "
+        "open to the search floor and is dropped, so the run ends with too few "
+        "columns to fit. Use --replay to rehearse the whole loop.",
+    )
 
     ex = sub.add_parser("export")
     ex.add_argument("mask")
