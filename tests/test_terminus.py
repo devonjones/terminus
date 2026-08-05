@@ -3489,3 +3489,47 @@ def test_a_daylight_re_measure_may_correct_the_type(tmp_path):
     _, cols = load_columns(str(out))
     assert cols[90]["type"] == "structure", "a fresh naming replaces an old one"
     assert cols[90]["type_source"] == "scope", "and brings its own source with it"
+
+
+def test_a_real_crossing_clears_the_photo_s_lower_bound_flag(tmp_path):
+    """`clipped` describes an altitude, not an obstruction.
+
+    It means the obstruction ran off the top of the PHOTO, so the altitude
+    beside it is a lower bound rather than a measurement. Once the scope
+    supplies a real crossing, that number is no longer the bound — carrying the
+    flag forward makes the file assert something false about a value it no
+    longer describes.
+
+    The contrast is `gap_fraction` and `uncertainty`, which describe how gappy
+    the canopy is and how far it moves. Those are properties of the thing, and
+    looking at it again from a different instrument does not change them.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {
+            90: {
+                "alt": 60.0, "type": "tree", "type_source": "photo",
+                "clipped": True, "gap_fraction": 0.4, "uncertainty": 4.2,
+            }
+        },  # fmt: skip
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # The scope finds a genuine edge well below the photo's cropped bound.
+    with patch.object(cli, "run_sweep", return_value=({90: (22.0, "")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["alt"] == 22.0
+    assert cols[90].get("clipped") is None, "22.0 is a measurement, not a lower bound"
+    assert cols[90]["gap_fraction"] == 0.4, "how gappy the canopy is did not change"
+    assert cols[90]["uncertainty"] == 4.2, "nor how far it moves"
+    assert cols[90]["type"] == "tree", "and the photo still knows what it is"

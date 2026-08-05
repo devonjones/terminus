@@ -228,11 +228,25 @@ def _merge_column(prior_col, fresh_col):
     if not out.get("type") and prior_col.get("type"):
         out["type"] = prior_col["type"]
         out["type_source"] = prior_col.get("type_source")
-    # Photo-only fields describe the panorama column, not this measurement, so a
-    # scope re-measure has nothing to say about them and must not erase them.
-    for key in ("clipped", "gap_fraction", "uncertainty"):
+    # Photo fields survive a re-measure only if they describe the OBSTRUCTION
+    # rather than the altitude. `gap_fraction` is how gappy the canopy is and
+    # `uncertainty` is how far that boundary moves — both are properties of the
+    # thing, and a second look at it from a different instrument does not change
+    # them.
+    for key in ("gap_fraction", "uncertainty"):
         if out.get(key) is None and prior_col.get(key) is not None:
             out[key] = prior_col[key]
+    # `clipped` is not such a property. It means THIS ALTITUDE IS A LOWER BOUND,
+    # because the obstruction ran off the top of the photo. Once the scope
+    # supplies a real crossing the altitude is no longer that bound, so carrying
+    # the flag forward makes the file assert something false about a number it
+    # no longer describes — the same bug this function fixes for `type`, one
+    # field over. Dropped rather than carried.
+    #
+    # A scope re-measure that hit its OWN ceiling is a different statement and
+    # the mask cannot express it yet: run_sweep returns a bare (alt, type) and
+    # the boundedness lives only in the status string. That is terminus-7's
+    # territory, not something to paper over by reusing the photo's flag.
     return out
 
 
