@@ -506,6 +506,13 @@ def _texture(args):
 
 
 def cmd_orient(sc, cfg, args):
+    try:
+        _orient(sc, cfg, args)
+    except OSError as e:
+        raise MaskError(f"could not read or write beside {args.mask}: {e}") from e
+
+
+def _orient(sc, cfg, args):
     """Solve where the photo horizon sits on the sky, one chosen column at a time.
 
     Two measurement sources, and the loop cannot tell them apart. `--replay`
@@ -513,8 +520,6 @@ def cmd_orient(sc, cfg, args):
     that is how this was built and how a planner change gets compared against a
     real run. Without it the scope measures, Sun-guarded like every other slew.
     """
-    import json
-
     from . import guide
     from .export import load_mask, write_mask
 
@@ -523,8 +528,7 @@ def cmd_orient(sc, cfg, args):
         raise MaskError(f"{args.mask} has no columns to orient")
 
     if args.replay:
-        with open(args.replay) as f:
-            measure = guide.replay(json.load(f), uncertainty=args.uncertainty)
+        measure = _replay_source(args)
         reachable = should_stop = None
         print(f"replaying {args.replay}: no telescope, no sky")
     else:
@@ -560,7 +564,8 @@ def cmd_orient(sc, cfg, args):
 
     if not settled:
         print(
-            "the yaw had not settled, so this orientation is provisional",
+            "the yaw had not settled, so this mask is written UNORIENTED and will not "
+            "export until you decide it is good enough (--allow-unoriented)",
             file=sys.stderr,
         )
 
@@ -572,7 +577,14 @@ def cmd_orient(sc, cfg, args):
         [],
         dict(
             meta,
-            oriented=True,
+            # NOT unconditionally True. Every exporter gates on this flag through
+            # `require_oriented`, and `fit_settled` was write-only — nothing read
+            # it — so a run that stopped with the yaw still moving wrote a mask
+            # that exported silently, with no --allow-unoriented needed. The
+            # warning went to stderr and the file said nothing. Reusing the flag
+            # the enforcement already keys on is the whole fix: a provisional
+            # orientation now refuses to export until someone says they know.
+            oriented=settled,
             yaw=round(solution["yaw"], 3),
             pitch=round(solution["pitch"], 3),
             tilt_mag=round(solution["tilt_mag"], 3),
@@ -583,7 +595,44 @@ def cmd_orient(sc, cfg, args):
             source_mask=os.path.abspath(args.mask),
         ),
     )
-    print(f"wrote {out} (now in TRUE azimuth; export it)")
+    print(
+        f"wrote {out} "
+        + (
+            "(now in TRUE azimuth; export it)"
+            if settled
+            else "(marked UNORIENTED: the yaw was still moving when the run stopped)"
+        )
+    )
+
+
+def _replay_source(args):
+    """`measure(az)` from a saved sweep's profiles, with its failures explained.
+
+    A missing file and a file of the wrong shape are the two most likely things
+    to happen here — the path is typed by hand and the JSON is hand-editable —
+    and both reached the user as tracebacks while a mask with too few columns
+    got a clean sentence.
+    """
+    import json
+
+    from . import guide
+
+    try:
+        with open(args.replay) as f:
+            profiles = json.load(f)
+    except OSError as e:
+        raise MaskError(f"could not read the profiles {args.replay}: {e}") from e
+    except ValueError as e:
+        raise MaskError(f"{args.replay} is not valid JSON: {e}") from e
+    if not isinstance(profiles, dict) or not profiles:
+        raise MaskError(
+            f"{args.replay} should be an object of azimuth -> [[alt, lum], ...], as "
+            f"`terminus sweep` writes beside its mask; got {type(profiles).__name__}"
+        )
+    try:
+        return guide.replay(profiles, uncertainty=args.uncertainty)
+    except (TypeError, ValueError) as e:
+        raise MaskError(f"{args.replay} is not shaped like a sweep's profiles: {e}") from e
 
 
 def _scope_measure(sc, cfg, args):
@@ -646,6 +695,21 @@ def _scope_measure(sc, cfg, args):
             # could not tell" into "it is at least 60 degrees" — an unevidenced
             # value in a file the fit trusts. Not attempted is the honest shape.
             print(f"az {az:3d}: {status}", file=sys.stderr)
+            return None
+        if status.startswith("open"):
+            # Open all the way to the search floor. That is a real constraint —
+            # the horizon is at or BELOW alt_min — but it is the opposite
+            # one-sided constraint from a ceiling bound, and `Fiducial` can only
+            # express "at least this high". Recording it as an exact edge AT the
+            # floor invents a measurement: "found nothing between 0 and 60" is
+            # not "the horizon is at 0". `orient.from_mask` reaches the same
+            # conclusion about the same status, and excludes it.
+            #
+            # So it is dropped, which loses information rather than inventing it.
+            # terminus-50 tracks giving `Fiducial` a downward bound so the fit
+            # can use these columns honestly.
+            print(f"az {az:3d}: open to the search floor (no constraint the fit can use)",
+                  file=sys.stderr)  # fmt: skip
             return None
         if status == "blocked_above":
             return None, sw["alt_max"], args.uncertainty
