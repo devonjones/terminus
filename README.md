@@ -91,12 +91,18 @@ as a hint, not a measurement.
 - A **`Horizon`** class for planners: `altitude_at(az)`, `is_above(az, alt)`,
   `is_visible(ra, dec, sky)`.
 
-**The horizon is specific to where the tripod stood.** How specific depends on
-distance: a ridge two kilometres out does not care where you stand, but a fence
-five metres away swings by degrees if you move a couple of metres, and by more
-if you move toward or away from it. The error is largest exactly where the
-horizon is highest, since the tall obstructions are the near ones. Measure from
-where you observe, and re-measure if you move.
+**The horizon is specific to where the tripod stood**, and how specific depends
+entirely on distance:
+
+| obstruction | move 2 m sideways | move 2 m closer |
+|---|---|---|
+| 2 m fence at 5 m | 1.4° | **11.9°** |
+| 100 m ridge at 2 km | ~0° | 0.003° |
+
+So a distant skyline does not care where you stand and a near one cares a great
+deal — and the error is largest exactly where the horizon is highest, because
+the tall obstructions are the near ones. Measure from where you observe, and
+re-measure if you move. This is geometry rather than something measured here.
 
 Anything classified as vegetation is exported with a **3° safety margin** added,
 applied at a single choke point every exporter routes through. A tree has gaps
