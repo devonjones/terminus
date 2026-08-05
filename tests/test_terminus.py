@@ -3984,3 +3984,81 @@ def test_an_unwritable_destination_is_explained_not_traced(tmp_path, capsys):
         _export_fails(capsys, ["export", mask], "could not write the export")
     finally:
         os.chmod(tmp_path, mode)
+
+
+def test_the_hor_profile_is_readable_by_pvsyst_s_own_rules(tmp_path):
+    """PVsyst: 'all lines containing text are considered comment lines'.
+
+    So the header needs no marker character — but every DATA line must contain
+    no text at all, or PVsyst silently drops it as a comment and the profile
+    comes back short with no error.
+    """
+    from terminus.export import to_pvsyst_hor
+
+    text = to_pvsyst_hor(
+        [(0, 10.0, "tree"), (90, 30.0, "structure"), (180, 5.0, "structure")],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    data = [ln for ln in lines if not any(c.isalpha() for c in ln)]
+    assert len(data) >= 4, "0, three measured columns and the 360 wrap"
+    for ln in data:
+        az, alt = ln.split()
+        float(az), float(alt)  # both parse as plain numbers
+    # The convention is stated, because PVsyst's import dialog asks for it and
+    # guessing produces a mirrored horizon that still looks plausible.
+    assert any("Clockwise" in ln for ln in lines)
+    assert any("true north" in ln for ln in lines)
+    # PVsyst reads a latitude/longitude comment as the profile's metadata.
+    assert any("Latitude 39.79" in ln and "Longitude -104.89" in ln for ln in lines)
+    # The vegetation margin is applied here as everywhere else, and declared.
+    first = next(ln for ln in data if ln.startswith("0 "))
+    assert float(first.split()[1]) == 13.0, "10 measured + 3 degrees of foliage margin"
+    assert any("Vegetation" in ln for ln in lines)
+
+
+def test_the_hor_profile_refuses_an_unoriented_mask():
+    """A solar siting tool has no more business with a rotated horizon than a
+    planner does, and the file's own header would be claiming true north."""
+    import pytest
+
+    from terminus.export import UnorientedMask, to_pvsyst_hor
+
+    with pytest.raises(UnorientedMask):
+        to_pvsyst_hor([(0, 10.0, "tree")], {"oriented": False})
+
+
+def test_our_hrz_matches_what_the_existing_generators_emit(tmp_path):
+    """Drop-in for people already using HRZ-Creator or panorama-horizon-maker.
+
+    Their writer is `f"{azimuth} {elevation:.1f}\\n"` — space separated, one
+    pair per line, ascending, starting at azimuth 0. Ours adds `#` comment
+    lines, which N.I.N.A. accepts and they simply never wrote. The test is that
+    stripping comments leaves a file with their exact shape, so a mask from
+    terminus goes where one of theirs went.
+    """
+    from terminus.export import to_nina_hrz
+
+    text = to_nina_hrz([(0, 10.0, "structure"), (90, 30.0, "structure")], {"lat": 1, "lon": 2})
+    data = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    assert data[0].split()[0] == "0", "their README: the file needs to start with Az 0"
+    azimuths = [float(ln.split()[0]) for ln in data]
+    assert azimuths == sorted(azimuths), "ascending azimuth"
+    assert azimuths[-1] == 360.0, "and closed at 360 so nothing extrapolates the wrap"
+    for ln in data:
+        assert len(ln.split()) == 2, "one space-separated az/alt pair per line"
+
+
+def test_export_writes_the_hor_only_when_asked(tmp_path, capsys):
+    """Opt-in, like the pictures: the default export is unchanged."""
+    from terminus.cli import main
+
+    mask = _picture_mask(tmp_path)
+    main(["export", mask])
+    assert not (tmp_path / "h.HOR").exists()
+
+    main(["export", mask, "--pvsyst"])
+    hor = tmp_path / "h.HOR"
+    assert hor.exists()
+    assert "Clockwise" in hor.read_text()
+    assert "north azimuth 0 on import" in capsys.readouterr().out

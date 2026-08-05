@@ -180,6 +180,8 @@ terminus export horizon_mask.yaml  # re-export a mask without re-sweeping
 
 # pictures, not just numbers: a Sky Safari panorama and a Stellarium landscape
 terminus export horizon_mask.yaml --skysafari --landscape
+# and a PVsyst .HOR profile, for the solar-siting tools that got here first
+terminus export horizon_mask.yaml --pvsyst
 # ...and with the panorama itself as the texture, gaps shown as sky
 terminus export horizon_mask.yaml --landscape \
     --texture pano.png --coverage pano.coverage.npy
@@ -200,6 +202,17 @@ into Stellarium's `landscapes/` folder.
 Where the panorama has no coverage the pixel is transparent, so the program
 draws sky. A gap in the survey is not black ground, and presenting it as such
 would give the viewer a wall to trust that nobody ever photographed.
+
+`--pvsyst` writes a `.HOR` horizon profile. PVsyst's import dialog asks for the
+rotation direction and the north azimuth angle, because its convention is not
+ours — set **Clockwise** and **0**, which the file's own header repeats. Guessing
+gives a mirrored horizon that still looks plausible.
+
+The `.hrz` is drop-in where [HRZ-Creator](https://neuronburner.com/hrz-creator/)
+or [panorama-horizon-maker](https://github.com/danngalann/panorama-horizon-maker)
+output went: same space-separated `az alt` pairs, ascending from 0 and closed at
+360. terminus adds `#` comment lines, which N.I.N.A. accepts and they never
+wrote.
 
 Review the `*_frames/` images, correct any misjudged rows in the mask by hand,
 then `terminus export` again.
