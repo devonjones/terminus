@@ -207,6 +207,35 @@ def _az_list(value, field):
         raise MaskError(f"the mask's {field} contains a non-numeric azimuth: {value!r}") from exc
 
 
+def _merge_column(prior_col, fresh_col):
+    """One column re-measured: take the new altitude, keep the better type.
+
+    A whole-record replace was wrong, and in a way that only shows up at night.
+    Re-measure a column at 2 a.m. that the photo had segmented as `tree` and the
+    fresh record carries `type: ""` — the scope cannot name anything after
+    sunset — so the replace silently threw away a real, in-focus segmentation
+    and the column exported without its seasonal buffer. A targeted re-measure,
+    which is meant to IMPROVE a column, made it worse.
+
+    The two fields come from two instruments and are not interchangeable, which
+    is the whole point of `type_source`. Altitude is the scope's answer and the
+    fresh one is always better. Type is whichever instrument could actually name
+    it, so a fresh naming replaces an old one and a fresh SILENCE does not.
+    """
+    if not prior_col:
+        return fresh_col
+    out = dict(fresh_col)
+    if not out.get("type") and prior_col.get("type"):
+        out["type"] = prior_col["type"]
+        out["type_source"] = prior_col.get("type_source")
+    # Photo-only fields describe the panorama column, not this measurement, so a
+    # scope re-measure has nothing to say about them and must not erase them.
+    for key in ("clipped", "gap_fraction", "uncertainty"):
+        if out.get(key) is None and prior_col.get(key) is not None:
+            out[key] = prior_col[key]
+    return out
+
+
 def _merge_meta(prior_meta, fresh, measured, skipped, present=None):
     """Meta for a merged mask, which describes BOTH runs.
 
@@ -330,7 +359,8 @@ def cmd_sweep(sc, cfg, args):
     }
     if prior:
         merged = dict(prior)
-        merged.update(mask)  # freshly measured columns win
+        for az, col in mask.items():
+            merged[az] = _merge_column(prior.get(az), col)
         meta = _merge_meta(
             prior_meta, fresh, measured=set(mask), skipped=skipped, present=set(merged)
         )

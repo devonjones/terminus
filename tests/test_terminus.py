@@ -3416,3 +3416,76 @@ def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
     assert cols[90]["type"] == "tree" and cols[90]["type_source"] == "scope"
     assert cols[270]["type"] == "", "an unnamed column stays unnamed"
     assert cols[270].get("type_source") is None, "and claims no source for it"
+
+
+def test_a_night_re_measure_does_not_throw_away_the_photo_s_type(tmp_path):
+    """A targeted re-measure is meant to improve a column, not degrade it.
+
+    The merge replaced the whole record, so re-measuring at 2 a.m. a column the
+    photo had segmented as `tree` overwrote it with `type: ""` — the scope
+    cannot name anything after sunset. A real, in-focus segmentation was thrown
+    away by a measurement that had nothing to say about type, and the column
+    then exported without its seasonal vegetation buffer.
+
+    Altitude is the scope's answer and the fresh one wins. Type is whichever
+    instrument could name it, so fresh silence must not overwrite it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {
+            90: {
+                "alt": 20.0, "type": "tree", "type_source": "photo",
+                "gap_fraction": 0.4, "uncertainty": 4.2,
+            },
+            180: {"alt": 5.0, "type": "structure", "type_source": "photo"},
+        },  # fmt: skip
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # Re-measure 90 after sunset: a new altitude, and no type at all.
+    with patch.object(cli, "run_sweep", return_value=({90: (33.0, "")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["alt"] == 33.0, "the fresh altitude must win"
+    assert cols[90]["type"] == "tree", "a fresh silence must not erase a real segmentation"
+    assert cols[90]["type_source"] == "photo", "and the source stays with the type"
+    assert cols[90]["gap_fraction"] == 0.4, "photo fields describe the panorama, not this scan"
+    assert cols[180]["type"] == "structure", "untouched columns are untouched"
+
+
+def test_a_daylight_re_measure_may_correct_the_type(tmp_path):
+    """The other direction: a column that CAN be named replaces the old name.
+
+    Preserving the old type unconditionally would be the mirror bug — a
+    re-measure that genuinely sees a wall where the mask says tree has to be
+    able to say so.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {90: {"alt": 20.0, "type": "tree", "type_source": "photo"}},
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with patch.object(cli, "run_sweep", return_value=({90: (21.0, "structure")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["type"] == "structure", "a fresh naming replaces an old one"
+    assert cols[90]["type_source"] == "scope", "and brings its own source with it"
