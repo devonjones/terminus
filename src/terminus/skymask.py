@@ -227,11 +227,23 @@ def sky_mask(image, backend="auto", **kw):
     report = kw.pop("report", False)
     seg_kw = {k: v for k, v in kw.items() if k == "tile"}
     heur_kw = {k: v for k, v in kw.items() if k != "tile"}
+    if backend == "heuristic" and "tile" in kw:
+        # Silently dropping it would be worse than the TypeError the caller used
+        # to get: `tile` means nothing to the heuristic, and a caller passing it
+        # believes they are tiling.
+        raise TypeError("heuristic_sky() got an unexpected keyword argument 'tile'")
     if backend == "auto":
         if available("segment"):
             try:
                 mask = segment_sky(image, **seg_kw)
                 return (mask, "segment") if report else mask
+            except (TypeError, AttributeError, NameError):
+                # A bug in this package, not a missing model. Degrading here
+                # would hide a broken segmentation path behind a warning nobody
+                # reads, and hand back a measurably worse mask while reporting
+                # success — the failure this whole module keeps guarding
+                # against, reintroduced by the guard against it.
+                raise
             except Exception as e:  # absent weights, empty cache, version skew
                 warnings.warn(
                     f"segmentation could not run ({type(e).__name__}: {e}); falling back "

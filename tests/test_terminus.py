@@ -2721,3 +2721,51 @@ def test_auto_reports_which_backend_actually_ran():
         mask, used = skymask.sky_mask(img, backend="auto", report=True)
     assert used == "heuristic"
     assert skymask.sky_mask(img, backend="auto").shape == mask.shape, "report is opt-in"
+
+
+def test_a_programming_error_is_not_degraded_into_a_worse_mask():
+    """`auto` degrades on a missing model, not on a bug in this package.
+
+    A TypeError from a bad kwarg or a changed signature is not an environmental
+    problem, and catching it would hand back a heuristic mask while reporting
+    success — the exact failure this module guards against, reintroduced by the
+    guard against it. Nothing consumes `report=True` yet, so such a bug could sit
+    behind an unread warning indefinitely.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    with patch.object(skymask, "available", lambda backend="segment": True):
+        # Environmental: degrade.
+        with patch.object(skymask, "segment_sky", side_effect=OSError("no cached weights")):
+            with pytest.warns(RuntimeWarning):
+                assert skymask.sky_mask(img, backend="auto", report=True)[1] == "heuristic"
+        # A bug: propagate.
+        for bug in (TypeError("bad kwarg"), AttributeError("gone"), NameError("typo")):
+            with patch.object(skymask, "segment_sky", side_effect=bug):
+                with pytest.raises(type(bug)):
+                    skymask.sky_mask(img, backend="auto")
+
+
+def test_tile_is_rejected_by_the_heuristic_rather_than_dropped():
+    """Splitting the kwargs silently swallowed `tile` for the heuristic.
+
+    Before the split it reached `heuristic_sky` and raised TypeError. Dropping it
+    is worse: a caller passing `tile` believes they are tiling, and gets a
+    single-pass mask with no indication otherwise.
+    """
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    with pytest.raises(TypeError, match="tile"):
+        skymask.sky_mask(img, backend="heuristic", tile=True)
