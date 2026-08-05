@@ -29,6 +29,7 @@ from .export import (
 )
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
+    MAX_POINTING_MISSES,
     Pointer,
     PointingError,
     Sky,
@@ -37,6 +38,8 @@ from .sweep import (
     column_touches_sun,
     obstruction_type,
     run_sweep,
+    scan_horizon,
+    sky_reference,
 )
 
 
@@ -502,6 +505,257 @@ def _texture(args):
     return texture, coverage
 
 
+def cmd_orient(sc, cfg, args):
+    try:
+        _orient(sc, cfg, args)
+    except OSError as e:
+        raise MaskError(f"could not read or write beside {args.mask}: {e}") from e
+
+
+def _orient(sc, cfg, args):
+    """Solve where the photo horizon sits on the sky, one chosen column at a time.
+
+    Two measurement sources, and the loop cannot tell them apart. `--replay`
+    re-judges a saved sweep's profiles, which needs no telescope and no night —
+    that is how this was built and how a planner change gets compared against a
+    real run. Without it the scope measures, Sun-guarded like every other slew.
+    """
+    from . import guide
+    from .export import load_mask, write_mask
+
+    meta, rows = load_mask(args.mask)
+    if not rows:
+        raise MaskError(f"{args.mask} has no columns to orient")
+
+    if args.replay:
+        measure = _replay_source(args)
+        reachable = should_stop = None
+        print(f"replaying {args.replay}: no telescope, no sky")
+    else:
+        measure, reachable, should_stop = _scope_measure(sc, cfg, args)
+
+    solution, steps = guide.run(
+        rows,
+        measure,
+        seed=args.seed,
+        max_columns=args.max_columns,
+        window=args.window,
+        yaw_tol=args.yaw_tol,
+        reachable=reachable,
+        should_stop=should_stop,
+        min_headroom=args.min_headroom,
+    )
+    if solution is None:
+        raise MaskError(
+            f"only {sum(1 for s in steps if s.fiducial)} columns were measured and the fit "
+            "needs four. Nothing was written — a mask oriented on too little is worse than "
+            "one that says it is not oriented."
+        )
+    settled = not any(s.note == "did not settle" for s in steps)
+    print(
+        f"\nyaw {solution['yaw']:.2f}  pitch {solution['pitch']:.2f}  "
+        f"tilt {solution['tilt_mag']:.2f} toward {solution['tilt_dir']:.1f}  "
+        f"rms {solution['rms']:.2f} over {solution['n']} columns "
+        f"({solution['n_bound']} of them bounds)"
+    )
+    worst = sorted(solution["residuals"].items(), key=lambda kv: -abs(kv[1]))[:3]
+    if worst:
+        print("largest residuals: " + ", ".join(f"az {a:g} {r:+.1f}" for a, r in worst))
+
+    if not settled:
+        print(
+            "the yaw had not settled, so this mask is written UNORIENTED and will not "
+            "export until you decide it is good enough (--allow-unoriented)",
+            file=sys.stderr,
+        )
+
+    out = args.out or os.path.splitext(args.mask)[0] + "_oriented.yaml"
+    oriented = guide.orient_mask(rows, solution)
+    write_mask(
+        out,
+        {int(round(az)): {"alt": alt, "type": t} for az, alt, t in oriented},
+        [],
+        dict(
+            meta,
+            # NOT unconditionally True. Every exporter gates on this flag through
+            # `require_oriented`, and `fit_settled` was write-only — nothing read
+            # it — so a run that stopped with the yaw still moving wrote a mask
+            # that exported silently, with no --allow-unoriented needed. The
+            # warning went to stderr and the file said nothing. Reusing the flag
+            # the enforcement already keys on is the whole fix: a provisional
+            # orientation now refuses to export until someone says they know.
+            oriented=settled,
+            yaw=round(solution["yaw"], 3),
+            pitch=round(solution["pitch"], 3),
+            tilt_mag=round(solution["tilt_mag"], 3),
+            tilt_dir=round(solution["tilt_dir"], 3),
+            fit_rms=round(solution["rms"], 3),
+            fit_columns=sorted(solution["residuals"]),
+            fit_settled=settled,
+            source_mask=os.path.abspath(args.mask),
+        ),
+    )
+    print(
+        f"wrote {out} "
+        + (
+            "(now in TRUE azimuth; export it)"
+            if settled
+            else "(marked UNORIENTED: the yaw was still moving when the run stopped)"
+        )
+    )
+
+
+def _replay_source(args):
+    """`measure(az)` from a saved sweep's profiles, with its failures explained.
+
+    A missing file and a file of the wrong shape are the two most likely things
+    to happen here — the path is typed by hand and the JSON is hand-editable —
+    and both reached the user as tracebacks while a mask with too few columns
+    got a clean sentence.
+    """
+    import json
+
+    from . import guide
+
+    try:
+        with open(args.replay) as f:
+            profiles = json.load(f)
+    except OSError as e:
+        raise MaskError(f"could not read the profiles {args.replay}: {e}") from e
+    except ValueError as e:
+        raise MaskError(f"{args.replay} is not valid JSON: {e}") from e
+    if not isinstance(profiles, dict) or not profiles:
+        raise MaskError(
+            f"{args.replay} should be an object of azimuth -> [[alt, lum], ...], as "
+            f"`terminus sweep` writes beside its mask; got {type(profiles).__name__}"
+        )
+    try:
+        return guide.replay(profiles, uncertainty=args.uncertainty)
+    except (TypeError, ValueError) as e:
+        raise MaskError(f"{args.replay} is not shaped like a sweep's profiles: {e}") from e
+
+
+def _scope_measure(sc, cfg, args):
+    """A `measure(az)` that points the telescope, and the reachability predicate.
+
+    Separated so the loop never learns which source it has. The predicate is
+    injected rather than imported by `plan`, because feasibility is Sun geometry
+    and changes with the clock — see `plan.partition`.
+    """
+    if not sc.is_eq_mode() and not args.dry_run:
+        raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
+    sky = _sky(sc, cfg)
+    sw = cfg["sweep"]
+    ptr = Pointer(sc, sky, sw["sun_cone_deg"], sw["slew_step_deg"], args.dry_run)
+    state = {"sky_ref": None, "misses": 0}
+
+    # Seeded before the first column, exactly as run_sweep does. Without it
+    # scan_horizon returns "no_reference" for EVERY column — it cannot tell dark
+    # terrain from a dim sky with nothing to compare against — and an
+    # inconclusive column that was then recorded as a bound would feed the fit a
+    # measurement nobody made.
+    if not args.dry_run:
+        try:
+            saz, _ = sky.sun()
+            ptr.point_to((saz + 180.0) % 360.0, 75.0)
+            state["sky_ref"] = sky_reference(sc.capture_rgb(warmup=0.3))
+            print(f"sky reference: {state['sky_ref']:.1f}")
+        except (SunGuard, PointingError, OSError) as e:
+            print(f"could not seed the sky reference ({e}); columns will be inconclusive",
+                  file=sys.stderr)  # fmt: skip
+
+    def measure(az):
+        try:
+            alt, status, _typ, profile = scan_horizon(
+                ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
+                sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
+                sun_alt=sky.sun()[1],
+            )  # fmt: skip
+        except SunGuard as e:
+            print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
+            return None
+        except PointingError as e:
+            state["misses"] += 1
+            print(f"az {az:3d}: did not arrive ({e})", file=sys.stderr)
+            if state["misses"] >= MAX_POINTING_MISSES:
+                raise SeestarError(
+                    f"{state['misses']} slews in a row did not arrive. A mount that cannot "
+                    "point will fail every remaining column too, and skipping them one by "
+                    "one would spend the night proving it. Check the arm is open and the "
+                    "mount is tracking."
+                ) from e
+            return None
+        state["misses"] = 0
+        if profile:
+            peak = max(lum for _, lum in profile)
+            state["sky_ref"] = peak if state["sky_ref"] is None else max(state["sky_ref"], peak)
+        if status in ("no_reference", "inconclusive"):
+            # The column was pointed at and photographed, and the result does not
+            # say where the horizon is. Recording that as a bound would turn "I
+            # could not tell" into "it is at least 60 degrees" — an unevidenced
+            # value in a file the fit trusts. Not attempted is the honest shape.
+            print(f"az {az:3d}: {status}", file=sys.stderr)
+            return None
+        if status.startswith("open"):
+            # Open all the way to the search floor. That is a real constraint —
+            # the horizon is at or BELOW alt_min — but it is the opposite
+            # one-sided constraint from a ceiling bound, and `Fiducial` can only
+            # express "at least this high". Recording it as an exact edge AT the
+            # floor invents a measurement: "found nothing between 0 and 60" is
+            # not "the horizon is at 0". `orient.from_mask` reaches the same
+            # conclusion about the same status, and excludes it.
+            #
+            # So it is dropped, which loses information rather than inventing it.
+            # terminus-50 tracks giving `Fiducial` a downward bound so the fit
+            # can use these columns honestly.
+            print(f"az {az:3d}: open to the search floor (no constraint the fit can use)",
+                  file=sys.stderr)  # fmt: skip
+            return None
+        if status == "blocked_above":
+            return None, sw["alt_max"], args.uncertainty
+        return {"alt": alt, "snr": None}, sw["alt_max"], args.uncertainty
+
+    def reachable(az):
+        """Is this column worth PLANNING for? Endpoint geometry, not the slew.
+
+        Deliberately the weaker `column_touches_sun` rather than sweep's
+        path-aware `reachable_now`. This predicate only decides which candidates
+        the D-optimality criterion gets to choose between, and the real slew is
+        still refused by `Pointer.point_to`, which checks every waypoint. Using
+        the path-aware test here would additionally depend on where the tube
+        currently IS, so the candidate set would change with the order columns
+        happened to be measured in — a planner whose answer depends on its own
+        history is harder to reason about than one that occasionally proposes a
+        column the mount then declines.
+        """
+        return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
+
+    def should_stop():
+        """Stop before a column that would run past the observing window.
+
+        terminus-17: the cutoff was enforced by the caller, before launch, and a
+        run overran by fourteen minutes because each column took longer than
+        estimated — the sky brightened toward dawn, more columns resolved, and
+        the run slowed exactly as the deadline approached. A caller starting an
+        N-column run cannot know how long N columns take, and the estimate
+        degrades in the direction that matters. So it is checked here, before
+        each column, where the answer is current.
+        """
+        if args.stop_above_sun_alt is None:
+            return False
+        _, alt = sky.sun()
+        if alt >= args.stop_above_sun_alt:
+            print(
+                f"stopping: the Sun is at {alt:.1f} deg, at or above the "
+                f"{args.stop_above_sun_alt:g} deg cutoff for this run",
+                file=sys.stderr,
+            )
+            return True
+        return False
+
+    return measure, reachable, should_stop
+
+
 # ---- offline photo pipeline -----------------------------------------------
 # Neither command touches the scope, the network, or config.toml. They are the
 # desktop half: build a panorama from photographs, then read a horizon off it.
@@ -669,6 +923,26 @@ NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
 OFFLINE = {"mosaic", "skymask", "export"}
 
 
+def _is_offline(args):
+    """Does this invocation need neither scope nor config.toml?
+
+    `orient` is the one command that answers differently depending on its flags:
+    with `--replay` it re-judges a saved night and touches nothing, without it
+    the telescope measures. Deciding by subcommand alone would force a config
+    file on someone replaying a run on a laptop, which is precisely the case
+    replay exists to serve.
+    """
+    if args.cmd == "orient":
+        return bool(args.replay)
+    return args.cmd in OFFLINE
+
+
+def _needs_scope(args):
+    if args.cmd == "orient":
+        return not args.replay
+    return args.cmd in NEEDS_SCOPE
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="terminus", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -694,6 +968,47 @@ def main(argv=None):
     )
     sw.add_argument("--no-export", action="store_true")
     sw.add_argument("--dry-run", action="store_true")
+    orp = sub.add_parser(
+        "orient", help="solve where a photo horizon sits on the sky, column by column"
+    )
+    orp.add_argument("mask", help="the UNORIENTED photo mask from `terminus skymask`")
+    orp.add_argument("--out", help="where to write the oriented mask")
+    orp.add_argument(
+        "--replay",
+        help="re-judge a saved sweep's <mask>_profiles.json instead of observing "
+        "(no telescope, no night)",
+    )
+    orp.add_argument("--seed", type=int, default=4, help="evenly spaced starting columns")
+    orp.add_argument("--max-columns", type=int, default=12)
+    orp.add_argument("--window", type=int, default=3, help="refits the yaw must hold still across")
+    orp.add_argument("--yaw-tol", type=float, default=1.0, help="degrees, the stability rule")
+    orp.add_argument(
+        "--uncertainty",
+        type=float,
+        default=None,
+        help="degrees a measured boundary may move; standardises the residual",
+    )
+    orp.add_argument(
+        "--min-headroom",
+        type=float,
+        default=None,
+        help="drop columns whose edge sits this close to their own search ceiling",
+    )
+    orp.add_argument(
+        "--stop-above-sun-alt",
+        type=float,
+        default=None,
+        help="stop before any column once the Sun reaches this altitude, checked "
+        "inside the loop (try -18 for astronomical twilight)",
+    )
+    orp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="rehearse the POINTING only. It cannot measure — every column reports "
+        "open to the search floor and is dropped, so the run ends with too few "
+        "columns to fit. Use --replay to rehearse the whole loop.",
+    )
+
     ex = sub.add_parser("export")
     ex.add_argument("mask")
     ex.add_argument("--skysafari", action="store_true", help="also write a Sky Safari panorama PNG")
@@ -757,10 +1072,11 @@ def main(argv=None):
         "export": cmd_export,
         "mosaic": cmd_mosaic,
         "skymask": cmd_skymask,
+        "orient": cmd_orient,
     }
     try:
-        cfg = {} if args.cmd in OFFLINE else load_config(args.config)
-        sc = _connect(cfg) if args.cmd in NEEDS_SCOPE else None
+        cfg = {} if _is_offline(args) else load_config(args.config)
+        sc = _connect(cfg) if _needs_scope(args) else None
         try:
             handlers[args.cmd](sc, cfg, args)
         finally:

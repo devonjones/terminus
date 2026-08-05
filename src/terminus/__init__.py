@@ -58,6 +58,8 @@ from .export import (
     to_stellarium_txt,
     write_mask,
 )
+from .guide import orient_mask, photo_sample, replay
+from .guide import run as guided_orient
 from .horizon import Horizon
 from .landscape import render, to_skysafari_png, write_landscape
 from .mosaic import MosaicError, hugin_available, write_manifest
@@ -111,10 +113,14 @@ __all__ = [
     # planning and export
     "Horizon",
     "export_all",
+    "guided_orient",
     "write_landscape",
     "write_mask",
     "load_mask",
+    "orient_mask",
+    "photo_sample",
     "render",
+    "replay",
     "to_nina_hrz",
     "to_pvsyst_hor",
     "to_skysafari_png",

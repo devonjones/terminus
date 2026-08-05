@@ -4111,3 +4111,428 @@ def test_the_hor_never_writes_a_number_in_scientific_notation():
     for ln in data:
         az, alt = ln.split()
         float(az), float(alt)
+
+
+# ---- the guided orientation loop (terminus-20) ----------------------------
+def _synthetic_horizon(step=5):
+    """A photo horizon with real structure: steep stretches carry the yaw."""
+    import math
+
+    return [
+        (a, 20.0 + 12.0 * math.sin(math.radians(2 * a)) + 6.0 * math.cos(math.radians(a)), "structure")
+        for a in range(0, 360, step)
+    ]  # fmt: skip
+
+
+# The accurate grid costs tens of seconds per refit — fine against the minutes a
+# real column takes to measure, hopeless in a suite. These tests are about the
+# LOOP (does it converge, when does it stop, what does it do with an absence),
+# not about the fit's resolution, so they run it coarse.
+_COARSE = {"yaw_step": 2.0, "tilt_max": 6.0, "tilt_step": 3.0, "pitch_range": 6.0}
+
+
+def _truth_measure(rows, truth, ceiling=60.0, snr=9.0):
+    """A `measure(az)` that reports what a scope WOULD see under `truth`."""
+    from terminus import guide, orient
+
+    sample = guide.photo_sample(rows)
+
+    def measure(az):
+        phi, raw = orient.native_column(
+            sample, az, truth["yaw"], truth["tilt_mag"], truth["tilt_dir"]
+        )
+        _, alt = orient.rotate(
+            phi + truth["yaw"], raw, truth["pitch"], truth["tilt_mag"], truth["tilt_dir"]
+        )
+        return {"alt": float(alt), "snr": snr}, ceiling, 0.5
+
+    return measure
+
+
+def test_the_loop_recovers_an_orientation_it_was_never_told():
+    """The claim the whole project rests on, as a test rather than a hope.
+
+    A handful of information-chosen columns should pin the photo horizon to the
+    sky. Nothing here tells the loop the answer: it plans a column, is told what
+    a telescope under a known orientation would have seen, refits, and stops
+    when the yaw holds still.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 36.0, "pitch": 1.5, "tilt_mag": 3.0, "tilt_dir": 110.0}
+    solution, steps = guide.run(
+        rows,
+        _truth_measure(rows, truth),
+        max_columns=12,
+        log=lambda *a, **k: None,
+        fit_kw=_COARSE,
+    )
+    assert solution is not None
+    err = abs(((solution["yaw"] - truth["yaw"] + 180) % 360) - 180)
+    assert err < 2.5, f"yaw off by {err:.2f} deg (grid is {_COARSE['yaw_step']} deg)"
+    assert abs(solution["pitch"] - truth["pitch"]) < 2.0
+    assert abs(solution["tilt_mag"] - truth["tilt_mag"]) < 3.5
+    # And it did it with a handful of columns, not a blind circle.
+    used = [s for s in steps if s.fiducial is not None]
+    assert len(used) <= 12, "the point is that a few chosen columns suffice"
+
+
+def test_the_loop_stops_when_the_yaw_settles_not_when_the_residual_is_small():
+    """Four points fitting four parameters interpolate: the RMS reads near zero
+    however wrong the answer is, and it is blind to uniform bias because the fit
+    absorbs a constant offset into pitch. What settles is the yaw."""
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 200.0, "pitch": 0.0, "tilt_mag": 1.0, "tilt_dir": 0.0}
+    solution, steps = guide.run(
+        rows,
+        _truth_measure(rows, truth),
+        max_columns=16,
+        log=lambda *a, **k: None,
+        fit_kw=_COARSE,
+    )
+    assert not any(s.note == "did not settle" for s in steps), "this one should converge"
+    fits = [s for s in steps if s.solution is not None]
+    # The first fit already had a tiny residual — that is exactly the trap.
+    assert fits[0].solution["rms"] < 1.0, "four points interpolate four parameters"
+    assert len(fits) > 1, "and stopping there would have been wrong"
+
+
+def test_an_unsettled_fit_says_so_rather_than_looking_converged():
+    """Running out of columns is not convergence.
+
+    The number that comes back is the best estimate available and is returned
+    rather than withheld — but an unsettled fit reads exactly like a settled one
+    unless something says otherwise.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 37.0, "pitch": 1.5, "tilt_mag": 3.0, "tilt_dir": 110.0}
+    messages = []
+    solution, steps = guide.run(
+        rows, _truth_measure(rows, truth), max_columns=5,  # too few to settle
+        window=3, log=lambda m, **k: messages.append(m), fit_kw=_COARSE,
+    )  # fmt: skip
+    assert solution is not None, "the estimate is still returned"
+    assert any(s.note == "did not settle" for s in steps)
+    assert any("STOPPED WITHOUT SETTLING" in m for m in messages)
+
+
+def test_a_column_that_finds_nothing_is_a_bound_and_one_never_tried_is_not():
+    """Two different absences, and conflating them loses the mask's meaning.
+
+    'Measured, and blocked above the ceiling' is information the fit uses as a
+    one-sided constraint. 'Never attempted' is not, and recording it as a bound
+    would invent a measurement.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 15.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    honest = _truth_measure(rows, truth)
+
+    def measure(az):
+        if az in (90, 95):
+            return None  # never attempted
+        if az in (180, 185):
+            return None, 60.0, 0.5  # attempted, found nothing
+        return honest(az)
+
+    solution, steps = guide.run(
+        rows, measure, candidates=[0, 90, 95, 180, 185, 270, 45, 135, 225, 315],
+        max_columns=10, log=lambda *a, **k: None, fit_kw=_COARSE,
+    )  # fmt: skip
+    by_az = {s.az: s for s in steps if s.az is not None}
+    # THE POSITIVE CASE, which is the half that was missing: a column measured
+    # and found empty must arrive as a bound AT THE CEILING, not be dropped.
+    for az in (180, 185):
+        assert az in by_az, f"az {az} was measured and must appear"
+        f = by_az[az].fiducial
+        assert f is not None, f"az {az} found nothing, which is still a measurement"
+        assert f.bound is True, f"az {az} must be a BOUND, not an exact edge"
+        assert f.alt == 60.0, "and the bound sits at the ceiling it searched to"
+    # The negative case: never attempted is a skip, and nothing is invented.
+    for az in (90, 95):
+        assert by_az[az].note == "skipped"
+        assert by_az[az].fiducial is None, "nothing was invented for a column never tried"
+    assert solution is not None
+
+
+def test_replay_reads_a_saved_night_and_needs_no_telescope():
+    """A column costs minutes of scope time and a clear night.
+
+    The judgement made from its brightness profile is a few lines of arithmetic
+    that keep changing, so being able to re-run the planner against a real night
+    without needing another one is the difference between tuning against
+    evidence and tuning against memory.
+    """
+    from terminus import guide
+
+    profiles = {
+        "0": [[35, 60.0], [30, 61.0], [25, 59.0], [20, 12.0], [15, 11.0], [10, 10.5]],
+        "90": [[35, 62.0], [30, 60.0], [25, 61.0], [20, 60.0], [15, 59.0], [10, 58.0]],
+    }
+    measure = guide.replay(profiles, uncertainty=1.0)
+    edge, ceiling, unc = measure(0)
+    assert ceiling == 35 and unc == 1.0
+    # The LAST CLEAR SKY sample, not the first terrain one: the mask's own
+    # definition is "altitude = lowest clear sky", and the true crossing lies
+    # somewhere between 20 and 25 where the replay cannot resolve it.
+    assert edge is not None and edge["alt"] == 25, "the step from 59 to 12 counts"
+    # A column with no step is measured-and-found-nothing: a bound, not a skip.
+    assert measure(90)[0] is None
+    # A column that night never visited is not attempted at all.
+    assert measure(270) is None
+
+
+def test_orienting_a_mask_is_not_a_relabelling_when_there_is_tilt():
+    """Yaw alone renames columns; tilt moves a point in azimuth as well.
+
+    So the photo column that ENDS at a true azimuth is not the one that started
+    at `az - yaw`, and shifting the mask by the yaw would reintroduce exactly
+    the small-angle error the fit exists to avoid.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    sol = {"yaw": 30.0, "pitch": 0.0, "tilt_mag": 8.0, "tilt_dir": 45.0}
+    oriented = dict((az, alt) for az, alt, _ in guide.orient_mask(rows, sol))
+    naive = {az: alt for az, alt, _ in rows}
+    # A pure relabelling would put the native column at az-30 exactly here.
+    diffs = [
+        abs(oriented[az] - naive[(az - 30) % 360]) for az in oriented if (az - 30) % 360 in naive
+    ]
+    assert max(diffs) > 0.5, "with 8 deg of tilt a shift is not the same answer"
+
+    # ...but that difference is mostly the ROTATION, which any implementation
+    # would apply. Isolate the fixed point itself: compare against reading the
+    # photo at the naive column `az - yaw` and rotating THAT. Both rotate; only
+    # one solves for the column that actually lands at the target azimuth.
+    sample = guide.photo_sample(rows)
+    from terminus.orient import native_column
+    from terminus.orient import rotate as rot
+
+    worst = 0.0
+    for az in range(0, 360, 5):
+        phi, raw = native_column(sample, az, 30.0, 8.0, 45.0)
+        _, solved = rot(phi + 30.0, raw, 0.0, 8.0, 45.0)
+        naive_phi = (az - 30.0) % 360.0
+        _, shortcut = rot(naive_phi + 30.0, sample(naive_phi), 0.0, 8.0, 45.0)
+        worst = max(worst, abs(float(solved) - float(shortcut)))
+    assert worst > 0.5, (
+        f"the fixed point must change the answer by more than {worst:.3f} deg, or "
+        "native_column is doing nothing and a shortcut would pass this test"
+    )
+
+    # With no tilt it IS a relabelling, and must agree.
+    flat = guide.orient_mask(rows, {"yaw": 30.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0})
+    for az, alt, _ in flat:
+        # 0.01 because the mask stores two decimals, not because the maths is
+        # approximate — with no tilt this is exactly a relabelling.
+        assert abs(alt - naive[(az - 30) % 360]) < 0.01
+
+
+def test_an_inconclusive_column_is_not_recorded_as_a_bound(tmp_path):
+    """ "I could not tell" and "it is at least 60 degrees" are different claims.
+
+    `scan_horizon` returns `no_reference` when it has no open-sky brightness to
+    compare against, and `inconclusive` when the column neither resolved nor
+    read as blocked. Both were being turned into a confident bound at the search
+    ceiling, which the fit then trusts one-sidedly — an unevidenced value in a
+    file other software consumes, and it happened on EVERY column when the sky
+    reference failed to seed.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 0.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
+
+    verdicts = {
+        "no_reference": None,
+        "inconclusive": None,
+        "blocked_above": "bound",
+        "edge(rel 0.42)": "edge",
+    }
+    for status, want in verdicts.items():
+        with patch.object(cli, "scan_horizon", return_value=(60.0 if want != "edge" else 22.0,
+                                                             status, "", [])):  # fmt: skip
+            measure, _reachable, _stop = cli._scope_measure(sc, cfg, args)
+            got = measure(90)
+        if want is None:
+            assert got is None, f"{status}: must be 'not attempted', got {got}"
+        elif want == "bound":
+            assert got == (None, 60, None) or got[0] is None, f"{status} is a bound"
+        else:
+            assert got[0] is not None and got[0]["alt"] == 22.0, f"{status} is a measurement"
+
+
+def test_a_mount_that_cannot_point_gives_up_instead_of_trying_every_column():
+    """`run_sweep` counts consecutive misses; this loop had no equivalent.
+
+    A dead mount would be retried on every remaining candidate — thirty-six
+    no-ops — before the run reported "fewer than four columns". Skipping one
+    column that will not arrive is right; spending the night proving the mount
+    is broken is not.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.sweep import MAX_POINTING_MISSES, PointingError
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 0.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
+
+    with patch.object(cli, "scan_horizon", side_effect=PointingError("arm closed")):
+        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        for i in range(MAX_POINTING_MISSES - 1):
+            assert measure(10 * i) is None, "one miss is a skip, not a verdict on the mount"
+        with pytest.raises(cli.SeestarError, match="did not arrive"):
+            measure(999)
+
+
+def test_the_loop_can_be_stopped_by_a_deadline_it_checks_itself():
+    """terminus-17: the cutoff was enforced by the caller, before launch.
+
+    A run overran by fourteen minutes because each column took longer than
+    estimated — the sky brightened toward dawn, more columns resolved, and it
+    slowed exactly as the deadline approached. A caller starting an N-column run
+    cannot know how long N columns take.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 12.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 6  # the window closes partway through
+
+    solution, steps = guide.run(
+        rows, _truth_measure(rows, truth), max_columns=20, should_stop=should_stop,
+        log=lambda *a, **k: None, fit_kw=_COARSE,
+    )  # fmt: skip
+    assert any(s.note == "stopped early" for s in steps)
+    measured = [s for s in steps if s.fiducial is not None]
+    assert len(measured) < 20, "the deadline, not the budget, ended this run"
+
+
+def test_a_provisional_orientation_does_not_claim_to_be_oriented(tmp_path):
+    """`fit_settled` was write-only: nothing in the codebase read it.
+
+    So a run that stopped with the yaw still moving wrote a mask that exported
+    silently, with no --allow-unoriented needed — the warning went to stderr and
+    the file itself said nothing. Every exporter gates on `oriented` through
+    `require_oriented`, so that is the flag a provisional result must set.
+    """
+    import json
+    import math
+
+    import pytest
+
+    from terminus.cli import main
+    from terminus.export import load_columns, write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {a: (20.0 + 12.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 5)}
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    profiles = {
+        str(a): [[60 - 5 * i, 80.0 if (60 - 5 * i) > rows[a][0] else 10.0] for i in range(13)]
+        for a in range(0, 360, 5)
+    }
+    prof = tmp_path / "p.json"
+    prof.write_text(json.dumps(profiles))
+
+    out = tmp_path / "solved.yaml"
+    # Far too few columns to settle: the fit is provisional by construction.
+    main(["orient", str(photo), "--replay", str(prof), "--out", str(out),
+          "--max-columns", "5"])  # fmt: skip
+
+    meta, _ = load_columns(str(out))
+    assert meta["fit_settled"] is False
+    assert meta["oriented"] is False, "an unsettled yaw is not an orientation"
+    # main() turns UnorientedMask into `error: ...` and exit 1.
+    with pytest.raises(SystemExit) as exc:
+        main(["export", str(out)])
+    assert exc.value.code == 1, "a provisional mask must not export silently"
+    # And the escape hatch still works for someone who has decided it is enough.
+    main(["export", str(out), "--allow-unoriented"])
+    assert (tmp_path / "solved.hrz").exists()
+
+
+def test_a_column_open_to_the_floor_is_not_an_edge_at_the_floor(tmp_path):
+    """ "Found nothing between 0 and 60" is not "the horizon is at 0".
+
+    Recording it as an exact edge at the search floor invents a measurement, and
+    a photo predicting 20 degrees there would be scored as 20 degrees wrong when
+    the column said nothing of the kind. `orient.from_mask` reaches the same
+    conclusion about the same status and excludes it. See terminus-50 for giving
+    `Fiducial` the downward bound that would let the fit use these honestly.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 0.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
+
+    with patch.object(cli, "scan_horizon", return_value=(0.0, "open_to_min", "open", [])):
+        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        assert measure(90) is None, "an open column must not become an edge at alt_min"
+
+
+def test_orient_explains_a_bad_replay_file_instead_of_tracing_back(tmp_path, capsys):
+    """The path is typed by hand and the JSON is hand-editable.
+
+    Both are the likeliest things to go wrong here, and both arrived as
+    tracebacks while a mask with too few columns got a clean sentence.
+    """
+    from terminus.cli import main
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    write_mask(str(photo), {a: (20.0, "structure") for a in range(0, 360, 10)}, [], {})
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not json at all")
+    wrong_shape = tmp_path / "list.json"
+    wrong_shape.write_text("[1, 2, 3]")
+
+    for path, message in (
+        (tmp_path / "nope.json", "could not read the profiles"),
+        (bad_json, "not valid JSON"),
+        (wrong_shape, "azimuth -> "),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(["orient", str(photo), "--replay", str(path)])
+        assert exc.value.code == 1, f"{path.name} must refuse cleanly, not crash"
+        assert message in capsys.readouterr().err, f"{path.name} must say what is wrong"
