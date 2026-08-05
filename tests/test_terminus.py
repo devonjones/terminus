@@ -2591,24 +2591,31 @@ def test_no_column_can_buy_control_of_the_fit_with_a_tiny_sigma():
 
 
 def test_a_second_lamp_column_is_not_mistaken_for_a_horizon():
-    """Real az 350, 2026-08-03. Settles a three-way disagreement.
+    """Real az 350, 2026-08-03, transcribed from the saved frame filenames.
 
-    The fixed noise estimator put an edge at 10.0 degrees here and at az 340,
-    while the evening sweep recorded both as blocked above 60 and the photo
-    mosaic put them near 56. The saved frames decide it: luminance runs ~5
-    counts below 10 degrees, spikes to 20.7 and 20.0 at 10 and 12.5, then falls
-    back to ~5 for the whole rest of the column.
+    Luminance runs 4.7-7 counts below 10 degrees, spikes to 20.7 and 20.0 at 10
+    and 12.5, then falls back to 4.7-9 for the whole rest of the column to 60.
 
     Dark BELOW and dark ABOVE a bright band is not a horizon — a horizon is dark
-    below and bright above, once. It is a streetlight, and the brightness-step
-    detector found the bottom of it. The sweep and the photograph were both
-    right; the edge detector was reading a lamp.
+    below and bright above, once. It is a streetlight.
+
+    Two things this does NOT claim. The 10.0 degree "edge" that made these
+    columns contentious came from an abandoned median-of-second-differences
+    prototype, never committed; the shipped RMS estimator reports snr 1.2-1.4
+    and no edge here, so `find_edge` was never fooled. And the deciding gate is
+    the sky-floor test on the TOP of the column against an absolute reference,
+    not `mask_lights` — disabling lamp-masking leaves this test passing, because
+    the column never looks like sky at the top in the first place.
+
+    The frames live under captures/, which is git-ignored, so these numbers
+    cannot be re-derived from a clean clone. That is why they are transcribed
+    literally rather than rounded.
     """
     from terminus.night import find_horizon
 
     prof = [
-        (60, 5.0), (50, 5.3), (45, 5.0), (40, 5.3), (35, 5.0), (30, 5.0),
-        (25, 5.3), (20, 6.0), (17.5, 7.0), (15, 9.0), (12.5, 20.0),
+        (60, 4.7), (50, 5.0), (45, 5.0), (40, 7.0), (35, 6.0), (30, 6.0),
+        (25, 7.0), (20, 6.0), (17.5, 7.0), (15, 9.0), (12.5, 20.0),
         (10, 20.7), (7.5, 4.7), (5, 5.0), (2.5, 5.0), (0, 5.0),
     ]  # fmt: skip
     alt, detail = find_horizon(prof, sky_ref=20.7)
