@@ -4111,3 +4111,197 @@ def test_the_hor_never_writes_a_number_in_scientific_notation():
     for ln in data:
         az, alt = ln.split()
         float(az), float(alt)
+
+
+# ---- the guided orientation loop (terminus-20) ----------------------------
+def _synthetic_horizon(step=5):
+    """A photo horizon with real structure: steep stretches carry the yaw."""
+    import math
+
+    return [
+        (a, 20.0 + 12.0 * math.sin(math.radians(2 * a)) + 6.0 * math.cos(math.radians(a)), "structure")
+        for a in range(0, 360, step)
+    ]  # fmt: skip
+
+
+# The accurate grid costs tens of seconds per refit — fine against the minutes a
+# real column takes to measure, hopeless in a suite. These tests are about the
+# LOOP (does it converge, when does it stop, what does it do with an absence),
+# not about the fit's resolution, so they run it coarse.
+_COARSE = {"yaw_step": 2.0, "tilt_max": 6.0, "tilt_step": 3.0, "pitch_range": 6.0}
+
+
+def _truth_measure(rows, truth, ceiling=60.0, snr=9.0):
+    """A `measure(az)` that reports what a scope WOULD see under `truth`."""
+    from terminus import guide, orient
+
+    sample = guide.photo_sample(rows)
+
+    def measure(az):
+        phi, raw = orient.native_column(
+            sample, az, truth["yaw"], truth["tilt_mag"], truth["tilt_dir"]
+        )
+        _, alt = orient.rotate(
+            phi + truth["yaw"], raw, truth["pitch"], truth["tilt_mag"], truth["tilt_dir"]
+        )
+        return {"alt": float(alt), "snr": snr}, ceiling, 0.5
+
+    return measure
+
+
+def test_the_loop_recovers_an_orientation_it_was_never_told():
+    """The claim the whole project rests on, as a test rather than a hope.
+
+    A handful of information-chosen columns should pin the photo horizon to the
+    sky. Nothing here tells the loop the answer: it plans a column, is told what
+    a telescope under a known orientation would have seen, refits, and stops
+    when the yaw holds still.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 36.0, "pitch": 1.5, "tilt_mag": 3.0, "tilt_dir": 110.0}
+    solution, steps = guide.run(
+        rows,
+        _truth_measure(rows, truth),
+        max_columns=12,
+        log=lambda *a, **k: None,
+        fit_kw=_COARSE,
+    )
+    assert solution is not None
+    err = abs(((solution["yaw"] - truth["yaw"] + 180) % 360) - 180)
+    assert err < 2.5, f"yaw off by {err:.2f} deg (grid is {_COARSE['yaw_step']} deg)"
+    assert abs(solution["pitch"] - truth["pitch"]) < 2.0
+    assert abs(solution["tilt_mag"] - truth["tilt_mag"]) < 3.5
+    # And it did it with a handful of columns, not a blind circle.
+    used = [s for s in steps if s.fiducial is not None]
+    assert len(used) <= 12, "the point is that a few chosen columns suffice"
+
+
+def test_the_loop_stops_when_the_yaw_settles_not_when_the_residual_is_small():
+    """Four points fitting four parameters interpolate: the RMS reads near zero
+    however wrong the answer is, and it is blind to uniform bias because the fit
+    absorbs a constant offset into pitch. What settles is the yaw."""
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 200.0, "pitch": 0.0, "tilt_mag": 1.0, "tilt_dir": 0.0}
+    solution, steps = guide.run(
+        rows,
+        _truth_measure(rows, truth),
+        max_columns=16,
+        log=lambda *a, **k: None,
+        fit_kw=_COARSE,
+    )
+    assert not any(s.note == "did not settle" for s in steps), "this one should converge"
+    fits = [s for s in steps if s.solution is not None]
+    # The first fit already had a tiny residual — that is exactly the trap.
+    assert fits[0].solution["rms"] < 1.0, "four points interpolate four parameters"
+    assert len(fits) > 1, "and stopping there would have been wrong"
+
+
+def test_an_unsettled_fit_says_so_rather_than_looking_converged():
+    """Running out of columns is not convergence.
+
+    The number that comes back is the best estimate available and is returned
+    rather than withheld — but an unsettled fit reads exactly like a settled one
+    unless something says otherwise.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 37.0, "pitch": 1.5, "tilt_mag": 3.0, "tilt_dir": 110.0}
+    messages = []
+    solution, steps = guide.run(
+        rows, _truth_measure(rows, truth), max_columns=5,  # too few to settle
+        window=3, log=lambda m, **k: messages.append(m), fit_kw=_COARSE,
+    )  # fmt: skip
+    assert solution is not None, "the estimate is still returned"
+    assert any(s.note == "did not settle" for s in steps)
+    assert any("STOPPED WITHOUT SETTLING" in m for m in messages)
+
+
+def test_a_column_that_finds_nothing_is_a_bound_and_one_never_tried_is_not():
+    """Two different absences, and conflating them loses the mask's meaning.
+
+    'Measured, and blocked above the ceiling' is information the fit uses as a
+    one-sided constraint. 'Never attempted' is not, and recording it as a bound
+    would invent a measurement.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    truth = {"yaw": 15.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    honest = _truth_measure(rows, truth)
+
+    def measure(az):
+        if az in (90, 95):
+            return None  # never attempted
+        if az in (180, 185):
+            return None, 60.0, 0.5  # attempted, found nothing
+        return honest(az)
+
+    solution, steps = guide.run(
+        rows, measure, max_columns=10, log=lambda *a, **k: None, fit_kw=_COARSE
+    )
+    skipped = {s.az for s in steps if s.note == "skipped"}
+    bounds = {s.az for s in steps if s.fiducial is not None and s.fiducial.bound}
+    assert skipped & {90, 95} or not skipped, "an unattempted column is skipped, never bounded"
+    assert not (skipped & bounds), "a column cannot be both"
+    for az in bounds:
+        assert az not in (90, 95), "nothing was invented for a column never tried"
+    assert solution is not None
+
+
+def test_replay_reads_a_saved_night_and_needs_no_telescope():
+    """A column costs minutes of scope time and a clear night.
+
+    The judgement made from its brightness profile is a few lines of arithmetic
+    that keep changing, so being able to re-run the planner against a real night
+    without needing another one is the difference between tuning against
+    evidence and tuning against memory.
+    """
+    from terminus import guide
+
+    profiles = {
+        "0": [[35, 60.0], [30, 61.0], [25, 59.0], [20, 12.0], [15, 11.0], [10, 10.5]],
+        "90": [[35, 62.0], [30, 60.0], [25, 61.0], [20, 60.0], [15, 59.0], [10, 58.0]],
+    }
+    measure = guide.replay(profiles, uncertainty=1.0)
+    edge, ceiling, unc = measure(0)
+    assert ceiling == 35 and unc == 1.0
+    # The LAST CLEAR SKY sample, not the first terrain one: the mask's own
+    # definition is "altitude = lowest clear sky", and the true crossing lies
+    # somewhere between 20 and 25 where the replay cannot resolve it.
+    assert edge is not None and edge["alt"] == 25, "the step from 59 to 12 counts"
+    # A column with no step is measured-and-found-nothing: a bound, not a skip.
+    assert measure(90)[0] is None
+    # A column that night never visited is not attempted at all.
+    assert measure(270) is None
+
+
+def test_orienting_a_mask_is_not_a_relabelling_when_there_is_tilt():
+    """Yaw alone renames columns; tilt moves a point in azimuth as well.
+
+    So the photo column that ENDS at a true azimuth is not the one that started
+    at `az - yaw`, and shifting the mask by the yaw would reintroduce exactly
+    the small-angle error the fit exists to avoid.
+    """
+    from terminus import guide
+
+    rows = _synthetic_horizon()
+    sol = {"yaw": 30.0, "pitch": 0.0, "tilt_mag": 8.0, "tilt_dir": 45.0}
+    oriented = dict((az, alt) for az, alt, _ in guide.orient_mask(rows, sol))
+    naive = {az: alt for az, alt, _ in rows}
+    # A pure relabelling would put the native column at az-30 exactly here.
+    diffs = [
+        abs(oriented[az] - naive[(az - 30) % 360]) for az in oriented if (az - 30) % 360 in naive
+    ]
+    assert max(diffs) > 0.5, "with 8 deg of tilt a shift is not the same answer"
+
+    # With no tilt it IS a relabelling, and must agree.
+    flat = guide.orient_mask(rows, {"yaw": 30.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0})
+    for az, alt, _ in flat:
+        # 0.01 because the mask stores two decimals, not because the maths is
+        # approximate — with no tilt this is exactly a relabelling.
+        assert abs(alt - naive[(az - 30) % 360]) < 0.01

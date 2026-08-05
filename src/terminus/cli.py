@@ -37,6 +37,7 @@ from .sweep import (
     column_touches_sun,
     obstruction_type,
     run_sweep,
+    scan_horizon,
 )
 
 
@@ -502,6 +503,119 @@ def _texture(args):
     return texture, coverage
 
 
+def cmd_orient(sc, cfg, args):
+    """Solve where the photo horizon sits on the sky, one chosen column at a time.
+
+    Two measurement sources, and the loop cannot tell them apart. `--replay`
+    re-judges a saved sweep's profiles, which needs no telescope and no night —
+    that is how this was built and how a planner change gets compared against a
+    real run. Without it the scope measures, Sun-guarded like every other slew.
+    """
+    import json
+
+    from . import guide
+    from .export import load_mask, write_mask
+
+    meta, rows = load_mask(args.mask)
+    if not rows:
+        raise MaskError(f"{args.mask} has no columns to orient")
+
+    if args.replay:
+        with open(args.replay) as f:
+            measure = guide.replay(json.load(f), uncertainty=args.uncertainty)
+        reachable = None
+        print(f"replaying {args.replay}: no telescope, no sky")
+    else:
+        measure, reachable = _scope_measure(sc, cfg, args)
+
+    solution, steps = guide.run(
+        rows,
+        measure,
+        seed=args.seed,
+        max_columns=args.max_columns,
+        window=args.window,
+        yaw_tol=args.yaw_tol,
+        reachable=reachable,
+        min_headroom=args.min_headroom,
+    )
+    if solution is None:
+        raise MaskError(
+            f"only {sum(1 for s in steps if s.fiducial)} columns were measured and the fit "
+            "needs four. Nothing was written — a mask oriented on too little is worse than "
+            "one that says it is not oriented."
+        )
+    settled = not any(s.note == "did not settle" for s in steps)
+    print(
+        f"\nyaw {solution['yaw']:.2f}  pitch {solution['pitch']:.2f}  "
+        f"tilt {solution['tilt_mag']:.2f} toward {solution['tilt_dir']:.1f}  "
+        f"rms {solution['rms']:.2f} over {solution['n']} columns "
+        f"({solution['n_bound']} of them bounds)"
+    )
+    worst = sorted(solution["residuals"].items(), key=lambda kv: -abs(kv[1]))[:3]
+    if worst:
+        print("largest residuals: " + ", ".join(f"az {a:g} {r:+.1f}" for a, r in worst))
+
+    if not settled:
+        print(
+            "the yaw had not settled, so this orientation is provisional",
+            file=sys.stderr,
+        )
+
+    out = args.out or os.path.splitext(args.mask)[0] + "_oriented.yaml"
+    oriented = guide.orient_mask(rows, solution)
+    write_mask(
+        out,
+        {int(round(az)): {"alt": alt, "type": t} for az, alt, t in oriented},
+        [],
+        dict(
+            meta,
+            oriented=True,
+            yaw=round(solution["yaw"], 3),
+            pitch=round(solution["pitch"], 3),
+            tilt_mag=round(solution["tilt_mag"], 3),
+            tilt_dir=round(solution["tilt_dir"], 3),
+            fit_rms=round(solution["rms"], 3),
+            fit_columns=sorted(solution["residuals"]),
+            fit_settled=settled,
+            source_mask=os.path.abspath(args.mask),
+        ),
+    )
+    print(f"wrote {out} (now in TRUE azimuth; export it)")
+
+
+def _scope_measure(sc, cfg, args):
+    """A `measure(az)` that points the telescope, and the reachability predicate.
+
+    Separated so the loop never learns which source it has. The predicate is
+    injected rather than imported by `plan`, because feasibility is Sun geometry
+    and changes with the clock — see `plan.partition`.
+    """
+    if not sc.is_eq_mode() and not args.dry_run:
+        raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
+    sky = _sky(sc, cfg)
+    sw = cfg["sweep"]
+    ptr = Pointer(sc, sky, sw["sun_cone_deg"], sw["slew_step_deg"], args.dry_run)
+
+    def measure(az):
+        try:
+            alt, status, _typ, _profile = scan_horizon(
+                ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
+                sw["alt_tol"], None, repeats=sw.get("samples_per_point", 1),
+                sun_alt=sky.sun()[1],
+            )  # fmt: skip
+        except (SunGuard, PointingError) as e:
+            print(f"az {az:3d}: not attempted ({e})", file=sys.stderr)
+            return None
+        if status.startswith("open"):
+            return None, sw["alt_max"], args.uncertainty
+        return {"alt": alt, "snr": None}, sw["alt_max"], args.uncertainty
+
+    def reachable(az):
+        return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
+
+    return measure, reachable
+
+
 # ---- offline photo pipeline -----------------------------------------------
 # Neither command touches the scope, the network, or config.toml. They are the
 # desktop half: build a panorama from photographs, then read a horizon off it.
@@ -669,6 +783,26 @@ NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
 OFFLINE = {"mosaic", "skymask", "export"}
 
 
+def _is_offline(args):
+    """Does this invocation need neither scope nor config.toml?
+
+    `orient` is the one command that answers differently depending on its flags:
+    with `--replay` it re-judges a saved night and touches nothing, without it
+    the telescope measures. Deciding by subcommand alone would force a config
+    file on someone replaying a run on a laptop, which is precisely the case
+    replay exists to serve.
+    """
+    if args.cmd == "orient":
+        return bool(args.replay)
+    return args.cmd in OFFLINE
+
+
+def _needs_scope(args):
+    if args.cmd == "orient":
+        return not args.replay
+    return args.cmd in NEEDS_SCOPE
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="terminus", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -694,6 +828,34 @@ def main(argv=None):
     )
     sw.add_argument("--no-export", action="store_true")
     sw.add_argument("--dry-run", action="store_true")
+    orp = sub.add_parser(
+        "orient", help="solve where a photo horizon sits on the sky, column by column"
+    )
+    orp.add_argument("mask", help="the UNORIENTED photo mask from `terminus skymask`")
+    orp.add_argument("--out", help="where to write the oriented mask")
+    orp.add_argument(
+        "--replay",
+        help="re-judge a saved sweep's <mask>_profiles.json instead of observing "
+        "(no telescope, no night)",
+    )
+    orp.add_argument("--seed", type=int, default=4, help="evenly spaced starting columns")
+    orp.add_argument("--max-columns", type=int, default=12)
+    orp.add_argument("--window", type=int, default=3, help="refits the yaw must hold still across")
+    orp.add_argument("--yaw-tol", type=float, default=1.0, help="degrees, the stability rule")
+    orp.add_argument(
+        "--uncertainty",
+        type=float,
+        default=None,
+        help="degrees a measured boundary may move; standardises the residual",
+    )
+    orp.add_argument(
+        "--min-headroom",
+        type=float,
+        default=None,
+        help="drop columns whose edge sits this close to their own search ceiling",
+    )
+    orp.add_argument("--dry-run", action="store_true")
+
     ex = sub.add_parser("export")
     ex.add_argument("mask")
     ex.add_argument("--skysafari", action="store_true", help="also write a Sky Safari panorama PNG")
@@ -757,10 +919,11 @@ def main(argv=None):
         "export": cmd_export,
         "mosaic": cmd_mosaic,
         "skymask": cmd_skymask,
+        "orient": cmd_orient,
     }
     try:
-        cfg = {} if args.cmd in OFFLINE else load_config(args.config)
-        sc = _connect(cfg) if args.cmd in NEEDS_SCOPE else None
+        cfg = {} if _is_offline(args) else load_config(args.config)
+        sc = _connect(cfg) if _needs_scope(args) else None
         try:
             handlers[args.cmd](sc, cfg, args)
         finally:
