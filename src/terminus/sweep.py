@@ -658,9 +658,29 @@ def save_boundary_frame(sc, ptr, az, alt, typ, save_dir, sky_ref=None):
 
 
 def run_sweep(
-    sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, log=print, azimuths=None
+    sc,
+    sky,
+    cfg,
+    az_start=0,
+    az_end=350,
+    save_dir=None,
+    dry=False,
+    log=print,
+    azimuths=None,
+    should_stop=None,
 ):
-    """Sweep azimuths, returning ({az: (alt, type)}, [skipped_az], {az: profile}).
+    """Sweep azimuths, returning ({az: {...}}, [skipped_az], {az: profile}).
+
+    Each column is a record, not a pair. It was `(alt, type)`, and the shape was
+    losing the one thing the fit most needs to know: whether the column is a
+    BOUND. `scan_horizon` returns status 'blocked_above' when it searched from
+    the ceiling down and never found an edge — the horizon is AT LEAST alt_max —
+    and `orient.fit` scores that one-sidedly. That status was logged and thrown
+    away, so the mask could not distinguish it from an exact measurement at the
+    ceiling, and `orient.from_mask` could not reconstruct it. See terminus-51.
+
+    `export._column` still accepts the old pair, so a caller or a test that hands
+    one over keeps working.
 
     `azimuths` scans an explicit list instead of the uniform az_start/az_end
     grid. The planner produces a list of interesting columns rather than a
@@ -669,6 +689,14 @@ def run_sweep(
 
     Each column's raw brightness profile is returned alongside the verdict, so a
     run can be re-judged later without re-observing the sky.
+
+    `should_stop()` is checked BEFORE each column and ends the sweep cleanly. It
+    exists because terminus-17 happened: the observing deadline was enforced by
+    the caller before launch, a run overran it by fourteen minutes, and the
+    reason it overran is that the sky brightened toward dawn, more columns
+    resolved, and the run slowed down exactly as the deadline approached. A
+    caller that starts an N-column run cannot know how long N columns will take,
+    and the estimate degrades in the direction that matters.
     """
     ptr = Pointer(sc, sky, cfg["sun_cone_deg"], cfg["slew_step_deg"], dry)
     saz, salt = sky.sun()
@@ -704,6 +732,9 @@ def run_sweep(
             skipped.append(az)
             log(f"az {az:3d}: skipped (Sun cone)", flush=True)
             continue
+        if should_stop is not None and should_stop():
+            log("stopping: the observing window has closed", flush=True)
+            break
         # Re-seed the reference as the sky changes. A full sweep spans hours, and
         # across twilight the sky itself changes by orders of magnitude while a
         # once-measured reference stays pinned at its daylight value. Everything
@@ -760,7 +791,7 @@ def run_sweep(
                 if (save_dir and not dry)
                 else "-"
             )
-            mask[az] = (alt, typ)
+            mask[az] = {"alt": alt, "type": typ, "bound": status == "blocked_above"}
             log(f"az {az:3d}: alt {alt:5.1f}  {typ:9s} [{status}]  {frame}", flush=True)
         except SunGuard as e:
             skipped.append(az)
@@ -803,13 +834,16 @@ def run_sweep(
     if refine_to and not dry:
         work = True
         while work and budget > 0:
+            if should_stop is not None and should_stop():
+                log("stopping refinement: the observing window has closed", flush=True)
+                break
             work = False
             known = sorted(mask)
             for a0, a1 in zip(known, known[1:], strict=False):
                 gap = a1 - a0
                 if gap > 2 * cfg["az_step"]:
                     continue  # a Sun-skipped hole, not a measured neighbour
-                if gap / 2 < refine_to or abs(mask[a1][0] - mask[a0][0]) < trigger:
+                if gap / 2 < refine_to or abs(mask[a1]["alt"] - mask[a0]["alt"]) < trigger:
                     continue
                 mid = int(round((a0 + a1) / 2))
                 if mid in mask or budget <= 0:
@@ -826,7 +860,7 @@ def run_sweep(
                         sky_ref,
                         frames_dir=(f"{save_dir}/scan" if save_dir else None),
                     )
-                    mask[mid] = (alt, typ)
+                    mask[mid] = {"alt": alt, "type": typ, "bound": status == "blocked_above"}
                     if profile:
                         profiles[mid] = profile
                     if save_dir:

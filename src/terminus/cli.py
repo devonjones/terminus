@@ -21,6 +21,7 @@ from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
 from .export import (
     MaskError,
+    _column,
     default_meta,
     export_all,
     is_oriented,
@@ -115,6 +116,34 @@ def cmd_classify(sc, cfg, args):
 # and a GPS fix wanders. This catches crossing the garden, not nudging the
 # tripod.
 MERGE_POSITION_TOLERANCE_M = 30.0
+
+
+def _sun_deadline(sky, stop_above):
+    """A `should_stop()` that ends a run once the Sun reaches `stop_above`.
+
+    None when no cutoff was asked for, so the caller passes None and nothing is
+    checked. The Sun is read fresh each time BECAUSE that is the whole point:
+    terminus-17 was a run enforcing its deadline before launch and overrunning
+    it by fourteen minutes, and the reason it overran is that the sky brightened
+    toward dawn, more columns resolved, and it slowed down exactly as the
+    deadline approached. An estimate made at the start degrades in the direction
+    that matters.
+    """
+    if stop_above is None:
+        return None
+
+    def should_stop():
+        _, alt = sky.sun()
+        if alt >= stop_above:
+            print(
+                f"the Sun has reached {alt:.1f} deg, at or above the {stop_above:g} deg "
+                "cutoff for this run",
+                file=sys.stderr,
+            )
+            return True
+        return False
+
+    return should_stop
 
 
 def _check_mergeable(prior_meta, sky):
@@ -331,6 +360,7 @@ def cmd_sweep(sc, cfg, args):
             save_dir=frames,
             dry=args.dry_run,
             azimuths=azimuths,
+            should_stop=_sun_deadline(sky, getattr(args, "stop_above_sun_alt", None)),
         )
     except PointingError as e:
         # A sweep runs for hours. Losing every column already measured because
@@ -371,8 +401,8 @@ def cmd_sweep(sc, cfg, args):
     # Stamped here rather than in run_sweep so its (alt, type) contract, which
     # several callers and tests depend on, stays as it was.
     mask = {
-        az: {"alt": alt, "type": typ, "type_source": "scope" if typ else None}
-        for az, (alt, typ) in mask.items()
+        az: dict(_column(col), type_source=("scope" if _column(col)["type"] else None))
+        for az, col in mask.items()
     }
     if prior:
         merged = dict(prior)
@@ -730,30 +760,7 @@ def _scope_measure(sc, cfg, args):
         """
         return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
 
-    def should_stop():
-        """Stop before a column that would run past the observing window.
-
-        terminus-17: the cutoff was enforced by the caller, before launch, and a
-        run overran by fourteen minutes because each column took longer than
-        estimated — the sky brightened toward dawn, more columns resolved, and
-        the run slowed exactly as the deadline approached. A caller starting an
-        N-column run cannot know how long N columns take, and the estimate
-        degrades in the direction that matters. So it is checked here, before
-        each column, where the answer is current.
-        """
-        if args.stop_above_sun_alt is None:
-            return False
-        _, alt = sky.sun()
-        if alt >= args.stop_above_sun_alt:
-            print(
-                f"stopping: the Sun is at {alt:.1f} deg, at or above the "
-                f"{args.stop_above_sun_alt:g} deg cutoff for this run",
-                file=sys.stderr,
-            )
-            return True
-        return False
-
-    return measure, reachable, should_stop
+    return measure, reachable, _sun_deadline(sky, getattr(args, "stop_above_sun_alt", None))
 
 
 # ---- offline photo pipeline -----------------------------------------------
@@ -967,6 +974,13 @@ def main(argv=None):
         "merges into --out if it exists",
     )
     sw.add_argument("--no-export", action="store_true")
+    sw.add_argument(
+        "--stop-above-sun-alt",
+        type=float,
+        default=None,
+        help="stop before any column once the Sun reaches this altitude, checked "
+        "inside the loop (try -18 for astronomical twilight)",
+    )
     sw.add_argument("--dry-run", action="store_true")
     orp = sub.add_parser(
         "orient", help="solve where a photo horizon sits on the sky, column by column"

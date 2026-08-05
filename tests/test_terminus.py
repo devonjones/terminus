@@ -3014,7 +3014,7 @@ def _sweep_args(out, azimuths=None):
 
     return SimpleNamespace(
         dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
-        no_export=True, azimuths=azimuths,
+        no_export=True, azimuths=azimuths, stop_above_sun_alt=None,
     )  # fmt: skip
 
 
@@ -4976,3 +4976,124 @@ def test_a_lamp_inside_terrain_is_not_read_as_a_horizon():
         alt, detail = find_horizon(prof, sky_ref=sky_ref)
         assert alt is None, f"az {az}: night detector reported {alt} ({detail['reason']})"
         assert "blocked" in detail["reason"], f"az {az}: {detail['reason']}"
+
+
+def test_a_blocked_column_reaches_the_mask_as_a_bound(tmp_path):
+    """terminus-51: the sweep knew, logged it, and threw it away.
+
+    `scan_horizon` returns `blocked_above` when it searched from the ceiling down
+    and never found an edge — the horizon is AT LEAST alt_max, which `orient.fit`
+    scores one-sidedly. That status lived in a local variable that was logged and
+    discarded, so the mask could not tell it from an exact measurement at the
+    ceiling, and `orient.from_mask` could not reconstruct it. Which matters most
+    for `--replay`, since a replay is only as good as what the night saved.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.export import load_columns
+    from terminus.orient import from_mask
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 120, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        if az == 120:
+            return 60.0, "blocked_above", "structure", []
+        return 20.0, "edge(rel 0.4)", "tree", []
+
+    with patch("terminus.sweep.scan_horizon", side_effect=fake_scan):
+        mask, _skipped, _prof = run_sweep(
+            sc, sky, cfg, az_start=0, az_end=240, dry=True, log=lambda *a, **k: None
+        )
+
+    assert mask[120]["bound"] is True, "a blocked column is a bound"
+    assert mask[0]["bound"] is False, "an edge is not"
+
+    # And it survives to the file and back out as a one-sided fiducial.
+    from terminus.export import write_mask
+
+    out = tmp_path / "m.yaml"
+    write_mask(str(out), mask, [], {"lat": 39.79, "lon": -104.89})
+    _meta, cols = load_columns(str(out))
+    assert [f.az for f in from_mask(cols, ceiling=60.0) if f.bound] == [120.0]
+
+
+def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
+    """terminus-17: the deadline was enforced by the caller, before launch.
+
+    A run overran by fourteen minutes, and the reason is the part worth keeping:
+    the sky brightened toward dawn, so MORE columns resolved and each took
+    longer — the run slowed down exactly as its deadline approached. An estimate
+    made at the start degrades in the direction that matters, so the check has
+    to live where the answer is current.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+
+    def sweep(should_stop):
+        with patch("terminus.sweep.scan_horizon", return_value=(20.0, "edge", "tree", [])):
+            return run_sweep(
+                sc, sky, cfg, az_start=0, az_end=330, dry=True,
+                log=lambda *a, **k: None, should_stop=should_stop,
+            )[0]  # fmt: skip
+
+    # Differential, because Sun-cone skips already shorten a sweep on their own —
+    # a bare count would pass with no deadline check at all, which is exactly
+    # what a first version of this test did.
+    calls = {"n": 0}
+
+    def closes_after_three():
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    stopped = sweep(closes_after_three)
+    full = sweep(None)
+    assert len(stopped) < len(full), (
+        f"the deadline must shorten the run: {len(stopped)} measured with it, "
+        f"{len(full)} without"
+    )
+    assert len(stopped) > 0, "and what was measured before it closed is kept"
+    # A sweep that stops is not a sweep that failed.
+    assert all("alt" in c for c in stopped.values())
+
+
+def test_the_sun_deadline_reads_the_sun_each_time_it_is_asked():
+    """Not once at the start — that is the bug, not the implementation detail."""
+    from types import SimpleNamespace
+
+    from terminus.cli import _sun_deadline
+
+    reads = {"n": 0}
+
+    def sun():
+        reads["n"] += 1
+        return 180.0, -20.0 + reads["n"] * 2.0  # climbing toward dawn
+
+    stop = _sun_deadline(SimpleNamespace(sun=sun), -14.0)
+    assert stop() is False, "-18 is still dark"
+    assert stop() is False, "-16 too"
+    assert stop() is True, "-14 has reached the cutoff"
+    assert reads["n"] == 3, "the Sun must be re-read every time, not cached"
+
+    assert _sun_deadline(SimpleNamespace(sun=sun), None) is None, "no cutoff, no check"
