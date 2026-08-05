@@ -478,7 +478,17 @@ def test_boundary_models_differ_for_tree_and_structure():
     assert tree["max_width_deg"] > wall["max_width_deg"]  # canopy is a band
     assert tree["buffer_deg"] > wall["buffer_deg"]
     assert tree["seasonal"] and not wall["seasonal"]
-    assert boundary_model(None) == wall  # unknown falls back to the strict model
+    # This line used to read `assert boundary_model(None) == wall`, calling the
+    # structure model "the strict model". It is not strict, it is a DIFFERENT
+    # rule: it demands a sharper step and calls a wide transition suspect, which
+    # is the wrong judgement for foliage. An unnamed column is most often a tree
+    # measured at night, so the old fallback pointed the wall rule at exactly
+    # the columns the vegetation rule exists for. Refusing is the honest answer;
+    # see test_an_unnamed_column_gets_no_boundary_model.
+    import pytest
+
+    with pytest.raises(ValueError):
+        boundary_model(None)
 
 
 def test_judge_width_flags_a_soft_wall_and_a_sharp_tree():
@@ -1990,9 +2000,12 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     # originally for — a header that grows quietly is how the photo-field lines
     # ended up on scope masks in the first place. Adding a universal note is
     # legitimate and should require deliberately updating this number.
-    # 8 = 3 original + 4 position note + 1 "skipped azimuths", which this
-    # fixture triggers by passing [180].
-    assert len(head) == 10, f"header changed size; update deliberately, got {len(head)}"
+    # 12 = 3 original + 4 explaining an EMPTY type + 4 position note + 1
+    # "skipped azimuths", which this fixture triggers by passing [180]. The
+    # empty-type note is universal: ANY mask may hold a column that was measured
+    # but not named, and a bare "type:" with nothing said about it reads as a
+    # bug rather than as an honest gap.
+    assert len(head) == 12, f"header changed size; update deliberately, got {len(head)}"
 
     rich = tmp_path / "photo.yaml"
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
@@ -3280,3 +3293,126 @@ def test_a_merged_mask_says_which_instrument_named_each_column(tmp_path):
     assert cols[180].get("type_source") is None, "no type means no source to claim"
     header = [ln for ln in (tmp_path / "src.yaml").read_text().splitlines() if ln.startswith("#")]
     assert any("type_source" in ln for ln in header), "and the file explains what it means"
+
+
+def test_an_unnamed_column_gets_no_boundary_model():
+    """Defaulting an unknown type to `structure` is the same bug, one layer down.
+
+    A tree measured at night has no type, and quietly judging it by the rule for
+    a wall is exactly the case that matters most — the vegetation model exists
+    because foliage is wide, gappy and moves. Nothing calls `boundary_model`
+    yet, so refusing costs nothing today and forces the decision at the moment
+    someone wires it up.
+    """
+    import pytest
+
+    from terminus.sweep import boundary_model, judge_width
+
+    assert boundary_model("tree")["repeats"] == 4
+    assert boundary_model("structure")["repeats"] == 2
+    # A misspelling is a typo, not an absence of evidence, so it still falls back.
+    assert boundary_model("treee") is boundary_model("structure")
+    for empty in ("", "   ", None):
+        with pytest.raises(ValueError, match="no obstruction type"):
+            boundary_model(empty)
+    # judge_width must not blow up on the same input; it has an honest answer.
+    verdict, note = judge_width("", 5.0)
+    assert verdict == "unknown" and "no type" in note
+
+
+def test_a_failed_sun_read_costs_one_reading_not_the_whole_sweep(monkeypatch):
+    """The new per-column `sky.sun()` sat inside a try that does not catch it.
+
+    That try catches SunGuard and PointingError only, so an OSError from the
+    ephemeris would escape cmd_sweep's abort handler and take the entire
+    in-memory mask with it — a column that had already cleared the Sun-cone gate
+    killing a sweep that was otherwise fine. And the fallback must be the LAST
+    KNOWN altitude, never None: None means "the caller did not say", which
+    restores the daylight assumption at exactly the wrong moment.
+    """
+    from terminus import sweep
+
+    calls = {"n": 0}
+    real_alt = -9.0
+
+    def flaky_sun():
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise OSError("ephemeris unavailable")
+        return 180.0, real_alt
+
+    sky = type("S", (), {"sun": staticmethod(flaky_sun)})()
+    seen = []
+
+    def fake_scan(ptr, sc, az, *a, **kw):
+        seen.append(kw["sun_alt"])
+        return 20.0, "edge", "", [(20.0, 5.0)]
+
+    monkeypatch.setattr(sweep, "scan_horizon", fake_scan)
+    monkeypatch.setattr(sweep, "column_touches_sun", lambda *a, **k: False)
+    monkeypatch.setattr(sweep, "Pointer", lambda *a, **k: object())
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 90, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 0.5,
+    }  # fmt: skip
+    mask, _, _ = sweep.run_sweep(
+        None, sky, cfg, az_start=0, az_end=270, dry=True, log=lambda *a, **k: None
+    )
+
+    assert len(mask) == 4, "a failed Sun read must not abandon the sweep"
+    assert all(v == real_alt for v in seen), (
+        "after the ephemeris failed, the last known altitude must be reused — "
+        f"None would restore the daylight assumption, got {seen}"
+    )
+
+
+def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
+    """The regression the code's own comment warns about, with a test behind it.
+
+    The heuristic backend segments nothing, so every class comes back -1 and
+    every type is empty. Stamping `type_source: photo` unconditionally would
+    have claimed a segmentation that never ran — an unevidenced provenance,
+    which is worse than none, because a reader trusts the field precisely to
+    tell photo columns apart from scope ones.
+    """
+    from terminus.cli import main
+    from terminus.export import load_columns
+
+    pano = tmp_path / "p.png"
+    _synthetic_panorama(str(pano))
+    main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"])
+
+    _, cols = load_columns(str(tmp_path / "p_mask.yaml"))
+    assert cols, "the fixture must produce columns for this to mean anything"
+    for az, col in cols.items():
+        assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
+        assert (
+            col.get("type_source") is None
+        ), f"az {az}: no type was measured, so no source may be claimed"
+
+
+def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
+    """`type_source` has to be stamped where the sweep writes, not just defined.
+
+    Dropping the stamp left every column sourceless while the field, the header
+    text and the loader all still worked, so nothing failed — which is how a
+    provenance field quietly becomes decorative.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns
+
+    out = tmp_path / "h.yaml"
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # 90 named in daylight, 270 measured after sunset and left unnamed.
+    with patch.object(
+        cli, "run_sweep", return_value=({90: (33.0, "tree"), 270: (7.0, "")}, [], {})
+    ):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["type"] == "tree" and cols[90]["type_source"] == "scope"
+    assert cols[270]["type"] == "", "an unnamed column stays unnamed"
+    assert cols[270].get("type_source") is None, "and claims no source for it"

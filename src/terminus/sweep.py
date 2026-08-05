@@ -719,6 +719,24 @@ def run_sweep(
             except (SunGuard, PointingError, OSError) as e:
                 log(f"sky reference refresh failed ({e}); keeping {sky_ref:.1f}", flush=True)
                 ref_taken = time.time()
+        # The Sun is re-read per column rather than reused from the seed: a full
+        # sweep spans hours and can start in daylight and end after sunset, so
+        # one altitude taken at the top would let the late columns inherit a
+        # daylight claim they never earned.
+        #
+        # Guarded, and OUTSIDE the try below, for two reasons. That try catches
+        # only SunGuard and PointingError, so an OSError from here would escape
+        # cmd_sweep's abort handler and take the whole in-memory mask with it —
+        # a column that had already cleared the Sun-cone gate killing a sweep
+        # that was otherwise fine. And the fallback is the LAST KNOWN altitude,
+        # not None: None means "the caller did not say" and would restore the
+        # daylight assumption, which is the wrong way to fail at night. The Sun
+        # moves about 15 deg an hour, so yesterday's value is stale, but the
+        # value from the previous column is not.
+        try:
+            salt = sky.sun()[1]
+        except (OSError, ValueError) as e:
+            log(f"az {az:3d}: could not re-read the Sun ({e}); keeping alt {salt:.1f}", flush=True)
         try:
             alt, status, typ, profile = scan_horizon(
                 ptr,
@@ -731,11 +749,7 @@ def run_sweep(
                 sky_ref,
                 frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
                 repeats=cfg.get("samples_per_point", 1),
-                # The Sun is re-read per column rather than reused from the seed:
-                # a full sweep spans hours and can start in daylight and end
-                # after sunset, so a single altitude taken at the top would let
-                # the late columns inherit a daylight claim they never earned.
-                sun_alt=sky.sun()[1],
+                sun_alt=salt,
             )
             if profile:
                 profiles[az] = profile
@@ -940,8 +954,26 @@ DEFAULT_MODEL = "structure"
 
 
 def boundary_model(kind):
-    """Measurement and acceptance parameters for a boundary of this kind."""
-    return BOUNDARY_MODELS.get((kind or "").lower(), BOUNDARY_MODELS[DEFAULT_MODEL])
+    """Measurement and acceptance parameters for a boundary of this kind.
+
+    Refuses an EMPTY kind rather than defaulting it. An empty type means the
+    column was measured but not named — see `obstruction_type` — and quietly
+    handing it the structure model would be the same bug this module's own
+    comment above describes, one layer down: a tree column measured at night
+    would be judged by the rule for a wall, which is exactly the case that
+    matters most. Nothing calls this yet, so raising costs nothing now and turns
+    a silent default into a decision at the moment someone wires it up.
+
+    An unrecognised but non-empty kind still falls back, because that is a
+    spelling mistake rather than an absence of evidence.
+    """
+    if not (kind or "").strip():
+        raise ValueError(
+            "no obstruction type for this column, so no boundary model applies. "
+            "Decide explicitly: measure the type from the photo (type_source: "
+            "photo), or pick a model deliberately and record why."
+        )
+    return BOUNDARY_MODELS.get(kind.lower(), BOUNDARY_MODELS[DEFAULT_MODEL])
 
 
 def judge_width(kind, width_deg):
@@ -952,6 +984,8 @@ def judge_width(kind, width_deg):
     you the column is not what it was labelled, or that the sky/terrain contrast
     has collapsed — exactly what a lit roof against a darkening sky produces.
     """
+    if not (kind or "").strip():
+        return "unknown", "the column has no type, so there is no rule to judge its width by"
     m = boundary_model(kind)
     if width_deg is None:
         return "unknown", "no width measured"

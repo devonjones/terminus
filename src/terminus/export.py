@@ -9,10 +9,18 @@ Mask YAML (terminus's own durable artifact, hand-editable after review):
       10: {alt: 60.0, type: tree, clipped: True, gap_fraction: 0.4, uncertainty: 4.2}
       ...
 
-`alt` and `type` are always present. The rest appear only when a photo-derived
-mask supplies them, so a scope-measured mask is byte-for-byte what it always
-was. `clipped` marks a column whose obstruction ran off the top of the data — a
+`alt` and `type` are always present. The rest appear only when the run that
+wrote them had something to say: `clipped`, `gap_fraction` and `uncertainty`
+come from a photo mask, and `type_source` from either instrument whenever it
+named a type. A scope mask measured in daylight therefore carries `type_source`
+where it once carried nothing — the file is no longer byte-for-byte what it was
+before that field existed, which is the point of the field.
+
+`clipped` marks a column whose obstruction ran off the top of the data — a
 lower bound recording where the frame was cropped, never a measurement.
+
+`type` may be empty. That means the column was measured but not named, which is
+a different statement from `open` and must not be read as one.
 
 Exports:
   N.I.N.A.  .hrz   -- "az alt" per line, ascending azimuth, '#' comments
@@ -79,8 +87,10 @@ def write_mask(path, mask, skipped, meta):
             "# !! orientation before any planner consumes this."
         ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
-        "#   Empty means the column was measured but its type was not: the scope",
-        "#   reads type from colour, and after sunset every silhouette is neutral.",
+        "#   Empty means the column was measured but NOT NAMED, which is not the",
+        "#   same as `open`. Either instrument can leave it empty: the scope reads",
+        "#   type from colour and every silhouette is neutral after sunset, and the",
+        "#   photo heuristic backend segments no classes at all. See type_source.",
         "# POSITION-SPECIFIC: the horizon from where the tripod stood. Moving a",
         "#   couple of metres NEARER a close obstruction shifts it by degrees (a",
         "#   2 m fence at 5 m: +11.9 closer, -5.9 further); along it, not at all. A",
