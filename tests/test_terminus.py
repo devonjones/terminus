@@ -2588,3 +2588,29 @@ def test_no_column_can_buy_control_of_the_fit_with_a_tiny_sigma():
         "one column can still dominate: it scores "
         f"{cost_of_ignoring_the_lone_column:.1f} against {cost_of_ignoring_four:.1f}"
     )
+
+
+def test_a_second_lamp_column_is_not_mistaken_for_a_horizon():
+    """Real az 350, 2026-08-03. Settles a three-way disagreement.
+
+    The fixed noise estimator put an edge at 10.0 degrees here and at az 340,
+    while the evening sweep recorded both as blocked above 60 and the photo
+    mosaic put them near 56. The saved frames decide it: luminance runs ~5
+    counts below 10 degrees, spikes to 20.7 and 20.0 at 10 and 12.5, then falls
+    back to ~5 for the whole rest of the column.
+
+    Dark BELOW and dark ABOVE a bright band is not a horizon — a horizon is dark
+    below and bright above, once. It is a streetlight, and the brightness-step
+    detector found the bottom of it. The sweep and the photograph were both
+    right; the edge detector was reading a lamp.
+    """
+    from terminus.night import find_horizon
+
+    prof = [
+        (60, 5.0), (50, 5.3), (45, 5.0), (40, 5.3), (35, 5.0), (30, 5.0),
+        (25, 5.3), (20, 6.0), (17.5, 7.0), (15, 9.0), (12.5, 20.0),
+        (10, 20.7), (7.5, 4.7), (5, 5.0), (2.5, 5.0), (0, 5.0),
+    ]  # fmt: skip
+    alt, detail = find_horizon(prof, sky_ref=20.7)
+    assert alt is None, f"reported a horizon at {alt}; this column is a lamp in the dark"
+    assert "blocked" in detail["reason"], detail
