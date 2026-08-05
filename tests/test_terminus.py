@@ -1965,20 +1965,34 @@ def test_cli_export_refuses_an_unoriented_mask(tmp_path, capsys):
     assert (tmp_path / "u.hrz").exists()
 
 
-def test_a_scope_mask_gains_no_new_header(tmp_path):
-    """The schema addition must be invisible to a mask that does not use it.
+def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
+    """Photo-only field explanations must not appear on a mask without them.
 
-    The header explained clipped/gap_fraction/uncertainty unconditionally, so every
-    scope-measured mask grew three comment lines about fields it does not carry
-    — while the docstring claimed such a mask was byte-for-byte unchanged.
+    The header explained clipped/gap_fraction/uncertainty unconditionally, so
+    every scope-measured mask grew three comment lines about fields it does not
+    carry — while the docstring claimed such a mask was unchanged.
+
+    A UNIVERSAL note is a different matter and belongs on every mask, so the
+    position-specificity warning is asserted present rather than counted as
+    bloat. Counting comment lines would have conflated the two.
     """
     from terminus.export import write_mask
 
     plain = tmp_path / "scope.yaml"
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
-    assert len(head) == 4, f"a scope mask should carry 4 comment lines, got {len(head)}"
-    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head)
+    assert not any(
+        "clipped" in ln or "gap_fraction" in ln for ln in head
+    ), "a scope mask must not explain fields it does not carry"
+    assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
+    # The count is still asserted. Dropping it for substring checks alone lost
+    # the ability to catch unrelated header bloat, which is what this test was
+    # originally for — a header that grows quietly is how the photo-field lines
+    # ended up on scope masks in the first place. Adding a universal note is
+    # legitimate and should require deliberately updating this number.
+    # 8 = 3 original + 4 position note + 1 "skipped azimuths", which this
+    # fixture triggers by passing [180].
+    assert len(head) == 8, f"header changed size; update deliberately, got {len(head)}"
 
     rich = tmp_path / "photo.yaml"
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
@@ -2807,3 +2821,31 @@ def test_tile_is_rejected_by_the_heuristic_rather_than_dropped():
     img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
     with pytest.raises(TypeError, match="tile"):
         skymask.sky_mask(img, backend="heuristic", tile=True)
+
+
+def test_every_mask_and_export_says_the_horizon_is_position_specific(tmp_path):
+    """A mask taken from the patio does not describe the sky from the lawn.
+
+    Reasoned from geometry, not measured here: a ridge two kilometres out does
+    not care where the observer stands, but a fence five metres away swings by
+    degrees for a couple of metres of displacement. The error is largest exactly
+    where the horizon is highest, because the tall obstructions are the near
+    ones — so the warning matters most where it is most consequential.
+
+    Stellarium's format forbids comments, so it cannot carry the note; that is a
+    limit of the format rather than an omission, and the mask and .hrz both say
+    it.
+    """
+    from terminus.export import export_all, write_mask
+
+    p = tmp_path / "m.yaml"
+    write_mask(str(p), {0: (12.0, "tree"), 90: (30.5, "structure")}, [], {"lat": 40})
+    assert "POSITION-SPECIFIC" in p.read_text()
+
+    hrz, txt = export_all(str(p), str(tmp_path / "out"))
+    hrz_text = open(hrz).read()
+    assert "Measured from one spot" in hrz_text
+    assert "nearer" in hrz_text.lower(), "the .hrz must name the direction that matters"
+
+    # Stellarium stays comment-free, which the format requires.
+    assert all(not ln.startswith("#") for ln in open(txt).read().splitlines())
