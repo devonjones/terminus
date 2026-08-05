@@ -478,7 +478,17 @@ def test_boundary_models_differ_for_tree_and_structure():
     assert tree["max_width_deg"] > wall["max_width_deg"]  # canopy is a band
     assert tree["buffer_deg"] > wall["buffer_deg"]
     assert tree["seasonal"] and not wall["seasonal"]
-    assert boundary_model(None) == wall  # unknown falls back to the strict model
+    # This line used to read `assert boundary_model(None) == wall`, calling the
+    # structure model "the strict model". It is not strict, it is a DIFFERENT
+    # rule: it demands a sharper step and calls a wide transition suspect, which
+    # is the wrong judgement for foliage. An unnamed column is most often a tree
+    # measured at night, so the old fallback pointed the wall rule at exactly
+    # the columns the vegetation rule exists for. Refusing is the honest answer;
+    # see test_an_unnamed_column_gets_no_boundary_model.
+    import pytest
+
+    with pytest.raises(ValueError):
+        boundary_model(None)
 
 
 def test_judge_width_flags_a_soft_wall_and_a_sharp_tree():
@@ -1990,9 +2000,12 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     # originally for — a header that grows quietly is how the photo-field lines
     # ended up on scope masks in the first place. Adding a universal note is
     # legitimate and should require deliberately updating this number.
-    # 8 = 3 original + 4 position note + 1 "skipped azimuths", which this
-    # fixture triggers by passing [180].
-    assert len(head) == 8, f"header changed size; update deliberately, got {len(head)}"
+    # 12 = 3 original + 4 explaining an EMPTY type + 4 position note + 1
+    # "skipped azimuths", which this fixture triggers by passing [180]. The
+    # empty-type note is universal: ANY mask may hold a column that was measured
+    # but not named, and a bare "type:" with nothing said about it reads as a
+    # bug rather than as an honest gap.
+    assert len(head) == 12, f"header changed size; update deliberately, got {len(head)}"
 
     rich = tmp_path / "photo.yaml"
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
@@ -3227,3 +3240,296 @@ def test_the_move_check_wraps_around_the_antimeridian():
     sky.loc.lon.deg = -179.9999
     # Raises MaskError if the wrap is missing; the point is that it does not.
     cli._check_mergeable({"oriented": True, "lat": -16.5, "lon": 179.9999}, sky)
+
+
+def test_the_scope_does_not_name_an_obstruction_it_cannot_see():
+    """After sunset every silhouette is neutral, so colour typing is not evidence.
+
+    `classify` calls a pixel vegetation only when it is green-dominant. A night
+    silhouette fails that test and falls into `structure = obstr & ~veg` by
+    default, so EVERY column came back "structure" — stated with exactly the
+    confidence of a real daylight reading, and it was that label the residual
+    table showed while the imagery said six of nine were trees.
+    """
+    from terminus.sweep import obstruction_type
+
+    # Daylight: the hint is real and is kept.
+    assert obstruction_type(0.6, 0.1, sun_alt=25.0) == "tree"
+    assert obstruction_type(0.1, 0.6, sun_alt=25.0) == "structure"
+    # After sunset the same neutral frame must not be named.
+    assert obstruction_type(0.0, 0.7, sun_alt=-8.0) == ""
+    assert obstruction_type(0.0, 0.7, sun_alt=-0.5) == ""
+    # "open" is a statement about how much obstruction there is, not about what
+    # kind, so darkness does not invalidate it.
+    assert obstruction_type(0.01, 0.02, sun_alt=-8.0) == "open"
+    # An unstated Sun keeps the old behaviour for a hand-run daylight probe.
+    assert obstruction_type(0.0, 0.7) == "structure"
+
+
+def test_a_merged_mask_says_which_instrument_named_each_column(tmp_path):
+    """One `type` field, two instruments, and they are not equally able.
+
+    The photo segments in focus and returns a real semantic class; the scope
+    reads colour through a 250mm lens focused at infinity. Merging is now
+    routine, so a reader has to be able to tell one column's provenance from
+    another's rather than trusting the file's header for all of them.
+    """
+    from terminus.export import load_columns, write_mask
+
+    out = str(tmp_path / "src.yaml")
+    write_mask(
+        out,
+        {
+            0: {"alt": 12.0, "type": "tree", "type_source": "photo"},
+            90: {"alt": 30.0, "type": "structure", "type_source": "scope"},
+            180: {"alt": 8.0, "type": "", "type_source": None},
+        },
+        [],
+        {"lat": 40, "lon": -104},
+    )
+    _, cols = load_columns(out)
+    assert cols[0]["type_source"] == "photo"
+    assert cols[90]["type_source"] == "scope"
+    assert cols[180].get("type_source") is None, "no type means no source to claim"
+    header = [ln for ln in (tmp_path / "src.yaml").read_text().splitlines() if ln.startswith("#")]
+    assert any("type_source" in ln for ln in header), "and the file explains what it means"
+
+
+def test_an_unnamed_column_gets_no_boundary_model():
+    """Defaulting an unknown type to `structure` is the same bug, one layer down.
+
+    A tree measured at night has no type, and quietly judging it by the rule for
+    a wall is exactly the case that matters most — the vegetation model exists
+    because foliage is wide, gappy and moves. Nothing calls `boundary_model`
+    yet, so refusing costs nothing today and forces the decision at the moment
+    someone wires it up.
+    """
+    import pytest
+
+    from terminus.sweep import boundary_model, judge_width
+
+    assert boundary_model("tree")["repeats"] == 4
+    assert boundary_model("structure")["repeats"] == 2
+    # A misspelling is a typo, not an absence of evidence, so it still falls back.
+    assert boundary_model("treee") is boundary_model("structure")
+    for empty in ("", "   ", None):
+        with pytest.raises(ValueError, match="no obstruction type"):
+            boundary_model(empty)
+    # judge_width must not blow up on the same input; it has an honest answer.
+    verdict, note = judge_width("", 5.0)
+    assert verdict == "unknown" and "no type" in note
+
+
+def test_a_failed_sun_read_costs_one_reading_not_the_whole_sweep(monkeypatch):
+    """The new per-column `sky.sun()` sat inside a try that does not catch it.
+
+    That try catches SunGuard and PointingError only, so an OSError from the
+    ephemeris would escape cmd_sweep's abort handler and take the entire
+    in-memory mask with it — a column that had already cleared the Sun-cone gate
+    killing a sweep that was otherwise fine. And the fallback must be the LAST
+    KNOWN altitude, never None: None means "the caller did not say", which
+    restores the daylight assumption at exactly the wrong moment.
+    """
+    from terminus import sweep
+
+    calls = {"n": 0}
+    real_alt = -9.0
+
+    def flaky_sun():
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise OSError("ephemeris unavailable")
+        return 180.0, real_alt
+
+    sky = type("S", (), {"sun": staticmethod(flaky_sun)})()
+    seen = []
+
+    def fake_scan(ptr, sc, az, *a, **kw):
+        seen.append(kw["sun_alt"])
+        return 20.0, "edge", "", [(20.0, 5.0)]
+
+    monkeypatch.setattr(sweep, "scan_horizon", fake_scan)
+    monkeypatch.setattr(sweep, "column_touches_sun", lambda *a, **k: False)
+    monkeypatch.setattr(sweep, "Pointer", lambda *a, **k: object())
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 90, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 0.5,
+    }  # fmt: skip
+    mask, _, _ = sweep.run_sweep(
+        None, sky, cfg, az_start=0, az_end=270, dry=True, log=lambda *a, **k: None
+    )
+
+    assert len(mask) == 4, "a failed Sun read must not abandon the sweep"
+    assert all(v == real_alt for v in seen), (
+        "after the ephemeris failed, the last known altitude must be reused — "
+        f"None would restore the daylight assumption, got {seen}"
+    )
+
+
+def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
+    """The regression the code's own comment warns about, with a test behind it.
+
+    The heuristic backend segments nothing, so every class comes back -1 and
+    every type is empty. Stamping `type_source: photo` unconditionally would
+    have claimed a segmentation that never ran — an unevidenced provenance,
+    which is worse than none, because a reader trusts the field precisely to
+    tell photo columns apart from scope ones.
+    """
+    from terminus.cli import main
+    from terminus.export import load_columns
+
+    pano = tmp_path / "p.png"
+    _synthetic_panorama(str(pano))
+    main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"])
+
+    _, cols = load_columns(str(tmp_path / "p_mask.yaml"))
+    assert cols, "the fixture must produce columns for this to mean anything"
+    for az, col in cols.items():
+        assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
+        assert (
+            col.get("type_source") is None
+        ), f"az {az}: no type was measured, so no source may be claimed"
+
+
+def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
+    """`type_source` has to be stamped where the sweep writes, not just defined.
+
+    Dropping the stamp left every column sourceless while the field, the header
+    text and the loader all still worked, so nothing failed — which is how a
+    provenance field quietly becomes decorative.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns
+
+    out = tmp_path / "h.yaml"
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # 90 named in daylight, 270 measured after sunset and left unnamed.
+    with patch.object(
+        cli, "run_sweep", return_value=({90: (33.0, "tree"), 270: (7.0, "")}, [], {})
+    ):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["type"] == "tree" and cols[90]["type_source"] == "scope"
+    assert cols[270]["type"] == "", "an unnamed column stays unnamed"
+    assert cols[270].get("type_source") is None, "and claims no source for it"
+
+
+def test_a_night_re_measure_does_not_throw_away_the_photo_s_type(tmp_path):
+    """A targeted re-measure is meant to improve a column, not degrade it.
+
+    The merge replaced the whole record, so re-measuring at 2 a.m. a column the
+    photo had segmented as `tree` overwrote it with `type: ""` — the scope
+    cannot name anything after sunset. A real, in-focus segmentation was thrown
+    away by a measurement that had nothing to say about type, and the column
+    then exported without its seasonal vegetation buffer.
+
+    Altitude is the scope's answer and the fresh one wins. Type is whichever
+    instrument could name it, so fresh silence must not overwrite it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {
+            90: {
+                "alt": 20.0, "type": "tree", "type_source": "photo",
+                "gap_fraction": 0.4, "uncertainty": 4.2,
+            },
+            180: {"alt": 5.0, "type": "structure", "type_source": "photo"},
+        },  # fmt: skip
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # Re-measure 90 after sunset: a new altitude, and no type at all.
+    with patch.object(cli, "run_sweep", return_value=({90: (33.0, "")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["alt"] == 33.0, "the fresh altitude must win"
+    assert cols[90]["type"] == "tree", "a fresh silence must not erase a real segmentation"
+    assert cols[90]["type_source"] == "photo", "and the source stays with the type"
+    assert cols[90]["gap_fraction"] == 0.4, "photo fields describe the panorama, not this scan"
+    assert cols[180]["type"] == "structure", "untouched columns are untouched"
+
+
+def test_a_daylight_re_measure_may_correct_the_type(tmp_path):
+    """The other direction: a column that CAN be named replaces the old name.
+
+    Preserving the old type unconditionally would be the mirror bug — a
+    re-measure that genuinely sees a wall where the mask says tree has to be
+    able to say so.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {90: {"alt": 20.0, "type": "tree", "type_source": "photo"}},
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    with patch.object(cli, "run_sweep", return_value=({90: (21.0, "structure")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["type"] == "structure", "a fresh naming replaces an old one"
+    assert cols[90]["type_source"] == "scope", "and brings its own source with it"
+
+
+def test_a_real_crossing_clears_the_photo_s_lower_bound_flag(tmp_path):
+    """`clipped` describes an altitude, not an obstruction.
+
+    It means the obstruction ran off the top of the PHOTO, so the altitude
+    beside it is a lower bound rather than a measurement. Once the scope
+    supplies a real crossing, that number is no longer the bound — carrying the
+    flag forward makes the file assert something false about a value it no
+    longer describes.
+
+    The contrast is `gap_fraction` and `uncertainty`, which describe how gappy
+    the canopy is and how far it moves. Those are properties of the thing, and
+    looking at it again from a different instrument does not change them.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(
+        str(out),
+        {
+            90: {
+                "alt": 60.0, "type": "tree", "type_source": "photo",
+                "clipped": True, "gap_fraction": 0.4, "uncertainty": 4.2,
+            }
+        },  # fmt: skip
+        [],
+        {"lat": 39.79, "lon": -104.89},
+    )
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    # The scope finds a genuine edge well below the photo's cropped bound.
+    with patch.object(cli, "run_sweep", return_value=({90: (22.0, "")}, [], {})):
+        cli.cmd_sweep(sc, _SWEEP_CFG, _sweep_args(out, "90"))
+
+    _, cols = load_columns(str(out))
+    assert cols[90]["alt"] == 22.0
+    assert cols[90].get("clipped") is None, "22.0 is a measurement, not a lower bound"
+    assert cols[90]["gap_fraction"] == 0.4, "how gappy the canopy is did not change"
+    assert cols[90]["uncertainty"] == 4.2, "nor how far it moves"
+    assert cols[90]["type"] == "tree", "and the photo still knows what it is"

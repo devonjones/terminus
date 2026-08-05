@@ -207,6 +207,49 @@ def _az_list(value, field):
         raise MaskError(f"the mask's {field} contains a non-numeric azimuth: {value!r}") from exc
 
 
+def _merge_column(prior_col, fresh_col):
+    """One column re-measured: take the new altitude, keep the better type.
+
+    A whole-record replace was wrong, and in a way that only shows up at night.
+    Re-measure a column at 2 a.m. that the photo had segmented as `tree` and the
+    fresh record carries `type: ""` — the scope cannot name anything after
+    sunset — so the replace silently threw away a real, in-focus segmentation
+    and the column exported without its seasonal buffer. A targeted re-measure,
+    which is meant to IMPROVE a column, made it worse.
+
+    The two fields come from two instruments and are not interchangeable, which
+    is the whole point of `type_source`. Altitude is the scope's answer and the
+    fresh one is always better. Type is whichever instrument could actually name
+    it, so a fresh naming replaces an old one and a fresh SILENCE does not.
+    """
+    if not prior_col:
+        return fresh_col
+    out = dict(fresh_col)
+    if not out.get("type") and prior_col.get("type"):
+        out["type"] = prior_col["type"]
+        out["type_source"] = prior_col.get("type_source")
+    # Photo fields survive a re-measure only if they describe the OBSTRUCTION
+    # rather than the altitude. `gap_fraction` is how gappy the canopy is and
+    # `uncertainty` is how far that boundary moves — both are properties of the
+    # thing, and a second look at it from a different instrument does not change
+    # them.
+    for key in ("gap_fraction", "uncertainty"):
+        if out.get(key) is None and prior_col.get(key) is not None:
+            out[key] = prior_col[key]
+    # `clipped` is not such a property. It means THIS ALTITUDE IS A LOWER BOUND,
+    # because the obstruction ran off the top of the photo. Once the scope
+    # supplies a real crossing the altitude is no longer that bound, so carrying
+    # the flag forward makes the file assert something false about a number it
+    # no longer describes — the same bug this function fixes for `type`, one
+    # field over. Dropped rather than carried.
+    #
+    # A scope re-measure that hit its OWN ceiling is a different statement and
+    # the mask cannot express it yet: run_sweep returns a bare (alt, type) and
+    # the boundedness lives only in the status string. That is terminus-7's
+    # territory, not something to paper over by reusing the photo's flag.
+    return out
+
+
 def _merge_meta(prior_meta, fresh, measured, skipped, present=None):
     """Meta for a merged mask, which describes BOTH runs.
 
@@ -320,9 +363,18 @@ def cmd_sweep(sc, cfg, args):
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
     fresh = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+    # The scope reads type from colour, so a column it typed was typed in
+    # daylight — after sunset `obstruction_type` returns "" rather than guessing.
+    # Stamped here rather than in run_sweep so its (alt, type) contract, which
+    # several callers and tests depend on, stays as it was.
+    mask = {
+        az: {"alt": alt, "type": typ, "type_source": "scope" if typ else None}
+        for az, (alt, typ) in mask.items()
+    }
     if prior:
         merged = dict(prior)
-        merged.update(mask)  # freshly measured columns win
+        for az, col in mask.items():
+            merged[az] = _merge_column(prior.get(az), col)
         meta = _merge_meta(
             prior_meta, fresh, measured=set(mask), skipped=skipped, present=set(merged)
         )
@@ -474,9 +526,14 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
         alt = 90.0 - (float(top[x]) / h) * 180.0
         is_clipped = bool(band["clipped"][x])
         clipped_n += is_clipped
+        typ = _type_name(int(classes[x]))
         mask[az] = {
             "alt": round(alt, 2),
-            "type": _type_name(int(classes[x])),
+            "type": typ,
+            # Only claim a source when there is a type to source. The heuristic
+            # backend segments nothing, so `classes` is -1 throughout and every
+            # column would otherwise be stamped "photo" for a type it never got.
+            "type_source": "photo" if typ else None,
             "clipped": is_clipped,
             "gap_fraction": round(float(band["gap_fraction"][x]), 3),
             "uncertainty": round(float(unc[x]), 2),
