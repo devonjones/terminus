@@ -895,8 +895,13 @@ def test_night_skips_a_lamp_and_finds_the_horizon_below_it():
         (5, 2.6),
         (0, 2.5),
     ]
+    # 25.0, not 15.0. The convention changed deliberately: the reported altitude
+    # is the LAST CLEAR SKY sample, not the first terrain one, because the mask
+    # defines altitude as "lowest clear sky" and a planner takes it literally.
+    # The step-back also has to skip the LAMP at 20 — reporting a streetlight
+    # burning inside the obstruction as the horizon would be worse than either.
     alt, detail = find_horizon(prof, sky_ref=22.0)
-    assert alt == 15.0, f"expected the horizon below the lamp, got {alt} ({detail})"
+    assert alt == 25.0, f"expected the last clear sky above the lamp, got {alt} ({detail})"
     assert 20.0 in detail["lights_at"], "the lamp must be identified, not treated as terrain"
 
 
@@ -1436,14 +1441,25 @@ def test_the_sky_reference_seeding_swallows_a_pointing_failure():
     assert mask, "a failed sky reference must not abort the sweep before it starts"
 
 
-def test_min_drop_frac_is_pinned_not_merely_incidental():
-    """Every other night fixture departs the sky model so drastically that the
-    threshold could be moved 0.5 -> 0.9 unnoticed.
+def test_the_departure_threshold_sits_between_model_error_and_real_terrain():
+    """Retired MIN_DROP_FRAC as the detector, and this test's old premise with it.
 
-    A real column can sit near it: distant terrain under light haze, or a low
-    pale wall, reads a substantial fraction of the modelled sky. Get this wrong
-    and the horizon is reported lower than it is, which is the dangerous
-    direction — a planner will then start an imaging run into the obstruction.
+    It used to assert that a drop to 0.55x the modelled sky is "still sky", which
+    pinned MIN_DROP_FRAC at a factor of two. Two real columns then landed astride
+    that line and neither survived it: az 60 cleared it by 0.004 and was thrown
+    away by the persistence check, and az 190 — a roofline visible by eye, thirty
+    sigma clear of the sky's own scatter — missed it by 0.018 and was never seen.
+    A rule that a genuine roofline fails by one part in fifty is not measuring
+    what it claims to.
+
+    So the threshold moved to a quarter, which is not a taste: skyglow departs
+    from a straight line by perhaps ten to twenty per cent over a full column,
+    and the az 190 roofline is forty-eight per cent down. A quarter separates the
+    two with room on both sides. The consequence, stated plainly because it is a
+    real behaviour change: a 45 per cent drop now reads as terrain where it used
+    to read as sky. That is the conservative direction — the error it prevents is
+    a planner starting a run into an obstruction — but it is a change, and if a
+    real hazy column turns out to sit there, this is the number to revisit.
     """
     from terminus.night import find_horizon
 
@@ -1453,13 +1469,22 @@ def test_min_drop_frac_is_pinned_not_merely_incidental():
     def column(frac):
         return [(a, sky(a)) for a in alts if a >= 25] + [(a, sky(a) * frac) for a in alts if a < 25]
 
-    # Comfortably below the threshold: terrain.
-    alt, detail = find_horizon(column(0.45), sky_ref=22.0)
-    assert alt == 20.0, f"a drop to 0.45x the model is terrain, got {alt} ({detail['reason']})"
-    # Comfortably above it: still sky, however dim.
-    alt, detail = find_horizon(column(0.55), sky_ref=22.0)
-    assert alt is None, f"a drop to only 0.55x is not an obstruction, got {alt}"
-    assert "open" in detail["reason"]
+    # The reported altitude is the last CLEAR sky sample, so 25 rather than 20.
+    for frac in (0.45, 0.55, 0.70):
+        alt, detail = find_horizon(column(frac), sky_ref=22.0)
+        assert alt == 25.0, f"a sustained drop to {frac}x is terrain, got {alt} ({detail})"
+
+    # A shallow, sustained dip is model error, not an obstruction. This is the
+    # half that keeps the threshold honest in the other direction.
+    alt, detail = find_horizon(column(0.85), sky_ref=22.0)
+    assert alt is None, f"a 15 per cent dip is within model error, got {alt}"
+
+    # And a single dark frame is not a horizon: the persistence check requires
+    # the column to STAY down.
+    spike = [(a, sky(a)) for a in alts]
+    spike[6] = (25, sky(25) * 0.3)
+    alt, detail = find_horizon(spike, sky_ref=22.0)
+    assert alt is None, f"one dark sample is not a roofline, got {alt}"
 
 
 def test_an_abandoned_sweep_keeps_its_profiles_too():
@@ -4536,3 +4561,106 @@ def test_orient_explains_a_bad_replay_file_instead_of_tracing_back(tmp_path, cap
             main(["orient", str(photo), "--replay", str(path)])
         assert exc.value.code == 1, f"{path.name} must refuse cleanly, not crash"
         assert message in capsys.readouterr().err, f"{path.name} must say what is wrong"
+
+
+# ---- terminus-47: the skyglow fit, against the columns that broke it -------
+# The measured columns terminus-47 was diagnosed from, COPIED INTO THE REPO
+# rather than read out of captures/, which is gitignored as too large to track.
+# Left there they skipped everywhere but the machine that measured them — in CI,
+# in every fresh clone, and in every reviewer's worktree — which for a
+# regression test is worse than not existing, because the suite still reports
+# green. They are a few hundred numbers; the evidence belongs with the test.
+_COLUMNS_JSON = os.path.join(os.path.dirname(__file__), "data", "terminus_47_columns.json")
+
+
+def _real_column(name):
+    import json
+
+    with open(_COLUMNS_JSON) as f:
+        return [(r[0], r[1]) for r in json.load(f)[name]]
+
+
+def test_the_skyglow_model_is_fitted_to_sky_not_to_the_ground_beneath_it():
+    """terminus-47, on the column it was measured from.
+
+    az 60 has a 103-count cliff at altitude 36.46 that is obvious by eye, in a
+    column searched from 55 — so more than half its samples are ground. Fitted
+    on a fixed top half, the terrain set the slope: +4.244 counts/deg, intercept
+    -55.115, predicting NEGATIVE sky below altitude 13. Everything else followed
+    from that, and `find_horizon` returned None, "open to the search floor".
+    """
+    from terminus.night import find_horizon, is_skyglow, sky_model
+
+    prof = _real_column("az60_coarse")
+    model, n_top = sky_model(prof)
+    assert model["slope"] < 0, "skyglow brightens toward the horizon; this fit is +4.244 when wrong"
+    assert n_top < len(prof), "the fit must not have swallowed the terrain"
+    assert is_skyglow(model, min(a for a, _ in prof)), "and must predict positive sky throughout"
+
+    alt, detail = find_horizon(prof)
+    assert alt is not None, f"the cliff is unmissable by eye; got {detail['reason']}"
+    # Samples every 2 deg, true crossing 36.46, so 37 is the last clear sky.
+    assert alt == 37.0, f"expected the last clear sample above the cliff, got {alt}"
+
+
+def test_deep_terrain_never_scores_as_perfect_sky():
+    """The worst of the three defects, and the one that poisoned the rest.
+
+    Where the broken model's prediction crossed zero, the ratio was 421.8; below
+    that the `pred > 1e-6` guard clamped it to exactly 1.0. So the further into
+    the ground a column went, the more sky-like it looked — and any median taken
+    across it was ruined. No sample may score as sky where the model has no
+    opinion.
+    """
+    import numpy as np
+
+    from terminus.night import sky_model
+
+    prof = _real_column("az60_coarse")
+    model, _ = sky_model(prof)
+    alts = np.array([a for a, _ in prof])
+    lums = np.array([lum for _, lum in prof])
+    pred = model["slope"] * alts + model["intercept"]
+    assert (pred > 0).all(), "a usable model predicts positive brightness everywhere it is applied"
+    frac = np.where(pred > 0, lums / pred, np.nan)
+    deep = frac[alts <= 15]
+    assert (deep < 0.5).all(), f"terrain below alt 15 must read as terrain, got {deep.max():.2f}"
+
+
+def test_a_roofline_thirty_sigma_clear_is_not_missed_by_one_part_in_fifty():
+    """az 190 drops 62.9 -> 32.7, a ratio of 0.518 against a 0.5 rule.
+
+    A genuine roofline, thirty sigma clear of the sky's own scatter, rejected by
+    one part in fifty. That is the mirror of az 60 clearing the same rule by
+    0.004 and being discarded by the persistence check — the ratio simply is not
+    the instrument.
+    """
+    from terminus.night import find_horizon
+
+    alt, detail = find_horizon(_real_column("az190_recheck"))
+    assert alt is not None, f"got {detail['reason']}"
+    # Samples every 1 deg, true crossing 38.59, so 39 is the last clear sky.
+    assert alt == 39.0, f"expected 39.0, got {alt}"
+
+
+def test_a_narrow_refinement_scan_is_refused_rather_than_guessed():
+    """A confident wrong answer in the unsafe direction is the failure to avoid.
+
+    The az 190 refinement scan spans 3.5 degrees and is mostly roof. The skyglow
+    premise needs a measurable gradient — about a count per degree against one
+    to six counts of scatter — so over that window there is nothing to fit, and
+    the module answered "open to the search floor" for a column full of
+    building. It now declines, and names the tool that does handle a narrow
+    two-level window.
+    """
+    from terminus.night import find_horizon
+    from terminus.sweep import find_edge
+
+    prof = _real_column("az190_fine")
+    alt, detail = find_horizon(prof)
+    assert alt is None
+    assert "spans only" in detail["reason"] and "find_edge" in detail["reason"]
+
+    # And the tool it points at does resolve it, conservatively.
+    k, _step, _snr = find_edge(prof, max(lum for _, lum in prof))
+    assert k is not None and prof[k][0] >= 38.59, "find_edge handles the narrow window"
