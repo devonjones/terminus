@@ -131,9 +131,36 @@ def classify(rgb, sky_ref=None):
     return float(sky.mean()), float(veg.mean()), float(structure.mean()), float(np.median(lum))
 
 
-def obstruction_type(veg_frac, struct_frac):
+# Below this Sun altitude the scope's colour tagging is not evidence about the
+# obstruction, only about the light. `classify` calls a pixel vegetation when it
+# is green-dominant; a silhouette is neutral, fails that test, and falls into
+# `structure = obstr & ~veg` by default. So after sunset EVERY column comes back
+# "structure", stated with exactly the confidence of a real daylight reading.
+#
+# Zero is the honest boundary rather than a tuned one: it is where direct
+# illumination stops. It is not the whole problem — for some minutes either side
+# of it the light is strongly reddened, which pushes r and g above b across the
+# whole frame and biases the test the other way. Nobody has measured how wide
+# that window is, so this does not pretend to correct for it.
+DAYLIGHT_TYPE_MIN_ALT = 0.0
+
+
+def obstruction_type(veg_frac, struct_frac, sun_alt=None):
+    """Vegetation or structure, from colour — a DAYLIGHT-ONLY hint.
+
+    Returns "" when the Sun is down, meaning "this instrument cannot tell". That
+    is a different claim from "structure" and must not be written as one: the
+    mask is consumed by other software, so a type in it has to have been
+    measured. Which instrument did the measuring is recorded alongside it; see
+    `type_source` in `export.write_mask`.
+
+    `sun_alt` of None means the caller did not say, and keeps the old behaviour
+    so a hand-run daylight probe still works.
+    """
     if veg_frac + struct_frac < 0.15:
         return "open"
+    if sun_alt is not None and sun_alt < DAYLIGHT_TYPE_MIN_ALT:
+        return ""
     return "tree" if veg_frac >= struct_frac else "structure"
 
 
@@ -540,6 +567,7 @@ def scan_horizon(
     sky_ref=None,
     frames_dir=None,
     repeats=1,
+    sun_alt=None,
 ):
     """Walk a column from `alt_max` down, then refine the brightness step.
 
@@ -593,7 +621,7 @@ def scan_horizon(
         if median < 0.5 * sky_ref:
             dark = frames[profile[0][0]]
             _, v, st, _ = classify(dark, sky_ref)
-            return alt_max, "blocked_above", obstruction_type(v, st), profile
+            return alt_max, "blocked_above", obstruction_type(v, st, sun_alt), profile
         if lums[0] >= 0.5 * sky_ref:
             return alt_min, "open_to_min", "open", profile
         # Bright overall but with dark samples that form no clean step: report it
@@ -612,7 +640,7 @@ def scan_horizon(
         else:
             lo = mid
     _, v, st, _ = classify(frames[lo_alt], hi_lum)
-    return round(hi, 1), f"edge(rel {rel:.2f})", obstruction_type(v, st), profile
+    return round(hi, 1), f"edge(rel {rel:.2f})", obstruction_type(v, st, sun_alt), profile
 
 
 def save_boundary_frame(sc, ptr, az, alt, typ, save_dir, sky_ref=None):
@@ -703,6 +731,11 @@ def run_sweep(
                 sky_ref,
                 frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
                 repeats=cfg.get("samples_per_point", 1),
+                # The Sun is re-read per column rather than reused from the seed:
+                # a full sweep spans hours and can start in daylight and end
+                # after sunset, so a single altitude taken at the top would let
+                # the late columns inherit a daylight claim they never earned.
+                sun_alt=sky.sun()[1],
             )
             if profile:
                 profiles[az] = profile

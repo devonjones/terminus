@@ -39,7 +39,11 @@ import yaml
 #                before the rename still opens.
 #   uncertainty  per-column altitude uncertainty in degrees, already widened for
 #                vegetation by type and gap_fraction.
-COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty")
+#   type_source  which instrument named the obstruction: "photo" (in-focus
+#                segmentation) or "scope" (colour, daylight only). Per column,
+#                because a merged mask holds both and they are not equally able
+#                to tell a tree from a wall.
+COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty", "type_source")
 # Old spellings still accepted when reading, never written.
 _RENAMED = {"gap_fraction": "porosity"}
 
@@ -60,7 +64,12 @@ def write_mask(path, mask, skipped, meta):
     # amount.
     oriented = is_oriented(meta)
     columns = {az: _column(v) for az, v in mask.items()}
-    extra = any(c.get(k) is not None for c in columns.values() for k in COLUMN_FIELDS)
+
+    def _present(*keys):
+        return any(c.get(k) is not None for c in columns.values() for k in keys)
+
+    photo_fields = _present("clipped", "gap_fraction", "uncertainty")
+    sourced = _present("type_source")
     lines = [
         "# terminus horizon mask (Seestar S50, EQ mode, RA/Dec goto).",
         (
@@ -70,18 +79,28 @@ def write_mask(path, mask, skipped, meta):
             "# !! orientation before any planner consumes this."
         ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
+        "#   Empty means the column was measured but its type was not: the scope",
+        "#   reads type from colour, and after sunset every silhouette is neutral.",
         "# POSITION-SPECIFIC: the horizon from where the tripod stood. Moving a",
         "#   couple of metres NEARER a close obstruction shifts it by degrees (a",
         "#   2 m fence at 5 m: +11.9 closer, -5.9 further); along it, not at all. A",
         "#   distant ridge does not care. Re-measure if you move nearer or further.",
     ]
-    # Only explain the photo-derived fields when the file actually carries them,
-    # so a scope-measured mask is byte-for-byte what it always was.
-    if extra:
+    # Each group of fields is explained only when the file actually carries it.
+    # A mask that has no photo columns should not be handed a paragraph about
+    # canopy porosity, and the two groups appear independently now that a scope
+    # sweep records its own type_source.
+    if photo_fields:
         lines += [
             "# clipped: true = obstruction ran off the top of the data; a lower BOUND,",
             "#          not a measurement. gap_fraction: sky fraction within the canopy",
             "#          band. uncertainty: degrees, already widened for vegetation.",
+        ]
+    if sourced:
+        lines += [
+            "# type_source: photo (in-focus segmentation) | scope (daylight colour).",
+            "#          Recorded per column, because a merged mask holds both and the",
+            "#          two instruments are not equally able to tell tree from wall.",
         ]
     lines += [f"meta: {meta}", "horizon:"]
     for az in sorted(columns):
@@ -127,7 +146,17 @@ def load_columns(path):
                 if raw is None and key in _RENAMED:
                     raw = v.get(_RENAMED[key])  # a mask written before the rename
                 if raw is not None:
-                    col[key] = bool(raw) if key == "clipped" else float(raw)
+                    # Each field has its own type: clipped is a flag, type_source
+                    # is a name, the rest are numbers. Coercing everything with
+                    # float() made a string field unreadable the moment one was
+                    # added, which is the kind of breakage that only shows up in
+                    # the next feature.
+                    if key == "clipped":
+                        col[key] = bool(raw)
+                    elif key == "type_source":
+                        col[key] = str(raw)
+                    else:
+                        col[key] = float(raw)
         else:  # bare "az: alt"
             col = {"alt": float(v), "type": ""}
         cols[int(az)] = col

@@ -1992,7 +1992,7 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     # legitimate and should require deliberately updating this number.
     # 8 = 3 original + 4 position note + 1 "skipped azimuths", which this
     # fixture triggers by passing [180].
-    assert len(head) == 8, f"header changed size; update deliberately, got {len(head)}"
+    assert len(head) == 10, f"header changed size; update deliberately, got {len(head)}"
 
     rich = tmp_path / "photo.yaml"
     write_mask(str(rich), {0: {"alt": 12.0, "type": "tree", "clipped": True}}, [], {})
@@ -3227,3 +3227,55 @@ def test_the_move_check_wraps_around_the_antimeridian():
     sky.loc.lon.deg = -179.9999
     # Raises MaskError if the wrap is missing; the point is that it does not.
     cli._check_mergeable({"oriented": True, "lat": -16.5, "lon": 179.9999}, sky)
+
+
+def test_the_scope_does_not_name_an_obstruction_it_cannot_see():
+    """After sunset every silhouette is neutral, so colour typing is not evidence.
+
+    `classify` calls a pixel vegetation only when it is green-dominant. A night
+    silhouette fails that test and falls into `structure = obstr & ~veg` by
+    default, so EVERY column came back "structure" — stated with exactly the
+    confidence of a real daylight reading, and it was that label the residual
+    table showed while the imagery said six of nine were trees.
+    """
+    from terminus.sweep import obstruction_type
+
+    # Daylight: the hint is real and is kept.
+    assert obstruction_type(0.6, 0.1, sun_alt=25.0) == "tree"
+    assert obstruction_type(0.1, 0.6, sun_alt=25.0) == "structure"
+    # After sunset the same neutral frame must not be named.
+    assert obstruction_type(0.0, 0.7, sun_alt=-8.0) == ""
+    assert obstruction_type(0.0, 0.7, sun_alt=-0.5) == ""
+    # "open" is a statement about how much obstruction there is, not about what
+    # kind, so darkness does not invalidate it.
+    assert obstruction_type(0.01, 0.02, sun_alt=-8.0) == "open"
+    # An unstated Sun keeps the old behaviour for a hand-run daylight probe.
+    assert obstruction_type(0.0, 0.7) == "structure"
+
+
+def test_a_merged_mask_says_which_instrument_named_each_column():
+    """One `type` field, two instruments, and they are not equally able.
+
+    The photo segments in focus and returns a real semantic class; the scope
+    reads colour through a 250mm lens focused at infinity. Merging is now
+    routine, so a reader has to be able to tell one column's provenance from
+    another's rather than trusting the file's header for all of them.
+    """
+    from terminus.export import load_columns, write_mask
+
+    out = "/tmp/claude-1000/-mnt-c-Users-devon-Documents-M110/db3f057c-e8ed-46fc-94fb-b5c9cdaf72d8/scratchpad/src.yaml"
+    write_mask(
+        out,
+        {
+            0: {"alt": 12.0, "type": "tree", "type_source": "photo"},
+            90: {"alt": 30.0, "type": "structure", "type_source": "scope"},
+            180: {"alt": 8.0, "type": "", "type_source": None},
+        },
+        [],
+        {"lat": 40, "lon": -104},
+    )
+    _, cols = load_columns(out)
+    assert cols[0]["type_source"] == "photo"
+    assert cols[90]["type_source"] == "scope"
+    assert cols[180].get("type_source") is None, "no type means no source to claim"
+    assert any("type_source" in ln for ln in open(out) if ln.startswith("#")), "and it is explained"

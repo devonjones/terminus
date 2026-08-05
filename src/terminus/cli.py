@@ -320,6 +320,14 @@ def cmd_sweep(sc, cfg, args):
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
     fresh = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+    # The scope reads type from colour, so a column it typed was typed in
+    # daylight — after sunset `obstruction_type` returns "" rather than guessing.
+    # Stamped here rather than in run_sweep so its (alt, type) contract, which
+    # several callers and tests depend on, stays as it was.
+    mask = {
+        az: {"alt": alt, "type": typ, "type_source": "scope" if typ else None}
+        for az, (alt, typ) in mask.items()
+    }
     if prior:
         merged = dict(prior)
         merged.update(mask)  # freshly measured columns win
@@ -474,9 +482,14 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
         alt = 90.0 - (float(top[x]) / h) * 180.0
         is_clipped = bool(band["clipped"][x])
         clipped_n += is_clipped
+        typ = _type_name(int(classes[x]))
         mask[az] = {
             "alt": round(alt, 2),
-            "type": _type_name(int(classes[x])),
+            "type": typ,
+            # Only claim a source when there is a type to source. The heuristic
+            # backend segments nothing, so `classes` is -1 throughout and every
+            # column would otherwise be stamped "photo" for a type it never got.
+            "type_source": "photo" if typ else None,
             "clipped": is_clipped,
             "gap_fraction": round(float(band["gap_fraction"][x]), 3),
             "uncertainty": round(float(unc[x]), 2),
