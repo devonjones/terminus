@@ -279,22 +279,23 @@ def write_landscape(
     across sky nobody photographed.
     """
     require_oriented(meta, allow_unoriented)
-    os.makedirs(directory, exist_ok=True)
     meta = meta or {}
 
-    with open(os.path.join(directory, "horizon.txt"), "w") as f:
-        # allow_unoriented=True: already checked above, and re-checking here
-        # would refuse a package the caller was explicitly permitted to build.
-        f.write(to_stellarium_txt(rows, meta, tree_buffer, allow_unoriented=True))
+    # EVERYTHING IS BUILT BEFORE ANYTHING IS WRITTEN. Rendering first meant a
+    # failure partway left a directory holding horizon.txt and no landscape.ini
+    # — which Stellarium reads as a broken landscape rather than as an absent
+    # one, so the failure presented as a corrupt install instead of as an error.
+    # A package that does not exist is a better outcome than one that half does.
+    # allow_unoriented=True below: already checked above, and re-checking would
+    # refuse a package the caller was explicitly permitted to build.
+    horizon = to_stellarium_txt(rows, meta, tree_buffer, allow_unoriented=True)
 
-    texture_keys, kind = "", "polygonal"
+    texture_keys, kind, rgba = "", "polygonal", None
     if texture is not None:
-        from PIL import Image
-
         tex = np.asarray(texture)
-        size = (tex.shape[1], tex.shape[0])
-        rgba = render(rows, size, texture, coverage, tree_buffer, _yaw(meta))
-        Image.fromarray(rgba, "RGBA").save(os.path.join(directory, "maptex.png"))
+        rgba = render(
+            rows, (tex.shape[1], tex.shape[0]), texture, coverage, tree_buffer, _yaw(meta)
+        )
         texture_keys, kind = _SPHERICAL_KEYS, "spherical"
 
     ini = LANDSCAPE_INI.format(
@@ -315,6 +316,13 @@ def write_landscape(
             else ""
         ),
     )
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, "horizon.txt"), "w") as f:
+        f.write(horizon)
+    if rgba is not None:
+        from PIL import Image
+
+        Image.fromarray(rgba, "RGBA").save(os.path.join(directory, "maptex.png"))
     with open(os.path.join(directory, "landscape.ini"), "w") as f:
         f.write(ini)
     return directory

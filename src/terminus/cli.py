@@ -403,6 +403,15 @@ def cmd_export(sc, cfg, args):  # sc unused; export is offline
     hrz, txt = export_all(args.mask, base, allow_unoriented=allow)
     print(f"wrote {hrz}\nwrote {txt}")
     if not (args.skysafari or args.landscape):
+        # Checked here rather than in `_texture`, which this return would skip
+        # past. Silently ignoring --texture is the bad outcome: the person
+        # believes they rendered a photo-real horizon and got the plain .hrz
+        # they already had, with nothing said about it.
+        if args.texture or args.coverage:
+            raise SeestarError(
+                "--texture and --coverage only affect the pictures; "
+                "add --skysafari and/or --landscape"
+            )
         return
 
     from .export import load_mask
@@ -410,19 +419,26 @@ def cmd_export(sc, cfg, args):  # sc unused; export is offline
 
     meta, rows = load_mask(args.mask)
     texture, coverage = _texture(args)
-    if args.skysafari:
-        png = to_skysafari_png(
-            rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
-            allow_unoriented=allow,
-        )  # fmt: skip
-        print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
-    if args.landscape:
-        d = write_landscape(
-            base + "_landscape", rows, meta, name=os.path.basename(base),
-            texture=texture, coverage=coverage, allow_unoriented=allow,
-        )  # fmt: skip
-        kind = "spherical" if texture is not None else "polygonal"
-        print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
+    # Every write below is wrapped: an unwritable directory or a full disk is an
+    # ordinary thing to hit and reached the user as a traceback, while a mask
+    # with a typo'd flag got a clean sentence. That is backwards — the one with
+    # the obvious fix should be the one that explains itself.
+    try:
+        if args.skysafari:
+            png = to_skysafari_png(
+                rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
+                allow_unoriented=allow,
+            )  # fmt: skip
+            print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
+        if args.landscape:
+            d = write_landscape(
+                base + "_landscape", rows, meta, name=os.path.basename(base),
+                texture=texture, coverage=coverage, allow_unoriented=allow,
+            )  # fmt: skip
+            kind = "spherical" if texture is not None else "polygonal"
+            print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
+    except OSError as e:
+        raise SeestarError(f"could not write the export beside {args.mask}: {e}") from e
 
 
 def _texture(args):
@@ -434,12 +450,23 @@ def _texture(args):
     ground the viewer has no reason to doubt.
     """
     if not args.texture:
+        if args.coverage:
+            raise SeestarError("--coverage describes a --texture; pass one or neither")
         return None, None
     import numpy as np
     from PIL import Image
 
+    # Lifted for the same reason as in `cmd_mosaic`: a full-sphere panorama is
+    # legitimately past Pillow's bomb threshold, and the file is the user's own
+    # mosaic rather than something fetched.
     Image.MAX_IMAGE_PIXELS = None
-    texture = np.asarray(Image.open(args.texture).convert("RGB"))
+    try:
+        with Image.open(args.texture) as im:
+            texture = np.asarray(im.convert("RGB"))
+    except OSError as e:
+        # Covers a missing file, a directory, a truncated PNG and a file that is
+        # not an image at all — UnidentifiedImageError subclasses OSError.
+        raise SeestarError(f"could not read the texture {args.texture}: {e}") from e
     if not args.coverage:
         print(
             "warning: --texture without --coverage; uncovered sky will be drawn "
@@ -447,7 +474,10 @@ def _texture(args):
             file=sys.stderr,
         )
         return texture, None
-    coverage = np.load(args.coverage)
+    try:
+        coverage = np.load(args.coverage)
+    except (OSError, ValueError) as e:
+        raise SeestarError(f"could not read the coverage {args.coverage}: {e}") from e
     if coverage.shape != texture.shape[:2]:
         raise SeestarError(
             f"coverage {coverage.shape} does not match texture {texture.shape[:2]}; "

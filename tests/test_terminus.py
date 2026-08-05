@@ -3728,3 +3728,135 @@ def test_a_landscape_invents_no_position_it_was_never_given(tmp_path):
     cp = configparser.ConfigParser()
     cp.read_string(ini)
     assert cp["landscape"]["polygonal_horizon_list"] == "horizon.txt"
+
+
+def test_a_failed_render_leaves_no_half_written_landscape(tmp_path):
+    """Stellarium reads a partial directory as broken, not as absent.
+
+    horizon.txt was written before the texture was rendered, so a failure
+    partway left a landscape with no landscape.ini — presenting as a corrupt
+    install rather than as an error. A package that does not exist is a better
+    outcome than one that half does.
+    """
+    import pytest
+
+    from terminus.landscape import write_landscape
+
+    d = tmp_path / "ls"
+    with pytest.raises((IndexError, ValueError)):
+        write_landscape(str(d), _LS_ROWS, _LS_META, texture=np.zeros((4,), np.uint8))
+    assert not d.exists(), "nothing may be left behind when the render fails"
+
+    # And the normal path still produces all three files.
+    write_landscape(str(d), _LS_ROWS, _LS_META, texture=np.zeros((8, 16, 3), np.uint8))
+    assert {p.name for p in d.iterdir()} == {"landscape.ini", "horizon.txt", "maptex.png"}
+
+
+def _export_fails(capsys, argv, message):
+    """Run the CLI expecting a clean refusal: `error: ...` on stderr, exit 1."""
+    import pytest
+
+    from terminus.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 1, "a refusal must not look like success"
+    err = capsys.readouterr().err
+    assert message in err, f"expected {message!r} in stderr, got {err!r}"
+
+
+def _picture_mask(tmp_path):
+    from terminus.export import write_mask
+
+    mask = tmp_path / "h.yaml"
+    write_mask(str(mask), {az: (alt, t) for az, alt, t in _LS_ROWS}, [], _LS_META)
+    return str(mask)
+
+
+def test_the_export_explains_an_unreadable_texture_instead_of_tracing_back(tmp_path, capsys):
+    """A missing file is the most ordinary failure there is.
+
+    It reached the user as a raw traceback while a mask with a typo'd flag got a
+    clean sentence — backwards, since the file path is the one with the obvious
+    fix. UnidentifiedImageError subclasses OSError, so a file that is not an
+    image at all is covered by the same catch.
+    """
+    from PIL import Image
+
+    mask = _picture_mask(tmp_path)
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(tmp_path / "nope.png")],
+        "could not read the texture",
+    )
+
+    not_an_image = tmp_path / "notes.txt"
+    not_an_image.write_text("this is not a panorama")
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(not_an_image)],
+        "could not read the texture",
+    )
+
+    good = tmp_path / "t.png"
+    Image.fromarray(np.zeros((8, 16, 3), np.uint8)).save(good)
+    bad_cov = tmp_path / "c.npy"
+    bad_cov.write_bytes(b"not a numpy array")
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(good), "--coverage", str(bad_cov)],
+        "could not read the coverage",
+    )
+
+    # A coverage from a different run must not be silently stretched to fit.
+    wrong = tmp_path / "w.npy"
+    np.save(wrong, np.ones((4, 4)))
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--texture", str(good), "--coverage", str(wrong)],
+        "does not match texture",
+    )
+
+
+def test_a_texture_with_nothing_to_draw_on_is_refused(tmp_path, capsys):
+    """Silently ignoring --texture is the bad outcome.
+
+    The person believes they rendered a photo-real horizon and got the plain
+    .hrz they already had, with nothing said about it. The check has to sit
+    before the early return, not inside the texture loader, because that return
+    is exactly what skips the loader.
+    """
+    from PIL import Image
+
+    mask = _picture_mask(tmp_path)
+    tex = tmp_path / "t.png"
+    Image.fromarray(np.zeros((8, 16, 3), np.uint8)).save(tex)
+
+    _export_fails(capsys, ["export", mask, "--texture", str(tex)], "add --skysafari")
+    _export_fails(capsys, ["export", mask, "--coverage", str(tex)], "add --skysafari")
+    # Coverage without a texture describes nothing.
+    _export_fails(
+        capsys,
+        ["export", mask, "--landscape", "--coverage", str(tex)],
+        "pass one or neither",
+    )
+
+
+def test_the_missing_coverage_warning_reaches_stderr(tmp_path, capsys):
+    """Without coverage the uncovered canvas is drawn as ground.
+
+    That is a real loss of honesty, so it must be said out loud rather than left
+    for the viewer to discover as a black wall they have no reason to doubt.
+    """
+    from PIL import Image
+
+    from terminus.cli import main
+
+    mask = _picture_mask(tmp_path)
+    tex = tmp_path / "t.png"
+    Image.fromarray(np.full((16, 32, 3), 90, np.uint8)).save(tex)
+
+    main(["export", mask, "--landscape", "--texture", str(tex)])
+    err = capsys.readouterr().err
+    assert "--coverage" in err and "drawn" in err
+    assert (tmp_path / "h_landscape" / "maptex.png").exists(), "and it still produces the package"
