@@ -2849,3 +2849,108 @@ def test_every_mask_and_export_says_the_horizon_is_position_specific(tmp_path):
 
     # Stellarium stays comment-free, which the format requires.
     assert all(not ln.startswith("#") for ln in open(txt).read().splitlines())
+
+
+# ---- sweep --azimuths (terminus-5) -----------------------------------------
+def test_run_sweep_scans_an_explicit_list_not_a_grid():
+    """The planner produces interesting columns, not a range.
+
+    Re-measuring the handful that came back unresolved should not cost a whole
+    circle, which is the only thing a uniform az_start/az_end walk can do.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    seen = []
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        seen.append(az)
+        return 20.0, "edge", "tree", []
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch("terminus.sweep.scan_horizon", fake_scan),
+    ):
+        mask, _, _ = run_sweep(
+            sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[55, 57, 82, 172]
+        )
+    assert seen == [55, 57, 82, 172], f"scanned {seen}"
+    assert sorted(mask) == [55, 57, 82, 172]
+
+
+def test_an_explicit_sweep_merges_rather_than_replaces(tmp_path, monkeypatch):
+    """Re-measuring four columns must not discard the thirty already good.
+
+    Replacing would make a targeted re-measure strictly worse than not running
+    it — the mask would come back shorter than it went in.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(str(out), {0: (10.0, "tree"), 90: (20.0, "structure"), 180: (5.0, "tree")}, [], {})
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {"az_step": 5, "alt_min": 0, "alt_max": 60, "sun_cone_deg": 30,
+                  "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+        no_export=True, azimuths="90,270",
+    )  # fmt: skip
+
+    with patch.object(
+        cli, "run_sweep", return_value=({90: (33.0, "tree"), 270: (7.0, "tree")}, [], {})
+    ):
+        cli.cmd_sweep(sc, cfg, args)
+
+    _, cols = load_columns(str(out))
+    assert sorted(cols) == [0, 90, 180, 270], "columns not re-measured must survive"
+    assert cols[90]["alt"] == 33.0, "a re-measured column must be replaced by the new value"
+    assert cols[0]["alt"] == 10.0 and cols[180]["alt"] == 5.0, "untouched columns preserved"
+
+
+def test_a_full_sweep_still_replaces(tmp_path):
+    """Merging is for --azimuths only. A full circle is a fresh measurement."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    out = tmp_path / "h.yaml"
+    write_mask(str(out), {0: (10.0, "tree"), 90: (20.0, "structure")}, [], {})
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89},
+        "sweep": {"az_step": 5, "alt_min": 0, "alt_max": 60, "sun_cone_deg": 30,
+                  "clear_thresh": 0.6},
+    }  # fmt: skip
+    args = SimpleNamespace(
+        dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+        no_export=True, azimuths=None,
+    )  # fmt: skip
+    with patch.object(cli, "run_sweep", return_value=({45: (12.0, "tree")}, [], {})):
+        cli.cmd_sweep(sc, cfg, args)
+    _, cols = load_columns(str(out))
+    assert sorted(cols) == [45], "a full sweep writes what it measured"

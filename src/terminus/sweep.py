@@ -629,8 +629,15 @@ def save_boundary_frame(sc, ptr, az, alt, typ, save_dir, sky_ref=None):
     return path
 
 
-def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, log=print):
+def run_sweep(
+    sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, log=print, azimuths=None
+):
     """Sweep azimuths, returning ({az: (alt, type)}, [skipped_az], {az: profile}).
+
+    `azimuths` scans an explicit list instead of the uniform az_start/az_end
+    grid. The planner produces a list of interesting columns rather than a
+    range, and re-measuring the handful that came back unresolved should not
+    cost a whole circle.
 
     Each column's raw brightness profile is returned alongside the verdict, so a
     run can be re-judged later without re-observing the sky.
@@ -660,7 +667,11 @@ def run_sweep(sc, sky, cfg, az_start=0, az_end=350, save_dir=None, dry=False, lo
             # carries no partial result for the caller to save.
             log(f"could not seed sky reference: {e}", flush=True)
     ref_taken = time.time()
-    for az in range(int(az_start), int(az_end) + 1, cfg["az_step"]):
+    if azimuths is None:
+        columns = list(range(int(az_start), int(az_end) + 1, cfg["az_step"]))
+    else:
+        columns = sorted({int(round(a)) % 360 for a in azimuths})
+    for az in columns:
         if column_touches_sun(sky, az, cfg["alt_min"], cfg["alt_max"], cfg["sun_cone_deg"]):
             skipped.append(az)
             log(f"az {az:3d}: skipped (Sun cone)", flush=True)

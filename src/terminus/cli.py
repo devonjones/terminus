@@ -18,7 +18,7 @@ import time
 
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
-from .export import MaskError, default_meta, export_all, write_mask
+from .export import MaskError, default_meta, export_all, load_columns, write_mask
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     Pointer,
@@ -115,10 +115,36 @@ def cmd_sweep(sc, cfg, args):
         print(f"exposure locked: {locked}")
         sc.start_view("scenery")
         time.sleep(3)
+    # getattr, matching cmd_export: several tests build an args namespace by
+    # hand, and a new flag should not break tests of unrelated behaviour.
+    requested = getattr(args, "azimuths", None)
+    azimuths = None
+    if requested:
+        azimuths = [float(a) for a in requested.replace(" ", "").split(",") if a]
+        if not azimuths:
+            raise SeestarError("--azimuths was given but parsed to nothing")
+        print(f"measuring {len(azimuths)} explicit columns: {sorted(azimuths)}")
+
+    # Merge, never replace. A targeted re-measure of four columns must not
+    # discard the thirty that were already good — that is the whole point of
+    # measuring a list rather than a range.
+    prior, prior_meta = {}, {}
+    if azimuths and os.path.exists(out):
+        prior_meta, prior_cols = load_columns(out)
+        prior = {az: c for az, c in prior_cols.items()}
+        print(f"merging into {out} ({len(prior)} existing columns)")
+
     aborted = None
     try:
         mask, skipped, profiles = run_sweep(
-            sc, sky, cfg["sweep"], args.az_start, args.az_end, save_dir=frames, dry=args.dry_run
+            sc,
+            sky,
+            cfg["sweep"],
+            args.az_start,
+            args.az_end,
+            save_dir=frames,
+            dry=args.dry_run,
+            azimuths=azimuths,
         )
     except PointingError as e:
         # A sweep runs for hours. Losing every column already measured because
@@ -153,9 +179,16 @@ def cmd_sweep(sc, cfg, args):
         print(f"wrote {prof_path} (raw column brightness profiles)")
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
-    write_mask(
-        out, mask, skipped, default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
-    )
+    if prior:
+        merged = dict(prior)
+        merged.update(mask)  # freshly measured columns win
+        meta = dict(prior_meta)
+        meta.update(default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped))
+        print(f"wrote {len(mask)} measured, {len(merged) - len(mask)} preserved")
+        mask = merged
+    else:
+        meta = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+    write_mask(out, mask, skipped, meta)
     print(
         f"\nwrote {out} ({len(mask)} azimuths, {len(skipped)} skipped); review frames in {frames}/"
     )
@@ -358,6 +391,12 @@ def main(argv=None):
     sw.add_argument("--az-end", type=float, default=350)
     sw.add_argument("--out", default=None)
     sw.add_argument("--frames", default=None)
+    sw.add_argument(
+        "--azimuths",
+        default=None,
+        help="comma list of azimuths to measure instead of a range; "
+        "merges into --out if it exists",
+    )
     sw.add_argument("--no-export", action="store_true")
     sw.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("export")
