@@ -46,6 +46,8 @@ fraction above the horizon line" is the phrasing both fields read without
 objection.
 """
 
+import warnings
+
 import numpy as np
 
 SKY_CLASS_ADE20K = 2
@@ -53,11 +55,26 @@ _MODEL = "nvidia/segformer-b0-finetuned-ade-512-512"
 
 
 def available(backend="segment"):
-    """True if `backend` can run in this environment."""
+    """True if `backend` can actually run here, not merely if it looks installed.
+
+    torchvision is checked as well as torch and transformers, because
+    `SegformerImageProcessor` needs it and fails only at construction:
+
+        ImportError: SegformerImageProcessor requires the Torchvision library
+        but it was not found
+
+    Omitting it made this a check that reported success while the thing it
+    vouched for did not work — the project's recurring failure mode in a new
+    place. `sky_mask(backend='auto')` consults this to choose, so a host with
+    torch and no torchvision got a hard crash exactly where the auto path exists
+    to degrade to the numpy heuristic. That is the Raspberry Pi case, and it is
+    where a crash is least welcome.
+    """
     if backend == "heuristic":
         return True
     try:
         import torch  # noqa: F401
+        import torchvision  # noqa: F401
         import transformers  # noqa: F401
     except ImportError:
         return False
@@ -190,12 +207,60 @@ def segment_sky(image, tile=True):
 
 
 def sky_mask(image, backend="auto", **kw):
-    """Sky mask for a PIL image. backend: 'segment', 'heuristic', or 'auto'."""
+    """Sky mask for a PIL image. backend: 'segment', 'heuristic', or 'auto'.
+
+    'auto' promises to DEGRADE, so it degrades on a failure to RUN and not only
+    on a failure to import. `available()` can answer whether the libraries are
+    present and nothing more: the model still has to be built, and
+    `from_pretrained` reaches for the network or a local cache and raises on a
+    fresh or offline machine that has all three libraries installed. Probing
+    imports alone left auto crashing on precisely the host it exists to serve.
+
+    'segment' asked for EXPLICITLY still fails loudly. A caller naming the
+    backend wants that backend, and quietly handing back a measurably worse mask
+    is the failure this project keeps guarding against.
+
+    Pass `report=True` for `(mask, backend_used)`. This is not a convenience:
+    a run that fell back produces a measurably different horizon, and without it
+    the caller records the backend it ASKED for. `cmd_skymask` did exactly that
+    and would have written `backend: segment` into a mask the heuristic
+    produced — a durable artifact stating something false about how it was made.
+
+    Note the catch is deliberately broad. An earlier version let TypeError,
+    AttributeError and NameError through on the theory that those indicate a bug
+    here rather than a missing model. That does not survive contact: this module
+    calls the transformers API directly, so a version skew — which is squarely
+    an environmental failure and named as one above — surfaces as TypeError and
+    would have made `auto` fatal on a dependency upgrade. Exception type cannot
+    separate the two. What can is recording which backend ran and making the
+    caller state it, which is what `report` is for.
+    """
+    report = kw.pop("report", False)
+    seg_kw = {k: v for k, v in kw.items() if k == "tile"}
+    heur_kw = {k: v for k, v in kw.items() if k != "tile"}
+    if backend == "heuristic" and "tile" in kw:
+        # Silently dropping it would be worse than the TypeError the caller used
+        # to get: `tile` means nothing to the heuristic, and a caller passing it
+        # believes they are tiling.
+        raise TypeError("heuristic_sky() got an unexpected keyword argument 'tile'")
     if backend == "auto":
-        backend = "segment" if available("segment") else "heuristic"
+        if available("segment"):
+            try:
+                mask = segment_sky(image, **seg_kw)
+                return (mask, "segment") if report else mask
+            except Exception as e:  # absent weights, empty cache, version skew
+                warnings.warn(
+                    f"segmentation could not run ({type(e).__name__}: {e}); falling back "
+                    "to the colour heuristic, which is markedly worse",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        backend = "heuristic"
     if backend == "segment":
-        return segment_sky(image, **{k: v for k, v in kw.items() if k == "tile"})
-    return heuristic_sky(np.asarray(image.convert("RGB")), **kw)
+        mask = segment_sky(image, **seg_kw)
+        return (mask, "segment") if report else mask
+    mask = heuristic_sky(np.asarray(image.convert("RGB")), **heur_kw)
+    return (mask, "heuristic") if report else mask
 
 
 # ---- horizon from a sky mask ---------------------------------------------

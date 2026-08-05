@@ -254,16 +254,16 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     Image.MAX_IMAGE_PIXELS = None
     image = Image.open(args.image).convert("RGB")
     w, h = image.size
-    backend = args.backend
-    if backend == "auto":
-        backend = "segment" if skymask.available("segment") else "heuristic"
-    if backend == "segment" and not skymask.available("segment"):
+    # Deliberately NOT resolved here. Pre-resolving 'auto' to 'segment' turns it
+    # into an EXPLICIT request, which sky_mask is right to fail loudly on — so
+    # the CLI would have defeated the very fallback it wants.
+    if args.backend == "segment" and not skymask.available("segment"):
         raise SeestarError(
             "the segment backend needs torch, torchvision and transformers.\n"
             "Install them, or pass --backend heuristic (markedly worse: colour "
             "rules read an off-white wall as sky)."
         )
-    print(f"backend: {backend} ({w}x{h})")
+    print(f"backend requested: {args.backend} ({w}x{h})")
 
     valid = None
     if args.coverage:
@@ -274,12 +274,16 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
                 "it must come from the same mosaic run"
             )
 
-    sky = skymask.sky_mask(image, backend=backend)
+    sky, backend = skymask.sky_mask(image, backend=args.backend, report=True)
+    # `backend` is now what RAN, not what was asked for. Everything below keys
+    # off it — the printed line, the segmentation-only type pass, and the mask
+    # meta — so a silent fallback cannot be recorded as a segment run.
     band = skymask.horizon_band(sky, valid=valid, run=args.run)
     px_per_deg = w / 360.0
     top = skymask.upper_envelope(band["top"], half_deg=args.envelope, px_per_deg=px_per_deg)
 
     classes = np.full(w, -1, dtype=int)
+    print(f"backend used: {backend}")
     if backend == "segment":
         classes = skymask.obstruction_classes(
             skymask.segment_classes(image), band["top"], valid=valid

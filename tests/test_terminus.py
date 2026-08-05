@@ -1705,7 +1705,7 @@ def test_segmentation_backend_tracks_the_imports_not_the_environment():
     """
     present = (
         "import sys, types\n"
-        "for n in ('torch', 'transformers'):\n"
+        "for n in ('torch', 'torchvision', 'transformers'):\n"
         "    sys.modules[n] = types.ModuleType(n)\n"
         "from terminus import skymask\n"
         "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
@@ -1714,11 +1714,12 @@ def test_segmentation_backend_tracks_the_imports_not_the_environment():
         "import sys\n"
         "class Block:\n"
         "    def find_spec(self, name, path=None, target=None):\n"
-        "        if name.split('.')[0] in ('torch', 'transformers'):\n"
+        "        if name.split('.')[0] in ('torch', 'torchvision', 'transformers'):\n"
         "            raise ImportError('blocked for test: ' + name)\n"
         "        return None\n"
         "sys.meta_path.insert(0, Block())\n"
-        "sys.modules.pop('torch', None); sys.modules.pop('transformers', None)\n"
+        "for n in ('torch', 'torchvision', 'transformers'):\n"
+        "    sys.modules.pop(n, None)\n"
         "from terminus import skymask\n"
         "print(repr((skymask.available('segment'), skymask.available('heuristic'))))\n"
     )
@@ -2621,3 +2622,188 @@ def test_a_second_lamp_column_is_not_mistaken_for_a_horizon():
     alt, detail = find_horizon(prof, sky_ref=20.7)
     assert alt is None, f"reported a horizon at {alt}; this column is a lamp in the dark"
     assert "blocked" in detail["reason"], detail
+
+
+def test_the_segment_backend_needs_all_three_libraries():
+    """Missing ANY of torch, torchvision or transformers must report False.
+
+    torchvision was unchecked, and it fails late: `SegformerImageProcessor`
+    raises at construction, not at import, with "requires the Torchvision
+    library but it was not found". So `available()` said yes and `sky_mask`
+    died — a check reporting success while the thing it vouches for does not
+    work, which is this project's recurring failure in a new place.
+
+    It matters most where it is least welcome: `sky_mask(backend='auto')`
+    consults this to choose, so a host with torch and no torchvision got a hard
+    crash exactly where the auto path exists to fall back to the numpy
+    heuristic. That is the Raspberry Pi.
+    """
+    for missing in ("torch", "torchvision", "transformers"):
+        body = (
+            "import sys, types\n"
+            "class Block:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            f"        if name.split('.')[0] == {missing!r}:\n"
+            "            raise ImportError('blocked for test')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, Block())\n"
+            "for n in ('torch', 'torchvision', 'transformers'):\n"
+            f"    if n != {missing!r}:\n"
+            "        sys.modules[n] = types.ModuleType(n)\n"
+            f"    else:\n"
+            "        sys.modules.pop(n, None)\n"
+            "from terminus import skymask\n"
+            "print(repr(skymask.available('segment')))\n"
+        )
+        got = eval(_in_clean_interpreter(body))
+        assert got is False, f"available('segment') said {got} with {missing} missing"
+
+    # And the other direction, in the same test: with all three importable it
+    # must say True. Without this the test passes against `return False`.
+    present = (
+        "import sys, types\n"
+        "for n in ('torch', 'torchvision', 'transformers'):\n"
+        "    sys.modules[n] = types.ModuleType(n)\n"
+        "from terminus import skymask\n"
+        "print(repr(skymask.available('segment')))\n"
+    )
+    assert eval(_in_clean_interpreter(present)) is True
+
+
+def test_auto_degrades_when_the_model_cannot_be_built(tmp_path):
+    """`available()` cannot promise the model will RUN, only that libs import.
+
+    `from_pretrained` reaches for the network or a local cache and raises on a
+    fresh or offline machine with all three libraries installed. Checking
+    imports alone left auto crashing on precisely the host it exists to serve —
+    the same bug this ticket fixes, one layer deeper.
+
+    Patching `segment_sky` rather than `available` is deliberate: patching
+    `available` proves only that `heuristic_sky` does not crash, and a mutation
+    hardcoding auto to "heuristic" survived that version of this test.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    boom = OSError("we couldn't connect to huggingface.co")
+
+    with (
+        patch.object(skymask, "available", lambda backend="segment": True),
+        patch.object(skymask, "segment_sky", side_effect=boom),
+    ):
+        with pytest.warns(RuntimeWarning, match="falling back"):
+            mask, used = skymask.sky_mask(img, backend="auto", report=True)
+        assert used == "heuristic", "auto must fall back, and say which ran"
+        assert mask.shape == (16, 32)
+
+        # But an EXPLICIT request must still fail loudly rather than degrade.
+        with pytest.raises(OSError):
+            skymask.sky_mask(img, backend="segment")
+
+
+def test_auto_reports_which_backend_actually_ran():
+    """A run that fell back produces a different horizon; the caller must know."""
+    from unittest.mock import patch
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    with patch.object(skymask, "available", lambda backend="segment": False):
+        mask, used = skymask.sky_mask(img, backend="auto", report=True)
+    assert used == "heuristic"
+    assert skymask.sky_mask(img, backend="auto").shape == mask.shape, "report is opt-in"
+
+
+def test_a_fallback_is_recorded_rather_than_guessed_at_by_exception_type():
+    """Any failure to run degrades, and the caller is told which backend ran.
+
+    An earlier version let TypeError, AttributeError and NameError propagate, on
+    the theory that those mean a bug here rather than a missing model. That does
+    not survive contact: this module calls the transformers API directly, so a
+    version skew — squarely environmental — surfaces as TypeError and would have
+    made `auto` fatal on a dependency upgrade, breaking the one promise `auto`
+    makes.
+
+    Exception type cannot separate "the environment is short something" from "we
+    have a bug". What can is recording which backend actually ran, so a silent
+    downgrade becomes a stated one.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    with patch.object(skymask, "available", lambda backend="segment": True):
+        for failure in (
+            OSError("we couldn't connect to huggingface.co"),
+            TypeError("unexpected keyword 'reduce_labels'"),  # a version skew
+            RuntimeError("model is on the wrong device"),
+        ):
+            with patch.object(skymask, "segment_sky", side_effect=failure):
+                with pytest.warns(RuntimeWarning, match="falling back"):
+                    mask, used = skymask.sky_mask(img, backend="auto", report=True)
+                assert used == "heuristic", f"{type(failure).__name__} must degrade, not crash"
+                assert mask.shape == (16, 32)
+
+        # An EXPLICIT request still fails loudly, whatever the cause.
+        with patch.object(skymask, "segment_sky", side_effect=TypeError("x")):
+            with pytest.raises(TypeError):
+                skymask.sky_mask(img, backend="segment")
+
+
+def test_the_mask_records_the_backend_that_ran_not_the_one_requested(tmp_path):
+    """A mask claiming `segment` that the heuristic produced is a false record.
+
+    `cmd_skymask` resolved the backend before calling and wrote that into the
+    meta, so an internal fallback would have been recorded as a segment run —
+    and the segmentation-only type pass would then have run against a heuristic
+    mask.
+    """
+    from unittest.mock import patch
+
+    from terminus.cli import main
+    from terminus.export import load_columns
+
+    pano = tmp_path / "p.png"
+    _synthetic_panorama(str(pano))
+    from terminus import skymask
+
+    with (
+        patch.object(skymask, "available", lambda backend="segment": True),
+        patch.object(skymask, "segment_sky", side_effect=OSError("no weights")),
+    ):
+        main(["skymask", str(pano), "--backend", "auto", "--az-step", "30"])
+
+    meta, _ = load_columns(str(tmp_path / "p_mask.yaml"))
+    assert meta["backend"] == "heuristic", "the mask must record what actually ran"
+
+
+def test_tile_is_rejected_by_the_heuristic_rather_than_dropped():
+    """Splitting the kwargs silently swallowed `tile` for the heuristic.
+
+    Before the split it reached `heuristic_sky` and raised TypeError. Dropping it
+    is worse: a caller passing `tile` believes they are tiling, and gets a
+    single-pass mask with no indication otherwise.
+    """
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from terminus import skymask
+
+    img = Image.fromarray(np.full((16, 32, 3), 120, np.uint8))
+    with pytest.raises(TypeError, match="tile"):
+        skymask.sky_mask(img, backend="heuristic", tile=True)
