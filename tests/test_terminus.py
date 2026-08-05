@@ -3649,11 +3649,17 @@ def test_both_stellarium_rotations_stay_zero_because_the_texture_is_pre_rotated(
     assert "type = spherical" in ini
     assert "angle_rotatez = 0" in ini and "polygonal_angle_rotatez = 0" in ini
     assert "maptex_top = 90" in ini and "maptex_bottom = -90" in ini
-    # A 90 degree yaw moves the marker a quarter of the way round, westward in
-    # image space, because the panorama's 0 IS true 90.
+    # Derived from the convention, not restated from the implementation.
+    # `orient` defines yaw by phi = target_az - yaw, so a native column phi sits
+    # at TRUE azimuth phi + yaw. The marker is at native 0, so with yaw 90 it
+    # belongs at true azimuth 90 — a QUARTER of the way across a 64px image,
+    # x = 16. The opposite roll would put it at 48, which is true 270: still a
+    # horizon, just somebody else's, and indistinguishable by eye for a small
+    # yaw. This assertion is the only thing standing between the two.
     rolled = _rotate_east(texture, 90.0)
     assert rolled[0, 0, 0] == 0, "the marker no longer sits at true north"
-    assert rolled[0, 64 - 16, 0] == 200, "it sits three quarters across, at true 270"
+    assert rolled[0, 16, 0] == 200, "native 0 with yaw 90 is true 90, a quarter across"
+    assert rolled[0, 48, 0] == 0, "and emphatically not true 270"
 
 
 def test_a_panorama_of_an_unoriented_mask_is_refused(tmp_path):
@@ -3694,3 +3700,31 @@ def test_export_writes_the_pictures_only_when_asked(tmp_path):
     assert img.size == (2048, 1024), "the vendor's documented panorama size"
     assert (tmp_path / "h_landscape" / "landscape.ini").exists()
     assert (tmp_path / "h_landscape" / "horizon.txt").exists()
+
+
+def test_a_landscape_invents_no_position_it_was_never_given(tmp_path):
+    """`latitude = 0, longitude = 0` is a claim, not a default.
+
+    It would move a Stellarium user to the Gulf of Guinea and tell them nothing
+    was wrong. A landscape with no [location] section simply leaves the observer
+    where they already are, which is the honest answer for a horizon whose site
+    we do not know.
+    """
+    from terminus.landscape import write_landscape
+
+    sited = tmp_path / "sited"
+    write_landscape(str(sited), _LS_ROWS, _LS_META)
+    ini = (sited / "landscape.ini").read_text()
+    assert "[location]" in ini and "latitude = 39.79" in ini and "longitude = -104.89" in ini
+
+    unsited = tmp_path / "unsited"
+    write_landscape(str(unsited), _LS_ROWS, {"measured": "2026-08-05"})
+    ini = (unsited / "landscape.ini").read_text()
+    assert "[location]" not in ini, "no position recorded means no position claimed"
+    assert "latitude" not in ini and "longitude" not in ini
+    # The rest of the file must still be a valid, complete landscape.
+    import configparser
+
+    cp = configparser.ConfigParser()
+    cp.read_string(ini)
+    assert cp["landscape"]["polygonal_horizon_list"] == "horizon.txt"

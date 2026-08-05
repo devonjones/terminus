@@ -105,11 +105,23 @@ def _rotate_east(img, yaw_deg):
     LANDSCAPE_INI: Stellarium has two rotation keys that turn two different
     things, and the surest way not to set the wrong one is to ship an image that
     needs neither.
+
+    SIGN, derived rather than guessed, because it is exactly the kind of thing
+    that looks right either way in a thumbnail. `orient` defines yaw by
+    ``phi = target_az - yaw``, so a native panorama column `phi` sits at true
+    azimuth ``phi + yaw``. The output pixel for true azimuth A must therefore
+    come from the texture at ``A - yaw``:
+
+        out[x] = tex[x - shift],  shift = yaw / 360 * width
+
+    and ``np.roll(a, k)[x] == a[x - k]``, so the roll is by +shift. Rolling the
+    other way moves the imagery by twice the yaw in the wrong direction, which
+    for a small yaw still looks like a horizon — just not this one.
     """
     if not yaw_deg:
         return img
     shift = int(round(yaw_deg / 360.0 * img.shape[1]))
-    return np.roll(img, -shift, axis=1)
+    return np.roll(img, shift, axis=1)
 
 
 def render(
@@ -214,12 +226,22 @@ polygonal_horizon_list_mode = azDeg_altDeg
 polygonal_angle_rotatez = 0
 ground_color = {ground_color}
 minimal_brightness = 0.05
+{location}"""
 
+# Written only when the mask actually recorded a position. A landscape.ini with
+# no [location] leaves the observer where they already are, which is the honest
+# outcome for a horizon whose site we do not know. Writing `latitude = 0,
+# longitude = 0` instead would move a Stellarium user to the Gulf of Guinea and
+# tell them nothing was wrong — a fabricated value dressed as a default, which
+# is the habit this repo refuses everywhere else.
+#
+# `altitude` is omitted rather than defaulted for the same reason: no mask
+# records elevation today, and 0 m is a claim, not an absence.
+LOCATION_INI = """
 [location]
 planet = Earth
 latitude = {lat}
 longitude = {lon}
-altitude = {elev}
 """
 
 _SPHERICAL_KEYS = "maptex = maptex.png\nmaptex_top = 90\nmaptex_bottom = -90\nangle_rotatez = 0\n"
@@ -246,6 +268,9 @@ def write_landscape(
     ground colour, which is all a scope-only sweep can honestly support. With
     one it is `type=spherical`, and the polygon ships alongside the picture so
     the numbers and the imagery agree.
+
+    The `[location]` section appears only when the mask recorded a position;
+    see `LOCATION_INI`.
 
     `maptex_top` and `maptex_bottom` are declared +90/-90 because the mosaic
     canvas IS full-sphere equirectangular. The phone does not FILL that canvas,
@@ -284,9 +309,11 @@ def write_landscape(
         texture_keys=texture_keys,
         # Stellarium's own dark green. Only visible in the polygonal case.
         ground_color=".15,.45,.05",
-        lat=meta.get("lat", 0),
-        lon=meta.get("lon", 0),
-        elev=int(meta.get("elev_m") or 0),
+        location=(
+            LOCATION_INI.format(lat=meta["lat"], lon=meta["lon"])
+            if meta.get("lat") is not None and meta.get("lon") is not None
+            else ""
+        ),
     )
     with open(os.path.join(directory, "landscape.ini"), "w") as f:
         f.write(ini)
