@@ -2845,7 +2845,7 @@ def test_every_mask_and_export_says_the_horizon_is_position_specific(tmp_path):
     hrz, txt = export_all(str(p), str(tmp_path / "out"))
     hrz_text = open(hrz).read()
     assert "Measured from one spot" in hrz_text
-    assert "toward or away" in hrz_text.lower(), "the .hrz must name the direction that matters"
+    assert "nearer" in hrz_text.lower(), "the .hrz must name the direction that matters"
 
     # Stellarium stays comment-free, which the format requires.
     assert all(not ln.startswith("#") for ln in open(txt).read().splitlines())

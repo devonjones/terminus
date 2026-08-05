@@ -92,19 +92,24 @@ as a hint, not a measurement.
   `is_visible(ra, dec, sky)`.
 
 **The horizon is specific to where the tripod stood**, and what matters most is
-moving *toward or away from* a near obstruction, not sideways past it:
+moving *closer to* a near obstruction, not sideways past it:
 
 | moving 2 m, against a 2 m fence 5 m away | change |
 |---|---|
-| **toward or away** | **11.9°** |
+| **2 m closer** | **+11.9°** |
+| 2 m further away | −5.9° |
 | along the fence (perpendicular distance unchanged) | 0° |
-| past a narrow obstruction — a post, a chimney | 1.4° |
+| past a narrow obstruction — a post, a chimney | −1.4° |
+
+Closer and further are not mirror images. `atan` is nonlinear, so approaching an
+obstruction costs more than retreating from it gains — which is why "toward or
+away" was the wrong way to say this.
 
 A 100 m ridge 2 km out moves 0.003° for the same 2 m, so distance is the whole
 story. The error is largest exactly where the horizon is highest, because the
 tall obstructions are the near ones. Measure from where you observe, and
-re-measure if you move — especially if you move nearer or further, which is the
-case that bites.
+re-measure if you move — above all if you move NEARER, which is the case that
+bites hardest.
 
 This is geometry, not something measured here. Note also that the mask and the
 `.hrz` carry this warning in their headers but the Stellarium `.txt` cannot:
