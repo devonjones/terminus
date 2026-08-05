@@ -4664,3 +4664,46 @@ def test_a_narrow_refinement_scan_is_refused_rather_than_guessed():
     # And the tool it points at does resolve it, conservatively.
     k, _step, _snr = find_edge(prof, max(lum for _, lum in prof))
     assert k is not None and prof[k][0] >= 38.59, "find_edge handles the narrow window"
+
+
+def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
+    """The model is a straight line; the real sky is a curve. Does it false-fire?
+
+    This is the risk the threshold change creates: `MIN_DIP_FRAC` moved from a
+    factor of two to a quarter, so a shallower departure now counts. If real
+    skyglow curvature could produce a quarter-drop below the fitted line, the
+    detector would invent a horizon in open sky — and a mask too pessimistic is
+    a mask that throws away good targets.
+
+    It cannot, and the reason is worth stating because it is not obvious from
+    the code: the curvature runs the SAFE way. Skyglow brightens toward the
+    horizon faster than linearly, so an air-mass curve sits ABOVE its own
+    straight-line fit at low altitude. The departure test only fires on a FALL.
+    """
+    import math
+
+    import numpy as np
+
+    from terminus.night import find_horizon
+
+    # An air-mass curve anchored to this site's measured numbers: 22 counts at
+    # altitude 60 rising to 71 at 12.
+    x1, x2 = 1 / math.sin(math.radians(60)), 1 / math.sin(math.radians(12))
+    a = (71.0 - 22.0) / (x2 - x1)
+    b = 22.0 - a * x1
+
+    def sky(alt):
+        return a / math.sin(math.radians(max(alt, 1.0))) + b
+
+    for lo, step in ((10, 2), (5, 2), (12, 1)):
+        prof = [(float(al), sky(al)) for al in np.arange(60, lo - 0.01, -step)]
+        alt, detail = find_horizon(prof)
+        assert alt is None, f"invented a horizon at {alt} in open sky ({detail['reason']})"
+
+    # The other direction is not what skyglow does, but the failure mode there
+    # must still not be a fabricated horizon. Strong dimming toward the horizon
+    # refuses outright rather than answering.
+    for power in (0.5, 1.5, 3.0):
+        prof = [(float(al), 60.0 * (al / 60.0) ** power) for al in np.arange(60, 9.9, -2)]
+        alt, detail = find_horizon(prof)
+        assert alt is None, f"dimming as alt^{power} produced a horizon at {alt}"

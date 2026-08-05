@@ -15,8 +15,24 @@ them. Measured under suburban light pollution, neither level holds:
 
 So brightness alone cannot be thresholded. What still holds is that **open sky
 follows the skyglow gradient smoothly, and terrain does not**. This module fits
-that gradient from the upper part of the column, then looks for where the
-profile departs from it.
+that gradient and looks for where the profile falls away from it.
+
+Fitting it is the hard part, and getting it wrong was terminus-47. The gradient
+cannot be fitted to "the upper part of the column", because on a blocked column
+the upper part is terrain — az 60 has its horizon at altitude 36 in a column
+searched from 55, so the fit described the ground and predicted negative sky.
+`sky_model` instead GROWS the sky region downward from the very top, stopping at
+the first sample that has fallen off the line it has established so far.
+
+THE MODEL IS A STRAIGHT LINE AND THE REAL SKY IS A CURVE, which sounds like a
+problem and is not, because the curvature runs the safe way. Skyglow brightens
+toward the horizon faster than linearly — an air-mass curve through this site's
+own numbers, 22 counts at altitude 60 and 71 at 12, sits ABOVE the straight line
+everywhere between. The departure test only fires on a fall, so real curvature
+pushes samples away from being called terrain, never toward it. Tested both
+directions: a curved but unobstructed column reports open, and a column
+contrived to dim toward the horizon instead refuses with "no usable sky model"
+rather than inventing a horizon.
 
 Per-frame repeats do not help: measured scatter across six captures at one
 pointing is 0.00-0.16 counts. The variation between altitudes is real scene
