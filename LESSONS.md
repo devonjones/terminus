@@ -12,6 +12,138 @@ sessions. If an entry does not change what someone *does*, it does not belong.
 are append-only: never renumber, mark superseded entries rather than deleting them.
 `terminus-NN` refs point at beads.
 
+
+## Index
+
+**The recurring failure: success that isn't**
+
+- `S-01` Commands report success while doing nothing
+- `S-02` Probe what is actually used, not a proxy for it
+- `S-03` A poll loop that times out must raise, never fall through
+- `S-04` Stale state fails silently, and in the dangerous direction
+- `S-05` A verified readback is worthless if it reads a field the device does not use
+
+**Measurement discipline**
+
+- `M-01` Timestamp the observation, not the calculation
+- `M-02` An edge is a persistent level shift
+- `M-03` A boundary is a sky boundary only if the level above it is still sky
+- `M-04` Estimate the reference from a region that excludes the signal
+- `M-05` Compare structure, not brightness
+- `M-06` Lock the exposure, and verify the readback
+- `M-07` The sky reference goes stale, inside a single session
+- `M-08` Dark directions want twilight, bright directions want night
+- `M-09` A capped column is a bound, not a value
+- `M-10` Save the numbers, not just the images
+- `M-11` Averaging repeats cannot fix variation that is not measurement noise
+- `M-12` At night the two-level model inverts: lights sit inside terrain
+- `M-13` Pick the detector per column, from that column's own conditions
+- `M-14` The real uncertainty is the spread across method variants, not the residual of one
+- `M-15` Skyglow varies with azimuth, so one pooled sky reference is a false detector
+- `M-16` Include known-good controls, and never change two things between comparisons
+- `M-17` A single-pass sweep confounds time with the swept parameter
+- `M-18` Know the measurement floor before chasing a number toward it
+- `M-19` Return "unmeasured", never a plausible wrong number
+- `M-20` No single photometric primitive separates sky from terrain
+- `M-21` Straight edges in a natural scene mean a pipeline artifact
+- `M-22` Calibrate a control's rate before using it, and do not hill-climb on a drifting signal
+
+**Fitting and validation**
+
+- `F-01` A residual only says a fit is self-consistent
+- `F-02` A frame that cannot be constrained must be dropped, never placed
+- `F-03` Correcting one member of a set with shared systematic error proves nothing
+- `F-04` A test that builds its fixtures with the same shortcut as the code cannot catch the bug
+- `F-05` Scan the landscape; do not trust the minimum
+- `F-06` One-sided bounds exclude wrong answers; they do not select among survivors
+- `F-07` A fix that improves every measure at once is real; one that trades is tuning
+- `F-08` A capture that succeeds and returns constant data is indistinguishable from a measurement
+- `F-09` Do not double-apply a transform
+- `F-10` Reducing an image to one curve throws away nearly all of it
+- `F-11` A scoring function that rewards a degenerate overlap will find one
+- `F-12` A bad refinement is worse than none
+- `F-13` A calibration is only valid for the detector version that produced it
+- `F-14` Ground truth built from the data it validates is not ground truth
+- `F-15` Detection succeeding does not mean matching will
+- `F-16` One outlier tips the whole sphere
+- `F-17` Find the binding constraint before optimising anything else
+- `F-18` Residuals 180° apart in azimuth are a tilt signature
+- `F-19` To test whether a forward model is exact, evaluate it at known-true parameters
+- `F-20` A stability stopping rule needs information-ordered additions
+- `F-21` Information about a parameter lives only where the data has gradient
+- `F-22` Measure a model correction's effect on the clean input set
+- `F-23` Multiplying a robust loss by 1/σ² is not inverse-variance weighting
+- `F-24` Floor a weight at the instrument's resolution, not a numerical epsilon
+- `F-25` A score is comparable only when everything except the thing under test was held fixed
+- `F-26` Dropping under-constrained inputs is iterative
+- `F-27` Detrending and outlier-robustness are different properties of a noise estimator
+- `F-28` Verify both arms run the current version of every shared component
+- `F-29` A detection that assumes correct pointing cannot be evidence about pointing
+
+**The instrument**
+
+- `I-01` The telescope can focus on terrain
+- `I-02` Some columns will not focus at any focuser position; the cause is unsettled
+- `I-03` The scale wall: telescope frames cannot be registered into phone imagery
+- `I-04` Sharpness finds a daylight edge that brightness cannot
+- `I-05` Local variance does not separate sky from structure
+- `I-06` Foliage moves between frames; rigid structure does not
+- `I-07` One control connection, and diagnostics read the log
+- `I-08` Do not carry an instrument's guess at a quantity it cannot measure
+- `I-09` Mount model and mechanical alignment are different quantities
+- `I-10` Driving the error at one sky position to zero is not alignment
+- `I-11` Check whether a sensor's geometry can express the quantity at all
+- `I-12` A fixed terrain edge is a free session-to-session pointing reference
+- `I-13` Per-axis tolerances are unsatisfiable at a coordinate singularity
+
+**Safety**
+
+- `SAFE-01` Check the path, not the endpoints
+- `SAFE-02` Enforce deadlines inside the loop, not at launch
+- `SAFE-03` Feasibility filters before ranking, never after
+- `SAFE-04` An operator's approval is permission, not evidence about a computable quantity
+- `SAFE-05` A safety-critical rewrite gets its first live test supervised and minimal
+- `SAFE-06` Never design a workflow that requires a human to look at the Sun
+- `SAFE-07` A hazard that cannot reach the optics is not a hazard
+- `SAFE-08` A command that lies can also act later
+
+**Code, tests and the repo**
+
+- `E-01` Mutation is the standard of proof
+- `E-02` A test can pin a bug instead of catching it
+- `E-03` An invariant is not pinned if the code that must obey it is unreachable
+- `E-04` A test that asserts what the dev box happens to satisfy passes vacuously
+- `E-05` Exception type cannot separate "the environment is short something" from "we have a bug"
+- `E-06` An absent value is not a matching value, and a fabricated default is a claim
+- `E-07` A guard in one caller is not a guard
+- `E-08` A half-written multi-file artifact reads as corrupt, not absent
+- `E-09` Two silent coercions: a string is iterable, and `{:g}` emits letters
+- `E-10` A threshold in degrees is not a threshold in distance, and longitude wraps
+- `E-11` When the raw data is not in version control, the fixture *is* the data
+- `E-12` A human-editable safety flag needs a closed vocabulary and a typed error
+- `E-13` Verify documentation by executing it
+- `E-14` Grep is not proof
+- `E-15` Concurrent agents make shared-checkout operations unsafe
+- `E-16` When two instruments write one record, merge field by field
+
+**Decisions**
+
+- `D-01` Individual photos over a stitched panorama
+- `D-02` Semantic segmentation primary, heuristics kept as fallback
+- `D-03` Report remaining error in degrees; assume nothing about the hardware
+- `D-04` Flag ambiguity; never average it away
+- `D-05` Leave the rooflines
+- `D-06` Two modes, never mixed
+- `D-07` Tilt is a feature; do not tell users to hold the camera level
+- `D-08` Never blend seams away
+- `D-09` Use the field's vocabulary
+- `D-10` The mask describes one spot, and must say so
+- `D-11` Prefer the sweep whose ceiling exceeded its own result
+- `D-12` Fragility is a per-layer policy: brittle on interpretation, robust on execution
+- `D-13` Don't re-derive an input the user has said is settled
+- `D-14` After the second refuted hypothesis, stop theorising and go look
+- `D-15` A file at a canonical path is not evidence that it is current
+
 ---
 
 ## The recurring failure: success that isn't
@@ -82,6 +214,24 @@ Caught mid-sweep before it fired. Fixed with a max age (420 s) and a refresh ins
 column loop. Note the failure direction: stale state made everything look *dark*, which
 is the same direction as the auto-exposure failure and the frozen stream. Silent failures
 in this project have a house style, and it is "confidently reports obstruction."
+
+### S-05 — A verified readback is worthless if it reads a field the device does not use
+
+`lock_exposure` set and verified `isp_exp_ms` and dutifully reported clamping — "asked 100, got
+20.0", "asked 400, got 31.5" — for hours. Every request clamped to 20. Then `get_view_state`
+showed `exp_ms: 240.0` against `get_setting`'s `isp_exp_ms: 20.0`. The real control is a nested
+object, `set_setting {exp_ms: {stack_l, continuous}}`, and scenery mode uses `continuous`. The
+field being verified was a writable-looking mirror that nothing consumed.
+
+The dew heater was the same shape: `set_setting heater_enable` returned success and changed
+nothing, because that key is read-only status and the real control is `pi_output_set2`. In both
+cases the answer came from reading a third-party client's source, not from the API's responses.
+
+So S-01's rule is necessary but not sufficient. A device can expose a settable field that no
+code path reads, and the verification passes while the setting is inert. **Cross-check against a
+second, independent status endpoint** — here the *view* state against the *settings* state —
+before believing a lock. Commanded exposures of 1.6, 6.4, 25 and 100 ms all returned `isp
+1.6296` with frame means identical to three decimals; that identity was the available tell.
 
 ---
 
@@ -266,6 +416,132 @@ night detector; az 150 gives 35.0 versus "open to the floor."
 
 Applying one model to a whole run means the answer depends on when the loop happened to
 reach a column. The reference is already recorded per column; select the detector from it.
+
+### M-14 — The real uncertainty is the spread across method variants, not the residual of one
+
+Five sky-classifier variants, all defensible, produced fit residuals between 2.08° and 2.59° —
+and solved yaw ranging **132.5° to 141.25°**. No single residual reflects that ±5°, which is the
+actual uncertainty in where north is.
+
+Re-running with each defensible nuisance choice and taking the spread of the *answer* costs a few
+reruns and is the only honest error bar when the nuisance parameters were never independently
+determined. Quote it alongside the residual, never instead of it.
+
+### M-15 — Skyglow varies with azimuth, so one pooled sky reference is a false detector
+
+Column-top luminance across 22 measured azimuths ran **7 to 104 counts** — az 10 at 8, az 30 at
+7, az 170 at 99, az 270 at 104. Setting the reference to the pooled median (74.1) returned 11
+edges and declared az 300 and 310 "blocked above the ceiling" when they are 10.0° and 12.5°:
+columns facing away from town get called blocked for being legitimately darker.
+
+Sweeping the parameter, `sky_ref = 40` reproduces the published table exactly and yields 15 edges
+instead of 11. Distinct from M-07, which is staleness in *time*; this is variation across the
+dimension being measured. A reference estimated by pooling over a dimension the quantity varies
+along converts the low end of that dimension into a false detection class.
+
+Re-running archived raw profiles through the shipped detector to reproduce a published table is a
+free validation of both detector and parameter, and it is how this was found.
+
+### M-16 — Include known-good controls, and never change two things between comparisons
+
+After a plate solve found the mount 3.7° off in azimuth, four columns were re-measured and a
+script printed `median |shift| 2.50 deg, max 21.20 — VERDICT: old data was affected by the
+misalignment`. The verdict was too confident: az 200's +21.2° was **the algorithm fix**, not the
+realignment — the re-run used the corrected `find_edge` and landed on exactly what re-judging the
+old saved profile gave. The genuine alignment signal was the other three at −2.5, −2.5, −1.2.
+
+What made the two separable was deliberately re-measuring columns that already agreed: "I
+included az 100 and az 70 as controls. If those two shift as much as 200 and 310, it's global. If
+only the disputed ones move, it's local."
+
+Note also that the polar error is not uniform — computed pointing error was 0.01° at az 0/alt 40
+(that *is* the pole, immune) and 3.67° at az 120 and 240. An azimuth-dependent signature with the
+same shape as the fit's tilt term, so it can be silently absorbed as camera tilt.
+
+### M-17 — A single-pass sweep confounds time with the swept parameter
+
+A four-hour circle started in daylight and finished in dark. Any drift across the run appears as
+a smooth function of azimuth — and the orientation fit contains a smooth azimuth term. **A
+four-hour brightness drift can be absorbed as camera tilt and still look like a good fit.**
+
+Confirmed afterwards: in the 18-fiducial fit the only two large residuals were az 60 (−17.40) and
+az 190 (+14.58), the two columns measured while the sky reference climbed 25 → 82 counts at dawn.
+All twelve others fell within ±3.0. The two detectors disagreed on exactly those columns.
+
+Randomise the visit order, re-visit a subset, or flag the regime boundary explicitly. A model
+with a smooth term in the swept parameter will hide this rather than report it.
+
+### M-18 — Know the measurement floor before chasing a number toward it
+
+`start_scan_planet` stops when it *has* the Sun, not when it is centred. Disc offsets from frame
+centre across one day: 0.316, 0.030, 0.124, 0.350, 0.030 degrees — up to a third of a degree of
+framing slop silently added to every "pointing error" reading. Below about 0.3° that scatter
+dominates, which became the stated stopping point for the whole alignment loop.
+
+Two free scale checks came from the same frames: the solar disc measured 0.524° across against a
+true 0.52°, and two independent autofocus runs landed on 1838 and 1839 of 2600 steps. Objects of
+known angular size validate the entire geometry chain at no cost.
+
+### M-19 — Return "unmeasured", never a plausible wrong number
+
+A sweep produced a mask whose columns had SNR ≈ 1 — steps of 4–23 counts against noise of 5–18,
+with only two genuine. The summary looked convincing and matched an independent daytime probe,
+while the raw profile for az 20 read `76, 116, 88, 92, 101, 104, 97, 79`: a one-frame spike, not
+terrain. The mask and exports were **deleted** rather than left on disk.
+
+The detector was changed to match, gating at 2.5× the column's own noise so noisy columns come
+back unmeasured instead of wrong. A file loses its provenance immediately and will be consumed by
+the next tool and by future-you. Design for "refused to answer" and "answered" — never "answered
+plausibly".
+
+### M-20 — No single photometric primitive separates sky from terrain
+
+Each candidate fails on a specific real material, and each failure was caught by ground truth:
+
+- **Blue-dominance** — a dark branch silhouetted against bright sky still reads blue, from
+  scattered skylight plus blur. A frame visibly ~20% branches scored sky = 0.96.
+- **Brightness** — a shadowed cloud base is genuinely dark, so brightness rejects it wherever the
+  threshold sits.
+- **Hue (not-warm and not-green)** — off-white siding is neutral and so is cloud, so the boundary
+  walked down into the building and outlined windows and trim.
+- **Texture** — measured rather than assumed: sky median 1.3 against ground 13.2, but cloud edges
+  reach p90 ≈ 14, overlapping structure (see I-05).
+
+Every classifier of this shape encodes an assumption about the materials present. Enumerate the
+materials in the scene that violate it before trusting a threshold, and expect the primitive to
+change with lighting regime rather than expecting one rule to hold.
+
+### M-21 — Straight edges in a natural scene mean a pipeline artifact
+
+Dark wedges in the sky were blamed on the classifier for six or seven rounds. Eliminated in turn:
+branches and wires (tightening made the fit *worse*, 2.38° → 3.10°), celeste's cloud model
+(0.0% of pixels, and its mask polarity is inverted from the obvious guess), alpha feathering
+(`nona` writes binary 0/255, zero partial-alpha pixels), and median filtering across azimuth
+(largest jump moved only 36.6° → 33.9°, so the excursions are broad, not spikes).
+
+The tell was noticed twice and not acted on: *"note the wedges have straight edges, which clouds
+don't."* Devon solved it from one image — "that's the umbrella from my garage in the corner of
+that image." One frame had been placed in the wrong part of the sky.
+
+Physical processes produce soft, irregular boundaries; software produces boundaries aligned to
+frame, tile or array edges. The geometry of an artifact identifies the layer it came from and
+rules out an entire class of hypotheses before any of them is tested.
+
+### M-22 — Calibrate a control's rate before using it, and do not hill-climb on a drifting signal
+
+`scope_speed_move` at speed 200 for 2 s, used as a "small probe", walked the scope **31°** off
+the Sun — about 7.5°/s. Linear extrapolation said speed 10 for 1 s would give ~0.4°; measured,
+speed 10 for 2 s moved **0.018°**, about 0.009°/s. A factor of **800 in rate for a factor of 20
+in speed**, with nothing usable in between. Devon supplied the missing context afterwards:
+"joystick has two modes, fast and slow, and I left it on fast" — the API presets are 1000 and 10.
+
+The 31° error then broke `start_scan_planet`, which searches around the current position, and the
+clear-sky window closed.
+
+In the same episode a hill-climb on sky brightness rose 28.06 → 38.36 over eight iterations while
+travelling ~0.15° in total, with the scope **82° from the Sun**. The signal was cloud thinning,
+not approach. Never hill-climb on a signal whose environmental drift is comparable to the effect
+of your step — the loop reports success while going nowhere.
 
 ---
 
@@ -480,6 +756,167 @@ looks like, and adding one sinusoid took RMS to 2.6° while independently recove
 A structured residual pattern names its own missing parameter. Read the residuals by
 azimuth before adding degrees of freedom blindly.
 
+### F-19 — To test whether a forward model is exact, evaluate it at known-true parameters
+
+Do not fit. Build a synthetic case, place it with a *known* rotation through the forward model,
+then ask what residual comes back **at those exact parameters**. Zero is the only passing answer.
+
+The rotation model claimed exactness and was not: at 12° of tilt the residual at the true
+parameters was `rms 0.556, max 1.289`, scaling cleanly with tilt (1° → 0.055, 3° → 0.143,
+6° → 0.248). After the fix, `rms 0.000, max 0.001`.
+
+Two fixture traps surfaced in the same pass. The pre-existing round-trip test generated its data
+with the buggy convention, so it *pinned* the defect (see E-02), and it used `cos(2a)`, making
+yaw ambiguous mod 180. And a pure-sinusoid test horizon is exactly degenerate with a tilt — a
+tilt about a horizontal axis adds precisely one sinusoid in azimuth — so the fit returned yaw
+65.5 against a true 40.0. That was a bad fixture, not bad code.
+
+A converging fit proves nothing about model exactness, and a fixture whose structure is
+degenerate with the parameter under test cannot detect an error in it.
+
+### F-20 — A stability stopping rule needs information-ordered additions
+
+Adding columns in measurement order gave yaw 131.38, 133.44, 133.38, 135.00, 135.00 — a spread of
+1.62° over the last four additions, still moving when the data ran out. Adding the same clean
+edges in D-optimal information-gain order gave **135.81, 135.81, 135.81, 135.88 — spread 0.06°,
+stable at seven columns**.
+
+Front-loading the columns that constrain rotation means the later additions are exactly the ones
+that *should not* move it, which is what makes the test mean something rather than reflecting
+exhausted data. Devon set the criterion: "we are looking for stability, the fit stops changing."
+
+Companion trap seen repeatedly: RMS was 0.03 at n=4 and *rose* to 0.55 at eight edges. **Four
+points fitting four parameters is interpolation** — the residual is meaningless until there is
+redundancy, and reads near zero however wrong the answer is.
+
+### F-21 — Information about a parameter lives only where the data has gradient
+
+For the 3-parameter rotation, `∂alt/∂yaw = −dH/daz`. So a column in a flat stretch of fence tells
+you almost nothing about yaw, while pitch and tilt want even coverage — and the D-optimal
+determinant balances the two automatically.
+
+The consequence is counterintuitive and it is the project's biggest single efficiency win: **a
+jagged skyline is an advantage and a flat, open one is the hard case.** Devon's site converged at
+**seven columns in about twenty minutes**, against a 36-column blind circle that took most of two
+nights and handed back ten fabricated columns. Offline replay against the completed circle showed
+4–6 seed columns already landing within ~3° of the full answer.
+
+Devon proposed the whole scheme: "we can start with 3 at 120, 4 at 90 or 6 at 60… match the
+photo, then calculate which new column will reduce the error the most… repeat until we are
+certain the yaw won't move." It maps 1:1 onto computerised adaptive testing — item information ↔
+Jacobian row, stop when SE(θ) stabilises ↔ stop when yaw stops moving.
+
+A completed brute-force dataset is the free simulator for validating an adaptive scheme offline.
+
+### F-22 — Measure a model correction's effect on the clean input set
+
+Fixing the rotation model and refitting reported "yaw moved **+1.38°**", 135.81 → 137.19. That
+number went into a commit message, a PR description, a review reply, and a session summary.
+
+It was measured on the 18-column set that still contained the two dawn-contaminated columns. On
+the curated 16, **the corrected model reproduces the published yaw exactly at 135.81°**. What
+actually moved was pitch (2.54 → 1.94), tilt direction (165° → 180°), and n (12 → 16 for a
+comparable residual).
+
+Running a fix against a set that still holds known-bad data attributes the contamination to the
+fix. Re-derive on the curated set before publishing the delta. The reassuring outcome here is
+that the headline number survived a genuine defect in the model that produced it.
+
+### F-23 — Multiplying a robust loss by 1/σ² is not inverse-variance weighting
+
+`weight /= uncertainty**2` applied as `w * huber(r, delta)` looks like inverse-variance weighting
+and is not, because `delta` is a threshold on the *residual* and stays fixed. Worked against the
+real `_huber`: at r=10°, σ=3, δ=4 the code gives **3.556** where the standardised form
+`huber(r/σ, δ)` gives **5.556** — a 36% gap. At r=2, σ=3 both give 0.2222 exactly.
+
+The two forms agree in the regime you test casually and diverge exactly where robustness matters —
+large residuals on high-σ vegetation columns, which is the case the weighting was added for.
+
+Scale must enter *before* the threshold. And keep the two concepts separate: **weight is how well
+the edge was detected; sigma is how far the thing detected may move.** Corollary when refactoring:
+standardising the input silently moves the breakpoint — extracting `objective()` changed δ=4 from
+4° to 12° for σ=3 columns. Re-derive every constant expressed in the old units, and pin the
+identity case (σ=1 everywhere) against the pre-refactor formula.
+
+### F-24 — Floor a weight at the instrument's resolution, not a numerical epsilon
+
+`max(float(uncertainty), 1e-6)` was added to avoid a divide-by-zero. With a fiducial at σ=1e-6
+carrying a mere 0.5° residual, `objective()` reads **399998.4** at the "four good columns exact"
+solution against **0.1** at the "sacrifice the four good columns by 0.5° each" solution. The
+optimiser will always pick the latter — one observation buys the whole fit, which is exactly what
+`orient.py`'s own docstring forbids, reintroduced by the guard meant to make sigma safe.
+
+Shipped as `MIN_SIGMA_DEG = 0.1`, the mosaic's real resolution: nothing may claim more certainty
+than the instrument delivered. An epsilon chosen to avoid a numerical problem is not a statement
+about the world, and wherever a weight is 1/σ it will be read as one.
+
+### F-25 — A score is comparable only when everything except the thing under test was held fixed
+
+Two instances. A "refinement" compared phase-correlation sharpness across *different resamplings*
+and moved a photo's solved azimuth from 20.8° to 326.9° for a gain inside the noise — resampling
+changes the peak statistics, so the comparison was invalid and the visually verified solutions
+stood. And after removing a misregistered frame the fit to the telescope got *worse* on paper,
+2.08° → 2.50°, which was correctly declined as a regression: the 2.08 came from a mosaic
+containing a misplaced frame plus three more frames of coverage, so part of it was fitting noise.
+The trustworthy number was the solver residual, four-fold better at 10.35 → 2.51.
+
+Changing inputs, resampling, or degrees of freedom changes the metric's own distribution.
+
+### F-26 — Dropping under-constrained inputs is iterative
+
+Removing the frame with zero control points changed what `cpclean` kept, which exposed two more
+weak frames at 1 and 4 points. Dropping those too: 19 → 16 frames, control points 350 → **422**,
+solver RMS 10.35 → **2.51**.
+
+Robust estimators are coupled to their input set — one bad member distorts the consensus that
+decides which other members look acceptable. Re-run the check after every removal until it
+reports clean, and log every drop.
+
+### F-27 — Detrending and outlier-robustness are different properties of a noise estimator
+
+`find_edge` estimated noise from mean absolute *consecutive* differences, so under light
+pollution the smooth skyglow gradient counted as noise — az 300 gave step 19.9 against noise 9.44,
+SNR 2.11. Switching to second differences gave noise 0.75 and SNR 26.58, and five failed columns
+"recovered".
+
+It was refused rather than shipped: az 350's recovered "edge" was a step of **3.7 counts against
+a sky of 19.7** — a gradient wobble, not a horizon. Then the *median* of second differences broke
+a regression test built from a real auto-exposure scatter profile, because the median ignores
+large excursions and in a pure-scatter profile those excursions **are** the noise. With a proper
+RMS second-difference estimator az 300's noise came out 8.2 against the original 9.44 —
+essentially unchanged. The fix recovered nothing, and the over-claim was retracted on the ticket.
+
+Keep a regression test built from a real pathological profile; it is what catches a "fix" that is
+merely worse in the other direction.
+
+### F-28 — Verify both arms run the current version of every shared component
+
+Mode B was reported as intrinsically worse than Mode A. Devon sent an image: "no wonder the phone
+panorama fails, JFC, look at this boundary." Mode A had been upgraded to SegFormer; **Mode B was
+still running the old brightness detector.** Segmenting the panorama in 8 tiles — needed because
+it is 6:1 and would distort squashed to a square input — moved fit RMS 2.51° → **2.24°**, usable
+columns 56% → **78%**, azimuth answered ~56% → **76%**.
+
+"That boundary was my error, not the mode's — I'd been reporting a fixed defect as an intrinsic
+limitation," and designing around it. A related counterintuitive result followed: the *wider*
+panorama was the worse input, because it was framed low and clipped the rooflines — 356° span
+with 16% sky gave 65% usable columns, against 346° with 60% sky giving 78%.
+
+### F-29 — A detection that assumes correct pointing cannot be evidence about pointing
+
+A daylight Moon "detection" reported disc excess +0.449% of sky at **320σ**, with a radial profile
+falling from centre and a centroid 0.063° from field centre. That evening's direct solar image
+established the mount carried a **3.2°** error at the time, so a 0.5° Moon was never inside a
+1.28° field. What read as a disc was residual gradient structure between frames.
+
+The same object had earlier produced the opposite error: a within-frame disc-versus-annulus test
+returned a confident *negative* because the fixed instrumental gradient dominated a 0.45% signal.
+Differencing between frames cancels that gradient; the naive within-frame test is worse than
+useless because it returns a confident wrong sign.
+
+When a measurement's validity depends on the quantity it claims to measure, a large sigma is
+circularity with error bars. An image of the target beats an inference about the target.
+
 ---
 
 ## The instrument
@@ -584,6 +1021,98 @@ and is a suspected contributor to the frozen stream (S-01).
 
 A sweep should hold a lock. Anything that wants to watch it reads the log, not the scope.
 
+### I-08 — Do not carry an instrument's guess at a quantity it cannot measure
+
+At 250 mm focused at infinity the hyperfocal distance is `f²/(N·c) ≈ 4.3 km`, and nothing at this
+site is further than a house across the street — three orders of magnitude inside the limit. That
+is what forced the split: **the scope measures altitude, the photos identify what.**
+
+The bug this produced: the mask's `type` field came from the scope's `obstruction_type()`, which
+infers vegetation from green and yellow colour in a 250 mm blur taken after dark, so after sunset
+it labels essentially everything `structure`. The residual table duly showed all four large
+disagreements as "structure" while Devon, reading the photo labels, counted six of nine as trees.
+
+Once an instrument provably cannot determine a quantity, stop storing its guess at all — a
+plausible field is consumed downstream exactly like a measured one.
+
+### I-09 — Mount model and mechanical alignment are different quantities
+
+A power cycle wipes the mount's belief about where it is pointing; it does not touch the polar
+axis. After one, gotos to the Sun's ephemeris reported a 0.14° *goto residual* — the mount
+arriving where it was told — and showed no disc. Then 49 grid positions over ±1.65°, a 16-position
+altitude sweep passing within 0.42° of the Sun's altitude with the frame never changing, and a
+brightness hill-climb, all found nothing.
+
+The cause: after a power cycle the frame is arbitrary, so an "offset in RA/Dec" moved the tube in
+a direction unrelated to the sky. A 3.3° box was searched in the wrong coordinate system. The
+true model error was **8.150°**, and one `scope_sync` took it to **0.003°**.
+
+Precise commands in an unvalidated frame are precisely wrong, and the failure looks like "search
+harder". Validate the frame with one absolute fix before any search, and never read a goto
+residual as a pointing error.
+
+### I-10 — Driving the error at one sky position to zero is not alignment
+
+A closed loop on the Sun ran all afternoon: 3.045° → 0.865°, with a screw calibration that looked
+beautifully linear (0.456, 0.452, 0.415 °/half-turn, agreeing to under 1%). That evening an
+8-minute drift run gave 0.87°/hour, implying polar misalignment ≈ **3.3°** — essentially where the
+day started, and where July's plate solve had put it.
+
+A single sky position cannot distinguish "the axis is tilted" from "the frame is rotated", and the
+metric responds to the axis through an unknown, position-dependent geometric gain (≈0.5 here). So
+the per-turn constant was calibrated against the wrong quantity, and ~8½ half-turns of *observed
+error* correction swung the axis through zero to roughly −4.5°. Devon caught the consequence:
+"wait, are we off by 3.3 in the other direction now?"
+
+A feedback loop converges beautifully on whatever you measure. Drift, or two widely separated
+targets, responds to polar error directly — which is why every real alignment procedure uses it.
+
+### I-11 — Check whether a sensor's geometry can express the quantity at all
+
+One magnetometer reading gave 275.59° magnetic against 282.69° true — a 7.10° difference against
+Denver's ~7.4°E declination, agreeing to under a degree. Six pointings across 150° of azimuth then
+gave implied offsets of +15.8, +29.2, +44.6, +48.8, −23.2, −37.2 — an **86° spread**.
+
+The structural cause: `gz` held constant to 0.005 across pointings spanning 90° of azimuth and 15°
+of altitude, at 0.646 against the 0.640 expected for a vector along the polar axis. **The sensors
+are in the base, not the tube**, so the assembly is blind to the declination axis. No amount of
+fixing makes a one-axis sensor report a two-axis quantity.
+
+Referenced against gravity instead — both fields are world-fixed, so their rotations must differ
+by a constant — the residual inconsistency is about ±11°. Also note the device's stored
+hard/soft-iron calibration is not optional: raw horizontal magnitude spanned 43–133, a factor of
+three; calibrated, 114–125.
+
+One agreeing sample from a direction-dependent sensor is a coincidence. Establish the geometry
+before characterising the accuracy, and reference a sensor against a second physical invariant
+rather than against your model of the world.
+
+### I-12 — A fixed terrain edge is a free session-to-session pointing reference
+
+The same commanded pointing 40 minutes apart, with an app session in between that took the
+control connection: edge angle −48.1975° → −48.2927° (Δ0.095°) and edge row 874.32 → 830.62 px
+(**Δ0.029°, 1.7 arcmin**), against a measurement floor of 0.026° in angle and 0.007° in position.
+The angle change is largely parallactic and computable, leaving ~1.7 arcmin of pointing residual.
+
+Sensitive from about 0.01°, useful to roughly half a frame (~0.6°) before the edge leaves the
+field, after which it degrades to a binary alarm — which is still exactly the alarm that was
+missing when 3.7° of drift went unnoticed for days. No stars, no Sun, no clear sky, no filter.
+
+### I-13 — Per-axis tolerances are unsatisfiable at a coordinate singularity
+
+Two live sweeps died identically: `goto did not arrive within 90s (wanted RA 16.763 Dec 89.89, at
+RA 14.716 Dec 80.65)`. At this latitude **az 0 at altitude ≈ 39.8° is the celestial pole**, so
+scanning north walks Dec to 89.8 and the arrival test — comparing raw RA — is degenerate. An
+arcminute of error swings RA by hours, so arrival can never be detected.
+
+The first fix was aimed at the waypoint router and was wrong; the failure was in the target
+itself. Two changes: compare true angular separation (`ang_sep < 0.6°`) rather than per-axis
+deltas, and nudge az 0 → az 3.0. **The azimuth is nudged rather than the altitude because
+altitude is the quantity being measured**, and 3° of azimuth is well inside the mask's own
+resolution.
+
+When you must perturb a target away from a singularity, perturb the axis you are not measuring.
+
 ---
 
 ## Safety
@@ -631,6 +1160,329 @@ Feasibility is also time-dependent, which the planner has no concept of: a colum
 now may be fine in two hours, and under a deadline the right move is sometimes to wait
 rather than substitute. At minimum, report *why* a candidate was excluded and when it
 becomes available.
+
+### SAFE-04 — An operator's approval is permission, not evidence about a computable quantity
+
+Devon: *"sun is low, and there's heavy cloud cover so heavy that I can't tell where the sun is, so
+you have my approval to start."* Preflight returned `Sun: az 272.8 alt 24.3` at 17:55 with sunset
+at 19:57 — the Sun was 24° up, due west, two hours early.
+
+Note the structure of the failure: **the cloud that made it feel safe was exactly what removed the
+ability to check.** The guard computes the Sun from time and site, so cloud does not weaken it —
+but it does mean the human can no longer eyeball the tube's relation to the Sun, so the guard is
+carrying the safety alone, which is precisely when it should be trusted least on its first outing.
+
+Conditions that degrade human observation — cloud, darkness, distance — systematically inflate
+confidence. Compute the quantity; take the approval as permission to proceed, not as data.
+
+### SAFE-05 — A safety-critical rewrite gets its first live test supervised and minimal
+
+A 3-hour daytime sweep was queued as the first run of a rewritten Sun guard that had never
+executed with the Sun above the horizon. Devon stopped it: *"wait, no, let's not risk another pass
+that might go right past the sun again, we'll wait until twilight."* The agreed sequence became
+mount → confirm polar alignment → read-only preflight → one supervised point → then sweep.
+
+Separately, his question "oh, do you want me to put the telescope on its mount?" caught that the
+scope was not on its tripod at all — preflight had reported `az 180 alt -39.9`, a parked tube, and
+the code was happy to sweep anyway. The instrument's physical configuration was a precondition no
+software check covered.
+
+The riskiest possible validation of new safety code is the longest unattended run of it.
+
+### SAFE-06 — Never design a workflow that requires a human to look at the Sun
+
+After blind searches failed, the proposed division was "the human does coarse acquisition — you
+can see the Sun, and no sensor on that mount can." Devon: *"no, human doing coarse correction
+sucked and I still see trails, I don't want to do that again."*
+
+That is the operator's eyes paying for a design decision. The replacement uses a signal that never
+needs the disc in frame: filtered sky brightness reads 22–24 far from the Sun, 27–28 within a few
+degrees, 32–40 closer — a monotonic gradient over tens of degrees, hill-climbable in 5–10° steps
+inside a box bounded by the accelerometer and compass.
+
+"The human can just look" is not an acceptable fallback for a hazard whose damage is to the human.
+A design that offloads an unsafe step to the operator has not solved it.
+
+### SAFE-07 — A hazard that cannot reach the optics is not a hazard
+
+A sweep finished early having skipped ten columns, refusing paths with the Sun at `az 297.2 alt
+−4.7`. The Sun was **below the horizon** and the guard still refused, because a column extends to
+alt 0 and −4.7° is within 30° of that. A third of the data lost to a guard that was wrong, not
+merely conservative.
+
+Fixed with `SUN_SAFE_ALT = -3.0`, with the margin chosen for the physics that bends it —
+refraction lifts the Sun about 0.6° — and tests in both directions so the guard still refuses when
+the Sun is genuinely up.
+
+A safety predicate expressed purely as distance-to-hazard ignores whether the hazard is
+physically reachable, and will quietly veto valid work.
+
+### SAFE-08 — A command that lies can also act later
+
+With the tube on the Sun, `scope_move_to_horizon` returned `{"result": 0, "code": 0}` and RA was
+unchanged — no motion, at the worst possible moment. An explicit goto through `point_to` cleared
+it, separation growing monotonically 30° → 58° → 70°.
+
+Later the mount was found at az 0.24 / alt 30.34 **with nothing having commanded it** — plausibly
+the earlier park finally acting, having reported success and done nothing at the time. That is
+worse than either failing or working, and verify-by-readback does not catch it.
+
+Confirm a park or abort by position *over time*, not once. And log the power state with every run:
+Devon's "telescope was at 6% power anyway, needs charging so I shut it off" is a plausible common
+cause for a class of impossible behaviour, and terminus reads battery state nowhere, though
+`seestar_alp` watches it for safe shutdown.
+
+---
+
+## Code, tests and the repo
+
+Most of these came out of adversarial PR review. The recurring shape is a change that is correct
+in the place you were looking and absent everywhere else, or a test that passes for a reason
+unrelated to the thing it names.
+
+### E-01 — Mutation is the standard of proof
+
+A green suite proves nothing about a specific guard; only breaking that guard does. Revert the
+fix in a throwaway worktree, confirm the *named* test fails, restore, confirm `git diff` is clean.
+
+It repeatedly caught tests asserting less than they appeared to: "the three-library test passed
+against `return False`; the fallback test passed against hardcoding auto to heuristic." A
+reviewer proved one round's fix was unguarded by **deleting it entirely and rerunning — 170/170
+still passed.** Removing dedup from `sorted({int(round(a)) % 360 ...})` survived the full suite.
+A test rewrite that swapped `len(head) == N` for substring checks silently lost header-bloat
+coverage, proved by inserting one unrelated header line and watching both tests still pass.
+
+Two cautions. A mutation that produces a collection or syntax error is a **null result, not a
+pass** — removing a whole `except` block leaves a bare `try:`. And verify you mutated what you
+think: an editable-install `.pth` pointing at the original checkout meant a reviewer's worktree
+mutations were never imported, and the first run "passed" for the wrong reason. Print the
+`__file__` of the module you believe you changed.
+
+### E-02 — A test can pin a bug instead of catching it
+
+`_rotate_east` rolled the texture the wrong way and the PR's own test asserted the wrong
+direction, locking it in. Mutation-checked: flipping the sign to the correct one made that exact
+assertion fail.
+
+The right answer came from the convention, not the code: `orient.native_column` defines
+`phi = (target_az - yaw) % 360`, so `true_az = native_az + yaw`, so a marker at native 0 with yaw
+90 belongs at true 90 — columns 16–23 of a 64 px image, not 48–55. The failure was invisible by
+eye: "for a small yaw that still looks like a horizon, just not this one."
+
+A test written by reading the code under test asserts only that the code does what it does. **A
+test that locks a bug in is worse than no test at all.**
+
+### E-03 — An invariant is not pinned if the code that must obey it is unreachable
+
+After fixing the Huber weighting (F-23), a test asserting the standardisation property was added.
+Its own mutation — reverting to scaling the loss — **survived, 123 passed.** The test checked the
+property in isolation and never pinned that `fit` applied it, because `cost_from` was a closure
+inside `fit`. Extracting `objective()` to module level made the same mutation fail.
+
+Testing a re-implementation of a rule proves the rule, not the code. If the production expression
+of an invariant is only reachable through a closure or a long pipeline, refactor until a test can
+call it directly.
+
+### E-04 — A test that asserts what the dev box happens to satisfy passes vacuously
+
+Three instances in one session. `test_optional_backends_report_rather_than_raise` gave zero
+coverage because torch and transformers are installed locally, so the `except ImportError` branch
+never ran — mutating it to `raise` survived all 88 tests, and CI installs neither, so the blocker
+"could be deleted outright with the test still passing. It only ever meant anything on this
+workstation." Fixed by injecting `types.ModuleType` stubs and asserting both directions.
+
+Then CI caught what no local run could: `terminus export` demanded a `config.toml` it never reads —
+"my checkout has one; CI doesn't."
+
+A claim about the environment must be tested by *constructing* the environment, not by inheriting
+it.
+
+### E-05 — Exception type cannot separate "the environment is short something" from "we have a bug"
+
+A fallback that degrades gracefully was made to re-raise `TypeError, AttributeError, NameError` so
+it would not swallow programming errors. The reviewer killed it: the segmenter calls transformers'
+API directly, so a version-skew break — the exact scenario the code's own comment assigns to the
+degrade side — raises `TypeError`. Asymmetric the other way too: `KeyError` and `IndexError` are
+equally bug-shaped and still degraded.
+
+The catch went back to broad and the fix moved somewhere it can work: **record which backend
+actually ran.** That immediately exposed two worse bugs — `cmd_skymask` wrote the *requested*
+backend into the mask meta, so a fallback produced a durable artifact claiming `backend: segment`
+that the heuristic made; and fixing that revealed the CLI pre-resolved `auto` → `segment`, turning
+it into an explicit request that `sky_mask` is correctly required to fail loudly on. **The CLI was
+defeating its own auto path.**
+
+Classifying failures by exception class is guessing. Report and persist the path that executed.
+And pre-resolving a policy value upstream silently disables the policy downstream.
+
+### E-06 — An absent value is not a matching value, and a fabricated default is a claim
+
+Three instances. The merge-position guard only fired when the prior mask carried `lat`/`lon`, so a
+London sweep merged into a positionless mask with no error — and the merged meta still had no
+position, propagating the hole forever. `write_landscape` defaulted latitude and longitude to 0,
+"so a mask that never recorded a site produced a `landscape.ini` placing the observer in the Gulf
+of Guinea and saying nothing was wrong"; altitude was dropped entirely because 0 m is a claim
+rather than an absence. And `boundary_model("")` silently returned the structure model — but an
+unnamed column is most often a tree measured at night, so the fallback pointed the wall rule at
+precisely the columns the vegetation rule exists for.
+
+Recorded deliberately as a counterpoint: the per-column Sun read falls back to the *last known*
+altitude rather than `None`, because `None` means "the caller did not say", which would restore
+the daylight assumption at the worst moment.
+
+Missing data must propagate as missing — not as zero, not as a permissive default, and never as
+"no mismatch detected". Choose the fallback by which wrong answer is dangerous.
+
+### E-07 — A guard in one caller is not a guard
+
+A PR claimed unoriented masks were refused "in the header, in meta.oriented, on stdout, and by
+refusing to export". The reviewer reproduced the opposite: the exporters had zero gating, and
+`terminus export photo_mask.yaml` produced a `.hrz` headed "true-north azimuth" carrying
+panorama-local values. The only refusal was a print inside a command that never calls export.
+
+The fix then covered **two of the three** exporters the finding had named — in a change whose own
+comment says a guard in one caller is not a guard. The miss was the worst one: the Stellarium
+format forbids comments, so unlike a `.hrz` header that file **cannot carry a warning at all**.
+
+Put the check where every path converges, enumerate the call sites, and re-read the finding's own
+list before declaring it fixed. Related shape: hardening only the code you just wrote leaves the
+sibling path broken and looks complete — an `except OSError` wrap was added around the new picture
+exporters while plain `terminus export` still traced back on the identical failure, and the test
+could not even reach the new code. **If a test cannot exercise the guard, that is evidence about
+placement.**
+
+### E-08 — A half-written multi-file artifact reads as corrupt, not absent
+
+`write_landscape` wrote `horizon.txt` before rendering the texture, so a mid-way failure left a
+directory Stellarium reads as a *broken* landscape — the failure looked like a corrupt install
+rather than an error. Building everything in memory first fixed the render phase, but the write
+phase was still three sequential `open()` calls, and a failure on the last leaves the first behind.
+
+Cleanup now removes only files this call created: "a landscape the person already had isn't ours
+to delete, though our own half-written files inside it are." A stale `maptex.png` is also removed,
+on the grounds that the harm is to the person who opens the folder, sees a photograph, and
+reasonably concludes it is part of the landscape.
+
+Partial success is a worse failure mode than none, because consumers cannot distinguish it from
+corruption.
+
+### E-09 — Two silent coercions: a string is iterable, and `{:g}` emits letters
+
+`skipped_az: "190"` — hand-edited, which the mask's own docstring invites — iterates to the
+characters `1`, `9`, `0`, recording three wrong columns as skipped **with no error at all**. A
+reviewer had reported it as a crash; the reality was worse, wrong-and-silent rather than
+loud-and-wrong.
+
+And PVsyst's `.HOR` spec says "all lines containing text are considered comment lines", while
+`format(v, 'g')` produces `1e-05`, `nan`, `inf` — so a non-finite altitude would be silently
+dropped as a comment rather than rejected. Guarded at the choke point so every exporter refuses
+non-finite altitudes.
+
+Validate iterables by type before iterating, and never emit a numeric format that can produce
+alphabetic output into a format whose comment rule is "contains text".
+
+### E-10 — A threshold in degrees is not a threshold in distance, and longitude wraps
+
+One degree threshold was compared against both latitude and longitude. At lat 39.79, 0.0003° is
+**33.4 m** north-south but **25.7 m** east-west — the east-west test 23% tighter than intended,
+and the docstring's "~30 m" true of one axis only. Proof it was untested: dropping the longitude
+check entirely survived the full 141-test suite, because no test moves purely east-west.
+
+Fixed by computing metres against a named constant — after which the metres conversion turned out
+to have no wrap, so two points ~2 m apart straddling the antimeridian computed as **39,466 km**.
+
+Any tolerance in angular units is a different physical tolerance per axis and per latitude, and
+any longitude difference taken by subtraction is wrong across ±180°.
+
+### E-11 — When the raw data is not in version control, the fixture *is* the data
+
+A regression fixture "wasn't a literal transcription — six of sixteen values off by up to 1.7
+counts, which matters more than usual because `captures/` is git-ignored and nobody can re-derive
+them." Fixed by re-reading from the saved frames and adding a programmatic check that the
+transcription is literal.
+
+Any paraphrase of unreproducible data becomes an unfalsifiable fabrication.
+
+### E-12 — A human-editable safety flag needs a closed vocabulary and a typed error
+
+Three iterations on one flag. `meta.get("oriented") is False` is an identity check, so
+`oriented: 'false'` and `oriented: 0` walk straight past it — and the mask is documented as "the
+durable, hand-editable artifact", so a *supported workflow* defeats the guard. Interpreting
+strings via a negative allowlist then failed **open**: `"flase"`, `"nope"`, `"unoriented"`, `"n"`
+all read as oriented. The fix is explicit true/false vocabularies and a raise on anything else,
+with the writer calling the same function so the file's header and the export gate cannot disagree.
+
+Then a fourth bug from the fix: the raise was a bare `ValueError` while `main()` caught only the
+domain exception, so a typo gave a raw traceback while a legitimately unoriented mask got a clean
+sentence — backwards, since the typo is the one with a five-second fix.
+
+Both truthiness and negative allowlists fail open. And a new exception type must be catchable by
+whatever already reports errors to the user.
+
+### E-13 — Verify documentation by executing it
+
+A reviewer that *ran* every command and snippet found three errors a stranger would have acted on:
+"250 mm at f/4.9" when 250/50 is f/5 exactly; a dependency on `enblend`, which is invoked nowhere,
+costing everyone who installs it; and "36 columns at 10° spacing" when the shipped default is 5°
+→ 72 columns, contradicting a comment in `config.example.toml` in the same repo.
+
+That last one is the dangerous shape: **the error is silent, because the sweep still completes and
+still produces a horizon file** — just the wrong shape and twice the duration.
+
+Verify each claim against the artifact that owns it, and treat a doc contradicting a config file
+in the same repo as a defect, not a style nit.
+
+### E-14 — Grep is not proof
+
+Three code sites told users to run a command that does not exist. Two were found by grep; the
+third "evaded my grep because the reference wraps across a line break", and surfaced only on a
+third recurrence. The working technique joins lines first, masking the legitimate module reference
+to avoid false hits.
+
+The converse also nearly shipped: grepping `deadline` in `sweep.py` matched, making a ticket look
+fixed, but all three matches were the goto timeout.
+
+A negative grep proves nothing about wrapped or reformatted text, and a positive one proves
+nothing about *which* mechanism matched. Read every hit before acting on a count.
+
+### E-15 — Concurrent agents make shared-checkout operations unsafe
+
+Three distinct losses in one project. **`git add -A`** run while a reviewer had a live mutation on
+disk committed and pushed `# mutation: shadow sweep.classify`, and CI failed on ruff — its edits
+are indistinguishable from yours at the staging step. **`git checkout --ours`** on
+`.beads/issues.jsonl` during a rebase silently deleted a ticket: right for a file holding machine
+state, wrong for an append-only log, "and it fails silently because a shorter log looks exactly
+like a valid one." **`bd` allocating IDs from the working checkout** reused `terminus-32` when
+another agent moved the tree across branches, losing three beads.
+
+The fixes are structural, not procedural: isolate reviewers in `git worktree`s rather than timing
+around them (which then introduced the editable-install trap in E-01); union-merge append-only
+logs and never resolve them with `--ours`/`--theirs`; close the window between allocating an ID
+and publishing it — "I committed **and pushed** in the same breath, so there was no window."
+
+Two smaller ones worth keeping: when data loss is suspected, diff the whole ID set against a
+pre-incident commit rather than restoring only the item someone noticed (37 issues against 48,
+"exactly one missing, twelve legitimately added"). And `&&`-chaining let a failed `cd` skip a
+`bd update` while the commit went ahead — "I pushed a commit whose message described two changes
+and contained one."
+
+### E-16 — When two instruments write one record, merge field by field
+
+A targeted re-measure must improve a record, never degrade it. Three defects in one merge path:
+`meta.update()` replaced rather than merged, so a 2-column patch run overwrote `skipped_az` and
+destroyed the record of *why* columns were missing; `skipped_az` was recomputed from only this
+run's measurements, so a column measured in patch 1 and Sun-blocked in patch 2 went back on the
+skip list while the mask still held its altitude; and the column merge was a whole-record replace,
+so re-measuring at 2 a.m. a column the photo had segmented as `tree` overwrote it with `type: ""`,
+losing the seasonal buffer on export.
+
+The rule that emerged: take the fresh altitude always, but **a fresh naming replaces an old one
+and a fresh silence does not** — justified by which instrument can make that claim at all.
+Conversely `clipped` *is* cleared by a real re-measure, because it means the altitude was a lower
+bound from the photo and the scope's value is a real crossing.
+
+Unconditional preservation is the mirror bug, so each rule needs a mutation test in both
+directions.
 
 ---
 
@@ -761,3 +1613,67 @@ Not "prefer newer." The rules, in order:
 
 Corollary: re-scan any column from an older mask whose altitude sits within ~5° of that
 sweep's ceiling. Those are the likely artefacts.
+
+### D-12 — Fragility is a per-layer policy: brittle on interpretation, robust on execution
+
+A review doctrine was imported from a batch-parser project largely unchanged, where "wrong data is
+worse than no data" makes failing at the first error correct. Devon corrected it. terminus drives
+hardware that is fragile by nature — mounts stall, streams freeze, sockets drop, cloud moves — so
+the doctrine splits:
+
+- **Interpretation** (observation → number) is **brittle.** Never record a value that is not
+  evidenced.
+- **Execution** (getting through the night) is **robust.** Retry, skip, degrade, continue.
+- The bridge between them: **a thing that failed must be recorded as failed.** Skipped columns go
+  into `skipped`; a ceiling-limited column becomes a bound; a no-edge column is a non-result with
+  a stated reason.
+
+"Robustness that quietly omits its failures is silent corruption with better manners." Concretely,
+the unadapted doctrine would have argued *against* the fix it took PR #1 six rounds to land.
+
+Importing a doctrine from a project with a different failure economy inverts its effect. State
+which layer each rule governs, and require that every recovery leaves a record.
+
+### D-13 — Don't re-derive an input the user has said is settled
+
+Asked for an observing plan, the first version was built from the sparse telescope columns; then
+the photo-derived boundary was judged "the right source", found never to have been saved as data,
+and a full Hugin re-stitch was launched to regenerate it. Devon: *"man, come on, I've lost 10
+minutes of telescope time on a boundary we more or less already knew, just give it a 5% buffer and
+give me something to work with."*
+
+The job was killed and the complete plan — five targets, the moonless window, moon separations,
+framing notes — was produced about 45 seconds later from data already in hand. The re-derivation
+was never needed for the deliverable.
+
+When the deliverable is a decision aid rather than a measurement, precision already in hand plus a
+stated margin beats regenerating the input from source. "We know what X is like" is an explicit
+instruction that the input is settled.
+
+### D-14 — After the second refuted hypothesis, stop theorising and go look
+
+Six explanations for frames that would not sharpen were proposed and separately measured against,
+across ~35 minutes of the remaining daylight: darkness, a north-facing wall in shadow, exposure
+lock breaking autofocus, similar sky and siding colour, dew, coarse focus sampling, degraded
+stream resolution. Two died to one-line facts that cost Devon nothing — *"it's still very bright
+out, it's not even sunset, I can see the sun"* and simply *"it's 71f"*.
+
+The fact that mattered had been stated at the start: *"right now it's pointed right at my house."*
+
+The cheapest available observation — look at the image, or ask the operator what the instrument is
+pointed at — outranks a measurement run you have to build. And an operator's free one-line facts
+are the highest-value input available; solicit them early rather than spending the window
+generating candidates.
+
+### D-15 — A file at a canonical path is not evidence that it is current
+
+`horizon_mask.yaml` at the repo root was read as the mask and a census computed over it — "six of
+sixteen columns sit at exactly 35.0" — and an earlier result justified against its values. Its own
+`meta:` block said `measured: 2026-08-02, az_step: 20, alt_search: [0, 35]`, superseded a day
+later by a sweep at `az_step: 10, alt_search: [0, 60]` in `captures/`, where the disputed column
+reads 32.5 rather than 12.5. The error surfaced only incidentally, from another agent's commit
+message.
+
+Read the provenance metadata every derived file carries before editing it or computing statistics
+over it — especially when a second agent is landing work in the same repo. The real finding
+underneath was better than the wrong one: az 0–60 has no current measurement at all.
