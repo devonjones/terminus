@@ -18,7 +18,14 @@ import time
 
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
-from .export import MaskError, default_meta, export_all, load_columns, write_mask
+from .export import (
+    MaskError,
+    default_meta,
+    export_all,
+    is_oriented,
+    load_columns,
+    write_mask,
+)
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     Pointer,
@@ -100,6 +107,68 @@ def cmd_classify(sc, cfg, args):
     sc.stop_view()
 
 
+def _check_mergeable(prior_meta, sky):
+    """Refuse to merge two runs that do not describe the same sky.
+
+    A merge silently mixes runs, and the mask is a durable artifact other tools
+    consume, so the mixing has to be checked rather than assumed.
+
+    Orientation: a photo-derived mask is in the panorama's own azimuth until the
+    orientation is solved. Merging true-north scope columns into it produces a
+    file where some columns are true and some are not, with nothing to say
+    which — and the header still claims one frame for all of them.
+
+    Position: the horizon belongs to where the tripod stood. A 2 m fence at 5 m
+    moves 11.9 degrees for 2 m of observer displacement, so merging across a
+    move is merging two different horizons. The check is deliberately loose
+    (about 30 m) because lat/lon in the mask is rounded to four decimals and a
+    GPS fix wanders; it catches moving to the far side of the garden, not
+    shuffling the tripod.
+    """
+    if not is_oriented(prior_meta):
+        raise MaskError(
+            "refusing to merge: the existing mask is UNORIENTED (its azimuth is the "
+            "panorama's own) and the scope measures in true azimuth. Merging would "
+            "produce a mask that is partly one frame and partly the other. Solve the "
+            "orientation first, or write to a different --out."
+        )
+    plat, plon = prior_meta.get("lat"), prior_meta.get("lon")
+    if plat is not None and plon is not None:
+        dlat = abs(float(plat) - sky.loc.lat.deg)
+        dlon = abs(float(plon) - sky.loc.lon.deg)
+        if max(dlat, dlon) > 0.0003:  # ~30 m
+            raise MaskError(
+                f"refusing to merge: the existing mask was measured at {plat},{plon} and "
+                f"this run is at {sky.loc.lat.deg:.4f},{sky.loc.lon.deg:.4f}. The horizon "
+                "belongs to one position — a near obstruction shifts by degrees for a few "
+                "metres — so these are two different horizons. Write to a different --out."
+            )
+
+
+def _merge_meta(prior_meta, fresh, measured, skipped):
+    """Meta for a merged mask, which describes BOTH runs.
+
+    `dict.update` was wrong: it let a two-column patch overwrite the whole file's
+    description. A patch that skipped nothing replaced `skipped_az: [190, 195]`
+    with `[]`, so those columns stayed absent from the mask with the record of
+    WHY they were missing destroyed.
+
+    Skips are unioned, minus anything this run actually measured. The original
+    measurement date is kept and the patch date recorded separately, because a
+    mask whose `measured` reads today when most of its columns are from Tuesday
+    is a false record.
+    """
+    meta = dict(prior_meta)
+    prior_skipped = {int(a) for a in (prior_meta.get("skipped_az") or [])}
+    meta["skipped_az"] = sorted((prior_skipped | set(skipped)) - set(measured))
+    meta["measured"] = prior_meta.get("measured", fresh["measured"])
+    meta["patched"] = sorted(set(prior_meta.get("patched") or []) | {fresh["measured"]})
+    meta["patched_columns"] = sorted(
+        set(prior_meta.get("patched_columns") or []) | {int(a) for a in measured}
+    )
+    return meta
+
+
 def cmd_sweep(sc, cfg, args):
     if not sc.is_eq_mode() and not args.dry_run:
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
@@ -131,7 +200,8 @@ def cmd_sweep(sc, cfg, args):
     prior, prior_meta = {}, {}
     if azimuths and os.path.exists(out):
         prior_meta, prior_cols = load_columns(out)
-        prior = {az: c for az, c in prior_cols.items()}
+        _check_mergeable(prior_meta, sky)
+        prior = dict(prior_cols)
         print(f"merging into {out} ({len(prior)} existing columns)")
 
     aborted = None
@@ -179,15 +249,15 @@ def cmd_sweep(sc, cfg, args):
         print(f"wrote {prof_path} (raw column brightness profiles)")
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
+    fresh = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
     if prior:
         merged = dict(prior)
         merged.update(mask)  # freshly measured columns win
-        meta = dict(prior_meta)
-        meta.update(default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped))
+        meta = _merge_meta(prior_meta, fresh, measured=set(mask), skipped=skipped)
         print(f"wrote {len(mask)} measured, {len(merged) - len(mask)} preserved")
         mask = merged
     else:
-        meta = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+        meta = fresh
     write_mask(out, mask, skipped, meta)
     print(
         f"\nwrote {out} ({len(mask)} azimuths, {len(skipped)} skipped); review frames in {frames}/"
