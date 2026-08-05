@@ -39,6 +39,7 @@ import numpy as np
 from .export import (
     TREE_BUFFER_DEG,
     _ascending_pairs,
+    is_oriented,
     require_oriented,
     to_stellarium_txt,
 )
@@ -186,6 +187,12 @@ def to_skysafari_png(
 
     Load it under Settings -> Horizon & Sky, choose "Show Horizon & Sky as
     Panoramic Image", and pick the file from the Panorama Horizon list.
+
+    `size` defaults to what the vendor asks for, so a larger mosaic is
+    DOWNSAMPLED to fit it. That is the right trade for this target — the app
+    wants 2048x1024 — but it means the panorama here is lower resolution than
+    the same imagery in the Stellarium package, which keeps the texture's own
+    size. Pass `size` to override.
     """
     from PIL import Image
 
@@ -247,6 +254,29 @@ longitude = {lon}
 _SPHERICAL_KEYS = "maptex = maptex.png\nmaptex_top = 90\nmaptex_bottom = -90\nangle_rotatez = 0\n"
 
 
+def _describe(meta):
+    """The landscape's description line, which is where a warning can live.
+
+    Stellarium shows this in its landscape browser, and it is the only place in
+    the package a person reliably reads. An `--allow-unoriented` export is a
+    legitimate workflow — someone who set north by hand — but the resulting
+    azimuth is not true north, and a picture cannot say so the way a `#` comment
+    in the .hrz can. So it says so here.
+    """
+    meta = meta or {}
+    where = f"from {meta.get('lat', '?')},{meta.get('lon', '?')} on {meta.get('measured', '?')}"
+    note = (
+        "POSITION-SPECIFIC: a near obstruction shifts by degrees for a few metres of "
+        "observer displacement, so this describes one spot."
+    )
+    if not is_oriented(meta):
+        return (
+            f"!! UNORIENTED: azimuth is the panorama's own, NOT true north. "
+            f"Horizon measured with terminus {where}. {note}"
+        )
+    return f"Horizon measured with terminus {where}. {note}"
+
+
 def write_landscape(
     directory,
     rows,
@@ -301,11 +331,7 @@ def write_landscape(
     ini = LANDSCAPE_INI.format(
         name=name,
         author=author,
-        description=(
-            f"Horizon measured with terminus from {meta.get('lat', '?')},{meta.get('lon', '?')} "
-            f"on {meta.get('measured', '?')}. POSITION-SPECIFIC: a near obstruction shifts by "
-            "degrees for a few metres of observer displacement, so this describes one spot."
-        ),
+        description=_describe(meta),
         type=kind,
         texture_keys=texture_keys,
         # Stellarium's own dark green. Only visible in the polygonal case.

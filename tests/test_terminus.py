@@ -3860,3 +3860,46 @@ def test_the_missing_coverage_warning_reaches_stderr(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "--coverage" in err and "drawn" in err
     assert (tmp_path / "h_landscape" / "maptex.png").exists(), "and it still produces the package"
+
+
+def test_an_allow_unoriented_landscape_says_so_where_a_person_will_read_it(tmp_path):
+    """A picture cannot carry a `#` comment, but a landscape browser shows a name.
+
+    Exporting an unoriented mask is a legitimate workflow — someone who set
+    north by hand — and the flag exists for it. But the azimuth is still not
+    true north, and the description line is the only part of the package a
+    person reliably sees.
+    """
+    from terminus.landscape import write_landscape
+
+    d = tmp_path / "ls"
+    write_landscape(str(d), _LS_ROWS, {"oriented": False, "lat": 1.0, "lon": 2.0},
+                    allow_unoriented=True)  # fmt: skip
+    ini = (d / "landscape.ini").read_text()
+    assert "UNORIENTED" in ini and "NOT true north" in ini
+
+    oriented = tmp_path / "ok"
+    write_landscape(str(oriented), _LS_ROWS, _LS_META)
+    assert "UNORIENTED" not in (oriented / "landscape.ini").read_text()
+    assert "POSITION-SPECIFIC" in (oriented / "landscape.ini").read_text()
+
+
+def test_a_mask_covering_part_of_the_circle_still_renders(tmp_path):
+    """A partial sweep is a normal intermediate state, not an error.
+
+    `_ascending_pairs` closes the wrap by repeating the first column at 0 and
+    360, so the gap is filled by interpolation rather than crashing. Whether
+    that is the RIGHT filling is a separate question — it is a straight line
+    across ground nobody measured — but it must not raise.
+    """
+    from terminus.landscape import horizon_altitudes, render
+
+    partial = [(10, 12.0, "structure"), (20, 15.0, "structure"), (30, 9.0, "structure")]
+    alts = horizon_altitudes(partial, 72)
+    assert np.isfinite(alts).all(), "every column must get a value"
+    assert abs(alts[2] - 12.0) < 1.0, "and a measured column keeps its own"
+    rgba = render(partial, (72, 36))
+    assert rgba.shape == (36, 72, 4)
+
+    single = [(90, 20.0, "structure")]
+    assert np.allclose(horizon_altitudes(single, 8), 20.0), "one column is a flat horizon"
