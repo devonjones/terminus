@@ -91,6 +91,13 @@ as a hint, not a measurement.
 - A **`Horizon`** class for planners: `altitude_at(az)`, `is_above(az, alt)`,
   `is_visible(ra, dec, sky)`.
 
+**The horizon is specific to where the tripod stood.** How specific depends on
+distance: a ridge two kilometres out does not care where you stand, but a fence
+five metres away swings by degrees if you move a couple of metres, and by more
+if you move toward or away from it. The error is largest exactly where the
+horizon is highest, since the tall obstructions are the near ones. Measure from
+where you observe, and re-measure if you move.
+
 Anything classified as vegetation is exported with a **3° safety margin** added,
 applied at a single choke point every exporter routes through. A tree has gaps
 low down with more canopy above, it moves in wind, and a crown measured in August

@@ -70,6 +70,9 @@ def write_mask(path, mask, skipped, meta):
             "# !! orientation before any planner consumes this."
         ),
         "# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.",
+        "# POSITION-SPECIFIC: this is the horizon from where the tripod stood. A",
+        "#   near obstruction moves by degrees for a few metres of observer",
+        "#   displacement; a distant ridge does not. Re-measure if you move.",
     ]
     # Only explain the photo-derived fields when the file actually carries them,
     # so a scope-measured mask is byte-for-byte what it always was.
@@ -181,7 +184,11 @@ def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=F
     # header is the thing that would lie: it declares "true-north azimuth".
     require_oriented(meta, allow_unoriented)
     pairs = _ascending_pairs(rows, tree_buffer)
-    out = ["# terminus horizon for N.I.N.A. (az alt), true-north azimuth."]
+    out = [
+        "# terminus horizon for N.I.N.A. (az alt), true-north azimuth.",
+        "# Measured from one spot. A near obstruction shifts by degrees if the",
+        "# observer moves a few metres; a distant ridge barely moves.",
+    ]
     if tree_buffer:
         out.append(f"# vegetation columns raised {tree_buffer:g} deg (seasonal, gappy)")
     if meta:
