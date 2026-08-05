@@ -53,11 +53,20 @@ import yaml
 #                before the rename still opens.
 #   uncertainty  per-column altitude uncertainty in degrees, already widened for
 #                vegetation by type and gap_fraction.
+#   bound        the horizon is AT LEAST this high — the search reached its
+#                ceiling without finding an edge. A one-sided constraint, which
+#                `orient.fit` scores one-sidedly, and NOT the same as a
+#                measurement that happens to sit at the ceiling. It used to be
+#                carried by spelling the type "blocked>35"; when the vocabulary
+#                changed to tree/structure that meaning was lost with it and
+#                `orient.from_mask` silently returned nothing for every mask
+#                written since. Boundedness is a property of the measurement,
+#                not a spelling of its type, so it has its own field now.
 #   type_source  which instrument named the obstruction: "photo" (in-focus
 #                segmentation) or "scope" (colour, daylight only). Per column,
 #                because a merged mask holds both and they are not equally able
 #                to tell a tree from a wall.
-COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty", "type_source")
+COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty", "type_source", "bound")
 # Old spellings still accepted when reading, never written.
 _RENAMED = {"gap_fraction": "porosity"}
 
@@ -84,6 +93,7 @@ def write_mask(path, mask, skipped, meta):
 
     photo_fields = _present("clipped", "gap_fraction", "uncertainty")
     sourced = _present("type_source")
+    bounded = _present("bound")
     lines = [
         "# terminus horizon mask (Seestar S50, EQ mode, RA/Dec goto).",
         (
@@ -111,6 +121,12 @@ def write_mask(path, mask, skipped, meta):
             "# clipped: true = obstruction ran off the top of the data; a lower BOUND,",
             "#          not a measurement. gap_fraction: sky fraction within the canopy",
             "#          band. uncertainty: degrees, already widened for vegetation.",
+        ]
+    if bounded:
+        lines += [
+            "# bound: true = the search reached its ceiling without finding an edge, so",
+            "#        the horizon is AT LEAST this altitude. A one-sided constraint, and",
+            "#        NOT the same as a measurement that happens to sit at the ceiling.",
         ]
     if sourced:
         lines += [
@@ -167,7 +183,7 @@ def load_columns(path):
                     # float() made a string field unreadable the moment one was
                     # added, which is the kind of breakage that only shows up in
                     # the next feature.
-                    if key == "clipped":
+                    if key in ("clipped", "bound"):
                         col[key] = bool(raw)
                     elif key == "type_source":
                         col[key] = str(raw)

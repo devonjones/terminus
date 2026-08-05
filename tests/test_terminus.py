@@ -4856,3 +4856,101 @@ def test_a_lamp_is_stepped_over_during_growth_not_stopped_at():
     with_lamp = sky[:5] + [(50.0, 400.0)] + sky[5:]
     _model, n_over = sky_model(with_lamp)
     assert n_over > 6, f"growth must continue past the lamp, only reached {n_over}"
+
+
+def test_from_mask_reads_every_mask_this_repo_has_ever_written():
+    """It returned ZERO fiducials for every mask written since 2026-08-02.
+
+    `from_mask` matched `type == "edge"` and `type.startswith("blocked")`, which
+    was the vocabulary of that date — `blocked>35` literally encoded "above the
+    35 degree ceiling". When the vocabulary became tree/structure/open the
+    encoding went with it, and this returned an empty list for every mask since.
+    Nothing failed, because an empty list is a legal result, and the only caller
+    was the worked example in the package docstring — so the documented way in
+    returned nothing and said nothing.
+    """
+    from terminus.orient import from_mask
+
+    # The old vocabulary still exists on disk and still means something.
+    old = {
+        0: {"alt": 35.0, "type": "blocked>35"},
+        40: {"alt": 32.5, "type": "edge"},
+        90: {"alt": 20.0, "type": "unknown"},
+    }
+    fids = from_mask(old, ceiling=35.0)
+    assert len(fids) == 2, "a failed measurement carries no information; the other two do"
+    assert [f.az for f in fids if f.bound] == [0.0]
+
+    # The current one, where boundedness is its own field rather than a spelling.
+    now = {
+        0: {"alt": 60.0, "type": "structure", "bound": True},
+        40: {"alt": 32.5, "type": "tree"},
+        90: {"alt": 12.0, "type": ""},
+    }
+    fids = from_mask(now, ceiling=60.0)
+    assert len(fids) == 3, f"an untyped column is an ordinary measurement, got {len(fids)}"
+    assert [f.az for f in fids if f.bound] == [0.0]
+
+    # A column with no altitude is not a measurement at all.
+    assert from_mask({0: {"type": "tree"}}) == []
+
+
+def test_bound_survives_a_round_trip_through_the_mask_file():
+    """A one-sided constraint the file cannot express is a constraint that is lost.
+
+    `orient.fit` scores a bound one-sidedly — a photo that also exceeds the
+    ceiling confirms it exactly, and only falling short contradicts it. Written
+    back as an ordinary measurement it becomes "the horizon is exactly at 60",
+    which is a different and much stronger claim than the scope made.
+    """
+    import tempfile
+
+    from terminus.export import load_columns, write_mask
+    from terminus.orient import from_mask
+
+    path = os.path.join(tempfile.mkdtemp(), "m.yaml")
+    write_mask(
+        path,
+        {0: {"alt": 60.0, "type": "structure", "bound": True}, 90: {"alt": 22.0, "type": "tree"}},
+        [],
+        {"lat": 1, "lon": 2},
+    )
+    _meta, cols = load_columns(path)
+    assert cols[0]["bound"] is True
+    assert cols[90].get("bound") is None, "an ordinary column claims nothing"
+    assert [f.az for f in from_mask(cols, ceiling=60.0) if f.bound] == [0.0]
+    assert any("bound" in ln for ln in open(path) if ln.startswith("#")), "and it is explained"
+
+
+def test_a_lamp_inside_terrain_is_not_read_as_a_horizon():
+    """az 340 and az 350, measured 2026-08-03, settled from the saved frames.
+
+    Both columns read 5-9 counts from altitude 60 all the way down, with a
+    BRIGHT BAND at 12-15 degrees and darkness below it again. Dark above and
+    dark below a bright band is a lamp sitting inside the obstruction — a
+    horizon would be bright above and dark below. The sweep's original verdict
+    of "blocked above 60" was right; the 10.0 degree reading a trend-insensitive
+    noise estimate produced was the lamp's lower edge.
+
+    Both detectors are asked, because the disagreement between them is what made
+    this ambiguous at the time.
+    """
+    from terminus.night import find_horizon
+    from terminus.sweep import find_edge
+
+    columns = {
+        340: [(60, 5.7), (50, 6.0), (45, 8.7), (40, 7.0), (35, 6.0), (30, 6.3), (25, 6.0),
+              (20, 7.7), (17.5, 11.0), (15, 50.7), (12.5, 53.3), (10, 27.7), (7.5, 8.0),
+              (5, 6.7), (2.5, 5.7), (0, 6.0)],
+        350: [(60, 4.7), (50, 5.0), (45, 5.0), (40, 7.0), (35, 6.0), (30, 6.0), (25, 7.0),
+              (20, 6.0), (17.5, 7.0), (15, 9.0), (12.5, 20.0), (10, 20.7), (7.5, 4.7),
+              (5, 5.0), (2.5, 5.0), (0, 5.0)],
+    }  # fmt: skip
+    sky_ref = 20.7  # the open sky measured that night
+
+    for az, prof in columns.items():
+        k, _step, snr = find_edge(prof, sky_ref)
+        assert k is None, f"az {az}: find_edge found an edge at {prof[k][0]} (snr {snr:.1f})"
+        alt, detail = find_horizon(prof, sky_ref=sky_ref)
+        assert alt is None, f"az {az}: night detector reported {alt} ({detail['reason']})"
+        assert "blocked" in detail["reason"], f"az {az}: {detail['reason']}"
