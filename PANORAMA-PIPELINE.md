@@ -14,12 +14,19 @@ is *not* recoverable, it says so.
 
 ## 1. The single most important fact
 
-**The source frames are not in the repo, and the files that look like them are the wrong ones.**
+**The source frames are not in git, and the files that look like them are the wrong ones.**
 
 | What you want | Where it is |
 |---|---|
-| **Mode A: 19 individual frames** — what the published fit used | `/mnt/d/Dropbox (Personal)/Camera Uploads/2026-08-03 15.33.22.jpg` … `15.34.36.jpg` (19 files) |
-| Mode B: stitched phone panoramas — a *different, worse* mode | `captures/panoramas/2026-08-03/14.1*.jpg` (staged in-repo) |
+| **Mode A: 19 individual frames** — what the published fit used | `captures/panoramas/2026-08-03-frames/` on this machine; originals at `/mnt/d/Dropbox (Personal)/Camera Uploads/2026-08-03 15.33.22.jpg` … `15.34.36.jpg` |
+| Mode B: stitched phone panoramas — a *different, worse* mode | `captures/panoramas/2026-08-03/14.1*.jpg` |
+
+"Not in git" is the precise claim: `captures/` is in `.gitignore`, so a fresh
+clone has none of this and a stranger must supply their own photographs. On the
+machine this was built on, the 19 Mode A frames are already staged at
+`captures/panoramas/2026-08-03-frames/`, and **that** is the directory to point
+`terminus mosaic` at. The Dropbox path is where they came from, not where to read
+them.
 
 `captures/panoramas/2026-08-03/` holds **five** files: four stitched panoramas and
 `14.12.15.jpg`, which is an **indoor workshop photo**, not a panorama at all (`terminus-4`
@@ -178,6 +185,13 @@ edges (`LESSONS.md` M-09).
 **A capped column is a bound, not a value.** Score one-sided. Clamping two-sided also clamps
 genuine measurements and manufactures a flattering residual.
 
+**Stages 5 and 6 have no CLI path.** `terminus orient` gets its fiducials by
+measuring them — live, or re-judged from a sweep's own `<mask>_profiles.json`
+with `--replay`. It cannot take them from a mask file that already holds solved
+columns, which is what these two stages do, so reproducing them today means
+calling `orient.from_mask` and `orient.fit` from Python as shown. This is the
+same point §2 makes generally, stated where it will actually bite.
+
 ### Stage 6 — solve the rotation
 
 ```python
@@ -285,7 +299,8 @@ at scope height; parallax against the near fence is the one error this does not 
 ## 6. What is not reproducible
 
 The original fiducial set and mosaic tiles lived only in a session scratchpad and are gone. The
-**inputs** all survive — 19 frames in Dropbox, telescope sweeps in `captures/2026-08-03-evening/` —
+**inputs** all survive — 19 frames staged at `captures/panoramas/2026-08-03-frames/`,
+telescope sweeps in `captures/2026-08-03-evening/` —
 so the pipeline is reproducible end to end, but you will be *recomputing* the published numbers,
 not verifying stored intermediates against them.
 
