@@ -204,6 +204,98 @@ class Pointer:
         if sep < self.cone:
             raise SunGuard(f"({az:.0f},{alt:.0f}) is {sep:.1f} deg from Sun (< {self.cone})")
 
+    # A leg longer than this in RA is split, so a goto cannot quietly take the
+    # short way round when the route deliberately goes the long way.
+    MAX_RA_LEG_H = 6.0
+
+    def routes(self, rd0, rd1):
+        """Every explicit route from rd0 to rd1, as (name, waypoints).
+
+        The old design handed the mount ONE goto and had no say in the route it
+        took, so it had to assume the worst of three shapes and refuse if any of
+        them grazed the Sun. That is why a tube parked in the west could not be
+        moved anywhere: hauling declination up at its own RA passed 18.7 degrees
+        from the Sun, and that hypothetical leg vetoed every target regardless of
+        where the target was.
+
+        Driving the route ourselves dissolves the problem. A leg that changes
+        ONLY declination, or ONLY right ascension, is unambiguous — there is no
+        other way for the mount to perform it — so a route built from such legs
+        is the route that actually happens.
+
+        Both directions round the RA circle are offered, because there are always
+        two and only one may be clear. The long way is split into legs under
+        MAX_RA_LEG_H so that no single goto can shortcut it back the short way.
+        """
+        ra0, dec0 = rd0
+        ra1, dec1 = rd1
+        short = wrap_ra(ra1 - ra0)
+        long_way = short - 24.0 if short > 0 else short + 24.0
+        out = []
+        for label, dra in (("short", short), ("long", long_way)):
+            n = max(1, int(math.ceil(abs(dra) / self.MAX_RA_LEG_H)))
+            # Wrapped, because these are COMMANDED to the mount. RA -3.795 is not
+            # a coordinate: the mount reports never arriving, the miss counter
+            # reads that as a broken mount, and the run is abandoned three
+            # columns later. Safe to wrap only because the legs are split — a
+            # step under MAX_RA_LEG_H has an unambiguous shortest direction, so
+            # wrapping cannot turn a deliberate long way back into the short one.
+            ra_steps = [(ra0 + dra * (i + 1) / n) % 24.0 for i in range(n)]
+            out.append((f"dec_first/{label}", [(ra0 % 24.0, dec1)] + [(r, dec1) for r in ra_steps]))
+            out.append(
+                (f"ra_first/{label}", [(r, dec0) for r in ra_steps] + [(ra_steps[-1], dec1)])
+            )
+        return out
+
+    def route_min_sep(self, rd0, waypoints, samples=PATH_SAMPLES):
+        """Smallest Sun separation along an explicit route. Sun read at call time."""
+        saz, salt = self.sky.sun()
+        if salt < SUN_SAFE_ALT:
+            return 180.0
+        worst = 180.0
+        a = rd0
+        for b in waypoints:
+            for i in range(samples + 1):
+                t = i / samples
+                ra = a[0] + (b[0] - a[0]) * t
+                dec = a[1] + (b[1] - a[1]) * t
+                az, alt = self.sky.radec_to_altaz(ra % 24.0, dec)
+                worst = min(worst, ang_sep(az, alt, saz, salt))
+            a = b
+        return worst
+
+    @staticmethod
+    def route_cost(rd0, waypoints):
+        """Total axis travel in degrees. Cheapest safe route wins.
+
+        Sum of both axes rather than the max: the legs are deliberately
+        single-axis, so the mount really does drive them one after another and
+        the time is the sum, not the larger.
+        """
+        cost = 0.0
+        a = rd0
+        for b in waypoints:
+            cost += abs(wrap_ra(b[0] - a[0])) * 15.0 + abs(b[1] - a[1])
+            a = b
+        return cost
+
+    def plan_route(self, rd0, rd1):
+        """Cheapest route that never approaches the Sun. None if there is none.
+
+        Plan every shape, discard the ones that come inside the cone, take the
+        shortest of what is left — rather than requiring that ALL shapes be safe,
+        which is a test no route has to pass once we are the one driving.
+        """
+        safe = [
+            (self.route_cost(rd0, wps), name, wps)
+            for name, wps in self.routes(rd0, rd1)
+            if self.route_min_sep(rd0, wps) >= self.cone
+        ]
+        if not safe:
+            return None
+        cost, name, wps = min(safe, key=lambda t: t[0])
+        return name, wps, cost
+
     def path_min_sep(self, rd0, rd1):
         """Smallest Sun separation (deg) over every plausible RA/Dec path from
         rd0 to rd1. Sun position is recomputed now, at call time."""
@@ -304,7 +396,34 @@ class Pointer:
         target = self.sky.altaz_to_radec(az, alt)
 
         if self.path_min_sep(cur, target) >= self.cone:
-            self._goto_wait(*target, SETTLE)  # whole path is clear
+            # Every shape is clear, so it does not matter which one the mount
+            # picks. One goto is the fastest thing available and it is safe
+            # however the mount chooses to get there.
+            self._goto_wait(*target, SETTLE)
+        elif (plan := self.plan_route(cur, target)) is not None:
+            # Some shape is unsafe, which used to end the attempt. It no longer
+            # has to: the reason the old code had to assume the worst shape is
+            # that it handed the mount one goto and had no say in the route. Here
+            # we DRIVE the route, and every leg changes one axis only — which the
+            # mount can perform in exactly one way.
+            name, waypoints, _cost = plan
+            log_name = name  # kept for the failure message below
+            for i, wp in enumerate(waypoints):
+                # Re-verify before every leg. A leg can run for minutes and the
+                # Sun moves; more to the point, the mount may not have landed
+                # where it was sent, so the remaining route is recomputed from
+                # where it ACTUALLY is rather than from where it was asked to go.
+                here = self.sc.equ_coord()
+                if here is None:
+                    raise SunGuard("lost the pointing mid-route; refusing to continue")
+                self._sun_check(*self.sky.radec_to_altaz(*here))
+                if self.route_min_sep(here, waypoints[i:]) < self.cone:
+                    raise SunGuard(
+                        f"the {log_name} route stopped being safe partway "
+                        f"(leg {i + 1} of {len(waypoints)}); the Sun has moved or the "
+                        "mount did not arrive. Nothing further was commanded."
+                    )
+                self._goto_wait(*wp, SETTLE if i == len(waypoints) - 1 else 0.3)
         else:
             # Route over the top: the Sun is never at high altitude from a
             # mid-latitude site, so a high waypoint clears it when a direct

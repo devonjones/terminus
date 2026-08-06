@@ -817,23 +817,27 @@ def test_floor_pinned_result_is_not_a_measurement():
 
 
 # ---- review round 1 regressions -------------------------------------------
-def test_second_leg_rechecks_the_sun_after_the_waypoint():
-    """A two-hop route must not fire its second leg on a stale clearance.
+def test_a_later_leg_rechecks_the_sun_instead_of_trusting_the_plan():
+    """A multi-leg route must not fire a later leg on a stale clearance.
 
-    GOTO_TIMEOUT is 90s and extends while the mount still reports motion, so the
-    first leg can run for minutes. The clearance was computed before it started;
-    by the time the second leg fires the Sun has moved. It must be recomputed
-    against where the mount actually landed.
+    GOTO_TIMEOUT is 90s and extends while the mount still reports motion, so one
+    leg can run for minutes. The clearance was computed before the route started;
+    by the time a later leg fires the Sun has moved. It must be recomputed
+    against where the mount ACTUALLY landed, not where it was sent.
+
+    Rewritten when routes became explicit. The check it guards is the same, and
+    matters more now: a planned route has more legs than the old two-hop
+    waypoint, so there are more moments at which the plan can go stale.
     """
     from unittest.mock import MagicMock, patch
+
+    import pytest
 
     from terminus.sweep import Pointer, Sky, SunGuard
 
     sky = Sky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.equ_coord.return_value = (12.0, 20.0)
-    # A real frame: scan_horizon short-circuits entirely in dry mode and never
-    # points, so the pointing path can only be exercised with dry=False.
     sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
     ptr = Pointer(sc, sky, 30, 5)
 
@@ -842,18 +846,66 @@ def test_second_leg_rechecks_the_sun_after_the_waypoint():
     def fake_goto(ra, dec, settle):
         legs.append((ra, dec))
 
-    # Direct path blocked -> route via a waypoint; both legs clear when planned;
-    # then the second leg is no longer clear once the waypoint is reached.
-    seps = iter([1.0, 90.0, 90.0, 1.0])
+    # Planning sees every candidate route as clear; then the first leg lands and
+    # the remaining route is no longer clear.
+    calls = {"n": 0}
+
+    def flaky_route_sep(self, rd0, waypoints, samples=None):
+        calls["n"] += 1
+        return 90.0 if calls["n"] <= 5 else 1.0
+
     with (
         patch.object(Pointer, "_goto_wait", side_effect=fake_goto),
         patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
         patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
-        patch.object(Pointer, "path_min_sep", lambda self, a, b: next(seps, 1.0)),
+        patch.object(Pointer, "path_min_sep", lambda self, a, b: 1.0),
+        patch.object(Pointer, "route_min_sep", flaky_route_sep),
     ):
         with pytest.raises(SunGuard, match="Sun has moved"):
-            ptr.point_to(200.0, 20.0)
-    assert len(legs) == 1, "the second leg must not fire once the path is no longer clear"
+            ptr.point_to(200.0, 30.0)
+
+    assert legs, "the route must have started before it was abandoned"
+    assert len(legs) < 4, f"it must stop as soon as the plan goes stale, drove {len(legs)}"
+
+
+def test_a_route_is_driven_leg_by_leg_not_handed_over_as_one_goto():
+    """The whole reason a blocked shape no longer blocks the target.
+
+    The old code gave the mount ONE goto and had no say in the route, so it had
+    to assume the worst of three shapes and refuse if any grazed the Sun. A tube
+    parked in the west could not be moved anywhere: hauling declination up at its
+    own RA passed 18.7 degrees from the Sun, and that hypothetical leg vetoed
+    every target regardless of where the target was.
+
+    Every leg of a planned route changes ONE axis, which the mount can perform in
+    exactly one way — so the route that was checked is the route that happens.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    ptr = Pointer(sc, sky, 30, 5)
+
+    legs = []
+    with (
+        patch.object(Pointer, "_goto_wait", side_effect=lambda ra, dec, s: legs.append((ra, dec))),
+        patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
+        patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
+        patch.object(Pointer, "path_min_sep", lambda self, a, b: 1.0),  # direct is blocked
+        patch.object(Pointer, "route_min_sep", lambda self, a, w, samples=None: 90.0),
+    ):
+        ptr.point_to(200.0, 30.0)
+
+    assert len(legs) >= 2, "a blocked direct path must be driven as an explicit route"
+    # Each leg moves one axis only, which is what makes the route unambiguous.
+    prev = (12.0, 20.0)
+    for ra, dec in legs:
+        moved = (abs(ra - prev[0]) > 1e-9, abs(dec - prev[1]) > 1e-9)
+        assert sum(moved) <= 1, f"leg {(ra, dec)} moves both axes, so its route is not determined"
+        prev = (ra, dec)
 
 
 def test_avoid_pole_nudges_azimuth_not_altitude():
@@ -5263,3 +5315,108 @@ def test_a_label_project_never_interpolates_a_class_that_does_not_exist(tmp_path
     assert f"m i{NEAREST}" in written, f"interpolation was left as poly3:\n{written}"
     assert 'n"labels/001.png"' in written, "the label image must replace the photograph"
     assert 'n"stage/frame2.jpg"' in written, "a frame with no label given is left alone"
+
+
+def test_both_ways_round_the_ra_circle_are_offered():
+    """There are always two, and only one may be clear.
+
+    `wrap_ra` gives the SHORT way, and the old check only ever considered that
+    one — so a slew whose short route grazes the Sun was refused outright, with
+    no way to express "go the other way round". Measured on 2026-08-05 the long
+    way was the worse of the two, which is exactly why it has to be evaluated
+    rather than assumed either way.
+
+    The long way is split into legs so a single goto cannot quietly shortcut it
+    back to the short way, which would silently drive the route that was
+    rejected.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, wrap_ra
+
+    sky = Sky(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    rd0, rd1 = (2.0, 10.0), (14.0, 40.0)
+
+    names = [name for name, _ in ptr.routes(rd0, rd1)]
+    assert any(n.endswith("/short") for n in names) and any(n.endswith("/long") for n in names)
+    assert len(names) == len(set(names)), "each route offered once"
+
+    for name, wps in ptr.routes(rd0, rd1):
+        assert wps[-1][0] % 24.0 == pytest.approx(rd1[0] % 24.0, abs=1e-9), f"{name} misses in RA"
+        assert wps[-1][1] == pytest.approx(rd1[1]), f"{name} misses in declination"
+        # No single leg may exceed the split, or a goto could take the short way.
+        prev = rd0
+        for wp in wps:
+            assert (
+                abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+            ), f"{name} has a leg a goto could shortcut"
+            prev = wp
+
+
+def test_the_cheapest_safe_route_wins_and_an_unsafe_one_is_never_chosen():
+    """Plan every shape, discard what grazes the Sun, take the shortest of the rest.
+
+    Requiring that ALL shapes be safe is a test no route has to pass once we are
+    the one driving. What must never happen is choosing a cheap route that is not
+    safe.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    rd0, rd1 = (2.0, 10.0), (8.0, 40.0)
+    all_routes = ptr.routes(rd0, rd1)
+
+    # Only the most expensive route is safe: it must still be the one chosen.
+    costs = {name: ptr.route_cost(rd0, wps) for name, wps in all_routes}
+    dearest = max(costs, key=costs.get)
+    ptr.route_min_sep = lambda a, w, samples=None, _d=dearest: (
+        90.0 if w == dict(all_routes)[_d] else 1.0
+    )
+    name, wps, cost = ptr.plan_route(rd0, rd1)
+    assert name == dearest, f"chose {name} over the only safe route {dearest}"
+
+    # Nothing safe at all is a refusal, not a fallback to the cheapest.
+    ptr.route_min_sep = lambda a, w, samples=None: 1.0
+    assert ptr.plan_route(rd0, rd1) is None
+
+
+def test_route_waypoints_are_coordinates_the_mount_can_accept():
+    """RA -3.795 was commanded to a real mount on 2026-08-05, three times.
+
+    `routes` built waypoints as `ra0 + dra * t` and never wrapped. The geometry
+    was fine — `route_min_sep` wraps before converting — so the SAFETY maths was
+    right and the value handed to the mount was not. It reported never arriving,
+    the miss counter read three of those as a broken mount, and abandoned a run
+    that had already solved its orientation.
+
+    Wrapping is safe only because the legs are split: a step under MAX_RA_LEG_H
+    has an unambiguous shortest direction, so wrapping cannot quietly turn a
+    deliberate long way round back into the short one. That is asserted here
+    too, because the two properties have to hold together or neither is worth
+    anything.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, wrap_ra
+
+    ptr = Pointer(MagicMock(), Sky(39.7917, -104.894, 1600), 30, 5, True)
+    starts = [(1.0, 20.0), (23.5, 10.0), (12.0, -30.0), (0.1, 5.0)]
+    targets = [(22.0, 40.0), (2.0, 60.0), (13.0, -5.0), (23.9, 0.0)]
+
+    for rd0 in starts:
+        for rd1 in targets:
+            for name, waypoints in ptr.routes(rd0, rd1):
+                prev = rd0
+                for ra, dec in waypoints:
+                    assert 0.0 <= ra < 24.0, f"{name}: RA {ra} is not a coordinate"
+                    assert -90.0 <= dec <= 90.0, f"{name}: Dec {dec} is not a coordinate"
+                    assert (
+                        abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+                    ), f"{name}: a leg long enough for a goto to shortcut"
+                    prev = (ra, dec)
+                assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
+                assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
