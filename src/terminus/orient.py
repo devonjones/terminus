@@ -107,6 +107,13 @@ class Fiducial:
         return f"Fiducial(az={self.az:.0f}, {kind}{self.alt:.1f}, ceiling={self.ceiling})"
 
 
+# How close to its ceiling a column must sit to count as censored by it. A tenth
+# of a degree is well inside the sweep's own altitude step, so this catches the
+# exact-equality case the writers actually produce without swallowing a genuine
+# measurement that merely landed high.
+CEILING_EPS = 0.1
+
+
 def from_mask(mask, ceiling=None):
     """Build fiducials from a mask dict ({az: {alt, type, bound?}}).
 
@@ -148,6 +155,16 @@ def from_mask(mask, ceiling=None):
             bool(entry.get("bound", False))
             or bool(entry.get("clipped", False))
             or typ.startswith("blocked")
+            # A COLUMN SITTING ON ITS CEILING IS A BOUND, whatever it is typed.
+            # The scope cannot tilt past its search ceiling, so "60.0" out of a
+            # 0-60 sweep does not mean the horizon is at 60 — it means the search
+            # ran out of sky (M-09). Masks written before the explicit `bound`
+            # field existed record these as ordinary edges, and the 2026-08-03
+            # evening sweeps still on disk have four of them: az 320, 330, 340
+            # and 350, all at exactly 60.0. Read as exact edges they claim a
+            # measurement nobody made, and the fit then scores them two-sided,
+            # so a photo horizon ABOVE 60 is penalised for being too high.
+            or (ceil is not None and alt >= ceil - CEILING_EPS)
         )
         out.append(Fiducial(az, alt, ceil, bound=bound))
     return out
@@ -224,6 +241,40 @@ def rotate(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
 def rotate_alt(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
     """Altitude after rotating the sphere. Exact, no small-angle assumption."""
     return rotate(az_deg, alt_deg, pitch, tilt_mag, tilt_dir)[1]
+
+
+def rotate_inverse(az_deg, alt_deg, pitch, tilt_mag, tilt_dir):
+    """The exact inverse of `rotate`: TRUE (az, alt) back to the photo's own.
+
+    Needed to draw the photograph rather than merely measure it. `rotate` carries
+    a photo direction to where it lands in the world, which answers "what is the
+    altitude at this fiducial"; rendering asks the opposite question — for this
+    pixel of sky, which pixel of the panorama shows it — and forward-mapping
+    instead leaves scatter holes that read as missing data when they are only
+    missing samples.
+
+    The rotation is rigid, so the inverse is the transpose and the pitch is
+    undone first, in the opposite order to `rotate` applying it last.
+    """
+    az = np.radians(np.asarray(az_deg, dtype=float))
+    alt = np.radians(np.asarray(alt_deg, dtype=float) + pitch)
+    w = np.stack([np.cos(alt) * np.cos(az), np.cos(alt) * np.sin(az), np.sin(alt)], axis=-1)
+    d = math.radians(tilt_dir)
+    x, y, z = -math.sin(d), math.cos(d), 0.0
+    th = math.radians(tilt_mag)
+    c, s = math.cos(th), math.sin(th)
+    R = np.array(
+        [
+            [c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+            [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
+            [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)],
+        ]
+    )
+    v = w @ R  # w @ R is R.T @ w, the transpose of what `rotate` applies
+    return (
+        np.degrees(np.arctan2(v[..., 1], v[..., 0])) % 360.0,
+        np.degrees(np.arcsin(np.clip(v[..., 2], -1.0, 1.0))),
+    )
 
 
 def native_column(sample, target_az, yaw, tilt_mag, tilt_dir, tol=1e-3, iters=8):
@@ -333,6 +384,90 @@ def objective(residuals, weights, sigmas, delta=4.0, robust=True):
     loss = _huber(z, delta) if robust else 0.5 * z**2
     w = np.asarray(weights, dtype=float)
     return float((w * loss).sum() / w.sum())
+
+
+PARAMS = 4  # yaw, pitch, and the two tilt components
+
+
+def effective_constraints(fids, sample, solution):
+    """How many fiducials actually constrain the fit.
+
+    Not the same as how many were measured, and the difference is what made two
+    runs look better determined than they were. A BOUND is scored one-sided: a
+    photo that already exceeds its ceiling confirms it for free and contributes
+    a residual of exactly zero, so it pins nothing. Counting it as a constraint
+    inflates the apparent redundancy of precisely the runs most likely to be
+    under-determined — the ones where columns failed to resolve and became
+    bounds.
+    """
+    r = residuals(
+        fids, sample, solution["yaw"], solution["pitch"],
+        solution["tilt_mag"], solution["tilt_dir"],
+    )  # fmt: skip
+    n = 0
+    for i, f in enumerate(fids):
+        if not math.isfinite(r[i]):
+            continue
+        if f.bound and abs(r[i]) < 1e-9:
+            continue  # satisfied for free; it is not holding anything down
+        n += 1
+    return n
+
+
+def yaw_uncertainty(fids, sample, solution, tol=None, span=60.0, step=1.0):
+    """Half-width of the yaw minimum, in degrees. None if it is not bounded.
+
+    THE NUMBER THAT WAS MISSING. Two runs on the same photo mask reported yaw
+    130.00 and 161.50, each with a small residual, and neither said anything
+    about how well the yaw was actually determined. Scanning the objective shows
+    why: the minimum is BROAD. On 2026-08-06 anything from 150 to 175 fitted
+    almost as well as the best, so a solved yaw of 161.50 was really "somewhere
+    around 160, give or take fifteen degrees" — and printed as if it were exact.
+
+    `tol` is how much worse than the best the fit may be and still count as
+    consistent. It defaults to the median sigma of the fiducials: the yaw is
+    pinned only as tightly as the columns it was measured from, and claiming
+    more precision than the measurements carry is the error this exists to
+    prevent.
+
+    PITCH AND TILT ARE RE-OPTIMISED AT EACH YAW, which is the whole point and
+    the thing an earlier version of this got wrong. Holding them fixed makes the
+    minimum look sharp — plus or minus one degree on data with no degrees of
+    freedom at all — because it measures how badly yaw alone breaks the fit
+    rather than how far yaw can move while the other parameters absorb it. The
+    parameters trade against each other; that trade IS the uncertainty.
+    """
+    if tol is None:
+        sig = [f.sigma for f in fids if f.sigma]
+        tol = float(np.median(sig)) if sig else 1.0
+    y0 = solution["yaw"]
+
+    def best_rms_at(y):
+        """Best achievable fit with the yaw pinned here."""
+        best = np.inf
+        for tm in np.arange(0.0, max(1e-9, solution["tilt_mag"] * 2 + 3.0), 3.0):
+            for td in np.arange(0.0, 360.0, 45.0) if tm else (0.0,):
+                photo = predict(fids, sample, y, float(tm), float(td))
+                for p in np.arange(solution["pitch"] - 12.0, solution["pitch"] + 12.1, 1.5):
+                    r = score(fids, photo, float(p))
+                    ok = np.isfinite(r)
+                    if ok.sum():
+                        best = min(best, float(np.sqrt((r[ok] ** 2).mean())))
+        return best
+
+    # Baseline is the FIT's own rms, not this coarse scan's value at the same
+    # yaw. The scan re-optimises on a deliberately cheap grid, so it can only do
+    # worse than the fit — and using its own optimistic-at-the-centre value as
+    # the reference made the interval look TIGHTER the coarser the scan got,
+    # which is exactly backwards. Anchoring on the real best means grid coarseness
+    # widens the interval, erring toward admitting uncertainty.
+    limit = float(solution["rms"]) + tol
+    half = 0.0
+    while half < span:
+        half += step
+        if best_rms_at(y0 - half) > limit and best_rms_at(y0 + half) > limit:
+            return half
+    return None  # still consistent `span` degrees away: not bounded at all
 
 
 def fit(

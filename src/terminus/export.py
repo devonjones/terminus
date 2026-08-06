@@ -272,7 +272,7 @@ def to_nina_hrz(rows, meta=None, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=F
         out.append(f"# vegetation columns raised {tree_buffer:g} deg (seasonal, gappy)")
     if meta:
         out.append(
-            f"# measured {meta.get('measured','?')} at {meta.get('lat','?')},{meta.get('lon','?')}"
+            f"# measured {meta.get('measured', '?')} at {meta.get('lat', '?')},{meta.get('lon', '?')}"
         )
     out += [f"{az} {alt:g}" for az, alt in pairs]
     return "\n".join(out) + "\n"

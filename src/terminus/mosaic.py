@@ -173,14 +173,6 @@ def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
     return sorted(glob.glob(out + "*.tif")), final
 
 
-# Panotools interpolator 6 is nearest neighbour. It is not a quality setting
-# here, it is a correctness one: a class index is a LABEL, not a magnitude, and
-# poly3 (the default, `m i0`) will happily produce 8.4 halfway between tree (4)
-# and building (1) — a class that does not exist. Everything downstream then
-# reads it as whatever ADE20K happens to number 8.
-NEAREST = 6
-
-
 def source_images(pto):
     """The image filenames a project references, in image-line order."""
     names = []
@@ -207,19 +199,40 @@ def remap_labels(pto, work_dir, label_for, prefix="label"):
     input the model expects — and then push the LABELS through the identical
     warp, so they land wherever their pixels landed.
 
+    NONA NEVER TOUCHES A CLASS ID. It is asked for COORDINATES (`-c`, which
+    writes `_x` and `_y` images naming the source pixel behind every output
+    pixel) and the ids are then looked up in the full-resolution label frame.
+    Anything else corrupts them, and it took three attempts to accept that:
+
+      * poly3 resampling averages two ids into a third, so class 2 beside class
+        4 becomes class 3. Setting the project's interpolator to nearest does
+        NOT prevent this — nona ignores the `m` line's `i` value entirely, and
+        `i0`, `i5` and `i6` produce byte-identical output. The guard that was
+        supposed to stop this had never once worked.
+      * the frames are 12 megapixels and the canvas is 2880 wide, so nearly
+        every output pixel straddles a class boundary. On the 2026-08-03 set
+        that was 75% of them, not some thin edge case.
+      * photometric correction applies exposure, white balance and a response
+        curve to whatever the file holds. Neutralising every coefficient is not
+        enough while the correction MODE is set, and even then the sRGB round
+        trip perturbs small integers.
+
+    A resampling kernel and an exposure curve are both arithmetic, and
+    arithmetic on an identifier is meaningless. Looking the id up by coordinate
+    is not a better approximation, it is an exact answer.
+
     `label_for` maps a source filename (as the project spells it) to a label
     image on disk. Returns the remapped layer paths.
     """
+    import numpy as np
+    from PIL import Image
+
     require_hugin()
     out_pto = os.path.join(work_dir, prefix + ".pto")
+    names = source_images(pto)
     with open(pto) as fh, open(out_pto, "w") as out:
         for line in fh:
-            if line.startswith("m "):
-                # Interpolation is set on the m line and defaults to poly3.
-                line = re.sub(r"\bi\d+", f"i{NEAREST}", line.rstrip("\n")) + "\n"
-                if f"i{NEAREST}" not in line:
-                    line = line.rstrip("\n") + f" i{NEAREST}\n"
-            elif line.startswith("i "):
+            if line.startswith("i "):
                 m = re.search(r'n"([^"]*)"', line)
                 if m and m.group(1) in label_for:
                     line = line.replace(m.group(0), f'n"{label_for[m.group(1)]}"')
@@ -227,8 +240,34 @@ def remap_labels(pto, work_dir, label_for, prefix="label"):
     stem = os.path.join(work_dir, prefix)
     for old in glob.glob(stem + "*.tif"):
         os.remove(old)
-    _run(["nona", "-m", "TIFF_m", "-o", stem, out_pto])
-    return sorted(glob.glob(stem + "*.tif"))
+    _run(["nona", "-c", "-m", "TIFF_m", "-o", stem, out_pto])
+
+    written = []
+    for index, name in enumerate(names):
+        layer = f"{stem}{index:04d}.tif"
+        xpath, ypath = f"{stem}{index:04d}_x.tif", f"{stem}{index:04d}_y.tif"
+        if not (os.path.exists(layer) and os.path.exists(xpath)):
+            continue  # nona placed no pixels for this frame
+        label_path = os.path.join(os.path.dirname(pto), label_for[name])
+        source = np.asarray(Image.open(label_path).convert("RGB"))[..., 0]
+        height, width = source.shape
+        xs = np.asarray(Image.open(xpath)).astype(np.int64)
+        ys = np.asarray(Image.open(ypath)).astype(np.int64)
+        with Image.open(layer) as im:
+            tags = im.tag_v2
+            alpha = np.asarray(im.convert("RGBA"))[..., 3] > 0
+            # Uncovered pixels carry a sentinel rather than a coordinate, so the
+            # bounds test is what separates "no source pixel" from "pixel 0,0".
+            ok = alpha & (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+            ids = np.zeros(xs.shape, np.uint8)
+            ids[ok] = source[ys[ok], xs[ok]]
+            rgba = np.dstack([ids, ids, ids, np.where(ok, 255, 0).astype(np.uint8)])
+            keep = {t: tags[t] for t in (282, 283, 286, 287) if t in tags}
+        Image.fromarray(rgba, "RGBA").save(layer, tiffinfo=keep)
+        os.remove(xpath)
+        os.remove(ypath)
+        written.append(layer)
+    return sorted(written)
 
 
 def combine_labels(layer_paths, width, height):

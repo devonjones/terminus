@@ -5,6 +5,7 @@
   terminus classify             capture at the current pointing, report sky/veg/structure
   terminus sweep                full horizon sweep -> mask YAML (+ review frames)
   terminus export MASK          write N.I.N.A. .hrz and Stellarium .txt from a mask
+  terminus polar MASK           one-page fisheye view of the horizon, layers toggleable
 
 Global: --config PATH (default ./config.toml). sweep: --az-start --az-end --out
 --frames --no-export --dry-run.
@@ -17,6 +18,7 @@ import os
 import sys
 import time
 
+from . import polar
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
 from .export import (
@@ -61,6 +63,49 @@ def _sky(sc, cfg):
     return Sky(loc[1], loc[0], site.get("elev_m", 0.0))  # scope gives (lon, lat)
 
 
+def _start_locked(sc, sw):
+    """Start the scenery view with exposure locked, in the order that works.
+
+    THE ORDER IS NOT THE OBVIOUS ONE and cost a run to find. The lock must be set
+    while the view is RUNNING: with the view stopped the scope accepts the call
+    and silently keeps auto-exposure, reporting the -999000 sentinel. The old
+    sequence locked first and started second, which worked every time it was
+    tried because some earlier command had left the stream up — and failed the
+    first time it ran from cold.
+
+    The stop before the start is still needed, and for a different reason: an
+    existing lock cannot be CHANGED in place. A second lock_exposure in the same
+    session keeps the first value, so the view has to be cycled to clear it.
+
+    Locking matters at all because with auto-exposure the camera renormalises
+    every frame toward mid-grey, which cancels the sky-versus-terrain difference
+    the whole measurement depends on.
+    """
+    sc.stop_view()
+    time.sleep(1)
+    sc.start_view("scenery")
+    time.sleep(3)
+    locked = sc.lock_exposure(exp_ms=sw.get("exp_ms"), gain=sw.get("gain"))
+    print(f"exposure locked: {locked}")
+
+
+def is_stowed(rd):
+    """Is the mount parked with its arm closed?
+
+    Devon: Dec -90 tells you it is stowed. The stow position IS the south
+    celestial pole, so this is readable from the pointing alone — no second call,
+    and true whatever the firmware chooses to report elsewhere.
+
+    Worth checking because the failure it causes is so misleading. A stowed mount
+    answers every query happily and simply never moves, so each goto waits out
+    GOTO_TIMEOUT and reports "did not arrive; mount may be closed, parked, or not
+    tracking". Three of those in a row trip MAX_POINTING_MISSES and abandon the
+    run. On 2026-08-05 that reading cost a session, and this morning it cost ten
+    minutes before the Dec was noticed.
+    """
+    return rd is not None and abs(abs(float(rd[1])) - 90.0) < 0.5
+
+
 def _pointer(sc, sky, sw, dry):
     """A Pointer with the mount's below-horizon floor applied.
 
@@ -90,6 +135,12 @@ def cmd_preflight(sc, cfg, args):
     if rd:
         az, alt = sky.radec_to_altaz(*rd)
         print(f"pointing: az {az:.1f} alt {alt:.1f}")
+        if is_stowed(rd):
+            print(
+                "  !! STOWED — the arm is closed and the mount will not slew. Every goto will\n"
+                "     report 'did not arrive' after waiting out its timeout, which reads like a\n"
+                "     broken mount and is not one. Open the arm in the Seestar app first."
+            )
     print(f"Sun: az {saz:.1f} alt {salt:.1f} (avoid within {cfg['sweep']['sun_cone_deg']} deg)")
     s = cfg["sweep"]
     blocked = [
@@ -335,14 +386,7 @@ def cmd_sweep(sc, cfg, args):
     out = args.out or "horizon_mask.yaml"
     frames = args.frames or (os.path.splitext(out)[0] + "_frames")
     if not args.dry_run:
-        sc.stop_view()
-        time.sleep(1)
-        # Lock exposure BEFORE the view starts: with auto-exposure the camera
-        # renormalises every frame and the sky/terrain difference disappears.
-        locked = sc.lock_exposure(exp_ms=cfg["sweep"].get("exp_ms"), gain=cfg["sweep"].get("gain"))
-        print(f"exposure locked: {locked}")
-        sc.start_view("scenery")
-        time.sleep(3)
+        _start_locked(sc, cfg["sweep"])
     # getattr, matching cmd_export: several tests build an args namespace by
     # hand, and a new flag should not break tests of unrelated behaviour.
     requested = getattr(args, "azimuths", None)
@@ -442,6 +486,98 @@ def cmd_sweep(sc, cfg, args):
         print(f"\nSWEEP ABANDONED: {aborted}", file=sys.stderr)
         print("the partial mask above was saved; re-run to cover the rest", file=sys.stderr)
         raise SystemExit(2)
+
+
+def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
+    """Write the fisheye page. Reads the mask; touches no hardware.
+
+    The photograph is OPTIONAL and the command degrades rather than refuses: a
+    scope-only sweep still gets a disc with its horizon on it, which is the same
+    bargain `landscape.py` strikes between its synthetic and photo modes. What it
+    will not do is draw an unoriented mask without being told to, because a
+    fisheye labelled N/E/S/W is a much stronger claim about north than a column
+    listing is, and it is the one people screenshot.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from . import orient as orient_mod
+    from . import polar
+    from .export import is_oriented, load_mask
+
+    meta, rows = load_mask(args.mask)
+    if not is_oriented(meta) and not args.allow_unoriented:
+        raise MaskError(
+            f"{args.mask} is not oriented: its azimuth is the panorama's own, not true north.\n"
+            "Run `terminus orient` first, or pass --allow-unoriented to draw it anyway "
+            "(the compass labels will be wrong)."
+        )
+    solution = polar.solution_from_meta(meta)
+
+    image = coverage = None
+    source = args.image or meta.get("source")
+    if source and os.path.exists(source):
+        Image.MAX_IMAGE_PIXELS = None
+        image = Image.open(source).convert("RGB")
+        cov_path = args.coverage
+        if cov_path is None:
+            # `terminus mosaic` writes <base>.png beside <base>.coverage.npy, so
+            # the sibling is a good guess and a missing one is not an error —
+            # it only costs the "not photographed" layer.
+            guess = os.path.splitext(source)[0] + ".coverage.npy"
+            cov_path = guess if os.path.exists(guess) else None
+        if cov_path:
+            coverage = np.load(cov_path)
+        else:
+            coverage = np.ones(np.asarray(image).shape[:2])
+            print("no coverage array: every pixel will be treated as photographed", file=sys.stderr)
+    elif source:
+        print(f"panorama {source} not found; drawing the horizon without it", file=sys.stderr)
+
+    fiducials = ()
+    if args.fiducials:
+        fid_meta, _ = load_mask(args.fiducials)
+        doc = _mask_entries(args.fiducials)
+        ceiling = args.ceiling
+        if ceiling is None:
+            search = fid_meta.get("alt_search") or []
+            ceiling = float(search[1]) if len(search) > 1 else None
+        fiducials = orient_mod.from_mask(doc, ceiling=ceiling)
+        n_bound = sum(1 for f in fiducials if f.bound)
+        print(f"{len(fiducials)} fiducials from {args.fiducials} ({n_bound} at the ceiling)")
+
+    out = args.out or os.path.splitext(args.mask)[0] + "_polar.html"
+    _write_or_explain(
+        out,
+        lambda: polar.write_page(
+            out,
+            rows,
+            solution,
+            image=image,
+            coverage=coverage,
+            fiducials=fiducials,
+            meta=meta,
+            size=args.size,
+            floor=args.floor,
+            title=args.title or f"terminus horizon — {os.path.basename(args.mask)}",
+        ),  # fmt: skip
+    )
+    print(f"wrote {out} ({os.path.getsize(out) // 1024} KB, self-contained)")
+
+
+def _mask_entries(path):
+    """The raw `horizon:` block of a mask, as `from_mask` wants it.
+
+    `load_mask` returns rows for drawing; the fit needs the per-column dict with
+    its `type` and `bound` fields intact, and re-reading is cheaper than widening
+    a return type every caller already unpacks.
+    """
+    import yaml
+
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    block = doc.get("horizon") or doc.get("mask") or {}
+    return {int(az): entry for az, entry in block.items()}
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
@@ -550,7 +686,17 @@ def _texture(args):
 
 
 def cmd_orient(sc, cfg, args):
-    _orient(sc, cfg, args)
+    try:
+        _orient(sc, cfg, args)
+    finally:
+        # However the run ended. A failure that leaves the instrument streaming
+        # is its own small fault, and last night's timeout did exactly that —
+        # stop_view had to be issued by hand afterwards.
+        if not args.dry_run and sc is not None:
+            try:
+                sc.stop_view()
+            except Exception as e:  # noqa: BLE001 - cleanup must not mask the real error
+                print(f"warning: could not stop the view ({e})", file=sys.stderr)
 
 
 def _write_or_explain(path, write):
@@ -609,12 +755,27 @@ def _orient(sc, cfg, args):
             "one that says it is not oriented."
         )
     settled = not any(s.note == "did not settle" for s in steps)
+    from .orient import yaw_uncertainty
+
+    # How well the yaw is actually pinned, with pitch and tilt free to absorb it.
+    # Reporting the value alone is what let two runs look like they disagreed by
+    # 30 degrees when both were really saying "somewhere around here, give or
+    # take fifteen".
+    fids = [s.fiducial for s in steps if s.fiducial is not None]
+    half = yaw_uncertainty(fids, guide.photo_sample(rows), solution, step=2.0)
+    spread = f"+/- {half:.0f} deg" if half else "NOT BOUNDED within 60 deg"
     print(
-        f"\nyaw {solution['yaw']:.2f}  pitch {solution['pitch']:.2f}  "
+        f"\nyaw {solution['yaw']:.2f} ({spread})  pitch {solution['pitch']:.2f}  "
         f"tilt {solution['tilt_mag']:.2f} toward {solution['tilt_dir']:.1f}  "
         f"rms {solution['rms']:.2f} over {solution['n']} columns "
-        f"({solution['n_bound']} of them bounds)"
+        f"({solution['n_bound']} of them bounds, {solution.get('dof', 0):+d} degrees of freedom)"
     )
+    if half is None or half > 5.0:
+        print(
+            "   the yaw is not well determined. More columns, spread widely and chosen\n"
+            "   where the horizon is steep, is what narrows it — see the residuals below.",
+            file=sys.stderr,
+        )
     worst = sorted(solution["residuals"].items(), key=lambda kv: -abs(kv[1]))[:3]
     if worst:
         print("largest residuals: " + ", ".join(f"az {a:g} {r:+.1f}" for a, r in worst))
@@ -710,10 +871,26 @@ def _scope_measure(sc, cfg, args):
     """
     if not sc.is_eq_mode() and not args.dry_run:
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
+    if not args.dry_run and is_stowed(sc.equ_coord()):
+        raise SeestarError(
+            "the mount is stowed (Dec -90) and will not slew. Every column would wait out "
+            "its goto timeout and report 'did not arrive', which reads like a broken mount. "
+            "Open the arm in the Seestar app and try again."
+        )
     sky = _sky(sc, cfg)
     sw = cfg["sweep"]
     ptr = _pointer(sc, sky, sw, args.dry_run)
     state = {"sky_ref": None, "misses": 0, "profiles": {}}
+
+    # START THE VIEW. `orient` never did, and got away with it because a sweep
+    # run earlier in the same session had left the scenery stream up — so it
+    # worked every time it was tested and failed the first time it ran on its
+    # own, with "Connection refused" on the RTSP port and nothing to say why.
+    # Locked before the view starts, for the same reason as in `cmd_sweep`: with
+    # auto-exposure the camera renormalises every frame and the sky/terrain
+    # difference this depends on disappears.
+    if not args.dry_run:
+        _start_locked(sc, sw)
     # A column costs about two and a half minutes of clear sky. Keeping nothing
     # from it meant every column orient measured was spent and gone — and it
     # defeated --replay, the feature this loop was built around, since replay
@@ -838,9 +1015,7 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
     # one with zero control points — that is how a garage umbrella ended up in
     # the sky and was blamed on the classifier.
     for name in sorted(dropped):
-        print(
-            f"  dropped {name}: {counts.get(name, 0)} control points " f"(need {args.min_points})"
-        )
+        print(f"  dropped {name}: {counts.get(name, 0)} control points (need {args.min_points})")
     if not kept:
         raise mosaic.MosaicError("no frame could be constrained; nothing to render")
 
@@ -953,7 +1128,35 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
                 "it must come from the same mosaic run"
             )
 
-    sky, backend = skymask.sky_mask(image, backend=args.backend, report=True)
+    seg = None
+    if args.classes:
+        seg = np.load(args.classes)
+        if seg.shape != (h, w):
+            raise SeestarError(
+                f"classes {seg.shape} do not match the image {(h, w)}; they must come "
+                "from the same mosaic run"
+            )
+
+    if seg is not None:
+        # THE ALTITUDES COME FROM THE FRAMES TOO, not just the obstruction type.
+        # For a long time only the type did, and the two were indistinguishable
+        # from outside: a mask written before the per-frame labels existed and
+        # one written after had byte-identical altitudes and differed only in
+        # `type`. D-01 chose individual photographs over a stitched panorama on
+        # mechanism — a 358-degree panorama has no meaningful focal length, and
+        # SegFormer reads photographs — and that reasoning is about where the
+        # HORIZON comes from, not merely what it is made of.
+        sky = seg == skymask.SKY_CLASS_ADE20K
+        backend = "segment (per frame)"
+        # UNLABELLED IS NOT GROUND. `horizon_rows` takes anything that is not
+        # positively sky as terrain, so leaving -1 in would turn "no frame voted
+        # here" into a solid obstruction — a plausible wrong number where the
+        # honest answer is a gap (M-19). Dropping it from `valid` removes those
+        # pixels from the column instead.
+        labelled = seg >= 0
+        valid = labelled if valid is None else (valid & labelled)
+    else:
+        sky, backend = skymask.sky_mask(image, backend=args.backend, report=True)
     # `backend` is now what RAN, not what was asked for. Everything below keys
     # off it — the printed line, the segmentation-only type pass, and the mask
     # meta — so a silent fallback cannot be recorded as a segment run.
@@ -963,16 +1166,8 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
 
     classes = np.full(w, -1, dtype=int)
     print(f"backend used: {backend}")
-    if args.classes:
-        # Labels computed on the FRAMES and warped here, which is the right way
-        # round; see cli._segment_frames.
-        seg = np.load(args.classes)
-        if seg.shape != (h, w):
-            raise SeestarError(
-                f"classes {seg.shape} do not match the image {(h, w)}; they must come "
-                "from the same mosaic run"
-            )
-        print(f"obstruction types from {args.classes} (segmented per frame)")
+    if seg is not None:
+        print(f"horizon and types from {args.classes} (segmented per frame)")
         classes = skymask.obstruction_classes(seg, band["top"], valid=valid)
     elif backend == "segment":
         classes = skymask.obstruction_classes(
@@ -1033,7 +1228,7 @@ NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
 # never looks at cfg. Demanding config.toml for it meant a machine with no
 # telescope could not re-export its own mask — and it was CI, which has no
 # config.toml, that surfaced this rather than any local run.
-OFFLINE = {"mosaic", "skymask", "export"}
+OFFLINE = {"mosaic", "skymask", "export", "polar"}
 
 
 def _is_offline(args):
@@ -1076,8 +1271,7 @@ def main(argv=None):
     sw.add_argument(
         "--azimuths",
         default=None,
-        help="comma list of azimuths to measure instead of a range; "
-        "merges into --out if it exists",
+        help="comma list of azimuths to measure instead of a range; merges into --out if it exists",
     )
     sw.add_argument("--no-export", action="store_true")
     sw.add_argument(
@@ -1145,6 +1339,40 @@ def main(argv=None):
         help="export a mask whose azimuth is not yet true north",
     )
 
+    po = sub.add_parser("polar", help="write a one-page fisheye view of the horizon")
+    po.add_argument("mask", help="an ORIENTED mask; its meta carries the solved rotation")
+    po.add_argument("--out", default=None, help="output .html (default: <mask>_polar.html)")
+    po.add_argument(
+        "--image",
+        default=None,
+        help="equirectangular panorama to reproject (default: the mask's own meta.source)",
+    )
+    po.add_argument("--coverage", default=None, help="the mosaic's .coverage.npy")
+    po.add_argument(
+        "--fiducials",
+        default=None,
+        help="a telescope mask to draw as measured columns over the photograph",
+    )
+    po.add_argument(
+        "--ceiling",
+        type=float,
+        default=None,
+        help="the fiducial sweep's altitude ceiling; columns reaching it are drawn as bounds",
+    )
+    po.add_argument(
+        "--floor",
+        type=float,
+        default=polar.FLOOR_DEG,
+        help="how far below the horizon the disc reaches (default %(default)s)",
+    )
+    po.add_argument("--size", type=int, default=polar.SIZE, help="pixels across the disc")
+    po.add_argument("--title", default=None)
+    po.add_argument(
+        "--allow-unoriented",
+        action="store_true",
+        help="draw a mask whose azimuth is not yet true north",
+    )
+
     mo = sub.add_parser("mosaic", help="register photographs into an equirectangular panorama")
     mo.add_argument("image_dir")
     mo.add_argument("--work", default=None, help="scratch dir (default: <image_dir>_mosaic)")
@@ -1197,6 +1425,7 @@ def main(argv=None):
         "classify": cmd_classify,
         "sweep": cmd_sweep,
         "export": cmd_export,
+        "polar": cmd_polar,
         "mosaic": cmd_mosaic,
         "skymask": cmd_skymask,
         "orient": cmd_orient,

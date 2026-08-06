@@ -2076,9 +2076,9 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     plain = tmp_path / "scope.yaml"
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
-    assert not any(
-        "clipped" in ln or "gap_fraction" in ln for ln in head
-    ), "a scope mask must not explain fields it does not carry"
+    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head), (
+        "a scope mask must not explain fields it does not carry"
+    )
     assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
     # The count is still asserted. Dropping it for substring checks alone lost
     # the ability to catch unrelated header bloat, which is what this test was
@@ -3471,9 +3471,9 @@ def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
     assert cols, "the fixture must produce columns for this to mean anything"
     for az, col in cols.items():
         assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
-        assert (
-            col.get("type_source") is None
-        ), f"az {az}: no type was measured, so no source may be claimed"
+        assert col.get("type_source") is None, (
+            f"az {az}: no type was measured, so no source may be claimed"
+        )
 
 
 def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
@@ -3525,8 +3525,11 @@ def test_a_night_re_measure_does_not_throw_away_the_photo_s_type(tmp_path):
         str(out),
         {
             90: {
-                "alt": 20.0, "type": "tree", "type_source": "photo",
-                "gap_fraction": 0.4, "uncertainty": 4.2,
+                "alt": 20.0,
+                "type": "tree",
+                "type_source": "photo",
+                "gap_fraction": 0.4,
+                "uncertainty": 4.2,
             },
             180: {"alt": 5.0, "type": "structure", "type_source": "photo"},
         },  # fmt: skip
@@ -3599,8 +3602,12 @@ def test_a_real_crossing_clears_the_photo_s_lower_bound_flag(tmp_path):
         str(out),
         {
             90: {
-                "alt": 60.0, "type": "tree", "type_source": "photo",
-                "clipped": True, "gap_fraction": 0.4, "uncertainty": 4.2,
+                "alt": 60.0,
+                "type": "tree",
+                "type_source": "photo",
+                "clipped": True,
+                "gap_fraction": 0.4,
+                "uncertainty": 4.2,
             }
         },  # fmt: skip
         [],
@@ -4775,9 +4782,9 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
         reasons[power] = detail["reason"]
     assert "open" in reasons[0.5], f"shallow dimming reads as open, got {reasons[0.5]!r}"
     for power in (1.5, 3.0):
-        assert (
-            "no usable sky model" in reasons[power]
-        ), f"steep dimming must refuse outright, got {reasons[power]!r}"
+        assert "no usable sky model" in reasons[power], (
+            f"steep dimming must refuse outright, got {reasons[power]!r}"
+        )
 
 
 def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
@@ -4822,9 +4829,9 @@ def test_a_steeply_graded_column_is_not_mistaken_for_a_glint():
     # The model must pass through the TOP of the column. A positive slope alone
     # is not enough to prove that — the median screen also produced one, fitted
     # to the tail — so this checks where the line actually sits.
-    assert (
-        abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0
-    ), "the fit must pass near the topmost sample, not the flat tail beneath it"
+    assert abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0, (
+        "the fit must pass near the topmost sample, not the flat tail beneath it"
+    )
     assert n_top >= 4
 
 
@@ -4846,8 +4853,7 @@ def test_one_glint_at_the_top_does_not_discard_the_whole_column():
         glinted = [(prof[0][0], prof[0][1] * factor)] + prof[1:]
         alt, detail = find_horizon(glinted)
         assert alt == clean, (
-            f"a {factor}x glint in the top sample changed the answer to {alt} "
-            f"({detail['reason']})"
+            f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
         )
 
 
@@ -5135,8 +5141,7 @@ def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
     stopped = sweep(closes_after_three)
     full = sweep(None)
     assert len(stopped) < len(full), (
-        f"the deadline must shorten the run: {len(stopped)} measured with it, "
-        f"{len(full)} without"
+        f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
     )
     assert len(stopped) > 0, "and what was measured before it closed is kept"
     # A sweep that stops is not a sweep that failed.
@@ -5191,9 +5196,9 @@ def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
     sky = FixedSky()
     for az in range(0, 360, 5):
         closest = min(ang_sep(az, alt / 2.0, 271.0, 25.5) for alt in range(0, 121))
-        assert column_touches_sun(sky, az, 0, 60, 30) == (
-            closest < 30
-        ), f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
+        assert column_touches_sun(sky, az, 0, 60, 30) == (closest < 30), (
+            f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
+        )
 
     # The two that were wrong, named so a regression is unmistakable.
     assert column_touches_sun(sky, 250, 0, 60, 30), "az 250 passes 19.1 deg from the Sun"
@@ -5303,31 +5308,144 @@ def test_labels_are_voted_not_last_wins_and_never_invented_where_no_frame_looked
     assert (out[:, 8:] == -1).all(), "no frame looked here, so there is no class"
 
 
-def test_a_label_project_never_interpolates_a_class_that_does_not_exist(tmp_path):
-    """`m i0` is poly3, and on a LABEL image cubic interpolation is nonsense.
+def test_a_label_project_asks_nona_for_coordinates_not_for_pixels(tmp_path):
+    """A class id must never pass through nona's pixel pipeline.
 
-    Halfway between tree (4) and building (1) it computes 8.4, and ADE20K class 8
-    is a bed — a class neither frame contained. Labels must be remapped nearest
-    neighbour, which is set on the project's `m` line, not by a nona flag.
+    THIS TEST USED TO ASSERT THE WRONG THING. It checked that the project's `m`
+    line said `i6` — nearest neighbour — on the theory that poly3 would average
+    tree (4) and building (1) into a class neither frame contained. The reasoning
+    was right and the mechanism was not: **nona ignores the `m` line's
+    interpolator entirely**, and `i0`, `i5` and `i6` produce byte-identical
+    output. The guard had never once worked, and this test reported that it had,
+    which is E-02 — a test pinning a bug instead of catching it. On the real
+    2026-08-03 set, 75% of one frame's pixels came back holding a class that was
+    never in the source.
+
+    So the property to assert is the one that now makes it exact: nona is asked
+    for COORDINATES (`-c`), and the ids are looked up afterwards in the
+    full-resolution label frame.
     """
-    from terminus.mosaic import NEAREST, remap_labels
+    import subprocess
+    from unittest.mock import patch
+
+    from terminus.mosaic import remap_labels
 
     project = tmp_path / "final.pto"
     project.write_text(
-        'p f2 w2880 h1440 v360 n"TIFF_m"\n'
+        'p f2 w2880 h1440 v360 E14.08 n"TIFF_m"\n'
         "m i0\n"
-        'i w3000 h4000 f0 n"stage/frame1.jpg"\n'
-        'i w3000 h4000 f0 n"stage/frame2.jpg"\n'
+        'i w3000 h4000 f0 Eev15.0 n"stage/frame1.jpg"\n'
+        'i w3000 h4000 f0 Eev13.1 n"stage/frame2.jpg"\n'
     )
-    try:
-        remap_labels(str(project), str(tmp_path), {"stage/frame1.jpg": "labels/001.png"})
-    except Exception:
-        pass  # nona will fail on files that do not exist; the rewrite is the point
+    seen = []
+
+    def fake_run(cmd, *a, **kw):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch("terminus.mosaic._run", side_effect=fake_run):
+        layers = remap_labels(str(project), str(tmp_path), {"stage/frame1.jpg": "labels/001.png"})
+
+    assert seen, "nona was never invoked"
+    assert "-c" in seen[0], f"nona must be asked for coordinate images:\n{seen[0]}"
+    assert layers == [], "no coordinate images on disk means no layers, not a crash"
 
     written = (tmp_path / "label.pto").read_text()
-    assert f"m i{NEAREST}" in written, f"interpolation was left as poly3:\n{written}"
     assert 'n"labels/001.png"' in written, "the label image must replace the photograph"
     assert 'n"stage/frame2.jpg"' in written, "a frame with no label given is left alone"
+    assert "w3000 h4000" in written, "geometry must be copied through untouched"
+
+
+def test_the_inverse_rotation_undoes_the_forward_one():
+    """`polar.project` draws the photograph by asking the inverse question.
+
+    Forward-mapping — carry each panorama pixel to where it lands — leaves
+    scatter holes that look exactly like missing data, and missing data is a real
+    and separately meaningful thing in these renders. So the disc is inverse
+    mapped, and the inverse has to actually be one.
+    """
+    import numpy as np
+
+    from terminus.orient import rotate, rotate_inverse
+
+    pitch, tilt_mag, tilt_dir = 4.5, 7.0, 210.0
+    az = np.array([0.0, 37.0, 129.0, 251.0, 359.0])
+    alt = np.array([-15.0, 0.0, 22.0, 61.0, 84.0])
+
+    out_az, out_alt = rotate(az, alt, pitch, tilt_mag, tilt_dir)
+    back_az, back_alt = rotate_inverse(out_az, out_alt, pitch, tilt_mag, tilt_dir)
+
+    # Compare azimuth on the circle: 359.9 and 0.1 are two tenths apart.
+    delta = (back_az - az + 180.0) % 360.0 - 180.0
+    assert np.allclose(delta, 0.0, atol=1e-9), f"azimuth did not come back: {delta}"
+    assert np.allclose(back_alt, alt, atol=1e-9), f"altitude did not come back: {back_alt - alt}"
+
+
+def test_the_polar_page_is_self_contained_and_layered(tmp_path):
+    """One file, no network, and the claims separable from each other.
+
+    The page is the artifact a person actually looks at and forwards, so it may
+    not depend on a CDN, a font host, or a sibling image that will not travel
+    with it. And the horizon, the telescope's own columns and the unphotographed
+    region are three different claims about the same sky: "does the yellow line
+    follow the roofline" cannot be answered while the yellow line covers it.
+    """
+    import re
+
+    from terminus import polar
+    from terminus.orient import Fiducial
+
+    rows = [(float(az), 20.0 + 5.0 * (az % 3), "structure") for az in range(0, 360, 10)]
+    solution = {"yaw": 130.0, "pitch": 2.0, "tilt_mag": 3.0, "tilt_dir": 180.0}
+    fids = [Fiducial(10.0, 30.0, 60.0), Fiducial(200.0, 60.0, 60.0, bound=True)]
+
+    html = polar.page(rows, solution, fiducials=fids, meta={"yaw": 130.0, "fit_rms": 0.8})
+
+    external = [
+        m
+        for m in re.findall(r'(?:src|href)="([^"]+)"', html)
+        if not m.startswith("data:") and not m.startswith("#")
+    ]
+    assert not external, f"the page reaches outside itself: {external}"
+
+    for layer in ("gap", "grid", "hz", "pts"):
+        assert f'data-layer="{layer}"' in html, f"missing the {layer} layer"
+        assert f'data-t="{layer}"' in html, f"missing the {layer} toggle"
+
+    # A bound is not a measurement, and must not be drawn as one.
+    assert html.count('class="edg"') == 1, "the ordinary column should be a circle"
+    assert 'class="bnd"' in html, "the ceiling-limited column needs its own marker"
+
+    path = polar.write_page(str(tmp_path / "p.html"), rows, solution)
+    assert os.path.getsize(path) > 0
+
+
+def test_a_column_at_its_ceiling_is_a_bound_however_it_is_typed():
+    """M-09, applied to the masks that are actually on disk.
+
+    A sweep with a 60 degree ceiling cannot report a horizon above 60, so a
+    column reading exactly 60.0 means the search ran out of sky — not that the
+    horizon is at 60. The 2026-08-03 evening masks predate the explicit `bound`
+    field and record four such columns as ordinary edges; read that way the fit
+    scores them TWO-sided, so a photo horizon genuinely above the ceiling is
+    penalised for being too high.
+    """
+    from terminus.orient import from_mask
+
+    mask = {
+        10: {"alt": 60.0, "type": "structure"},  # sitting on the ceiling
+        20: {"alt": 59.5, "type": "structure"},  # close, but a real measurement
+        30: {"alt": 12.0, "type": "tree"},
+    }
+    fids = {int(f.az): f for f in from_mask(mask, ceiling=60.0)}
+
+    assert fids[10].bound, "a column at the ceiling is a bound, whatever its type says"
+    assert not fids[20].bound, "half a degree of headroom is still a measurement"
+    assert not fids[30].bound
+
+    # Without a ceiling there is nothing to compare against and nothing to infer.
+    loose = {int(f.az): f for f in from_mask(mask)}
+    assert not loose[10].bound, "no ceiling given, no inference possible"
 
 
 def test_both_ways_round_the_ra_circle_are_offered():
@@ -5361,9 +5479,9 @@ def test_both_ways_round_the_ra_circle_are_offered():
         # No single leg may exceed the split, or a goto could take the short way.
         prev = rd0
         for wp in wps:
-            assert (
-                abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
-            ), f"{name} has a leg a goto could shortcut"
+            assert abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
+                f"{name} has a leg a goto could shortcut"
+            )
             prev = wp
 
 
@@ -5427,9 +5545,9 @@ def test_route_waypoints_are_coordinates_the_mount_can_accept():
                 for ra, dec in waypoints:
                     assert 0.0 <= ra < 24.0, f"{name}: RA {ra} is not a coordinate"
                     assert -90.0 <= dec <= 90.0, f"{name}: Dec {dec} is not a coordinate"
-                    assert (
-                        abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
-                    ), f"{name}: a leg long enough for a goto to shortcut"
+                    assert abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
+                        f"{name}: a leg long enough for a goto to shortcut"
+                    )
                     prev = (ra, dec)
                 assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
                 assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
@@ -5475,9 +5593,9 @@ def test_one_false_bound_cannot_capture_the_fit():
         good + [false_bound], sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0
     )
     swing = abs(((poisoned["yaw"] - clean["yaw"] + 180) % 360) - 180)
-    assert (
-        swing < 15.0
-    ), f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
+    assert swing < 15.0, (
+        f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
+    )
 
 
 def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
@@ -5656,9 +5774,9 @@ def test_a_tube_inside_the_cone_can_still_be_moved_out():
 
     assert legs, "it must move rather than refuse"
     final = sky.radec_to_altaz(*landed["rd"])
-    assert (
-        ang_sep(*final, 270.0, 20.0) >= 30.0
-    ), f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
+    assert ang_sep(*final, 270.0, 20.0) >= 30.0, (
+        f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
+    )
 
 
 def test_the_way_out_is_a_turn_not_a_descent():
@@ -5696,9 +5814,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
                 here = ang_sep(az, alt, 270.0, sun_alt)
                 cw = ang_sep((az + step) % 360, alt, 270.0, sun_alt)
                 ccw = ang_sep((az - step) % 360, alt, 270.0, sun_alt)
-                assert (
-                    max(cw, ccw) > here or here > 60.0
-                ), f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
+                assert max(cw, ccw) > here or here > 60.0, (
+                    f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
+                )
 
                 target = ptr.escape_target(az, alt)
                 assert ang_sep(*target, 270.0, sun_alt) >= ptr.cone + ptr.ESCAPE_MARGIN_DEG - 1e-9
@@ -5707,9 +5825,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
 
         assert trapped, f"Sun at {sun_alt}: the probe found nothing trapped"
         if sun_alt <= 40.0:
-            assert (
-                turned == trapped
-            ), f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
+            assert turned == trapped, (
+                f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
+            )
         else:
             # A high summer Sun leaves near-zenith pointings where azimuth barely
             # moves the tube. Those fall back to the descent, which is what the
@@ -5818,9 +5936,9 @@ def test_a_tied_turn_goes_against_the_sun_s_own_drift():
         ptr = Pointer(MagicMock(), sky, 30, 5, True)
         assert (ptr.sun_drift() > 0) == (rate > 0), "the drift must be measured, not guessed"
         # A tube directly above the Sun: both turns are identical by symmetry.
-        assert (
-            ptr.escape_turn(270.0, 25.0) == expected
-        ), f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
+        assert ptr.escape_turn(270.0, 25.0) == expected, (
+            f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
+        )
 
     # And a test double with no clock still gets an answer, from the hemisphere.
     class Frozen(Sky):
@@ -5832,3 +5950,64 @@ def test_a_tied_turn_goes_against_the_sun_s_own_drift():
     assert north.sun_drift() > 0 and south.sun_drift() < 0
     assert north.escape_turn(270.0, 25.0) == -1.0
     assert south.escape_turn(270.0, 25.0) == 1.0
+
+
+def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_forever():
+    """Measured 2026-08-06: one goto spent 288 seconds not arriving.
+
+    The deadline extended whenever the mount reported MOTION, so a mount that
+    moves without converging renewed it indefinitely. The failing gotos reached
+    the right declination exactly and never the right RA — so they were moving
+    the whole time, and the run spent minutes per column discovering nothing.
+
+    Progress is the right test, not motion. It also distinguishes two faults that
+    read identically today: a stowed mount that never moves, and a reachable-
+    looking target the mount will not converge on.
+    """
+    import time
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import NO_PROGRESS_S, Pointer, PointingError, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.goto.return_value = None
+    # Dec arrives; RA never does — exactly what the mount did.
+    sc.equ_coord.return_value = (4.551, 60.43)
+    sc.call.return_value = {"result": {"mount": {"move_type": "ScopeGoto"}}}
+    ptr = Pointer(sc, sky, 30, 5)
+
+    started = time.time()
+    with pytest.raises(PointingError) as exc:
+        ptr._goto_wait(8.604, 60.43, 0.1)
+    elapsed = time.time() - started
+
+    assert elapsed < NO_PROGRESS_S + 15, (
+        f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+    )
+    assert "stopped improving" in str(exc.value), (
+        "it must say the mount moved but would not converge, not that it never moved"
+    )
+
+
+def test_a_mount_that_never_moves_is_reported_differently():
+    """The other fault, which used to produce the same message.
+
+    A stowed mount answers every query and never moves. Saying so plainly is the
+    difference between opening the arm and hunting for a pointing bug.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import Pointer, PointingError, Sky
+
+    sc = MagicMock()
+    sc.equ_coord.return_value = (5.759, -90.0)  # parked at the pole, stowed
+    sc.call.return_value = {"result": {"mount": {"move_type": "none"}}}
+    ptr = Pointer(sc, Sky(39.7917, -104.894, 1600), 30, 5)
+
+    with pytest.raises(PointingError, match="never moved toward it at all"):
+        ptr._goto_wait(8.604, 60.43, 0.1)

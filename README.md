@@ -255,6 +255,37 @@ whole loop later with no telescope and no sky.
 terminus export oriented.yaml --skysafari --landscape --pvsyst
 ```
 
+**6. Look at it.**
+
+```bash
+terminus polar oriented.yaml
+```
+
+One self-contained HTML file — no network, no assets, nothing to serve — showing
+the whole sky as a disc with north up and the photograph reprojected through the
+solved rotation. The layers toggle: the horizon ring, the telescope's own
+columns, the region no photograph covered, and the altitude grid.
+
+This is the check that catches what a residual cannot. A wrong yaw stops being a
+number and becomes the neighbour's house in the wrong place. Turn the horizon
+layer off and on and see whether the yellow line follows the roofline; turn on
+"not photographed" and see whether the gaps are where you think they are.
+
+```bash
+# draw the telescope's measured columns over the photograph too
+terminus polar oriented.yaml --fiducials horizon_part2.yaml
+
+# the disc reaches 20 degrees below the horizon by default, so the deck and
+# fence are in frame; --floor 0 stops at the horizon
+terminus polar oriented.yaml --floor -35 --size 1600
+```
+
+Columns that reached the sweep's altitude ceiling are drawn as upward chevrons
+rather than dots, because the scope stopped at its tilt limit: the horizon there
+is *at least* that high, not exactly that high. Without a panorama the command
+still works and draws the measured horizon on a plain disc, which is all a
+scope-only sweep can honestly support.
+
 ### What breaks
 
 Written down because it will bite you, and because it is being worked on rather

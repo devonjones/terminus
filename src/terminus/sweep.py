@@ -31,6 +31,8 @@ SETTLE = 1.5
 GOTO_TIMEOUT = 90
 SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
 ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
+PROGRESS_DEG = 0.5  # a closing of at least this much counts as progress
+NO_PROGRESS_S = 25.0  # ...and this long without any ends the attempt
 MAX_TARGET_DEC = 88.5  # never command a goto nearer a pole than this
 MAX_VIA_DEC = 80.0  # a waypoint nearer a pole than this is unreachable: RA is
 #                     singular there and the mount cannot converge
@@ -531,6 +533,9 @@ class Pointer:
     def _goto_wait(self, ra, dec, settle):
         self.sc.goto(ra, dec)
         deadline = time.time() + GOTO_TIMEOUT
+        best = float("inf")
+        last_progress = time.time()
+        moved = False
         while time.time() < deadline:
             time.sleep(0.7)
             rd = self.sc.equ_coord()
@@ -540,14 +545,26 @@ class Pointer:
             # straight onto it and an arcminute of position error there swings RA
             # by hours. A raw-RA test can never be satisfied, which stalled a live
             # sweep at Dec 89.8 that the mount had in fact reached.
-            if rd and ang_sep(rd[0] * 15.0, rd[1], ra * 15.0, dec) < ARRIVE_DEG:
-                time.sleep(settle)
-                return
-            # Extend while the mount is demonstrably still slewing. A long swing
-            # in RA can outlast any fixed timeout, and giving up mid-slew is the
-            # dangerous case: the scope keeps moving after we stop watching.
-            if self._moving():
+            if rd:
+                sep = ang_sep(rd[0] * 15.0, rd[1], ra * 15.0, dec)
+                if sep < ARRIVE_DEG:
+                    time.sleep(settle)
+                    return
+                if sep < best - PROGRESS_DEG:
+                    best, last_progress = sep, time.time()
+                    moved = True
+            # Extend while the mount is still CLOSING ON THE TARGET. Extending on
+            # motion alone was wrong: a mount that moves without converging
+            # renews the deadline forever, and on 2026-08-06 one spent 288
+            # seconds doing exactly that — reaching the right declination and
+            # never the right RA. Requiring measurable progress turns that into a
+            # 25 second failure and, more usefully, tells the difference between
+            # "still slewing" and "moving but not arriving".
+            stalled = time.time() - last_progress > NO_PROGRESS_S
+            if self._moving() and not stalled:
                 deadline = max(deadline, time.time() + GOTO_TIMEOUT)
+            elif stalled:
+                break
         # Never fall through silently. A goto that quietly fails to arrive voids
         # every Sun-safety guarantee: the caller believes the scope is where it
         # asked, and plans the next path from a position the mount never reached.
@@ -555,10 +572,15 @@ class Pointer:
         # while the mount had not moved at all.
         rd = self.sc.equ_coord()
         where = f"RA {rd[0]:.3f} Dec {rd[1]:.2f}" if rd else "unreadable"
+        why = (
+            f"closed to {best:.1f} deg and then stopped improving"
+            if moved
+            else "never moved toward it at all"
+        )
         raise PointingError(
-            f"goto did not arrive within {GOTO_TIMEOUT}s "
-            f"(wanted RA {ra:.3f} Dec {dec:.2f}, at {where}); "
-            "mount may be closed, parked, or not tracking"
+            f"goto did not arrive (wanted RA {ra:.3f} Dec {dec:.2f}, at {where}): {why}. "
+            "A mount that is stowed, parked or not tracking never moves; one that moves "
+            "but will not converge is usually being asked for a position it cannot reach."
         )
 
     def avoid_pole(self, az, alt):
@@ -903,6 +925,42 @@ def save_scan_frame(rgb, az, alt, lum, save_dir, sky_ref=None):
     im.save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:05.1f}.png")
 
 
+def classify_no_edge(profile, sky_ref):
+    """A column with no step in it: is it blocked, open, or unreadable?
+
+    Extracted so the LIVE path and the REPLAY path answer it the same way. They
+    did not: `scan_horizon` learned to demand contrast before asserting a bound
+    (terminus-58) and `guide.replay` kept calling every non-detection a bound, so
+    replaying a night manufactured exactly the false bounds the live path had
+    stopped producing. A rule that only half the callers obey is not a rule.
+
+    Returns "blocked", "open" or "inconclusive".
+    """
+    lums = sorted(lum for _, lum in profile)
+    if not lums or not sky_ref:
+        return "inconclusive"
+    median = lums[len(lums) // 2]
+    # Median, not peak: a blocked column can still contain one bright sample (a
+    # gap in foliage, a streetlight, a passing reflection), and judging by the
+    # maximum lets that single outlier declare the whole column open.
+    if median < 0.5 * sky_ref:
+        # A BOUND IS A STRONG CLAIM AND NEEDS THE CONTRAST TO SUPPORT IT.
+        # `orient.fit` scores it one-sided, so a false one is not a symmetric
+        # error the robust loss can absorb — it is a lever, and the fit can only
+        # reduce that residual by rotating the whole sphere. The separation must
+        # therefore stand clear of the column's own scatter, which is
+        # self-calibrating: trivial under a bright sky, impossible once the sky
+        # falls toward the terrain's own brightness. Which is when it stopped
+        # being true.
+        spread = (lums[-1] - lums[0]) or 1e-9
+        if (0.5 * sky_ref - median) < spread:
+            return "inconclusive"
+        return "blocked"
+    if lums[0] >= 0.5 * sky_ref:
+        return "open"
+    return "inconclusive"
+
+
 def scan_horizon(
     ptr,
     sc,
@@ -960,43 +1018,13 @@ def scan_horizon(
         # guessed at — an unmeasured azimuth is safer than a wrong one.
         if sky_ref is None:
             return alt_max, "no_reference", "unknown", profile
-        lums = sorted(lum for _, lum in profile)
-        median = lums[len(lums) // 2]
-        # Median, not peak: a blocked column can still contain one bright sample
-        # (a gap in foliage, a streetlight, a passing reflection), and judging by
-        # the maximum lets that single outlier declare the whole column open.
-        if median < 0.5 * sky_ref:
-            # A BOUND IS A STRONG CLAIM AND NEEDS THE CONTRAST TO SUPPORT IT.
-            # `orient.fit` scores a bound one-sided: a photo above the ceiling
-            # confirms it for free, only falling short contradicts it. So a false
-            # bound is not a symmetric error the robust loss can shrug off, it is
-            # a LEVER — the fit can only reduce that residual by rotating the
-            # whole sphere. Measured 2026-08-05: az 140 read a clean edge at 26.2
-            # with the sky reference at 49.3, and an hour later, at 7.0, the same
-            # column read "blocked above 60". That single false bound moved the
-            # solved yaw by 164 degrees and the RMS from 0.18 to 1.63.
-            #
-            # The sky darkened; the roofline did not move. What failed is that
-            # "I cannot see a step" was recorded as "there is terrain above the
-            # ceiling". Those are different statements and only one of them is
-            # evidence.
-            #
-            # So the separation has to stand clear of the column's own scatter.
-            # That is self-calibrating and needs no threshold: at a bright
-            # reference the gap is enormous and this passes trivially, and as the
-            # sky falls toward the terrain's own brightness the two overlap and
-            # the claim can no longer be made. Which is exactly when it stopped
-            # being true.
-            spread = (max(lums) - min(lums)) or 1e-9
-            if (0.5 * sky_ref - median) < spread:
-                return alt_max, "inconclusive", "unknown", profile
+        verdict = classify_no_edge(profile, sky_ref)
+        if verdict == "blocked":
             dark = frames[profile[0][0]]
             _, v, st, _ = classify(dark, sky_ref)
             return alt_max, "blocked_above", obstruction_type(v, st, sun_alt), profile
-        if lums[0] >= 0.5 * sky_ref:
+        if verdict == "open":
             return alt_min, "open_to_min", "open", profile
-        # Bright overall but with dark samples that form no clean step: report it
-        # as unmeasured rather than inventing a horizon.
         return alt_max, "inconclusive", "unknown", profile
 
     hi_alt, hi_lum = profile[idx]
