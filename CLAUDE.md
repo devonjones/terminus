@@ -34,6 +34,15 @@ PR branch, and never mix code + beads in one commit. Create issues with
   `uv run pytest -q`.
 - uv-managed: `uv sync --dev`; the lockfile (`uv.lock`) is committed.
 - Review conventions live in `AGENT-REVIEWERS.md` (consumed by pr-review-loop).
+- `PANORAMA-PIPELINE.md` reconstructs how the published photo mosaic and orientation
+  fit were actually built — inputs, code state, parameters and traps. Read it before
+  attempting to rebuild the mosaic. The source frames are the 19 individual photos in
+  `captures/panoramas/2026-08-03-frames/`, **not** the stitched panoramas in
+  `captures/panoramas/2026-08-03/` — those are a different and worse capture mode.
+- Lessons and deliberate decisions live in `LESSONS.md` — measurement discipline,
+  fitting pitfalls, and instrument behaviour that cost real time to learn. Read it
+  before re-deriving a rule; add to it when something is learned the hard way. IDs
+  are append-only: mark entries superseded rather than renumbering or deleting.
 - Versions bump in `pyproject.toml` **and** `src/terminus/__init__.py` together,
   with the change reflected where user-visible. (PyPI name is `terminus-horizon`;
   the import package and CLI are `terminus`.)
