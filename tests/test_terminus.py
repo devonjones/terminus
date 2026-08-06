@@ -2024,9 +2024,9 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     plain = tmp_path / "scope.yaml"
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
-    assert not any(
-        "clipped" in ln or "gap_fraction" in ln for ln in head
-    ), "a scope mask must not explain fields it does not carry"
+    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head), (
+        "a scope mask must not explain fields it does not carry"
+    )
     assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
     # The count is still asserted. Dropping it for substring checks alone lost
     # the ability to catch unrelated header bloat, which is what this test was
@@ -3014,7 +3014,7 @@ def _sweep_args(out, azimuths=None):
 
     return SimpleNamespace(
         dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
-        no_export=True, azimuths=azimuths,
+        no_export=True, azimuths=azimuths, stop_above_sun_alt=None,
     )  # fmt: skip
 
 
@@ -3117,6 +3117,84 @@ def test_a_measured_column_leaves_the_skipped_list(tmp_path):
     meta, cols = load_columns(str(out))
     assert meta["skipped_az"] == [], "190 was measured this time; it is no longer skipped"
     assert cols[190]["alt"] == 12.0
+
+
+def test_a_truncated_sweep_is_visible_in_the_file_and_the_exit_code(tmp_path):
+    """End to end through cmd_sweep, on both the fresh and the merge path.
+
+    Every existing test passes `stop_above_sun_alt=None`, so nothing drove
+    `cmd_sweep` with a deadline that actually fires: deleting both the meta stamp
+    and the `SystemExit(3)` left the whole suite green. That gap is why the merge
+    path shipped broken — the flag was stamped onto `fresh`, and `_merge_meta`
+    builds from `prior_meta` and discards `fresh`.
+
+    Both directions matter. Losing the flag lets a truncated run read as
+    complete; INHERITING it lets a mask stay flagged forever however many
+    complete patches follow. A record that cannot be cleared is not a record.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    def args(out, azimuths=None):
+        return SimpleNamespace(
+            dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+            no_export=True, azimuths=azimuths, stop_above_sun_alt=-12.0,
+        )  # fmt: skip
+
+    class Deadline:
+        """Stands in for `_sun_deadline`, firing or not on demand."""
+
+        def __init__(self, fires):
+            self.fires = fires
+            self.fired = False
+
+        def __call__(self):
+            if self.fires:
+                self.fired = True
+            return self.fires
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+
+    def sweep(out, deadline, azimuths=None):
+        def run(*a, **k):
+            k["should_stop"]()  # the real loop asks; asking is what sets `fired`
+            return {90: (12.0, "tree")}, [], {}
+
+        with (
+            patch.object(cli, "_sun_deadline", return_value=deadline),
+            patch.object(cli, "run_sweep", side_effect=run),
+        ):
+            cli.cmd_sweep(sc, _SWEEP_CFG, args(out, azimuths))
+
+    # 1. A fresh run the window closed on: exit 3, and the file says so.
+    out = tmp_path / "h.yaml"
+    with pytest.raises(SystemExit) as exc:
+        sweep(out, Deadline(fires=True))
+    assert exc.value.code == 3, "a closed window is not the same outcome as a mount fault (2)"
+    meta, _ = load_columns(str(out))
+    assert meta.get("stopped_early") is True, "the file outlives the terminal and must say it"
+
+    # 2. A patch that is ALSO truncated must keep saying so after merging.
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"lat": 39.79, "lon": -104.89})
+    with pytest.raises(SystemExit) as exc:
+        sweep(out, Deadline(fires=True), azimuths="90")
+    assert exc.value.code == 3
+    meta, _ = load_columns(str(out))
+    assert meta.get("stopped_early") is True, "merging must not discard this run's truncation"
+
+    # 3. A complete patch over a truncated mask CLEARS the flag.
+    sweep(out, Deadline(fires=False), azimuths="90")
+    meta, cols = load_columns(str(out))
+    assert not meta.get("stopped_early"), (
+        "a mask since completed must stop claiming it was cut short"
+    )
+    assert 90 in cols, "and the merge still did its actual job"
 
 
 def test_duplicate_azimuths_are_measured_once():
@@ -3419,9 +3497,9 @@ def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
     assert cols, "the fixture must produce columns for this to mean anything"
     for az, col in cols.items():
         assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
-        assert (
-            col.get("type_source") is None
-        ), f"az {az}: no type was measured, so no source may be claimed"
+        assert col.get("type_source") is None, (
+            f"az {az}: no type was measured, so no source may be claimed"
+        )
 
 
 def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
@@ -3473,8 +3551,11 @@ def test_a_night_re_measure_does_not_throw_away_the_photo_s_type(tmp_path):
         str(out),
         {
             90: {
-                "alt": 20.0, "type": "tree", "type_source": "photo",
-                "gap_fraction": 0.4, "uncertainty": 4.2,
+                "alt": 20.0,
+                "type": "tree",
+                "type_source": "photo",
+                "gap_fraction": 0.4,
+                "uncertainty": 4.2,
             },
             180: {"alt": 5.0, "type": "structure", "type_source": "photo"},
         },  # fmt: skip
@@ -3547,8 +3628,12 @@ def test_a_real_crossing_clears_the_photo_s_lower_bound_flag(tmp_path):
         str(out),
         {
             90: {
-                "alt": 60.0, "type": "tree", "type_source": "photo",
-                "clipped": True, "gap_fraction": 0.4, "uncertainty": 4.2,
+                "alt": 60.0,
+                "type": "tree",
+                "type_source": "photo",
+                "clipped": True,
+                "gap_fraction": 0.4,
+                "uncertainty": 4.2,
             }
         },  # fmt: skip
         [],
@@ -4723,9 +4808,9 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
         reasons[power] = detail["reason"]
     assert "open" in reasons[0.5], f"shallow dimming reads as open, got {reasons[0.5]!r}"
     for power in (1.5, 3.0):
-        assert (
-            "no usable sky model" in reasons[power]
-        ), f"steep dimming must refuse outright, got {reasons[power]!r}"
+        assert "no usable sky model" in reasons[power], (
+            f"steep dimming must refuse outright, got {reasons[power]!r}"
+        )
 
 
 def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
@@ -4770,9 +4855,9 @@ def test_a_steeply_graded_column_is_not_mistaken_for_a_glint():
     # The model must pass through the TOP of the column. A positive slope alone
     # is not enough to prove that — the median screen also produced one, fitted
     # to the tail — so this checks where the line actually sits.
-    assert (
-        abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0
-    ), "the fit must pass near the topmost sample, not the flat tail beneath it"
+    assert abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0, (
+        "the fit must pass near the topmost sample, not the flat tail beneath it"
+    )
     assert n_top >= 4
 
 
@@ -4794,8 +4879,7 @@ def test_one_glint_at_the_top_does_not_discard_the_whole_column():
         glinted = [(prof[0][0], prof[0][1] * factor)] + prof[1:]
         alt, detail = find_horizon(glinted)
         assert alt == clean, (
-            f"a {factor}x glint in the top sample changed the answer to {alt} "
-            f"({detail['reason']})"
+            f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
         )
 
 
@@ -4976,3 +5060,268 @@ def test_a_lamp_inside_terrain_is_not_read_as_a_horizon():
         alt, detail = find_horizon(prof, sky_ref=sky_ref)
         assert alt is None, f"az {az}: night detector reported {alt} ({detail['reason']})"
         assert "blocked" in detail["reason"], f"az {az}: {detail['reason']}"
+
+
+def test_a_blocked_column_reaches_the_mask_as_a_bound(tmp_path):
+    """terminus-51: the sweep knew, logged it, and threw it away.
+
+    `scan_horizon` returns `blocked_above` when it searched from the ceiling down
+    and never found an edge — the horizon is AT LEAST alt_max, which `orient.fit`
+    scores one-sidedly. That status lived in a local variable that was logged and
+    discarded, so the mask could not tell it from an exact measurement at the
+    ceiling, and `orient.from_mask` could not reconstruct it. Which matters most
+    for `--replay`, since a replay is only as good as what the night saved.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.export import load_columns
+    from terminus.orient import from_mask
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 120, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        if az == 120:
+            return 60.0, "blocked_above", "structure", []
+        return 20.0, "edge(rel 0.4)", "tree", []
+
+    with patch("terminus.sweep.scan_horizon", side_effect=fake_scan):
+        mask, _skipped, _prof = run_sweep(
+            sc, sky, cfg, az_start=0, az_end=240, dry=True, log=lambda *a, **k: None
+        )
+
+    assert mask[120]["bound"] is True, "a blocked column is a bound"
+    assert mask[0]["bound"] is False, "an edge is not"
+
+    # And it survives to the file and back out as a one-sided fiducial.
+    from terminus.export import write_mask
+
+    out = tmp_path / "m.yaml"
+    write_mask(str(out), mask, [], {"lat": 39.79, "lon": -104.89})
+    _meta, cols = load_columns(str(out))
+    assert [f.az for f in from_mask(cols, ceiling=60.0) if f.bound] == [120.0]
+
+
+def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
+    """terminus-17: the deadline was enforced by the caller, before launch.
+
+    A run overran by fourteen minutes, and the reason is the part worth keeping:
+    the sky brightened toward dawn, so MORE columns resolved and each took
+    longer — the run slowed down exactly as its deadline approached. An estimate
+    made at the start degrades in the direction that matters, so the check has
+    to live where the answer is current.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+
+    def sweep(should_stop):
+        with patch("terminus.sweep.scan_horizon", return_value=(20.0, "edge", "tree", [])):
+            return run_sweep(
+                sc, sky, cfg, az_start=0, az_end=330, dry=True,
+                log=lambda *a, **k: None, should_stop=should_stop,
+            )[0]  # fmt: skip
+
+    # Differential, because Sun-cone skips already shorten a sweep on their own —
+    # a bare count would pass with no deadline check at all, which is exactly
+    # what a first version of this test did.
+    calls = {"n": 0}
+
+    def closes_after_three():
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    stopped = sweep(closes_after_three)
+    full = sweep(None)
+    assert len(stopped) < len(full), (
+        f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
+    )
+    assert len(stopped) > 0, "and what was measured before it closed is kept"
+    # A sweep that stops is not a sweep that failed.
+    assert all("alt" in c for c in stopped.values())
+
+
+def test_refinement_checks_the_deadline_before_every_column():
+    """Per column, not per round — a round is up to 24 columns long.
+
+    The check used to sit at the top of the refine `while`, so once a round had
+    started it ran to completion: with the default `refine_max_columns` that is
+    24 further slews, each a coarse walk plus a bisection, after the window had
+    closed. Refinement is the LAST phase of a sweep, which is when a dawn
+    deadline is nearest, and it accelerates as the sky brightens and more
+    columns resolve — terminus-17's failure mode, one scope deeper. SAFE-02.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 0, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+        # Every neighbouring pair disagrees, so refinement wants to subdivide
+        # everywhere and only the budget holds it back.
+        "az_refine_deg": 1, "refine_threshold_deg": 0, "refine_max_columns": 24,
+    }  # fmt: skip
+
+    seq = {"n": 0}
+
+    def alternating(*a, **k):
+        seq["n"] += 1
+        return (10.0 if seq["n"] % 2 else 50.0, "edge", "tree", [])
+
+    # THE WINDOW MUST CLOSE *MID-ROUND*, which is the whole point. The main
+    # sweep asks 12 times (one per column); the old code's next question was at
+    # the top of the refine `while`, the new code's is before each candidate
+    # pair. Closing on question 13 stops BOTH versions identically and the test
+    # passes against the bug — it did, on the first attempt. Letting 13 through
+    # and closing on 14 separates them: the old code has already committed to a
+    # whole round of up to `refine_max_columns`, the new one has committed to
+    # exactly one column.
+    asked = {"n": 0}
+
+    def closes_as_refinement_opens():
+        asked["n"] += 1
+        return asked["n"] > 13
+
+    from terminus.sweep import Pointer
+
+    with (
+        patch("terminus.sweep.scan_horizon", side_effect=alternating),
+        patch("terminus.sweep.save_boundary_frame"),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+    ):
+        mask, _skipped, _prof = run_sweep(
+            sc, sky, cfg, az_start=0, az_end=330, dry=False,
+            log=lambda *a, **k: None, should_stop=closes_as_refinement_opens,
+        )  # fmt: skip
+
+    refined = {az for az in mask if az % cfg["az_step"]}
+    assert len(refined) <= 1, (
+        f"refinement continued past the deadline: {len(refined)} columns added "
+        f"after the window closed ({sorted(refined)})"
+    )
+
+
+def test_a_run_the_window_closed_on_does_not_look_like_a_finished_one():
+    """Exit code and mask must both say the sweep was cut short.
+
+    Both ways a sweep ends early used to be distinguishable only by log text: a
+    PointingError abort printed SWEEP ABANDONED and exited 2, while a closed
+    observing window returned normally, wrote and exported the mask exactly as a
+    complete run would, and exited 0. A scheduler — which is the whole reason
+    the cutoff flag exists — could not tell "the window closed and columns are
+    missing" from "everything asked for was measured".
+    """
+    from terminus.cli import _sun_deadline
+
+    class FakeSky:
+        def __init__(self, alt):
+            self._alt = alt
+
+        def sun(self):
+            return 180.0, self._alt
+
+    # Never reached: the deadline must not claim it fired.
+    open_window = _sun_deadline(FakeSky(-30.0), -12.0)
+    assert open_window() is False
+    assert open_window.fired is False, "an unfired deadline must not report a truncated run"
+
+    closed = _sun_deadline(FakeSky(-5.0), -12.0)
+    assert closed.fired is False, "it has not been asked yet"
+    assert closed() is True
+    assert closed.fired is True, "the deadline has to remember, or the caller cannot tell"
+
+    assert _sun_deadline(FakeSky(0.0), None) is None, "no cutoff asked for, nothing to enforce"
+
+
+def test_the_sun_deadline_reads_the_sun_each_time_it_is_asked():
+    """Not once at the start — that is the bug, not the implementation detail."""
+    from types import SimpleNamespace
+
+    from terminus.cli import _sun_deadline
+
+    reads = {"n": 0}
+
+    def sun():
+        reads["n"] += 1
+        return 180.0, -20.0 + reads["n"] * 2.0  # climbing toward dawn
+
+    stop = _sun_deadline(SimpleNamespace(sun=sun), -14.0)
+    assert stop() is False, "-18 is still dark"
+    assert stop() is False, "-16 too"
+    assert stop() is True, "-14 has reached the cutoff"
+    assert reads["n"] == 3, "the Sun must be re-read every time, not cached"
+
+    assert _sun_deadline(SimpleNamespace(sun=sun), None) is None, "no cutoff, no check"
+
+
+def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
+    """Found 2026-08-05 17:46, with the scope set up and about to sweep.
+
+    `column_touches_sun` tested `alt_min` and `alt_max` only. The Sun spends
+    most of the day at a middling altitude, which is the MIDDLE of a 0-60
+    column, so both ends can be clear while the scan passes straight through it.
+    With the Sun at az 271 alt 25.5, az 250 and az 290 were reported safe and
+    come within 19.1 and 16.9 degrees of it.
+
+    The same mistake this module's docstring warns about for slew paths, in the
+    function that decides which columns to attempt at all. `Pointer.point_to`
+    refused the individual slews so nothing was in danger — but the planner
+    proposed columns the mount would abandon partway up, wasting the observing
+    time it exists to save.
+    """
+    from terminus.sweep import ang_sep, column_touches_sun
+
+    class FixedSky:
+        """The Sun parked mid-column, which is where it lives most of the day."""
+
+        @staticmethod
+        def sun():
+            return 271.0, 25.5
+
+    sky = FixedSky()
+    for az in range(0, 360, 5):
+        closest = min(ang_sep(az, alt / 2.0, 271.0, 25.5) for alt in range(0, 121))
+        assert column_touches_sun(sky, az, 0, 60, 30) == (closest < 30), (
+            f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
+        )
+
+    # The two that were wrong, named so a regression is unmistakable.
+    assert column_touches_sun(sky, 250, 0, 60, 30), "az 250 passes 19.1 deg from the Sun"
+    assert column_touches_sun(sky, 290, 0, 60, 30), "az 290 passes 16.9 deg from the Sun"
+    # A column genuinely clear of it is still allowed.
+    assert not column_touches_sun(sky, 90, 0, 60, 30), "the anti-Sun column is safe"
+
+    # And a Sun below the horizon blocks nothing, whatever the geometry says.
+    class NightSky:
+        @staticmethod
+        def sun():
+            return 271.0, -20.0
+
+    assert not column_touches_sun(NightSky(), 271, 0, 60, 30)
