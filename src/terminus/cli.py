@@ -1206,7 +1206,17 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     # meta — so a silent fallback cannot be recorded as a segment run.
     band = skymask.horizon_band(sky, valid=valid, run=args.run)
     px_per_deg = w / 360.0
-    top = skymask.upper_envelope(band["top"], half_deg=args.envelope, px_per_deg=px_per_deg)
+    # IMAGE PROCESSING EMITS THE FAITHFUL SKYLINE (terminus-55). The envelope
+    # only ever RAISES the horizon, so at this layer it deleted detail nobody
+    # could get back — and it deleted it before anyone knew which way was up,
+    # since the rotation onto the sky is solved later from telescope fiducials.
+    # Filling a gap the telescope cannot point through is a real requirement; it
+    # now happens in `export`, where the instrument is known. Default 0 here.
+    top = (
+        skymask.upper_envelope(band["top"], half_deg=args.envelope, px_per_deg=px_per_deg)
+        if args.envelope
+        else band["top"]
+    )
 
     classes = np.full(w, -1, dtype=int)
     print(f"backend used: {backend}")
@@ -1456,7 +1466,12 @@ def main(argv=None):
         help="rows of sustained non-sky before the skyline is believed",
     )
     sk.add_argument(
-        "--envelope", type=float, default=2.0, help="half-width in degrees for the upper envelope"
+        "--envelope",
+        type=float,
+        default=0.0,
+        help="raise the skyline to the highest terrain within +-N degrees. Default 0: "
+        "the mask records what the photograph shows. The usable-gap envelope now "
+        "lives in `terminus export`, which knows the instrument (terminus-55)",
     )
     for sp in (sub.choices["preflight"], sub.choices["classify"]):
         sp.add_argument("--dry-run", action="store_true")  # harmless, keeps a uniform namespace

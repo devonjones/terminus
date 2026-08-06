@@ -221,7 +221,45 @@ def apply_tree_buffer(rows, buffer_deg=TREE_BUFFER_DEG, types=("tree", "vegetati
     return out
 
 
-def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
+# How wide a gap the instrument cannot use, in degrees of azimuth either side.
+# THIS BELONGS HERE AND NOT IN `skymask` (terminus-55). Filling a narrow gap is a
+# statement about the telescope — its field of view, its pointing error, its
+# guard cone — and image processing knows none of those. It does not even know
+# which way is up: the rotation onto the sky is solved later, from telescope
+# fiducials. Applied at capture time it destroyed the map before anyone could
+# check it, and it is ONE-WAY — a faithful skyline can always be made more
+# conservative later, but detail deleted at capture time cannot be put back.
+#
+# It was also invisible in the one number people watched. The transform only
+# ever RAISES the horizon, so its error is one-signed, and a rigid rotation
+# absorbs a uniform lift into PITCH. Measured against the 29-column evening
+# fiducial set: at the old 2.0 default pitch solved to +4.03 where the published
+# value is +1.94; with no envelope it solves to +2.09. RMS moved 0.67 over the
+# same range — visible, but nowhere near enough to point at the cause.
+#
+# terminus-56 covers deriving this from the instrument rather than declaring it.
+USABLE_GAP_DEG = 2.0
+
+
+def usable_envelope(pairs, half_deg=USABLE_GAP_DEG):
+    """Raise each column to the highest horizon within +-half_deg of azimuth.
+
+    A gap narrower than the instrument can point through is not usable sky: a
+    branch gap, or a dip between two roof peaks, still blocks the telescope.
+
+    Wraps, because azimuth does. The columns either side of north are
+    neighbours, and a window that stopped at the ends would leave the one place
+    the horizon is least likely to be flat treated as though it were.
+    """
+    if not half_deg or len(pairs) < 2:
+        return pairs
+    return [
+        (az, max(o for oaz, o in pairs if min(abs(oaz - az), 360.0 - abs(oaz - az)) <= half_deg))
+        for az, _alt in pairs
+    ]
+
+
+def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG, usable_gap=USABLE_GAP_DEG):
     """(az, alt) ascending, guaranteeing endpoints at 0 and 360 for full wrap.
 
     The vegetation buffer is applied HERE, not in the callers. Every exporter
@@ -230,6 +268,10 @@ def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
     buffer in `export_all` instead left `to_nina_hrz` and `to_stellarium_txt`
     exporting raw altitudes whenever they were imported directly, which is a
     documented public path. The margin is not meant to be optional.
+
+    The usable-gap envelope is applied here for the same reason, and one more:
+    this is the first point in the pipeline that is unambiguously about USING
+    the horizon rather than measuring it.
     """
     if tree_buffer:
         rows = apply_tree_buffer(rows, tree_buffer)
@@ -250,6 +292,9 @@ def _ascending_pairs(rows, tree_buffer=TREE_BUFFER_DEG):
             "other software that will either reject it or, worse, drop the column and "
             "carry on. Fix or remove those columns in the mask."
         )
+    # After the finite check, so a NaN is reported as a NaN rather than
+    # propagating silently through a max().
+    pairs = usable_envelope(pairs, usable_gap)
     if pairs[0][0] != 0:
         pairs.insert(0, (0, pairs[0][1]))
     if pairs[-1][0] != 360:
