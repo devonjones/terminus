@@ -140,8 +140,18 @@ def _sun_deadline(sky, stop_above):
                 "cutoff for this run",
                 file=sys.stderr,
             )
+            # THE DEADLINE REMEMBERS THAT IT FIRED, so a caller can tell a
+            # truncated run from a finished one. Without this the two are
+            # indistinguishable downstream: `run_sweep` returns normally either
+            # way, the mask is written and exported the same, and the process
+            # exits 0. A scheduler — the deployment this flag exists for — could
+            # not tell "the window closed and columns are missing" from "the
+            # sweep measured everything asked of it" without parsing log text.
+            should_stop.fired = True
             return True
         return False
+
+    should_stop.fired = False
 
     return should_stop
 
@@ -350,6 +360,9 @@ def cmd_sweep(sc, cfg, args):
         print(f"merging into {out} ({len(prior)} existing columns)")
 
     aborted = None
+    # Bound to a name rather than passed inline: after the run we ask it whether
+    # it fired, which is how a truncated sweep is told from a finished one.
+    should_stop = _sun_deadline(sky, getattr(args, "stop_above_sun_alt", None))
     try:
         mask, skipped, profiles = run_sweep(
             sc,
@@ -360,7 +373,7 @@ def cmd_sweep(sc, cfg, args):
             save_dir=frames,
             dry=args.dry_run,
             azimuths=azimuths,
-            should_stop=_sun_deadline(sky, getattr(args, "stop_above_sun_alt", None)),
+            should_stop=should_stop,
         )
     except PointingError as e:
         # A sweep runs for hours. Losing every column already measured because
@@ -396,6 +409,14 @@ def cmd_sweep(sc, cfg, args):
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
     fresh = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+    # A run the window closed on is NOT a finished sweep, and the mask has to say
+    # so itself. The log line is not enough: the file outlives the terminal, and
+    # the next tool to read it — or future-you — has no other way to know that
+    # the missing azimuths are missing because time ran out rather than because
+    # nobody asked for them.
+    stopped_early = bool(getattr(should_stop, "fired", False))
+    if stopped_early:
+        fresh["stopped_early"] = True
     # The scope reads type from colour, so a column it typed was typed in
     # daylight — after sunset `obstruction_type` returns "" rather than guessing.
     # Stamped here rather than in run_sweep so its (alt, type) contract, which
@@ -428,6 +449,19 @@ def cmd_sweep(sc, cfg, args):
         print(f"\nSWEEP ABANDONED: {aborted}", file=sys.stderr)
         print("the partial mask above was saved; re-run to cover the rest", file=sys.stderr)
         raise SystemExit(2)
+    if stopped_early:
+        # A DISTINCT code, because it is a distinct outcome. 2 means the mount
+        # stopped answering and the run was abandoned; 3 means the run did
+        # exactly what it was told and the clock beat it. A scheduler should
+        # retry the second tomorrow night, not treat it as a fault.
+        print(
+            "\nSWEEP INCOMPLETE: the observing window closed before every column", file=sys.stderr
+        )
+        print(
+            f"the {len(mask)} columns measured were saved; re-run to cover the rest",
+            file=sys.stderr,
+        )
+        raise SystemExit(3)
 
 
 def cmd_export(sc, cfg, args):  # sc unused; export is offline
@@ -792,9 +826,7 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
     # one with zero control points — that is how a garage umbrella ended up in
     # the sky and was blamed on the classifier.
     for name in sorted(dropped):
-        print(
-            f"  dropped {name}: {counts.get(name, 0)} control points " f"(need {args.min_points})"
-        )
+        print(f"  dropped {name}: {counts.get(name, 0)} control points (need {args.min_points})")
     if not kept:
         raise mosaic.MosaicError("no frame could be constrained; nothing to render")
 
@@ -970,8 +1002,7 @@ def main(argv=None):
     sw.add_argument(
         "--azimuths",
         default=None,
-        help="comma list of azimuths to measure instead of a range; "
-        "merges into --out if it exists",
+        help="comma list of azimuths to measure instead of a range; merges into --out if it exists",
     )
     sw.add_argument("--no-export", action="store_true")
     sw.add_argument(
