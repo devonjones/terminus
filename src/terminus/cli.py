@@ -773,7 +773,12 @@ def _orient(sc, cfg, args):
     if not rows:
         raise MaskError(f"{args.mask} has no columns to orient")
 
-    if args.replay:
+    if args.fiducials:
+        measure, reachable = _fiducial_source(args.fiducials, args.uncertainty)
+        should_stop = None
+        state = {"profiles": {}}
+        print(f"orienting against {len(args.fiducials)} fiducial mask(s): no telescope, no sky")
+    elif args.replay:
         measure = _replay_source(args)
         reachable = should_stop = None
         state = {"profiles": {}}
@@ -874,6 +879,76 @@ def _orient(sc, cfg, args):
             else "(marked UNORIENTED: the yaw was still moving when the run stopped)"
         )
     )
+
+
+def _fiducial_source(paths, uncertainty):
+    """`measure(az)` from telescope columns that were ALREADY measured.
+
+    The third way in, beside a live sweep and `--replay`. Replay re-judges raw
+    brightness profiles, so it needs the profiles; this reads masks that already
+    hold judged columns — which is what a finished sweep leaves behind, and what
+    the 2026-08-03 evening sweeps are.
+
+    Without it the orientation fit had no CLI path at all: `orient.from_mask` and
+    `orient.fit` were reachable only from Python, so the one step that turns a
+    photo mask into a true-north one could not be run by the tool that produces
+    the mask. PANORAMA-PIPELINE.md says so in as many words.
+
+    Several masks may be given and are merged, first one wins, because a sweep
+    is routinely split across arcs and nights — az 70-250 in one file and 260-350
+    in another is the shape actually on disk.
+
+    Returns (measure, reachable). `reachable` confines the planner to azimuths a
+    fiducial exists for, so the adaptive chooser still does its real job of
+    ordering them by information gain rather than being handed a fixed list.
+    """
+    import yaml
+
+    from .orient import CEILING_EPS
+
+    columns = {}
+    for path in paths:
+        try:
+            with open(path) as fh:
+                doc = yaml.safe_load(fh) or {}
+        except OSError as e:
+            raise MaskError(f"could not read the fiducials {path}: {e}") from e
+        block = doc.get("horizon") or doc.get("mask") or {}
+        if not block:
+            raise MaskError(
+                f"{path} has no `horizon:` block. --fiducials wants a mask a sweep wrote, "
+                "not a profiles.json (that is --replay)."
+            )
+        search = (doc.get("meta") or {}).get("alt_search") or []
+        ceiling = float(search[1]) if len(search) > 1 else None
+        for az, entry in block.items():
+            columns.setdefault(int(az), (entry, ceiling))
+
+    def measure(az):
+        got = columns.get(int(az))
+        if got is None:
+            return None
+        entry, ceiling = got
+        alt = entry.get("alt")
+        typ = str(entry.get("type", "") or "")
+        if alt is None or typ == "unknown":
+            return None  # measured and found nothing; not an edge, not a bound
+        alt = float(alt)
+        # A column at its ceiling is a BOUND however it is typed: the scope
+        # cannot tilt past its search ceiling, so the horizon is at least that
+        # high, not exactly that high (M-09). Masks written before the explicit
+        # `bound` field record these as ordinary edges.
+        bound = (
+            bool(entry.get("bound", False))
+            or bool(entry.get("clipped", False))
+            or typ.startswith("blocked")
+            or (ceiling is not None and alt >= ceiling - CEILING_EPS)
+        )
+        if bound:
+            return None, alt, uncertainty
+        return {"alt": alt}, ceiling, uncertainty
+
+    return measure, (lambda az: int(az) in columns)
 
 
 def _replay_source(args):
@@ -1295,13 +1370,13 @@ def _is_offline(args):
     replay exists to serve.
     """
     if args.cmd == "orient":
-        return bool(args.replay)
+        return bool(args.replay or args.fiducials)
     return args.cmd in OFFLINE
 
 
 def _needs_scope(args):
     if args.cmd == "orient":
-        return not args.replay
+        return not (args.replay or args.fiducials)
     return args.cmd in NEEDS_SCOPE
 
 
@@ -1346,6 +1421,14 @@ def main(argv=None):
         "--replay",
         help="re-judge a saved sweep's <mask>_profiles.json instead of observing "
         "(no telescope, no night)",
+    )
+    orp.add_argument(
+        "--fiducials",
+        action="append",
+        metavar="MASK",
+        help="orient against telescope columns ALREADY measured, from a mask a sweep "
+        "wrote. Repeatable, and merged first-wins, because a sweep is routinely split "
+        "across arcs and nights. No telescope, no night",
     )
     orp.add_argument("--seed", type=int, default=4, help="evenly spaced starting columns")
     orp.add_argument("--max-columns", type=int, default=12)
@@ -1441,6 +1524,13 @@ def main(argv=None):
     mo.add_argument("--width", type=int, default=2880)
     mo.add_argument("--height", type=int, default=1440)
     mo.add_argument("--no-celeste", action="store_true", help="skip cpfind's sky filter")
+    mo.add_argument(
+        "--segment",
+        action="store_true",
+        help="segment each FRAME and warp the labels through the same solve, writing "
+        "<out>.classes.npy for `terminus skymask --classes`. Needs torch, torchvision "
+        "and transformers",
+    )
 
     sk = sub.add_parser("skymask", help="read a horizon off a panorama (UNORIENTED)")
     sk.add_argument("image")
