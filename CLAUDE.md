@@ -34,6 +34,10 @@ PR branch, and never mix code + beads in one commit. Create issues with
   `uv run pytest -q`.
 - uv-managed: `uv sync --dev`; the lockfile (`uv.lock`) is committed.
 - Review conventions live in `AGENT-REVIEWERS.md` (consumed by pr-review-loop).
+- `PANORAMA-PIPELINE.md` reconstructs how the published photo mosaic and orientation
+  fit were actually built — inputs, code state, parameters and traps. Read it before
+  attempting to rebuild the mosaic; the source frames are not the files in
+  `captures/panoramas/`.
 - Lessons and deliberate decisions live in `LESSONS.md` — measurement discipline,
   fitting pitfalls, and instrument behaviour that cost real time to learn. Read it
   before re-deriving a rule; add to it when something is learned the hard way. IDs
