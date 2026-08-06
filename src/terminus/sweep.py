@@ -208,6 +208,86 @@ class Pointer:
     # short way round when the route deliberately goes the long way.
     MAX_RA_LEG_H = 6.0
 
+    ESCAPE_MARGIN_DEG = 5.0  # clear the cone by this much, not merely reach its edge
+
+    def safe_depth(self):
+        """How far below the horizon every azimuth is clear of the Sun.
+
+        Devon's observation, and it is a better rule than anything angular. For a
+        tube at altitude -h and the Sun at +s, the smallest separation over ALL
+        azimuths is s + h, reached only when they share one. So below the horizon
+        there is always a depth at which the whole circle is safe, and it is
+        arithmetic rather than a search:
+
+            h = (cone + margin) - s,  never less than zero
+
+        The deepest it ever demands is the cone plus the margin, and only when
+        the Sun is already on the horizon — which is when it matters least. With
+        the Sun high, in the middle of the day when the danger is greatest, the
+        horizon itself is already clear and h is zero.
+
+        This is why descending beats climbing as an escape. Climbing away can be
+        blocked, because a summer Sun near the meridian is most of the way up the
+        sky. The ground is never in the way of pointing at the ground.
+        """
+        _saz, salt = self.sky.sun()
+        if salt < SUN_SAFE_ALT:
+            return 0.0
+        return max(0.0, (self.cone + self.ESCAPE_MARGIN_DEG) - salt)
+
+    def escape_target(self, az, alt):
+        """A safe pointing reached by DESCENDING at the current azimuth.
+
+        Dropping altitude at a fixed azimuth moves monotonically away from a Sun
+        that is above the tube, so the route out cannot dip closer on the way —
+        which is the property an escape most needs and the one an L-shaped
+        RA/Dec route could not give. It also needs no direction-finding: there is
+        one axis and one way along it.
+        """
+        _saz, salt = self.sky.sun()
+        want = self.cone + self.ESCAPE_MARGIN_DEG
+        if salt < SUN_SAFE_ALT or ang_sep(az, alt, _saz, salt) >= want:
+            return az, alt
+        return az, -self.safe_depth()
+
+    def escape(self):
+        """Get the tube out of the cone. Returns the pointing it reached.
+
+        THE GUARD USED TO REFUSE EVERY SLEW WHEN THE TUBE WAS ALREADY INSIDE THE
+        CONE, INCLUDING A SLEW STRAIGHT AWAY FROM THE SUN. That is not caution,
+        it is a trap: the software welds the instrument in the one place it must
+        not stay. And it is not exotic — the Sun moves 15 degrees an hour, so a
+        tube parked outside the cone and left alone is overtaken by it.
+
+        The rule while escaping is weaker than the normal one and has to be: the
+        route may not bring the tube CLOSER than it already is, and must end
+        outside the cone. Demanding the usual clearance would refuse the escape
+        for the same reason it refused everything else.
+        """
+        az, alt = self.current_azalt()
+        saz, salt = self.sky.sun()
+        if salt < SUN_SAFE_ALT or ang_sep(az, alt, saz, salt) >= self.cone:
+            return az, alt
+        here_sep = ang_sep(az, alt, saz, salt)
+        target_alt = -self.safe_depth()
+        # Descend in short steps at the CURRENT azimuth. Each step is a small
+        # goto, so the mount has almost no room to route creatively, and every
+        # step increases separation because it moves away from a Sun that is
+        # above. Stepping rather than one long slew is what makes that true of
+        # the journey and not merely of the destination.
+        step = max(1.0, float(self.slew_step))
+        alt_now = alt
+        while alt_now > target_alt + 1e-9:
+            alt_now = max(target_alt, alt_now - step)
+            self._goto_wait(*self.sky.altaz_to_radec(az, alt_now), 0.3)
+        out = self.current_azalt()
+        if ang_sep(*out, *self.sky.sun()) < self.cone:
+            raise SunGuard(
+                f"descended to {out[1]:.1f} deg and is still {ang_sep(*out, *self.sky.sun()):.1f} "
+                f"deg from the Sun (was {here_sep:.1f}). Cover the aperture and move it by hand."
+            )
+        return out
+
     def routes(self, rd0, rd1):
         """Every explicit route from rd0 to rd1, as (name, waypoints).
 
@@ -391,6 +471,16 @@ class Pointer:
         cur = self.sc.equ_coord()
         if cur is None:
             raise SunGuard("cannot read current pointing; refusing to slew")
+        # If the tube is already inside the cone, LEAVE rather than refuse. The
+        # old code raised here, which trapped it: every slew was refused,
+        # including one straight away from the Sun.
+        here = self.sky.radec_to_altaz(*cur)
+        saz, salt = self.sky.sun()
+        if salt >= SUN_SAFE_ALT and ang_sep(*here, saz, salt) < self.cone:
+            self.escape()
+            cur = self.sc.equ_coord()
+            if cur is None:
+                raise SunGuard("lost the pointing during the escape; refusing to slew")
         self._sun_check(*self.sky.radec_to_altaz(*cur))
         az, alt = self.avoid_pole(az, alt)
         target = self.sky.altaz_to_radec(az, alt)

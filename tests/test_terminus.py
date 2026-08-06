@@ -5048,7 +5048,20 @@ def test_a_blocked_column_reaches_the_mask_as_a_bound(tmp_path):
     from terminus.orient import from_mask
     from terminus.sweep import Sky, run_sweep
 
-    sky = Sky(39.7917, -104.894, 1600)
+    class NightSky(Sky):
+        """The Sun pinned below the horizon.
+
+        This test used a real `Sky` at wall-clock time and so depended on the
+        hour it was run: it passed at 21:00 with the Sun down and failed at 09:09
+        the next morning, when az 120 became genuinely Sun-blocked and never
+        reached the mask. A test about how a BOUND is recorded should not have an
+        opinion about the time of day.
+        """
+
+        def sun(self):
+            return 270.0, -30.0
+
+    sky = NightSky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.equ_coord.return_value = (12.0, 20.0)
     sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
@@ -5601,3 +5614,102 @@ def test_orient_keeps_what_it_measured(tmp_path):
     # And what it saved is the shape --replay consumes.
     measure = guide.replay(data)
     assert measure(int(next(iter(data)))) is not None
+
+
+def test_a_tube_inside_the_cone_can_still_be_moved_out():
+    """Devon asked whether the mount could get trapped inside its own banned wedge.
+
+    It could, completely. `point_to` Sun-checked the CURRENT pointing and raised
+    before doing anything, so a tube 5.1 degrees from the Sun refused every slew
+    — including one straight away from it. The refusal even named the current
+    position rather than the target. That is not caution, it is the software
+    welding the instrument in the one place it must not stay.
+
+    And it arrives on its own: the Sun moves 15 degrees an hour, so a tube parked
+    outside the cone and left alone is overtaken.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky, ang_sep
+
+    class FixedSky(Sky):
+        def sun(self):
+            return 270.0, 20.0
+
+    sky = FixedSky(39.7917, -104.894, 1600)
+    trapped = (265.0, 22.0)
+    assert ang_sep(*trapped, 270.0, 20.0) < 30.0, "precondition: it is inside the cone"
+
+    sc = MagicMock()
+    landed = {"rd": sky.altaz_to_radec(*trapped)}
+    sc.equ_coord.side_effect = lambda: landed["rd"]
+    ptr = Pointer(sc, sky, 30, 5)
+
+    legs = []
+
+    def fake_goto(ra, dec, settle):
+        legs.append((ra, dec))
+        landed["rd"] = (ra, dec)
+
+    with patch.object(Pointer, "_goto_wait", side_effect=fake_goto):
+        ptr.point_to(90.0, 45.0)
+
+    assert legs, "it must move rather than refuse"
+    final = sky.radec_to_altaz(*landed["rd"])
+    assert (
+        ang_sep(*final, 270.0, 20.0) >= 30.0
+    ), f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
+
+
+def test_the_way_out_is_always_downwards():
+    """Devon's rule, and it is better than any angular heuristic.
+
+    For a tube at altitude -h and the Sun at +s, the smallest separation over ALL
+    azimuths is s + h, reached only when they share one. So below the horizon
+    there is always a depth at which the whole circle is clear, and it is
+    arithmetic rather than a search. The ground is never in the way of pointing
+    at the ground.
+
+    An earlier version of this escape CLIMBED away instead, and treated a
+    below-horizon target as something to avoid. That is backwards: climbing can
+    be blocked, because a summer Sun near the meridian is most of the way up the
+    sky, while descending is always available.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, ang_sep
+
+    for sun_alt in (60.0, 40.0, 20.0, 10.0, 5.0, 2.0):
+
+        class FixedSky(Sky):
+            def sun(self, _s=sun_alt):
+                return 270.0, _s
+
+        sky = FixedSky(39.7917, -104.894, 1600)
+        ptr = Pointer(MagicMock(), sky, 30, 5, True)
+        depth = ptr.safe_depth()
+
+        # The arithmetic: cone + margin - sun altitude, never below zero.
+        assert depth == pytest.approx(max(0.0, 35.0 - sun_alt))
+
+        # And it holds for EVERY azimuth, which is the property that matters —
+        # once down there the tube can travel the whole circle freely.
+        worst = min(ang_sep(az, -depth, 270.0, sun_alt) for az in range(0, 360, 2))
+        assert (
+            worst >= ptr.cone
+        ), f"Sun at {sun_alt}: at {-depth:.1f} deg the worst azimuth is {worst:.1f} deg out"
+
+        # A trapped tube escapes by dropping at its own azimuth, which moves
+        # monotonically away from a Sun that is above it.
+        for az in (265.0, 270.0, 275.0):
+            target = ptr.escape_target(az, sun_alt)
+            assert target[0] == az, "the escape keeps the azimuth and changes altitude"
+            assert target[1] <= 0.0 or ang_sep(*target, 270.0, sun_alt) >= 30.0
+
+    # Deepest ever required is the cone plus the margin, and only with the Sun on
+    # the horizon — which is when it matters least.
+    class Setting(Sky):
+        def sun(self):
+            return 270.0, 0.0
+
+    assert Pointer(MagicMock(), Setting(39.79, -104.89, 1600), 30, 5, True).safe_depth() == 35.0
