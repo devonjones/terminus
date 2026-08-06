@@ -4453,7 +4453,7 @@ def test_an_inconclusive_column_is_not_recorded_as_a_bound(tmp_path):
     for status, want in verdicts.items():
         with patch.object(cli, "scan_horizon", return_value=(60.0 if want != "edge" else 22.0,
                                                              status, "", [])):  # fmt: skip
-            measure, _reachable, _stop = cli._scope_measure(sc, cfg, args)
+            measure, _reachable, _stop, _st = cli._scope_measure(sc, cfg, args)
             got = measure(90)
         if want is None:
             assert got is None, f"{status}: must be 'not attempted', got {got}"
@@ -4489,7 +4489,7 @@ def test_a_mount_that_cannot_point_gives_up_instead_of_trying_every_column():
     args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
 
     with patch.object(cli, "scan_horizon", side_effect=PointingError("arm closed")):
-        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        measure, _r, _s, _state = cli._scope_measure(sc, cfg, args)
         for i in range(MAX_POINTING_MISSES - 1):
             assert measure(10 * i) is None, "one miss is a skip, not a verdict on the mount"
         with pytest.raises(cli.SeestarError, match="did not arrive"):
@@ -4591,7 +4591,7 @@ def test_a_column_open_to_the_floor_is_not_an_edge_at_the_floor(tmp_path):
     args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
 
     with patch.object(cli, "scan_horizon", return_value=(0.0, "open_to_min", "open", [])):
-        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        measure, _r, _s, _state = cli._scope_measure(sc, cfg, args)
         assert measure(90) is None, "an open column must not become an edge at alt_min"
 
 
@@ -5420,3 +5420,184 @@ def test_route_waypoints_are_coordinates_the_mount_can_accept():
                     prev = (ra, dec)
                 assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
                 assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
+
+
+def test_one_false_bound_cannot_capture_the_fit():
+    """The property that matters, and it failed on real hardware.
+
+    az 140 read a clean edge at 26.2 with the sky reference at 49.3, and an hour
+    later — same roofline, darker sky — the same column read "blocked above 60".
+    That one false bound moved the solved yaw by 164 degrees and the RMS from
+    0.18 to 1.63.
+
+    A bound is scored ONE-SIDED: a photo above the ceiling confirms it for free,
+    only falling short contradicts it. So a false bound is not a symmetric error
+    the robust loss can absorb — it is a lever, and the fit can only reduce that
+    residual by rotating the whole sphere. This asserts the damage is bounded.
+    """
+    import math
+
+    from terminus import guide, orient
+    from terminus.orient import Fiducial
+
+    rows = [
+        (a, 20.0 + 12.0 * math.sin(math.radians(2 * a)) + 6.0 * math.cos(math.radians(a)), "structure")
+        for a in range(0, 360, 5)
+    ]  # fmt: skip
+    sample = guide.photo_sample(rows)
+    truth = {"yaw": 40.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+
+    def honest(az):
+        phi, raw = orient.native_column(sample, az, truth["yaw"], 0.0, 0.0)
+        _, alt = orient.rotate(phi + truth["yaw"], raw, truth["pitch"], 0.0, 0.0)
+        return Fiducial(az, float(alt), ceiling=60.0, weight=1.0, sigma=1.0)
+
+    good = [honest(az) for az in (0, 70, 140, 210, 280)]
+    clean = orient.fit(good, sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0)
+    assert abs(((clean["yaw"] - 40.0 + 180) % 360) - 180) < 3.0, "precondition: the truth is found"
+
+    # Now one column that saw nothing and said "at least 60" instead.
+    false_bound = Fiducial(175, 60.0, ceiling=60.0, bound=True, weight=1.0, sigma=1.0)
+    poisoned = orient.fit(
+        good + [false_bound], sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0
+    )
+    swing = abs(((poisoned["yaw"] - clean["yaw"] + 180) % 360) - 180)
+    assert (
+        swing < 15.0
+    ), f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
+
+
+def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
+    """ "I cannot see a step" is not "there is terrain above the ceiling".
+
+    As the sky falls toward the terrain's own brightness the two overlap, and a
+    non-detection stops being evidence of anything. The test is self-calibrating
+    rather than a threshold: at a bright reference the gap is enormous and this
+    passes trivially; at twilight it cannot be made.
+    """
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from terminus.sweep import scan_horizon
+
+    def column(sky_ref, values):
+        """A column whose brightness cycles through `values` as it descends."""
+        ptr = MagicMock()
+        ptr.dry = False
+        sc = MagicMock()
+        seq = iter(values * 40)
+        sc.capture_rgb.side_effect = lambda **kw: np.full((8, 8, 3), next(seq), dtype=np.float32)
+        return scan_horizon(ptr, sc, 140, 0, 60, 5.0, 1.5, sky_ref)[1]
+
+    # Daylight: terrain at 6 against a reference of 100. Unmistakable.
+    assert column(100.0, [6.0, 7.0, 5.0]) == "blocked_above"
+
+    # Twilight: the same terrain, but the sky is now as dark as it is. The gap
+    # between the column and half the reference is smaller than the column's own
+    # scatter, so no bound may be asserted.
+    assert column(7.0, [2.0, 5.0, 3.0]) == "inconclusive"
+
+    # Genuinely dark terrain under a dark sky is still a bound: contrast is what
+    # matters, not absolute brightness.
+    assert column(7.0, [0.5, 0.6, 0.4]) == "blocked_above"
+
+
+def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
+    """On 2026-08-05 a mid-run timeout was reported as:
+
+        error: could not read or write beside .../photo_mask.yaml: timed out
+
+    Nothing was wrong with that file. `socket.timeout` is an `OSError`, so a
+    network fault was caught by whatever file-handling wrapper happened to be
+    outermost — sending the operator to inspect a healthy file, at night, with
+    the mount possibly mid-slew.
+    """
+    import socket
+
+    import pytest
+
+    from terminus.client import Seestar, SeestarError
+
+    # A closed local port refuses immediately: the same OSError family as the
+    # timeout that caused this, without spending ten seconds waiting for one.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    with pytest.raises(SeestarError) as exc:
+        Seestar("127.0.0.1", "~/.seestar/seestar_client_key.pem")
+    message = str(exc.value)
+    assert "127.0.0.1" in message, "it must name what it could not reach"
+    assert "yaml" not in message and "could not write" not in message, "not a file problem"
+    assert port is not None
+
+
+def test_orient_keeps_what_it_measured(tmp_path):
+    """A column costs minutes of clear sky; discarding it after one use is waste.
+
+    `cmd_orient` passed `frames_dir=None` and dropped the returned profile, so
+    the loop that `--replay` was built around was the one command saving nothing
+    to replay. It also made terminus-58 undiagnosable: the column that poisoned
+    the fit left no record of what it actually saw.
+    """
+    import json
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, seed=3, max_columns=5, window=3,
+        yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False, frames=None,
+        stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    with (
+        patch.object(cli, "scan_horizon", return_value=(25.0, "edge(rel 3.0)", "tree", prof)),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(
+            guide,
+            "fit",
+            return_value={
+                "yaw": 10.0,
+                "pitch": 0.0,
+                "tilt_mag": 0.0,
+                "tilt_dir": 0.0,
+                "rms": 0.1,
+                "n": 4,
+                "n_bound": 0,
+                "residuals": {0.0: 0.1},
+                "dropped": [],
+            },
+        ),
+    ):
+        cli.cmd_orient(sc, cfg, args)
+
+    saved = tmp_path / "solved_profiles.json"
+    assert saved.exists(), "the columns it measured must survive the run"
+    data = json.loads(saved.read_text())
+    assert data, "and must not be empty"
+    # And what it saved is the shape --replay consumes.
+    measure = guide.replay(data)
+    assert measure(int(next(iter(data)))) is not None

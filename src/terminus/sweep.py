@@ -756,6 +756,30 @@ def scan_horizon(
         # (a gap in foliage, a streetlight, a passing reflection), and judging by
         # the maximum lets that single outlier declare the whole column open.
         if median < 0.5 * sky_ref:
+            # A BOUND IS A STRONG CLAIM AND NEEDS THE CONTRAST TO SUPPORT IT.
+            # `orient.fit` scores a bound one-sided: a photo above the ceiling
+            # confirms it for free, only falling short contradicts it. So a false
+            # bound is not a symmetric error the robust loss can shrug off, it is
+            # a LEVER — the fit can only reduce that residual by rotating the
+            # whole sphere. Measured 2026-08-05: az 140 read a clean edge at 26.2
+            # with the sky reference at 49.3, and an hour later, at 7.0, the same
+            # column read "blocked above 60". That single false bound moved the
+            # solved yaw by 164 degrees and the RMS from 0.18 to 1.63.
+            #
+            # The sky darkened; the roofline did not move. What failed is that
+            # "I cannot see a step" was recorded as "there is terrain above the
+            # ceiling". Those are different statements and only one of them is
+            # evidence.
+            #
+            # So the separation has to stand clear of the column's own scatter.
+            # That is self-calibrating and needs no threshold: at a bright
+            # reference the gap is enormous and this passes trivially, and as the
+            # sky falls toward the terrain's own brightness the two overlap and
+            # the claim can no longer be made. Which is exactly when it stopped
+            # being true.
+            spread = (max(lums) - min(lums)) or 1e-9
+            if (0.5 * sky_ref - median) < spread:
+                return alt_max, "inconclusive", "unknown", profile
             dark = frames[profile[0][0]]
             _, v, st, _ = classify(dark, sky_ref)
             return alt_max, "blocked_above", obstruction_type(v, st, sun_alt), profile

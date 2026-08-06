@@ -536,10 +536,22 @@ def _texture(args):
 
 
 def cmd_orient(sc, cfg, args):
+    _orient(sc, cfg, args)
+
+
+def _write_or_explain(path, write):
+    """Run a write, and blame the file only when the file is actually at fault.
+
+    This used to be a blanket `except OSError` around the whole command. A
+    socket timeout is an OSError, so a scope that stopped responding mid-run was
+    reported as "could not read or write beside photo_mask.yaml" — a file that
+    was perfectly fine. Wrapping only the write means the message can name a
+    cause it actually knows.
+    """
     try:
-        _orient(sc, cfg, args)
+        write()
     except OSError as e:
-        raise MaskError(f"could not read or write beside {args.mask}: {e}") from e
+        raise MaskError(f"could not write {path}: {e}") from e
 
 
 def _orient(sc, cfg, args):
@@ -560,9 +572,10 @@ def _orient(sc, cfg, args):
     if args.replay:
         measure = _replay_source(args)
         reachable = should_stop = None
+        state = {"profiles": {}}
         print(f"replaying {args.replay}: no telescope, no sky")
     else:
-        measure, reachable, should_stop = _scope_measure(sc, cfg, args)
+        measure, reachable, should_stop, state = _scope_measure(sc, cfg, args)
 
     solution, steps = guide.run(
         rows,
@@ -600,6 +613,15 @@ def _orient(sc, cfg, args):
         )
 
     out = args.out or os.path.splitext(args.mask)[0] + "_oriented.yaml"
+    if state.get("profiles"):
+        prof_path = os.path.splitext(out)[0] + "_profiles.json"
+
+        def _write_profiles():
+            with open(prof_path, "w") as f:
+                json.dump({str(az): p for az, p in state["profiles"].items()}, f, indent=1)
+
+        _write_or_explain(prof_path, _write_profiles)
+        print(f"wrote {prof_path} ({len(state['profiles'])} columns, replayable)")
     oriented = guide.orient_mask(rows, solution)
     write_mask(
         out,
@@ -677,7 +699,15 @@ def _scope_measure(sc, cfg, args):
     sky = _sky(sc, cfg)
     sw = cfg["sweep"]
     ptr = Pointer(sc, sky, sw["sun_cone_deg"], sw["slew_step_deg"], args.dry_run)
-    state = {"sky_ref": None, "misses": 0}
+    state = {"sky_ref": None, "misses": 0, "profiles": {}}
+    # A column costs about two and a half minutes of clear sky. Keeping nothing
+    # from it meant every column orient measured was spent and gone — and it
+    # defeated --replay, the feature this loop was built around, since replay
+    # re-judges a saved night and orient was the one command saving nothing.
+    frames_dir = getattr(args, "frames", None) or (
+        os.path.splitext(getattr(args, "out", None) or getattr(args, "mask", "orient"))[0]
+        + "_frames"
+    )
 
     # Seeded before the first column, exactly as run_sweep does. Without it
     # scan_horizon returns "no_reference" for EVERY column — it cannot tell dark
@@ -700,6 +730,7 @@ def _scope_measure(sc, cfg, args):
                 ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
                 sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
                 sun_alt=sky.sun()[1],
+                frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
             )  # fmt: skip
         except SunGuard as e:
             print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
@@ -717,6 +748,7 @@ def _scope_measure(sc, cfg, args):
             return None
         state["misses"] = 0
         if profile:
+            state["profiles"][int(az)] = profile
             peak = max(lum for _, lum in profile)
             state["sky_ref"] = peak if state["sky_ref"] is None else max(state["sky_ref"], peak)
         if status in ("no_reference", "inconclusive"):
@@ -760,7 +792,7 @@ def _scope_measure(sc, cfg, args):
         """
         return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
 
-    return measure, reachable, _sun_deadline(sky, getattr(args, "stop_above_sun_alt", None))
+    return measure, reachable, _sun_deadline(sky, getattr(args, "stop_above_sun_alt", None)), state
 
 
 # ---- offline photo pipeline -----------------------------------------------
@@ -1047,6 +1079,7 @@ def main(argv=None):
     )
     orp.add_argument("mask", help="the UNORIENTED photo mask from `terminus skymask`")
     orp.add_argument("--out", help="where to write the oriented mask")
+    orp.add_argument("--frames", help="where to save the measured frames (default: beside --out)")
     orp.add_argument(
         "--replay",
         help="re-judge a saved sweep's <mask>_profiles.json instead of observing "

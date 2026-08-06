@@ -79,7 +79,19 @@ class Seestar:
         self.buf = ""
         self.s = socket.socket()
         self.s.settimeout(10)
-        self.s.connect((self.host, CONTROL_PORT))
+        try:
+            self.s.connect((self.host, CONTROL_PORT))
+        except OSError as e:
+            # A scope fault must carry the scope's error type. socket.timeout is
+            # an OSError, so a network failure used to surface as one and get
+            # caught by whatever file-handling wrapper happened to be outermost:
+            # on 2026-08-05 a mid-run timeout was reported as "could not read or
+            # write beside photo_mask.yaml", sending the operator to inspect a
+            # file that was perfectly fine, at night, with the mount mid-slew.
+            raise SeestarError(
+                f"could not reach the scope at {self.host}:{CONTROL_PORT}: {e}. "
+                "Check it is powered, awake, and on the same network."
+            ) from e
 
     def reconnect(self):
         """Reopen and re-authenticate after a dropped connection.
