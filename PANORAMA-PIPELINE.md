@@ -81,12 +81,20 @@ Two of the above will bite you directly:
   `photo_type`, `scope_type`, and `weight`/`sigma` are deliberately *separate* — see `LESSONS.md`
   F-23, because multiplying a Huber loss by 1/σ² is not inverse-variance weighting.
 
-Two defects that were open in this area are **fixed** on HEAD, in `c660ad7`:
-`terminus-48` (`from_mask` matched type strings no writer produced — it now reads
-an explicit `bound:` field) and `terminus-14` (the find_edge noise estimator).
-The beads still read OPEN, which is bead housekeeping rather than code state; the
-code is the authority. If HEAD misbehaves, diff against `4866544` before assuming
-the pipeline is wrong.
+Two defects that were open in this area are **fixed** on HEAD, but not in the same
+place, and the difference matters if you go looking:
+
+- `terminus-48` — `from_mask` matched type strings no writer produced. Fixed in
+  `c660ad7`, which is after the `4866544` baseline, so it *does* show up in a diff
+  against it. It now reads an explicit `bound:` field.
+- `terminus-14` — the find_edge noise estimator. Already fixed **at** `4866544`:
+  the RMS second-difference estimator and the `EDGE_MIN_STEP_FRAC` floor are both
+  in that commit's `sweep.py`. `c660ad7` added only the regression test. Diffing
+  against the baseline will show nothing, because there is nothing to show.
+
+The beads still read OPEN for both, which is bead housekeeping rather than code
+state; the code is the authority. If HEAD misbehaves, diff against `4866544`
+before assuming the pipeline is wrong.
 
 ---
 
