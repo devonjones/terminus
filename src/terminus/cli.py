@@ -321,6 +321,16 @@ def _merge_meta(prior_meta, fresh, measured, skipped, present=None):
     meta["patched_columns"] = sorted(
         _az_list(prior_meta.get("patched_columns"), "patched_columns") | {int(a) for a in measured}
     )
+    # `stopped_early` describes THIS run, so it is neither inherited nor dropped.
+    # Starting from `dict(prior_meta)` got it wrong in both directions: a mask
+    # once truncated stayed flagged forever however many complete patches
+    # followed, and a patch that WAS truncated lost the flag entirely because
+    # `fresh` is discarded on this path. Same shape as the `skipped_az` bug this
+    # function was written for — meta contradicting the data it describes.
+    if fresh.get("stopped_early"):
+        meta["stopped_early"] = True
+    else:
+        meta.pop("stopped_early", None)
     return meta
 
 

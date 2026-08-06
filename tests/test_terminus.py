@@ -3119,6 +3119,84 @@ def test_a_measured_column_leaves_the_skipped_list(tmp_path):
     assert cols[190]["alt"] == 12.0
 
 
+def test_a_truncated_sweep_is_visible_in_the_file_and_the_exit_code(tmp_path):
+    """End to end through cmd_sweep, on both the fresh and the merge path.
+
+    Every existing test passes `stop_above_sun_alt=None`, so nothing drove
+    `cmd_sweep` with a deadline that actually fires: deleting both the meta stamp
+    and the `SystemExit(3)` left the whole suite green. That gap is why the merge
+    path shipped broken — the flag was stamped onto `fresh`, and `_merge_meta`
+    builds from `prior_meta` and discards `fresh`.
+
+    Both directions matter. Losing the flag lets a truncated run read as
+    complete; INHERITING it lets a mask stay flagged forever however many
+    complete patches follow. A record that cannot be cleared is not a record.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    def args(out, azimuths=None):
+        return SimpleNamespace(
+            dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+            no_export=True, azimuths=azimuths, stop_above_sun_alt=-12.0,
+        )  # fmt: skip
+
+    class Deadline:
+        """Stands in for `_sun_deadline`, firing or not on demand."""
+
+        def __init__(self, fires):
+            self.fires = fires
+            self.fired = False
+
+        def __call__(self):
+            if self.fires:
+                self.fired = True
+            return self.fires
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+
+    def sweep(out, deadline, azimuths=None):
+        def run(*a, **k):
+            k["should_stop"]()  # the real loop asks; asking is what sets `fired`
+            return {90: (12.0, "tree")}, [], {}
+
+        with (
+            patch.object(cli, "_sun_deadline", return_value=deadline),
+            patch.object(cli, "run_sweep", side_effect=run),
+        ):
+            cli.cmd_sweep(sc, _SWEEP_CFG, args(out, azimuths))
+
+    # 1. A fresh run the window closed on: exit 3, and the file says so.
+    out = tmp_path / "h.yaml"
+    with pytest.raises(SystemExit) as exc:
+        sweep(out, Deadline(fires=True))
+    assert exc.value.code == 3, "a closed window is not the same outcome as a mount fault (2)"
+    meta, _ = load_columns(str(out))
+    assert meta.get("stopped_early") is True, "the file outlives the terminal and must say it"
+
+    # 2. A patch that is ALSO truncated must keep saying so after merging.
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"lat": 39.79, "lon": -104.89})
+    with pytest.raises(SystemExit) as exc:
+        sweep(out, Deadline(fires=True), azimuths="90")
+    assert exc.value.code == 3
+    meta, _ = load_columns(str(out))
+    assert meta.get("stopped_early") is True, "merging must not discard this run's truncation"
+
+    # 3. A complete patch over a truncated mask CLEARS the flag.
+    sweep(out, Deadline(fires=False), azimuths="90")
+    meta, cols = load_columns(str(out))
+    assert not meta.get("stopped_early"), (
+        "a mask since completed must stop claiming it was cut short"
+    )
+    assert 90 in cols, "and the merge still did its actual job"
+
+
 def test_duplicate_azimuths_are_measured_once():
     """370 and 10 are the same column; asking for both must not scan twice."""
     from unittest.mock import MagicMock, patch
