@@ -60,14 +60,19 @@ have the pipeline wrong.
 
 ### What has drifted since `4866544`
 
+Measured against `main`, not against whatever happens to be in your working tree:
+
 ```
-src/terminus/mosaic.py   +91    source_images(), remap_labels(), combine_labels(), NEAREST
 src/terminus/orient.py   +122   Fiducial gains sigma/photo_type/scope_type; objective() extracted
 src/terminus/plan.py     +112   feasibility filtering
 src/terminus/skymask.py  +196   _tiles(), segment_classes(); porosity -> gap_fraction rename
 ```
 
-Two of these will bite you directly:
+`mosaic.py` has **not** drifted. Per-frame label transport — `source_images`,
+`remap_labels`, `combine_labels` — arrives with PR #23 and is not on `main` yet,
+so check which branch you are on before looking for those names.
+
+Two of the above will bite you directly:
 
 - **`porosity` was renamed to `gap_fraction`** in `8c8dd51`. At `4866544` the parameter is
   `type_uncertainty(classes, porosity, ...)`; on HEAD it is `gap_fraction`. Same quantity.
@@ -76,9 +81,12 @@ Two of these will bite you directly:
   `photo_type`, `scope_type`, and `weight`/`sigma` are deliberately *separate* — see `LESSONS.md`
   F-23, because multiplying a Huber loss by 1/σ² is not inverse-variance weighting.
 
-Current HEAD has known open defects in this area — `terminus-48` (`orient.from_mask` matches
-type strings no writer has ever produced) and `terminus-14` (find_edge noise estimator). If HEAD
-misbehaves, diff against `4866544` before assuming the pipeline is wrong.
+Two defects that were open in this area are **fixed** on HEAD, in `c660ad7`:
+`terminus-48` (`from_mask` matched type strings no writer produced — it now reads
+an explicit `bound:` field) and `terminus-14` (the find_edge noise estimator).
+The beads still read OPEN, which is bead housekeeping rather than code state; the
+code is the authority. If HEAD misbehaves, diff against `4866544` before assuming
+the pipeline is wrong.
 
 ---
 
