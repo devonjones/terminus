@@ -134,7 +134,9 @@ def write_mask(path, mask, skipped, meta):
             "#          Recorded per column, because a merged mask holds both and the",
             "#          two instruments are not equally able to tell tree from wall.",
         ]
-    lines += [f"meta: {meta}", "horizon:"]
+    # Sanitised, not trusted: meta is assembled from a config file, astropy and
+    # the caller, and only primitives survive a repr into YAML. See `_plain`.
+    lines += [f"meta: {_plain(dict(meta))}", "horizon:"]
     for az in sorted(columns):
         col = columns[az]
         parts = [f"alt: {col['alt']}", f"type: {col.get('type', '')}"]
@@ -428,6 +430,32 @@ def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriente
     with open(txt, "w") as f:
         f.write(to_stellarium_txt(rows, meta, tree_buffer, allow_unoriented=True))
     return hrz, txt
+
+
+def _plain(v):
+    """A YAML-safe primitive. Numpy scalars are the reason this exists.
+
+    `write_mask` serialises meta as a Python repr, which is only YAML by
+    coincidence — it holds for str, int, float, bool, list and dict, and breaks
+    for anything else. Numpy 2 changed scalar repr from `39.7917` to
+    `np.float64(39.7917)`, so every mask written since silently gained a lat and
+    lon that `yaml.safe_load` reads back as a STRING. `float()` on it raises,
+    which means the position guard in `cli._check_mergeable` — the whole point of
+    which is to refuse a merge across a tripod move — could not run at all
+    without a traceback.
+
+    Nothing caught it because every test builds meta from Python literals. It
+    took a real sweep, where lat and lon come from astropy as numpy scalars.
+    """
+    if isinstance(v, bool) or v is None:
+        return v
+    if hasattr(v, "item"):  # numpy scalar, and anything else pretending to be one
+        return v.item()
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    return v
 
 
 def default_meta(sky_lat, sky_lon, cfg, skipped):

@@ -5143,3 +5143,123 @@ def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
             return 271.0, -20.0
 
     assert not column_touches_sun(NightSky(), 271, 0, 60, 30)
+
+
+def test_a_mask_written_from_real_instruments_is_still_yaml(tmp_path):
+    """Found by running the CLI on the actual scope, not by any test here.
+
+    `write_mask` serialises meta as a Python repr, which is YAML only by
+    coincidence: it holds for str, int, float, bool, list and dict, and breaks
+    for anything else. Numpy 2 changed scalar repr from `39.7917` to
+    `np.float64(39.7917)`, and lat/lon reach `default_meta` from astropy as
+    numpy scalars — so every mask written by a real sweep since that numpy
+    release had a lat and lon that `yaml.safe_load` reads back as a STRING.
+
+    `float()` on that raises, which means `cli._check_mergeable` — whose whole
+    job is refusing a merge across a tripod move — could not run without a
+    traceback. The guard was inoperative on exactly the files it guards.
+
+    Every test in this suite builds meta from Python literals, which is why none
+    of them saw it.
+    """
+    import numpy as np
+    import yaml
+
+    from terminus.export import load_columns, write_mask
+
+    path = str(tmp_path / "m.yaml")
+    write_mask(
+        path,
+        {0: (60.0, "structure"), 90: (12.5, "tree")},
+        [],
+        {
+            "measured": "2026-08-05 18:03",
+            "lat": np.float64(39.7917),  # as astropy hands it over
+            "lon": np.float64(-104.894),
+            "alt_search": [np.int64(0), np.int64(60)],
+            "clear_thresh": np.float32(0.85),
+        },
+    )
+    raw = yaml.safe_load(open(path))
+    for key in ("lat", "lon", "clear_thresh"):
+        value = raw["meta"][key]
+        assert isinstance(value, float), f"{key} came back as {type(value).__name__}"
+        float(value)  # the operation _check_mergeable performs
+    assert raw["meta"]["alt_search"] == [0, 60]
+    assert all(isinstance(v, int) for v in raw["meta"]["alt_search"])
+
+    # And the guard that could not run now can.
+    from types import SimpleNamespace
+
+    from terminus.cli import _check_mergeable
+
+    meta, _cols = load_columns(path)
+    here = SimpleNamespace(loc=SimpleNamespace(lat=SimpleNamespace(deg=39.7917),
+                                               lon=SimpleNamespace(deg=-104.894)))  # fmt: skip
+    _check_mergeable(dict(meta, oriented=True), here)  # same spot: allowed, no traceback
+
+
+def test_labels_are_voted_not_last_wins_and_never_invented_where_no_frame_looked():
+    """Combining remapped label layers, which is where a class can be fabricated.
+
+    Two frames overlapping may disagree, and the answer more of the evidence
+    supports beats the one that happened to be stitched second — the same
+    reasoning `segment_classes` already uses across tiles. And a pixel no frame
+    covered has no class at all: -1, not a guess.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus.mosaic import combine_labels
+
+    def layer(tmp, name, value, box):
+        """A remapped layer: class `value` inside `box`, transparent elsewhere."""
+        x0, y0, x1, y1 = box
+        rgb = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+        rgb[..., :3] = value
+        rgb[..., 3] = 255
+        path = os.path.join(tmp, name)
+        im = Image.fromarray(rgb, "RGBA")
+        im.save(path, tiffinfo={286: ((x0, 1),), 287: ((y0, 1),), 282: ((1, 1),), 283: ((1, 1),)})
+        return path
+
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
+    # Two frames call the same strip 'tree' (4); one calls it 'building' (1).
+    paths = [
+        layer(tmp, "a.tif", 4, (0, 0, 6, 4)),
+        layer(tmp, "b.tif", 4, (2, 0, 8, 4)),
+        layer(tmp, "c.tif", 1, (2, 0, 8, 4)),
+    ]
+    out = combine_labels(paths, 10, 4)
+    assert out[0, 3] == 4, "two votes for tree beat one for building"
+    assert out[0, 0] == 4, "a pixel only one frame saw takes that frame's answer"
+    assert (out[:, 8:] == -1).all(), "no frame looked here, so there is no class"
+
+
+def test_a_label_project_never_interpolates_a_class_that_does_not_exist(tmp_path):
+    """`m i0` is poly3, and on a LABEL image cubic interpolation is nonsense.
+
+    Halfway between tree (4) and building (1) it computes 8.4, and ADE20K class 8
+    is a bed — a class neither frame contained. Labels must be remapped nearest
+    neighbour, which is set on the project's `m` line, not by a nona flag.
+    """
+    from terminus.mosaic import NEAREST, remap_labels
+
+    project = tmp_path / "final.pto"
+    project.write_text(
+        'p f2 w2880 h1440 v360 n"TIFF_m"\n'
+        "m i0\n"
+        'i w3000 h4000 f0 n"stage/frame1.jpg"\n'
+        'i w3000 h4000 f0 n"stage/frame2.jpg"\n'
+    )
+    try:
+        remap_labels(str(project), str(tmp_path), {"stage/frame1.jpg": "labels/001.png"})
+    except Exception:
+        pass  # nona will fail on files that do not exist; the rewrite is the point
+
+    written = (tmp_path / "label.pto").read_text()
+    assert f"m i{NEAREST}" in written, f"interpolation was left as poly3:\n{written}"
+    assert 'n"labels/001.png"' in written, "the label image must replace the photograph"
+    assert 'n"stage/frame2.jpg"' in written, "a frame with no label given is left alone"

@@ -173,6 +173,97 @@ def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
     return sorted(glob.glob(out + "*.tif")), final
 
 
+# Panotools interpolator 6 is nearest neighbour. It is not a quality setting
+# here, it is a correctness one: a class index is a LABEL, not a magnitude, and
+# poly3 (the default, `m i0`) will happily produce 8.4 halfway between tree (4)
+# and building (1) — a class that does not exist. Everything downstream then
+# reads it as whatever ADE20K happens to number 8.
+NEAREST = 6
+
+
+def source_images(pto):
+    """The image filenames a project references, in image-line order."""
+    names = []
+    with open(pto) as fh:
+        for line in fh:
+            if line.startswith("i "):
+                m = re.search(r'n"([^"]*)"', line)
+                if m:
+                    names.append(m.group(1))
+    return names
+
+
+def remap_labels(pto, work_dir, label_for, prefix="label"):
+    """Warp per-frame LABEL images through the same solve as the photographs.
+
+    This is the point of the whole arrangement, and doing it the other way round
+    is a mistake worth naming. Segmenting the finished panorama asks the model to
+    read an equirectangular projection: downsampled from eighteen 12-megapixel
+    frames to one 2880x1440 canvas, seamed where frames blend, and stretched
+    without limit toward the poles. SegFormer was trained on photographs. A
+    photograph is what each frame still is.
+
+    So segment the frames — full resolution, native projection, exactly the
+    input the model expects — and then push the LABELS through the identical
+    warp, so they land wherever their pixels landed.
+
+    `label_for` maps a source filename (as the project spells it) to a label
+    image on disk. Returns the remapped layer paths.
+    """
+    require_hugin()
+    out_pto = os.path.join(work_dir, prefix + ".pto")
+    with open(pto) as fh, open(out_pto, "w") as out:
+        for line in fh:
+            if line.startswith("m "):
+                # Interpolation is set on the m line and defaults to poly3.
+                line = re.sub(r"\bi\d+", f"i{NEAREST}", line.rstrip("\n")) + "\n"
+                if f"i{NEAREST}" not in line:
+                    line = line.rstrip("\n") + f" i{NEAREST}\n"
+            elif line.startswith("i "):
+                m = re.search(r'n"([^"]*)"', line)
+                if m and m.group(1) in label_for:
+                    line = line.replace(m.group(0), f'n"{label_for[m.group(1)]}"')
+            out.write(line)
+    stem = os.path.join(work_dir, prefix)
+    for old in glob.glob(stem + "*.tif"):
+        os.remove(old)
+    _run(["nona", "-m", "TIFF_m", "-o", stem, out_pto])
+    return sorted(glob.glob(stem + "*.tif"))
+
+
+def combine_labels(layer_paths, width, height):
+    """Majority vote per pixel across the remapped label layers.
+
+    Majority, not last-wins, for the same reason `segment_classes` votes across
+    tiles: where two frames overlap they may disagree, and the answer that more
+    of the evidence supports is better than the answer that happened to be
+    stitched second.
+
+    Returns an int array of ADE20K classes, -1 where no frame covered.
+    """
+    votes = {}
+    covered = np.zeros((height, width), bool)
+    for path in layer_paths:
+        rgb, mask, ox, oy = _layer(path)
+        lab = rgb[..., 0].astype(int)  # class id stored in every channel
+        h, w = lab.shape
+        ys, xs = np.mgrid[0:h, 0:w]
+        Y, X = ys[mask] + oy, xs[mask] + ox
+        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
+        Y, X, L = Y[ok], X[ok], lab[mask][ok]
+        covered[Y, X] = True
+        for cls in np.unique(L):
+            box = votes.setdefault(int(cls), np.zeros((height, width), np.int32))
+            sel = L == cls
+            np.add.at(box, (Y[sel], X[sel]), 1)
+    if not votes:
+        return np.full((height, width), -1, dtype=int)
+    labels = sorted(votes)
+    stack = np.stack([votes[c] for c in labels], axis=0)
+    out = np.asarray(labels, dtype=int)[np.argmax(stack, axis=0)]
+    return np.where(covered, out, -1)
+
+
 def _layer(path):
     from PIL import Image
 

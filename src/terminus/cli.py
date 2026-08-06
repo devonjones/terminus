@@ -814,9 +814,58 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
         min_points=args.min_points,
         gains={n: float(g) for n, g in zip(sorted(tiffs), gains, strict=False)},
     )
+    if args.segment:
+        _segment_frames(args, mosaic, final, base, work)
     covered = float((coverage > 0).any(axis=0).mean()) * 100.0
     print(f"wrote {base}.png ({args.width}x{args.height}, {covered:.0f}% of azimuth covered)")
     print(f"wrote {base}.coverage.npy and {base}.manifest.json")
+
+
+def _segment_frames(args, mosaic, final, base, work):
+    """Segment each FRAME, then warp the labels through the same solve.
+
+    The other order — stitch, then segment the panorama — is what this replaces,
+    and it asks the model to do something it was never trained for. A finished
+    equirectangular canvas is eighteen 12-megapixel photographs resampled down to
+    one 2880x1440 image, blended across seams, stretched without limit toward the
+    poles, and black where nobody pointed. SegFormer reads photographs. Each
+    frame still IS one, at full resolution, in the projection the camera made.
+
+    So the labels are computed where the model is at home and then follow their
+    own pixels into the panorama, nearest-neighbour so a class index is never
+    interpolated into a class that does not exist.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from . import skymask
+
+    if not skymask.available("segment"):
+        raise SeestarError(
+            "--segment needs torch, torchvision and transformers.\n"
+            "Install them, or drop --segment and let `terminus skymask` read the "
+            "stitched panorama instead (worse: the model was trained on photographs, "
+            "not on equirectangular projections)."
+        )
+    names = mosaic.source_images(final)
+    label_dir = os.path.join(work, "labels")
+    os.makedirs(label_dir, exist_ok=True)
+    label_for = {}
+    for i, name in enumerate(names, 1):
+        src = os.path.join(os.path.dirname(final), name)
+        print(f"  segmenting frame {i}/{len(names)}: {os.path.basename(name)}", flush=True)
+        classes = skymask.segment_classes(Image.open(src).convert("RGB"))
+        # The class id in all three channels: nona remaps RGB, and reading one
+        # channel back is simpler than persuading it to carry a palette.
+        lab = np.repeat(classes.astype(np.uint8)[:, :, None], 3, axis=2)
+        path = os.path.join(label_dir, f"{i:03d}.png")
+        Image.fromarray(lab).save(path)
+        label_for[name] = os.path.relpath(path, os.path.dirname(final))
+    layers = mosaic.remap_labels(final, work, label_for)
+    classes = mosaic.combine_labels(layers, args.width, args.height)
+    np.save(base + ".classes.npy", classes)
+    named = int((classes >= 0).sum())
+    print(f"wrote {base}.classes.npy ({named * 100 // classes.size}% of pixels labelled)")
 
 
 def _type_name(cls):
@@ -868,7 +917,18 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
 
     classes = np.full(w, -1, dtype=int)
     print(f"backend used: {backend}")
-    if backend == "segment":
+    if args.classes:
+        # Labels computed on the FRAMES and warped here, which is the right way
+        # round; see cli._segment_frames.
+        seg = np.load(args.classes)
+        if seg.shape != (h, w):
+            raise SeestarError(
+                f"classes {seg.shape} do not match the image {(h, w)}; they must come "
+                "from the same mosaic run"
+            )
+        print(f"obstruction types from {args.classes} (segmented per frame)")
+        classes = skymask.obstruction_classes(seg, band["top"], valid=valid)
+    elif backend == "segment":
         classes = skymask.obstruction_classes(
             skymask.segment_classes(image), band["top"], valid=valid
         )
@@ -1061,6 +1121,12 @@ def main(argv=None):
         default=None,
         help="the .coverage.npy from `terminus mosaic`; without it, "
         "uncovered pixels read as terrain",
+    )
+    sk.add_argument(
+        "--classes",
+        default=None,
+        help="the .classes.npy from `terminus mosaic --segment`: obstruction types "
+        "read from the frames themselves rather than from the stitched panorama",
     )
     sk.add_argument("--out", default=None)
     sk.add_argument("--az-step", type=float, default=1.0)
