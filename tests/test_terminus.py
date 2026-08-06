@@ -3171,6 +3171,84 @@ def test_a_measured_column_leaves_the_skipped_list(tmp_path):
     assert cols[190]["alt"] == 12.0
 
 
+def test_a_truncated_sweep_is_visible_in_the_file_and_the_exit_code(tmp_path):
+    """End to end through cmd_sweep, on both the fresh and the merge path.
+
+    Every existing test passes `stop_above_sun_alt=None`, so nothing drove
+    `cmd_sweep` with a deadline that actually fires: deleting both the meta stamp
+    and the `SystemExit(3)` left the whole suite green. That gap is why the merge
+    path shipped broken — the flag was stamped onto `fresh`, and `_merge_meta`
+    builds from `prior_meta` and discards `fresh`.
+
+    Both directions matter. Losing the flag lets a truncated run read as
+    complete; INHERITING it lets a mask stay flagged forever however many
+    complete patches follow. A record that cannot be cleared is not a record.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.export import load_columns, write_mask
+
+    def args(out, azimuths=None):
+        return SimpleNamespace(
+            dry_run=True, out=str(out), frames=None, az_start=0, az_end=350,
+            no_export=True, azimuths=azimuths, stop_above_sun_alt=-12.0,
+        )  # fmt: skip
+
+    class Deadline:
+        """Stands in for `_sun_deadline`, firing or not on demand."""
+
+        def __init__(self, fires):
+            self.fires = fires
+            self.fired = False
+
+        def __call__(self):
+            if self.fires:
+                self.fired = True
+            return self.fires
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+
+    def sweep(out, deadline, azimuths=None):
+        def run(*a, **k):
+            k["should_stop"]()  # the real loop asks; asking is what sets `fired`
+            return {90: (12.0, "tree")}, [], {}
+
+        with (
+            patch.object(cli, "_sun_deadline", return_value=deadline),
+            patch.object(cli, "run_sweep", side_effect=run),
+        ):
+            cli.cmd_sweep(sc, _SWEEP_CFG, args(out, azimuths))
+
+    # 1. A fresh run the window closed on: exit 3, and the file says so.
+    out = tmp_path / "h.yaml"
+    with pytest.raises(SystemExit) as exc:
+        sweep(out, Deadline(fires=True))
+    assert exc.value.code == 3, "a closed window is not the same outcome as a mount fault (2)"
+    meta, _ = load_columns(str(out))
+    assert meta.get("stopped_early") is True, "the file outlives the terminal and must say it"
+
+    # 2. A patch that is ALSO truncated must keep saying so after merging.
+    write_mask(str(out), {0: (10.0, "tree")}, [], {"lat": 39.79, "lon": -104.89})
+    with pytest.raises(SystemExit) as exc:
+        sweep(out, Deadline(fires=True), azimuths="90")
+    assert exc.value.code == 3
+    meta, _ = load_columns(str(out))
+    assert meta.get("stopped_early") is True, "merging must not discard this run's truncation"
+
+    # 3. A complete patch over a truncated mask CLEARS the flag.
+    sweep(out, Deadline(fires=False), azimuths="90")
+    meta, cols = load_columns(str(out))
+    assert not meta.get("stopped_early"), (
+        "a mask since completed must stop claiming it was cut short"
+    )
+    assert 90 in cols, "and the merge still did its actual job"
+
+
 def test_duplicate_azimuths_are_measured_once():
     """370 and 10 are the same column; asking for both must not scan twice."""
     from unittest.mock import MagicMock, patch
@@ -5146,6 +5224,105 @@ def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
     assert len(stopped) > 0, "and what was measured before it closed is kept"
     # A sweep that stops is not a sweep that failed.
     assert all("alt" in c for c in stopped.values())
+
+
+def test_refinement_checks_the_deadline_before_every_column():
+    """Per column, not per round — a round is up to 24 columns long.
+
+    The check used to sit at the top of the refine `while`, so once a round had
+    started it ran to completion: with the default `refine_max_columns` that is
+    24 further slews, each a coarse walk plus a bisection, after the window had
+    closed. Refinement is the LAST phase of a sweep, which is when a dawn
+    deadline is nearest, and it accelerates as the sky brightens and more
+    columns resolve — terminus-17's failure mode, one scope deeper. SAFE-02.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 0, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+        # Every neighbouring pair disagrees, so refinement wants to subdivide
+        # everywhere and only the budget holds it back.
+        "az_refine_deg": 1, "refine_threshold_deg": 0, "refine_max_columns": 24,
+    }  # fmt: skip
+
+    seq = {"n": 0}
+
+    def alternating(*a, **k):
+        seq["n"] += 1
+        return (10.0 if seq["n"] % 2 else 50.0, "edge", "tree", [])
+
+    # THE WINDOW MUST CLOSE *MID-ROUND*, which is the whole point. The main
+    # sweep asks 12 times (one per column); the old code's next question was at
+    # the top of the refine `while`, the new code's is before each candidate
+    # pair. Closing on question 13 stops BOTH versions identically and the test
+    # passes against the bug — it did, on the first attempt. Letting 13 through
+    # and closing on 14 separates them: the old code has already committed to a
+    # whole round of up to `refine_max_columns`, the new one has committed to
+    # exactly one column.
+    asked = {"n": 0}
+
+    def closes_as_refinement_opens():
+        asked["n"] += 1
+        return asked["n"] > 13
+
+    from terminus.sweep import Pointer
+
+    with (
+        patch("terminus.sweep.scan_horizon", side_effect=alternating),
+        patch("terminus.sweep.save_boundary_frame"),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+    ):
+        mask, _skipped, _prof = run_sweep(
+            sc, sky, cfg, az_start=0, az_end=330, dry=False,
+            log=lambda *a, **k: None, should_stop=closes_as_refinement_opens,
+        )  # fmt: skip
+
+    refined = {az for az in mask if az % cfg["az_step"]}
+    assert len(refined) <= 1, (
+        f"refinement continued past the deadline: {len(refined)} columns added "
+        f"after the window closed ({sorted(refined)})"
+    )
+
+
+def test_a_run_the_window_closed_on_does_not_look_like_a_finished_one():
+    """Exit code and mask must both say the sweep was cut short.
+
+    Both ways a sweep ends early used to be distinguishable only by log text: a
+    PointingError abort printed SWEEP ABANDONED and exited 2, while a closed
+    observing window returned normally, wrote and exported the mask exactly as a
+    complete run would, and exited 0. A scheduler — which is the whole reason
+    the cutoff flag exists — could not tell "the window closed and columns are
+    missing" from "everything asked for was measured".
+    """
+    from terminus.cli import _sun_deadline
+
+    class FakeSky:
+        def __init__(self, alt):
+            self._alt = alt
+
+        def sun(self):
+            return 180.0, self._alt
+
+    # Never reached: the deadline must not claim it fired.
+    open_window = _sun_deadline(FakeSky(-30.0), -12.0)
+    assert open_window() is False
+    assert open_window.fired is False, "an unfired deadline must not report a truncated run"
+
+    closed = _sun_deadline(FakeSky(-5.0), -12.0)
+    assert closed.fired is False, "it has not been asked yet"
+    assert closed() is True
+    assert closed.fired is True, "the deadline has to remember, or the caller cannot tell"
+
+    assert _sun_deadline(FakeSky(0.0), None) is None, "no cutoff asked for, nothing to enforce"
 
 
 def test_the_sun_deadline_reads_the_sun_each_time_it_is_asked():

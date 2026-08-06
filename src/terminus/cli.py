@@ -205,8 +205,18 @@ def _sun_deadline(sky, stop_above):
                 "cutoff for this run",
                 file=sys.stderr,
             )
+            # THE DEADLINE REMEMBERS THAT IT FIRED, so a caller can tell a
+            # truncated run from a finished one. Without this the two are
+            # indistinguishable downstream: `run_sweep` returns normally either
+            # way, the mask is written and exported the same, and the process
+            # exits 0. A scheduler — the deployment this flag exists for — could
+            # not tell "the window closed and columns are missing" from "the
+            # sweep measured everything asked of it" without parsing log text.
+            should_stop.fired = True
             return True
         return False
+
+    should_stop.fired = False
 
     return should_stop
 
@@ -376,6 +386,16 @@ def _merge_meta(prior_meta, fresh, measured, skipped, present=None):
     meta["patched_columns"] = sorted(
         _az_list(prior_meta.get("patched_columns"), "patched_columns") | {int(a) for a in measured}
     )
+    # `stopped_early` describes THIS run, so it is neither inherited nor dropped.
+    # Starting from `dict(prior_meta)` got it wrong in both directions: a mask
+    # once truncated stayed flagged forever however many complete patches
+    # followed, and a patch that WAS truncated lost the flag entirely because
+    # `fresh` is discarded on this path. Same shape as the `skipped_az` bug this
+    # function was written for — meta contradicting the data it describes.
+    if fresh.get("stopped_early"):
+        meta["stopped_early"] = True
+    else:
+        meta.pop("stopped_early", None)
     return meta
 
 
@@ -408,6 +428,9 @@ def cmd_sweep(sc, cfg, args):
         print(f"merging into {out} ({len(prior)} existing columns)")
 
     aborted = None
+    # Bound to a name rather than passed inline: after the run we ask it whether
+    # it fired, which is how a truncated sweep is told from a finished one.
+    should_stop = _sun_deadline(sky, getattr(args, "stop_above_sun_alt", None))
     try:
         mask, skipped, profiles = run_sweep(
             sc,
@@ -418,7 +441,7 @@ def cmd_sweep(sc, cfg, args):
             save_dir=frames,
             dry=args.dry_run,
             azimuths=azimuths,
-            should_stop=_sun_deadline(sky, getattr(args, "stop_above_sun_alt", None)),
+            should_stop=should_stop,
         )
     except PointingError as e:
         # A sweep runs for hours. Losing every column already measured because
@@ -454,6 +477,14 @@ def cmd_sweep(sc, cfg, args):
     lat = sky.loc.lat.deg
     lon = sky.loc.lon.deg
     fresh = default_meta(round(lat, 4), round(lon, 4), cfg["sweep"], skipped)
+    # A run the window closed on is NOT a finished sweep, and the mask has to say
+    # so itself. The log line is not enough: the file outlives the terminal, and
+    # the next tool to read it — or future-you — has no other way to know that
+    # the missing azimuths are missing because time ran out rather than because
+    # nobody asked for them.
+    stopped_early = bool(getattr(should_stop, "fired", False))
+    if stopped_early:
+        fresh["stopped_early"] = True
     # The scope reads type from colour, so a column it typed was typed in
     # daylight — after sunset `obstruction_type` returns "" rather than guessing.
     # Stamped here rather than in run_sweep so its (alt, type) contract, which
@@ -486,6 +517,19 @@ def cmd_sweep(sc, cfg, args):
         print(f"\nSWEEP ABANDONED: {aborted}", file=sys.stderr)
         print("the partial mask above was saved; re-run to cover the rest", file=sys.stderr)
         raise SystemExit(2)
+    if stopped_early:
+        # A DISTINCT code, because it is a distinct outcome. 2 means the mount
+        # stopped answering and the run was abandoned; 3 means the run did
+        # exactly what it was told and the clock beat it. A scheduler should
+        # retry the second tomorrow night, not treat it as a fault.
+        print(
+            "\nSWEEP INCOMPLETE: the observing window closed before every column", file=sys.stderr
+        )
+        print(
+            f"the {len(mask)} columns measured were saved; re-run to cover the rest",
+            file=sys.stderr,
+        )
+        raise SystemExit(3)
 
 
 def cmd_polar(sc, cfg, args):  # sc unused; polar is offline

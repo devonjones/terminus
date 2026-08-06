@@ -1232,13 +1232,23 @@ def run_sweep(
     budget = cfg.get("refine_max_columns", 24)
     if refine_to and not dry:
         work = True
-        while work and budget > 0:
-            if should_stop is not None and should_stop():
-                log("stopping refinement: the observing window has closed", flush=True)
-                break
+        # THE DEADLINE IS CHECKED PER COLUMN, NOT PER ROUND. Checking only at the
+        # top of the `while` let a single round insert up to `refine_max_columns`
+        # (24 by default) further columns after the window had already closed —
+        # each one a slew plus a coarse walk plus a bisection. That is
+        # terminus-17 reopened inside the one phase where a dawn deadline is
+        # most likely to be near: refinement runs last, and it speeds up as the
+        # sky brightens and more columns resolve, so the estimate degrades in
+        # the direction that matters. SAFE-02.
+        stopped = False
+        while work and budget > 0 and not stopped:
             work = False
             known = sorted(mask)
             for a0, a1 in zip(known, known[1:], strict=False):
+                if should_stop is not None and should_stop():
+                    log("stopping refinement: the observing window has closed", flush=True)
+                    stopped = True
+                    break
                 gap = a1 - a0
                 if gap > 2 * cfg["az_step"]:
                     continue  # a Sun-skipped hole, not a measured neighbour
