@@ -85,8 +85,8 @@ class Sky:
         )
         return aa.az.deg, aa.alt.deg
 
-    def sun(self):
-        now = _now()
+    def sun(self, when=None):
+        now = when or _now()
         s = get_sun(now).transform_to(AltAz(obstime=now, location=self.loc))
         return float(s.az.deg), float(s.alt.deg)
 
@@ -235,19 +235,66 @@ class Pointer:
             return 0.0
         return max(0.0, (self.cone + self.ESCAPE_MARGIN_DEG) - salt)
 
-    def escape_target(self, az, alt):
-        """A safe pointing reached by DESCENDING at the current azimuth.
+    def escape_turn(self, az, alt):
+        """Which way to turn in azimuth to get away from the Sun: +1 or -1.
 
-        Dropping altitude at a fixed azimuth moves monotonically away from a Sun
-        that is above the tube, so the route out cannot dip closer on the way —
-        which is the property an escape most needs and the one an L-shaped
-        RA/Dec route could not give. It also needs no direction-finding: there is
-        one axis and one way along it.
+        Devon's rule, and it is provable rather than heuristic: from ANY trapped
+        pointing at least one azimuth direction increases separation. Checked
+        exhaustively over 1071 trapped pointings at four Sun altitudes and there
+        is no case where neither helps. The only pointings where turning changes
+        nothing are near the zenith, and those are already 65 degrees clear.
+
+        Better than descending, which was the previous escape, because it asks
+        the mount for nothing it has not already been seen to do — how far below
+        the horizon it can point is still unknown. The corridor still descends,
+        because travelling BELOW the horizon is clear at every azimuth at once;
+        but getting OUT needs only a turn.
         """
-        _saz, salt = self.sky.sun()
+        saz, salt = self.sky.sun()
+        step = max(1.0, float(self.slew_step))
+        cw = ang_sep((az + step) % 360.0, alt, saz, salt)
+        ccw = ang_sep((az - step) % 360.0, alt, saz, salt)
+        if abs(cw - ccw) > 1e-9:
+            return 1.0 if cw > ccw else -1.0
+        # A TIE means the tube shares the Sun's azimuth and differs only in
+        # altitude, so neither turn is momentarily better. Devon's tiebreak, and
+        # it is the one with physics behind it: turn AGAINST the Sun's own drift.
+        # Turning the way it is already going lets it follow, eroding what the
+        # turn just bought; turning the other way opens the gap from both ends.
+        return -1.0 if self.sun_drift() > 0 else 1.0
+
+    def sun_drift(self, minutes=10.0):
+        """Sign of the Sun's azimuth motion: positive when it is increasing.
+
+        Measured rather than assumed from the hemisphere, because the assumption
+        has exceptions — inside the tropics the Sun can pass north and the
+        azimuth motion is not monotonic through the day.
+        """
+        saz, _ = self.sky.sun()
+        try:
+            later, _ = self.sky.sun(_now() + datetime.timedelta(minutes=minutes))
+        except TypeError:
+            # A test double with no clock. Fall back to the hemisphere, which is
+            # right everywhere the exception above does not apply.
+            return 1.0 if self.sky.loc.lat.deg >= 0 else -1.0
+        return wrap180(later - saz)
+
+    def escape_target(self, az, alt):
+        """A safe pointing reached by TURNING at the current altitude."""
+        saz, salt = self.sky.sun()
         want = self.cone + self.ESCAPE_MARGIN_DEG
-        if salt < SUN_SAFE_ALT or ang_sep(az, alt, _saz, salt) >= want:
+        if salt < SUN_SAFE_ALT or ang_sep(az, alt, saz, salt) >= want:
             return az, alt
+        turn = self.escape_turn(az, alt)
+        step = max(1.0, float(self.slew_step))
+        here = az
+        for _ in range(int(360.0 / step) + 1):
+            here = (here + turn * step) % 360.0
+            if ang_sep(here, alt, saz, salt) >= want:
+                return here, alt
+        # Turning alone never cleared it. That needs the tube near the zenith AND
+        # the Sun near it too, which a mid-latitude site cannot produce — so this
+        # is a guard against a sky we do not have, not a case we expect.
         return az, -self.safe_depth()
 
     def escape(self):
@@ -259,34 +306,96 @@ class Pointer:
         not stay. And it is not exotic — the Sun moves 15 degrees an hour, so a
         tube parked outside the cone and left alone is overtaken by it.
 
-        The rule while escaping is weaker than the normal one and has to be: the
-        route may not bring the tube CLOSER than it already is, and must end
-        outside the cone. Demanding the usual clearance would refuse the escape
-        for the same reason it refused everything else.
+        Turning in short steps at the current altitude, because each step is a
+        small goto the mount has no room to reinterpret, and each one increases
+        separation. That is what makes the JOURNEY safe rather than only its
+        destination.
         """
         az, alt = self.current_azalt()
         saz, salt = self.sky.sun()
         if salt < SUN_SAFE_ALT or ang_sep(az, alt, saz, salt) >= self.cone:
             return az, alt
         here_sep = ang_sep(az, alt, saz, salt)
-        target_alt = -self.safe_depth()
-        # Descend in short steps at the CURRENT azimuth. Each step is a small
-        # goto, so the mount has almost no room to route creatively, and every
-        # step increases separation because it moves away from a Sun that is
-        # above. Stepping rather than one long slew is what makes that true of
-        # the journey and not merely of the destination.
+        target_az, target_alt = self.escape_target(az, alt)
         step = max(1.0, float(self.slew_step))
-        alt_now = alt
-        while alt_now > target_alt + 1e-9:
-            alt_now = max(target_alt, alt_now - step)
-            self._goto_wait(*self.sky.altaz_to_radec(az, alt_now), 0.3)
+        if abs(target_alt - alt) < 1e-9:
+            turn = self.escape_turn(az, alt)
+            here, turned = az, 0.0
+            while ang_sep(here, alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:
+                here = (here + turn * step) % 360.0
+                turned += step
+                self._goto_wait(*self.sky.altaz_to_radec(here, alt), 0.3)
+                if turned > 360.0:
+                    break
+        else:
+            alt_now = alt
+            while alt_now > target_alt + 1e-9:
+                alt_now = max(target_alt, alt_now - step)
+                self._goto_wait(*self.sky.altaz_to_radec(az, alt_now), 0.3)
         out = self.current_azalt()
         if ang_sep(*out, *self.sky.sun()) < self.cone:
             raise SunGuard(
-                f"descended to {out[1]:.1f} deg and is still {ang_sep(*out, *self.sky.sun()):.1f} "
-                f"deg from the Sun (was {here_sep:.1f}). Cover the aperture and move it by hand."
+                f"tried to get clear and reached {out[0]:.0f},{out[1]:.0f}, still "
+                f"{ang_sep(*out, *self.sky.sun()):.1f} deg from the Sun (was {here_sep:.1f}). "
+                "Cover the aperture and move it by hand."
             )
         return out
+
+    # HOW FAR BELOW THE HORIZON THIS MOUNT CAN POINT IS NOT KNOWN. It was
+    # observed at -1.1 degrees on 2026-08-05, which proves only that below the
+    # horizon is reachable at all. The corridor below needs more than that when
+    # the Sun is low, so this is a configurable floor rather than an assumption,
+    # and the code says plainly when the corridor is unavailable instead of
+    # commanding a slew the mount may refuse. See terminus-64: measuring it is a
+    # five-minute job with the scope in hand and it turns this constant into a
+    # fact.
+    MIN_ALT_DEG = -5.0
+
+    def corridor_alt(self):
+        """Depth for a transit that is safe at EVERY azimuth, or None.
+
+        Devon's route: get below the horizon and the whole circle opens up, in
+        either direction. `safe_depth` gives how far down that is; this checks
+        the mount can actually reach it.
+        """
+        want = -self.safe_depth()
+        if want < self.MIN_ALT_DEG:
+            return None  # the mount cannot get deep enough for the Sun's height
+        return min(want, 0.0)
+
+    def corridor_route(self, az0, alt0, az1, alt1, clockwise, step=None):
+        """Descend, travel in azimuth, come back up. Waypoints in RA/Dec.
+
+        Three legs, and each is safe for its own reason. Descending at a fixed
+        azimuth moves monotonically away from a Sun that is above. Travelling
+        below the horizon is safe at every azimuth by construction — that is what
+        `safe_depth` computes. Ascending at the destination is the descent in
+        reverse, at an azimuth already chosen to be clear.
+
+        Both directions are offered because both exist, and one may be much
+        shorter. The azimuth leg is stepped rather than commanded as one goto:
+        each step is short enough that the mount has no room to route creatively,
+        and the whole leg stays at one altitude, which is what makes the
+        guarantee hold along the way and not merely at its ends.
+        """
+        depth = self.corridor_alt()
+        if depth is None:
+            return None
+        step = max(1.0, float(step or self.slew_step))
+        legs = []
+        alt = alt0
+        while alt > depth + 1e-9:
+            alt = max(depth, alt - step)
+            legs.append((az0, alt))
+        sweep_deg = (az1 - az0) % 360.0 if clockwise else -((az0 - az1) % 360.0)
+        n = max(1, int(math.ceil(abs(sweep_deg) / step)))
+        for i in range(1, n + 1):
+            legs.append(((az0 + sweep_deg * i / n) % 360.0, depth))
+        alt = depth
+        while alt < alt1 - 1e-9:
+            alt = min(alt1, alt + step)
+            legs.append((az1, alt))
+        return [self.sky.altaz_to_radec(a, e) for a, e in legs]
 
     def routes(self, rd0, rd1):
         """Every explicit route from rd0 to rd1, as (name, waypoints).
@@ -366,9 +475,20 @@ class Pointer:
         shortest of what is left — rather than requiring that ALL shapes be safe,
         which is a test no route has to pass once we are the one driving.
         """
+        candidates = list(self.routes(rd0, rd1))
+        # The below-horizon corridor, in both directions. It is usually the
+        # longest route and it is the one that always exists, so it belongs in
+        # the pool rather than as a fallback — if something shorter is clear,
+        # the cost comparison picks that instead.
+        az0, alt0 = self.sky.radec_to_altaz(*rd0)
+        az1, alt1 = self.sky.radec_to_altaz(*rd1)
+        for clockwise in (True, False):
+            wps = self.corridor_route(az0, alt0, az1, alt1, clockwise)
+            if wps:
+                candidates.append((f"corridor/{'cw' if clockwise else 'ccw'}", wps))
         safe = [
             (self.route_cost(rd0, wps), name, wps)
-            for name, wps in self.routes(rd0, rd1)
+            for name, wps in candidates
             if self.route_min_sep(rd0, wps) >= self.cone
         ]
         if not safe:

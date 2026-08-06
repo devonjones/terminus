@@ -847,12 +847,12 @@ def test_a_later_leg_rechecks_the_sun_instead_of_trusting_the_plan():
         legs.append((ra, dec))
 
     # Planning sees every candidate route as clear; then the first leg lands and
-    # the remaining route is no longer clear.
-    calls = {"n": 0}
-
+    # the remaining route is no longer clear. Keyed on whether a leg has actually
+    # been driven, NOT on a count of calls — counting broke the moment the
+    # planner gained more candidate routes to evaluate, which is a thing it
+    # should be free to do.
     def flaky_route_sep(self, rd0, waypoints, samples=None):
-        calls["n"] += 1
-        return 90.0 if calls["n"] <= 5 else 1.0
+        return 1.0 if legs else 90.0
 
     with (
         patch.object(Pointer, "_goto_wait", side_effect=fake_goto),
@@ -5661,55 +5661,174 @@ def test_a_tube_inside_the_cone_can_still_be_moved_out():
     ), f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
 
 
-def test_the_way_out_is_always_downwards():
-    """Devon's rule, and it is better than any angular heuristic.
+def test_the_way_out_is_a_turn_not_a_descent():
+    """Devon's rule, and it is provable rather than heuristic.
 
-    For a tube at altitude -h and the Sun at +s, the smallest separation over ALL
-    azimuths is s + h, reached only when they share one. So below the horizon
-    there is always a depth at which the whole circle is clear, and it is
-    arithmetic rather than a search. The ground is never in the way of pointing
-    at the ground.
+    From ANY trapped pointing at least one azimuth direction increases
+    separation from the Sun. Verified exhaustively here; there is no case where
+    neither helps. The only pointings where turning changes nothing are near the
+    zenith, and those are already tens of degrees clear.
 
-    An earlier version of this escape CLIMBED away instead, and treated a
-    below-horizon target as something to avoid. That is backwards: climbing can
-    be blocked, because a summer Sun near the meridian is most of the way up the
-    sky, while descending is always available.
+    Better than the descent this replaced, because it asks the mount for nothing
+    it has not been seen to do — how far below the horizon it can point is still
+    unknown, and an escape that depends on an unmeasured limit is not one.
     """
     from unittest.mock import MagicMock
 
     from terminus.sweep import Pointer, Sky, ang_sep
 
-    for sun_alt in (60.0, 40.0, 20.0, 10.0, 5.0, 2.0):
+    for sun_alt in (5.0, 20.0, 40.0, 60.0):
 
         class FixedSky(Sky):
             def sun(self, _s=sun_alt):
                 return 270.0, _s
 
-        sky = FixedSky(39.7917, -104.894, 1600)
-        ptr = Pointer(MagicMock(), sky, 30, 5, True)
-        depth = ptr.safe_depth()
+        ptr = Pointer(MagicMock(), FixedSky(39.79, -104.89, 1600), 30, 5, True)
+        trapped = turned = 0
+        for az in range(0, 360, 7):
+            for alt in range(-20, 86, 7):
+                if ang_sep(az, alt, 270.0, sun_alt) >= ptr.cone:
+                    continue
+                trapped += 1
 
-        # The arithmetic: cone + margin - sun altitude, never below zero.
-        assert depth == pytest.approx(max(0.0, 35.0 - sun_alt))
+                # One direction must always help.
+                step = max(1.0, float(ptr.slew_step))
+                here = ang_sep(az, alt, 270.0, sun_alt)
+                cw = ang_sep((az + step) % 360, alt, 270.0, sun_alt)
+                ccw = ang_sep((az - step) % 360, alt, 270.0, sun_alt)
+                assert (
+                    max(cw, ccw) > here or here > 60.0
+                ), f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
 
-        # And it holds for EVERY azimuth, which is the property that matters —
-        # once down there the tube can travel the whole circle freely.
-        worst = min(ang_sep(az, -depth, 270.0, sun_alt) for az in range(0, 360, 2))
-        assert (
-            worst >= ptr.cone
-        ), f"Sun at {sun_alt}: at {-depth:.1f} deg the worst azimuth is {worst:.1f} deg out"
+                target = ptr.escape_target(az, alt)
+                assert ang_sep(*target, 270.0, sun_alt) >= ptr.cone + ptr.ESCAPE_MARGIN_DEG - 1e-9
+                if abs(target[1] - alt) < 1e-9:
+                    turned += 1
 
-        # A trapped tube escapes by dropping at its own azimuth, which moves
-        # monotonically away from a Sun that is above it.
-        for az in (265.0, 270.0, 275.0):
-            target = ptr.escape_target(az, sun_alt)
-            assert target[0] == az, "the escape keeps the azimuth and changes altitude"
-            assert target[1] <= 0.0 or ang_sep(*target, 270.0, sun_alt) >= 30.0
+        assert trapped, f"Sun at {sun_alt}: the probe found nothing trapped"
+        if sun_alt <= 40.0:
+            assert (
+                turned == trapped
+            ), f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
+        else:
+            # A high summer Sun leaves near-zenith pointings where azimuth barely
+            # moves the tube. Those fall back to the descent, which is what the
+            # corridor depth is for.
+            assert turned > trapped * 0.8
 
-    # Deepest ever required is the cone plus the margin, and only with the Sun on
-    # the horizon — which is when it matters least.
-    class Setting(Sky):
+
+def test_the_below_horizon_corridor_is_safe_at_every_azimuth():
+    """Devon's route: get below the horizon and the whole circle opens up.
+
+    Descending at a fixed azimuth moves monotonically away from a Sun that is
+    above; travelling below the horizon is clear at every azimuth by
+    construction; ascending is the descent in reverse at an azimuth already
+    chosen to be safe. Three legs, each safe for its own reason.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    class HighSun(Sky):
         def sun(self):
-            return 270.0, 0.0
+            return 270.0, 40.0
 
-    assert Pointer(MagicMock(), Setting(39.79, -104.89, 1600), 30, 5, True).safe_depth() == 35.0
+    sky = HighSun(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    assert ptr.corridor_alt() is not None, "a high Sun leaves the horizon itself clear"
+
+    start, end = (230.0, 25.0), (310.0, 25.0)
+    rd0 = sky.altaz_to_radec(*start)
+    for clockwise in (True, False):
+        wps = ptr.corridor_route(*start, *end, clockwise)
+        assert wps, "both directions exist"
+        assert ptr.route_min_sep(rd0, wps) >= ptr.cone, "and both are clear of the Sun"
+        # It ends where it was asked to.
+        final = sky.radec_to_altaz(*wps[-1])
+        assert final[0] == pytest.approx(end[0], abs=0.5)
+        assert final[1] == pytest.approx(end[1], abs=0.5)
+
+    # The corridor is a CANDIDATE, not a default: when something shorter is
+    # clear, the cost comparison picks that instead.
+    chosen = ptr.plan_route(rd0, sky.altaz_to_radec(*end))
+    assert chosen is not None
+
+
+def test_the_corridor_says_when_the_mount_cannot_reach_it():
+    """The depth depends on the Sun's altitude; the floor is hardware.
+
+    How far below the horizon this mount can point is NOT KNOWN — observed at
+    -1.1 degrees and no further. So the corridor is unavailable for a low Sun
+    until that is measured, and the code says so rather than commanding a slew
+    the mount may refuse.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    def pointer(sun_alt, floor):
+        class F(Sky):
+            def sun(self, _s=sun_alt):
+                return 270.0, _s
+
+        p = Pointer(MagicMock(), F(39.7917, -104.894, 1600), 30, 5, True)
+        p.MIN_ALT_DEG = floor
+        return p
+
+    # A high Sun needs no depth at all: the horizon is already 40 degrees away.
+    assert pointer(40.0, -5.0).corridor_alt() is not None
+    # A low Sun needs real depth, and a shallow mount cannot provide it.
+    assert pointer(20.0, -5.0).corridor_alt() is None
+    assert pointer(20.0, -15.0).corridor_alt() is not None
+    # Deepest ever demanded, and only with the Sun on the horizon.
+    assert pointer(0.0, -35.0).corridor_alt() == pytest.approx(-35.0)
+    assert pointer(0.0, -34.0).corridor_alt() is None
+
+
+def test_a_tied_turn_goes_against_the_sun_s_own_drift():
+    """When the tube shares the Sun's azimuth, neither turn is momentarily better.
+
+    Devon's tiebreak, and it is the one with physics behind it: turn AGAINST the
+    Sun's motion. Turning the way it is already going lets it follow, eroding
+    what the turn just bought; turning the other way opens the gap from both
+    ends.
+
+    The drift is measured rather than assumed from the hemisphere, because the
+    assumption has exceptions — inside the tropics the Sun can pass north and
+    its azimuth motion is not monotonic through the day.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, _now
+
+    class DriftingSky(Sky):
+        """A Sun whose azimuth moves at a chosen rate."""
+
+        def __init__(self, rate, *a, **kw):
+            super().__init__(*a, **kw)
+            self.rate = rate  # degrees per minute
+            self.t0 = _now()
+
+        def sun(self, when=None):
+            minutes = ((when or self.t0) - self.t0).to_value("min") if when else 0.0
+            return (270.0 + self.rate * minutes) % 360.0, 20.0
+
+    for rate, expected in ((0.2, -1.0), (-0.2, 1.0)):
+        sky = DriftingSky(rate, 39.7917, -104.894, 1600)
+        ptr = Pointer(MagicMock(), sky, 30, 5, True)
+        assert (ptr.sun_drift() > 0) == (rate > 0), "the drift must be measured, not guessed"
+        # A tube directly above the Sun: both turns are identical by symmetry.
+        assert (
+            ptr.escape_turn(270.0, 25.0) == expected
+        ), f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
+
+    # And a test double with no clock still gets an answer, from the hemisphere.
+    class Frozen(Sky):
+        def sun(self):
+            return 270.0, 20.0
+
+    north = Pointer(MagicMock(), Frozen(39.79, -104.89, 1600), 30, 5, True)
+    south = Pointer(MagicMock(), Frozen(-33.87, 151.21, 1600), 30, 5, True)
+    assert north.sun_drift() > 0 and south.sun_drift() < 0
+    assert north.escape_turn(270.0, 25.0) == -1.0
+    assert south.escape_turn(270.0, 25.0) == 1.0

@@ -61,6 +61,22 @@ def _sky(sc, cfg):
     return Sky(loc[1], loc[0], site.get("elev_m", 0.0))  # scope gives (lon, lat)
 
 
+def _pointer(sc, sky, sw, dry):
+    """A Pointer with the mount's below-horizon floor applied.
+
+    How far below the horizon this mount can point is not known — it was seen at
+    -1.1 degrees and no further, which proves only that below the horizon is
+    reachable. The safe-transit corridor needs more than that whenever the Sun is
+    low, so the floor is configurable and defaults to something barely past what
+    was observed, rather than to a number that would be convenient. Measure it
+    and set `min_alt_deg`; see terminus-64.
+    """
+    ptr = Pointer(sc, sky, sw["sun_cone_deg"], sw["slew_step_deg"], dry)
+    if sw.get("min_alt_deg") is not None:
+        ptr.MIN_ALT_DEG = float(sw["min_alt_deg"])
+    return ptr
+
+
 def cmd_preflight(sc, cfg, args):
     sky = _sky(sc, cfg)
     eq = sc.is_eq_mode()
@@ -86,9 +102,7 @@ def cmd_preflight(sc, cfg, args):
 
 def cmd_point(sc, cfg, args):
     sky = _sky(sc, cfg)
-    ptr = Pointer(
-        sc, sky, cfg["sweep"]["sun_cone_deg"], cfg["sweep"]["slew_step_deg"], args.dry_run
-    )
+    ptr = _pointer(sc, sky, cfg["sweep"], args.dry_run)
     try:
         faz, falt = ptr.point_to(args.az, args.alt)
         print(f"target ({args.az},{args.alt}) -> landed az {faz:.1f} alt {falt:.1f}")
@@ -698,7 +712,7 @@ def _scope_measure(sc, cfg, args):
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
     sky = _sky(sc, cfg)
     sw = cfg["sweep"]
-    ptr = Pointer(sc, sky, sw["sun_cone_deg"], sw["slew_step_deg"], args.dry_run)
+    ptr = _pointer(sc, sky, sw, args.dry_run)
     state = {"sky_ref": None, "misses": 0, "profiles": {}}
     # A column costs about two and a half minutes of clear sky. Keeping nothing
     # from it meant every column orient measured was spent and gone — and it
