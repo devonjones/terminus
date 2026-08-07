@@ -5642,6 +5642,216 @@ def test_the_polar_page_is_self_contained_and_layered(tmp_path):
     assert os.path.getsize(path) > 0
 
 
+def _orient_measure_fixture(tmp_path, sun_alt, scan_stub=None):
+    """A `measure` built by `_scope_measure` with the hardware mocked out.
+
+    The Sun is pinned (a test about night behaviour must not depend on when the
+    suite runs — terminus-63), the seeding slew is refused so the try/except
+    absorbs it, and the scanner is a stub the test controls.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.sweep import PointingError, Sky
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    sc.equ_coord.return_value = (5.0, 20.0)
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {
+            "az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+            "coarse_step": 5.0, "sun_cone_deg": 30, "clear_thresh": 0.85,
+            "slew_step_deg": 5, "samples_per_point": 1,
+        },
+    }  # fmt: skip
+    args = SimpleNamespace(
+        dry_run=False, out=str(tmp_path / "out.yaml"), mask=str(tmp_path / "mask.yaml"),
+        frames=str(tmp_path / "frames"), uncertainty=1.0, stop_above_sun_alt=None,
+    )  # fmt: skip
+    patches = [
+        patch.object(cli, "_start_locked"),
+        patch.object(Sky, "sun", return_value=(180.0, sun_alt)),
+        patch.object(cli.Pointer, "point_to", side_effect=PointingError("mocked")),
+    ]
+    if scan_stub is not None:
+        patches.append(patch.object(cli, "scan_horizon", side_effect=scan_stub))
+        patches.append(patch.object(cli, "scan_horizon_night", side_effect=scan_stub))
+    started = [pt.start() for pt in patches]
+    try:
+        measure, reachable, _stop, state = cli._scope_measure(sc, cfg, args)
+        yield_val = (measure, reachable, args)
+    finally:
+        pass  # patches stopped by the caller via the returned stopper
+    return yield_val, patches, started
+
+
+def test_orient_checkpoints_every_column_and_resumes_without_the_scope(tmp_path):
+    """terminus-58: a run that dies leaves its columns behind, and a rerun
+    serves them from the file instead of re-observing.
+
+    The first prototype of this fix checkpointed only successes, and its very
+    first crash — before any success — left nothing. So the test's first
+    assertion is that the file exists after ONE measurement, not at the end.
+    """
+    calls = {"n": 0}
+
+    def scan(*a, **k):
+        calls["n"] += 1
+        return 12.0, "edge(rel 3.0)", "structure", [(60, 100.0), (30, 90.0), (0, 10.0)]
+
+    (measure, _reach, args), patches, _ = _orient_measure_fixture(tmp_path, 20.0, scan)
+    try:
+        got = measure(90)
+        assert got is not None and got[0]["alt"] == 12.0
+        assert calls["n"] == 1
+        ckpt = tmp_path / "out_fiducials.jsonl"
+        assert ckpt.exists(), "the column must be on disk the moment it completes"
+        # Same azimuth again in the SAME run: served from cache, no new scan.
+        assert measure(90)[0]["alt"] == 12.0
+        assert calls["n"] == 1, "a measured column is never re-observed"
+    finally:
+        for p in patches:
+            p.stop()
+
+    # A FRESH run — new measure, same files — must resume from the checkpoint.
+    (measure2, _r, _a), patches2, _ = _orient_measure_fixture(tmp_path, 20.0, scan)
+    try:
+        assert measure2(90)[0]["alt"] == 12.0
+        assert calls["n"] == 1, "the rerun re-observed a column the checkpoint already held"
+    finally:
+        for p in patches2:
+            p.stop()
+
+
+def test_a_night_checkpoint_is_rejudged_by_the_current_detector(tmp_path):
+    """Judge is code, data is data. The stored verdict is what an OLD detector
+    thought; the stored profile is what the sky did. Re-judging on load turned
+    two wrong verdicts into right ones the night this was built, without
+    re-observing either column.
+    """
+    import json as _json
+
+    # A profile with an unmistakable persistent edge at 45 -> 40, stored with
+    # the WRONG verdict, as the buggy detector wrote it that night.
+    profile = [[60, 900.0], [55, 950.0], [50, 1000.0], [45, 1050.0],
+               [40, 400.0], [35, 380.0], [30, 360.0]]  # fmt: skip
+    ckpt = tmp_path / "out_fiducials.jsonl"
+    ckpt.write_text(
+        _json.dumps(
+            {
+                "az": 120,
+                "verdict": "blocked",
+                "alt": None,
+                "ceiling": 60,
+                "channel": "star4800",
+                "profile": profile,
+            }
+        )
+        + "\n"
+    )
+
+    def scan(*a, **k):
+        raise AssertionError("re-judging must not touch the scope")
+
+    (measure, _reach, _args), patches, _ = _orient_measure_fixture(tmp_path, -30.0, scan)
+    try:
+        got = measure(120)
+        assert got is not None, "the re-judged column must be served"
+        edge, ceiling, _unc = got
+        assert edge is not None and edge["alt"] == 42.5, (
+            f"blocked -> edge under the current detector, at the bracket midpoint; got {edge}"
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def test_at_night_the_planner_never_offers_a_near_pole_column(tmp_path):
+    """az 0 cost 206 seconds and a connection reset on 2026-08-06; the walk
+    crosses declinations where RA cannot converge. Day keeps them: daytime
+    sweeps have measured az 0, and the difference is not yet understood."""
+    (m, reach_night, _a), patches, _ = _orient_measure_fixture(
+        tmp_path, -30.0, lambda *a, **k: None
+    )
+    try:
+        assert not reach_night(0), "due north at night must not be a candidate"
+        assert not reach_night(5) and not reach_night(355)
+        assert reach_night(20), "the zone is 8 degrees, not a hemisphere"
+    finally:
+        for p in patches:
+            p.stop()
+    (m2, reach_day, _a2), patches2, _ = _orient_measure_fixture(
+        tmp_path, 20.0, lambda *a, **k: None
+    )
+    try:
+        assert reach_day(0), "daytime keeps az 0 until the difference is understood"
+    finally:
+        for p in patches2:
+            p.stop()
+
+
+def test_the_night_detector_reads_real_profiles_the_way_the_sky_did():
+    """Six real columns from 2026-08-06, each checked against an independent source.
+
+    The fixture IS the data (E-11): raw16 medians from the star-mode imaging
+    channel, walked live, with the evening telescope sweep (a different night,
+    a different channel) as ground truth. The six cover every night regime met
+    so far: clean cliffs on shallow and steep sections, a canopy column rough
+    from the very top, and a glare column that brightens to the floor and must
+    be refused rather than guessed at (M-19).
+
+    Two rules in `night_find_edge` exist because live columns broke their
+    absence, and each has a fixture that fails without it:
+      * only NEGATIVE steps are roughness — the skyglow gradient accelerates
+        toward the horizon, and bounding step magnitude called az 120 and 240
+        "blocked" across textbook edges
+      * an edge's drop is never recovered — a transient dark sample 52.5
+        degrees up az 325 fired as an edge while the real answer (canopy,
+        blocked) sat in the roughness the transient rule then has to preserve
+    """
+    import json
+
+    with open(
+        os.path.join(os.path.dirname(__file__), "data", "night_profiles_2026_08_07.json")
+    ) as fh:
+        fixtures = json.load(fh)
+
+    from terminus.sweep import night_find_edge
+
+    assert len(fixtures) == 6
+    for az, fx in sorted(fixtures.items(), key=lambda kv: int(kv[0])):
+        profile = [(a, lum) for a, lum in fx["profile"]]
+        idx, verdict = night_find_edge(profile)
+        want_verdict, want_alt = fx["expect"]
+        assert verdict == want_verdict, (
+            f"az {az}: {verdict!r}, want {want_verdict!r} ({fx['ground_truth']})"
+        )
+        if want_alt is not None:
+            assert idx is not None and profile[idx][0] == want_alt, (
+                f"az {az}: edge above {profile[idx][0] if idx is not None else None}, "
+                f"want {want_alt} ({fx['ground_truth']})"
+            )
+
+
+def test_the_night_detector_refuses_what_it_cannot_confirm():
+    """The boundary of the data is not the boundary of the sky.
+
+    A drop on the FINAL sample has nothing after it to confirm persistence, so
+    it must never fire — az 175 ended 1936 -> dark at the floor and the first
+    version called that an edge at 3.75 degrees, eighteen degrees below the
+    real horizon. And fewer than three samples is not a profile.
+    """
+    from terminus.sweep import night_find_edge
+
+    idx, verdict = night_find_edge([(60, 900.0), (55, 950.0), (50, 1000.0), (45, 400.0)])
+    assert idx is None and verdict == "open", "a final-sample drop is unconfirmable"
+
+    idx, verdict = night_find_edge([(60, 900.0), (55, 400.0)])
+    assert idx is None and verdict == "short"
+
+
 def test_a_column_at_its_ceiling_is_a_bound_however_it_is_typed():
     """M-09, applied to the masks that are actually on disk.
 
@@ -5924,11 +6134,18 @@ def test_orient_keeps_what_it_measured(tmp_path):
     sc = MagicMock()
     sc.is_eq_mode.return_value = True
     prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    from terminus.sweep import Sky as _Sky
+
     with (
         patch.object(cli, "scan_horizon", return_value=(25.0, "edge(rel 3.0)", "tree", prof)),
         patch.object(cli, "sky_reference", return_value=80.0),
         patch.object(cli, "Pointer"),
         patch.object(cli, "column_touches_sun", return_value=False),
+        # PINNED. Without this the test's behaviour depends on when the suite
+        # runs: after dark, orient auto-selects the night measurement path and
+        # these mocks no longer reach it. Found the honest way — the suite ran
+        # at 23:30 and two tests flipped (terminus-63, E-04).
+        patch.object(_Sky, "sun", return_value=(180.0, 20.0)),
         patch.object(
             guide,
             "fit",
