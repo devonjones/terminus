@@ -2076,9 +2076,9 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     plain = tmp_path / "scope.yaml"
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
-    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head), (
-        "a scope mask must not explain fields it does not carry"
-    )
+    assert not any(
+        "clipped" in ln or "gap_fraction" in ln for ln in head
+    ), "a scope mask must not explain fields it does not carry"
     assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
     # The count is still asserted. Dropping it for substring checks alone lost
     # the ability to catch unrelated header bloat, which is what this test was
@@ -3243,9 +3243,9 @@ def test_a_truncated_sweep_is_visible_in_the_file_and_the_exit_code(tmp_path):
     # 3. A complete patch over a truncated mask CLEARS the flag.
     sweep(out, Deadline(fires=False), azimuths="90")
     meta, cols = load_columns(str(out))
-    assert not meta.get("stopped_early"), (
-        "a mask since completed must stop claiming it was cut short"
-    )
+    assert not meta.get(
+        "stopped_early"
+    ), "a mask since completed must stop claiming it was cut short"
     assert 90 in cols, "and the merge still did its actual job"
 
 
@@ -3549,9 +3549,9 @@ def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
     assert cols, "the fixture must produce columns for this to mean anything"
     for az, col in cols.items():
         assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
-        assert col.get("type_source") is None, (
-            f"az {az}: no type was measured, so no source may be claimed"
-        )
+        assert (
+            col.get("type_source") is None
+        ), f"az {az}: no type was measured, so no source may be claimed"
 
 
 def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
@@ -4882,9 +4882,9 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
         reasons[power] = detail["reason"]
     assert "open" in reasons[0.5], f"shallow dimming reads as open, got {reasons[0.5]!r}"
     for power in (1.5, 3.0):
-        assert "no usable sky model" in reasons[power], (
-            f"steep dimming must refuse outright, got {reasons[power]!r}"
-        )
+        assert (
+            "no usable sky model" in reasons[power]
+        ), f"steep dimming must refuse outright, got {reasons[power]!r}"
 
 
 def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
@@ -4929,9 +4929,9 @@ def test_a_steeply_graded_column_is_not_mistaken_for_a_glint():
     # The model must pass through the TOP of the column. A positive slope alone
     # is not enough to prove that — the median screen also produced one, fitted
     # to the tail — so this checks where the line actually sits.
-    assert abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0, (
-        "the fit must pass near the topmost sample, not the flat tail beneath it"
-    )
+    assert (
+        abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0
+    ), "the fit must pass near the topmost sample, not the flat tail beneath it"
     assert n_top >= 4
 
 
@@ -4952,9 +4952,9 @@ def test_one_glint_at_the_top_does_not_discard_the_whole_column():
     for factor in (3.0, 5.0, 10.0):
         glinted = [(prof[0][0], prof[0][1] * factor)] + prof[1:]
         alt, detail = find_horizon(glinted)
-        assert alt == clean, (
-            f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
-        )
+        assert (
+            alt == clean
+        ), f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
 
 
 def test_every_refusal_path_is_exercised_not_merely_written():
@@ -5240,9 +5240,9 @@ def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
 
     stopped = sweep(closes_after_three)
     full = sweep(None)
-    assert len(stopped) < len(full), (
-        f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
-    )
+    assert len(stopped) < len(
+        full
+    ), f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
     assert len(stopped) > 0, "and what was measured before it closed is kept"
     # A sweep that stops is not a sweep that failed.
     assert all("alt" in c for c in stopped.values())
@@ -5395,9 +5395,9 @@ def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
     sky = FixedSky()
     for az in range(0, 360, 5):
         closest = min(ang_sep(az, alt / 2.0, 271.0, 25.5) for alt in range(0, 121))
-        assert column_touches_sun(sky, az, 0, 60, 30) == (closest < 30), (
-            f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
-        )
+        assert column_touches_sun(sky, az, 0, 60, 30) == (
+            closest < 30
+        ), f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
 
     # The two that were wrong, named so a regression is unmistakable.
     assert column_touches_sun(sky, 250, 0, 60, 30), "az 250 passes 19.1 deg from the Sun"
@@ -5683,9 +5683,9 @@ def test_the_fit_writes_down_which_fiducials_it_used_and_why(tmp_path):
     assert "headroom" in record[45.0]["reason"], "and the reason must say which gate rejected it"
     assert record[0.0]["used"] is True and record[0.0]["reason"] is None
     for f in record.values():
-        assert {"az", "alt", "bound", "weight", "sigma"} <= set(f), (
-            "enough to refit from this record alone"
-        )
+        assert {"az", "alt", "bound", "weight", "sigma"} <= set(
+            f
+        ), "enough to refit from this record alone"
 
 
 def test_a_column_excluded_in_the_mask_is_never_offered_to_the_planner():
@@ -5772,9 +5772,9 @@ def test_both_ways_round_the_ra_circle_are_offered():
         # No single leg may exceed the split, or a goto could take the short way.
         prev = rd0
         for wp in wps:
-            assert abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
-                f"{name} has a leg a goto could shortcut"
-            )
+            assert (
+                abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+            ), f"{name} has a leg a goto could shortcut"
             prev = wp
 
 
@@ -5838,9 +5838,9 @@ def test_route_waypoints_are_coordinates_the_mount_can_accept():
                 for ra, dec in waypoints:
                     assert 0.0 <= ra < 24.0, f"{name}: RA {ra} is not a coordinate"
                     assert -90.0 <= dec <= 90.0, f"{name}: Dec {dec} is not a coordinate"
-                    assert abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
-                        f"{name}: a leg long enough for a goto to shortcut"
-                    )
+                    assert (
+                        abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+                    ), f"{name}: a leg long enough for a goto to shortcut"
                     prev = (ra, dec)
                 assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
                 assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
@@ -5886,9 +5886,9 @@ def test_one_false_bound_cannot_capture_the_fit():
         good + [false_bound], sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0
     )
     swing = abs(((poisoned["yaw"] - clean["yaw"] + 180) % 360) - 180)
-    assert swing < 15.0, (
-        f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
-    )
+    assert (
+        swing < 15.0
+    ), f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
 
 
 def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
@@ -6067,9 +6067,9 @@ def test_a_tube_inside_the_cone_can_still_be_moved_out():
 
     assert legs, "it must move rather than refuse"
     final = sky.radec_to_altaz(*landed["rd"])
-    assert ang_sep(*final, 270.0, 20.0) >= 30.0, (
-        f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
-    )
+    assert (
+        ang_sep(*final, 270.0, 20.0) >= 30.0
+    ), f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
 
 
 def test_the_way_out_is_a_turn_not_a_descent():
@@ -6107,9 +6107,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
                 here = ang_sep(az, alt, 270.0, sun_alt)
                 cw = ang_sep((az + step) % 360, alt, 270.0, sun_alt)
                 ccw = ang_sep((az - step) % 360, alt, 270.0, sun_alt)
-                assert max(cw, ccw) > here or here > 60.0, (
-                    f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
-                )
+                assert (
+                    max(cw, ccw) > here or here > 60.0
+                ), f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
 
                 target = ptr.escape_target(az, alt)
                 assert ang_sep(*target, 270.0, sun_alt) >= ptr.cone + ptr.ESCAPE_MARGIN_DEG - 1e-9
@@ -6118,9 +6118,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
 
         assert trapped, f"Sun at {sun_alt}: the probe found nothing trapped"
         if sun_alt <= 40.0:
-            assert turned == trapped, (
-                f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
-            )
+            assert (
+                turned == trapped
+            ), f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
         else:
             # A high summer Sun leaves near-zenith pointings where azimuth barely
             # moves the tube. Those fall back to the descent, which is what the
@@ -6172,9 +6172,9 @@ def test_an_escape_that_succeeds_is_verified_against_where_the_tube_ACTUALLY_is(
     ptr, at = trapped(obedient=True)
     assert ang_sep(at["az"], at["alt"], *sky.sun()) < ptr.cone, "the premise: it starts trapped"
     out = ptr.escape()
-    assert ang_sep(*out, *sky.sun()) >= ptr.cone, (
-        f"escape returned {out} which is still inside the cone"
-    )
+    assert (
+        ang_sep(*out, *sky.sun()) >= ptr.cone
+    ), f"escape returned {out} which is still inside the cone"
     assert out == (at["az"], at["alt"]), "it must report where the tube IS, not where it aimed"
 
     # A mount that takes the commands and does not move is the dangerous case,
@@ -6443,9 +6443,9 @@ def test_a_tied_turn_goes_against_the_sun_s_own_drift():
         ptr = Pointer(MagicMock(), sky, 30, 5, True)
         assert (ptr.sun_drift() > 0) == (rate > 0), "the drift must be measured, not guessed"
         # A tube directly above the Sun: both turns are identical by symmetry.
-        assert ptr.escape_turn(270.0, 25.0) == expected, (
-            f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
-        )
+        assert (
+            ptr.escape_turn(270.0, 25.0) == expected
+        ), f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
 
     # And a test double with no clock still gets an answer, from the hemisphere.
     class Frozen(Sky):
@@ -6491,12 +6491,12 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
         ptr._goto_wait(8.604, 60.43, 0.1)
     elapsed = time.time() - started
 
-    assert elapsed < NO_PROGRESS_S + 15, (
-        f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
-    )
-    assert "stopped improving" in str(exc.value), (
-        "it must say the mount moved but would not converge, not that it never moved"
-    )
+    assert (
+        elapsed < NO_PROGRESS_S + 15
+    ), f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+    assert "stopped improving" in str(
+        exc.value
+    ), "it must say the mount moved but would not converge, not that it never moved"
 
 
 def test_a_mount_that_never_moves_is_reported_differently():
