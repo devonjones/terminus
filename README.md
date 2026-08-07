@@ -249,9 +249,10 @@ stops when the solved yaw stops moving.
 > is consulted, so in daylight some of them can be unreachable and the run
 > spends time discovering that. Worse, a run that ends without a fit currently
 > discards the columns it did measure. Both are terminus-58, and until it lands
-> a daylight run can lose an observing window. Roughly **2.5 minutes per column**, so
-eight chosen columns is about **20 minutes** — against ~95 minutes for a blind
-36-column circle.
+> a daylight run can lose an observing window.
+
+Roughly **2.5 minutes per column**, so eight chosen columns is about
+**20 minutes** — against ~95 minutes for a blind 36-column circle.
 
 Every column it measures is saved, so `--replay <profiles.json>` will re-run the
 whole loop later with no telescope and no sky.
