@@ -5517,6 +5517,8 @@ def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     wrong — which is precisely the shape of corruption the coordinate-lookup
     rewrite was written to eliminate, arriving through a different door.
     """
+    from unittest.mock import patch
+
     import pytest
 
     from terminus.mosaic import MosaicError, remap_labels
@@ -5525,7 +5527,11 @@ def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     project.write_text(
         'p f2 w2880 h1440 v360 n"TIFF_m"\nm i0\ni w3000 h4000 f0 n"stage/frame1.jpg"\n'
     )
-    with pytest.raises(MosaicError, match="does not contain"):
+    # The subject is the NAME guard, which fires before nona is ever invoked.
+    # Without this patch the test asserted what the dev box happens to satisfy
+    # (E-04): on a host with no hugin, require_hugin raises first with a
+    # different message, and CI is such a host.
+    with patch("terminus.mosaic.require_hugin"), pytest.raises(MosaicError, match="does not contain"):  # fmt: skip
         # Right file, wrong spelling: no directory prefix.
         remap_labels(str(project), str(tmp_path), {"frame1.jpg": "labels/001.png"})
 
@@ -5565,7 +5571,10 @@ def test_a_label_project_asks_nona_for_coordinates_not_for_pixels(tmp_path):
         seen.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    with patch("terminus.mosaic._run", side_effect=fake_run):
+    # require_hugin is patched for the same reason _run is: the subject is the
+    # project rewrite and the nona ARGUMENTS, and a host with no hugin (CI)
+    # must exercise them identically to one with it (E-04).
+    with patch("terminus.mosaic.require_hugin"), patch("terminus.mosaic._run", side_effect=fake_run):  # fmt: skip
         layers = remap_labels(str(project), str(tmp_path), {"stage/frame1.jpg": "labels/001.png"})
 
     assert seen, "nona was never invoked"
@@ -6026,7 +6035,7 @@ def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
     assert column(7.0, [0.5, 0.6, 0.4]) == "blocked_above"
 
 
-def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
+def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem(tmp_path):
     """On 2026-08-05 a mid-run timeout was reported as:
 
         error: could not read or write beside .../photo_mask.yaml: timed out
@@ -6039,8 +6048,24 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
     import socket
 
     import pytest
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
     from terminus.client import Seestar, SeestarError
+
+    # A throwaway key, because the interop key exists only on the dev box and
+    # this test previously asserted what that box happens to satisfy (E-04):
+    # on a host without the key — CI — the constructor failed on the pem
+    # instead and the error named a file, not the unreachable host.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = tmp_path / "key.pem"
+    pem.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
 
     # A closed local port refuses immediately: the same OSError family as the
     # timeout that caused this, without spending ten seconds waiting for one.
@@ -6050,7 +6075,7 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
     probe.close()
 
     with pytest.raises(SeestarError) as exc:
-        Seestar("127.0.0.1", "~/.seestar/seestar_client_key.pem")
+        Seestar("127.0.0.1", str(pem))
     message = str(exc.value)
     assert "127.0.0.1" in message, "it must name what it could not reach"
     assert "yaml" not in message and "could not write" not in message, "not a file problem"
