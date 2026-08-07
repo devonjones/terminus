@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -49,6 +50,7 @@ class Seestar:
         self.cmdid = 100
         self.buf = ""
         self.s = None
+        self.img = None
         self._reconnecting = False
         self._open()
 
@@ -223,6 +225,79 @@ class Seestar:
     def stop_view(self):
         return self.call("iscope_stop_view", {"stage": "Stack"})
 
+    # ---- imaging channel (4800): star-mode raw frames ---------------------
+    IMG_HEADER = ">HHHIHHBBHH"  # first 20 of 80 bytes: size@3, id@7, width@8, height@9
+    IMAGING_PORT = 4800
+
+    def _open_imaging(self):
+        self.close_imaging()
+        self.img = socket.socket()
+        self.img.settimeout(30)
+        self.img.connect((self.host, self.IMAGING_PORT))
+        self.img.sendall(b'{"id": 21, "method": "begin_streaming"}\r\n')
+
+    def close_imaging(self):
+        try:
+            if self.img:
+                self.img.close()
+        except OSError:
+            pass
+        self.img = None
+
+    def _img_exact(self, n):
+        b = b""
+        while len(b) < n:
+            c = self.img.recv(n - len(b))
+            if not c:
+                raise ConnectionError("imaging socket closed mid-frame")
+            b += c
+        return b
+
+    def _raw16_frame(self, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            v = struct.unpack(self.IMG_HEADER, self._img_exact(80)[:20])
+            size, mid, w, h = v[3], v[7], v[8], v[9]
+            data = self._img_exact(size) if size else b""
+            if size == w * h * 2 and mid == 21:
+                return np.frombuffer(data, dtype="<u2").reshape(h, w)
+        raise TimeoutError(f"no raw16 frame in {timeout}s")
+
+    def capture_raw16_median(self, exposure_s=2.0):
+        """Median of one raw 16-bit frame EXPOSED at the current pointing.
+
+        The night capture path. The scenery RTSP stream is blind after dark —
+        measured 2026-08-06: its ISP pins exposure at ~30 ms and gain at 112.5
+        whatever is requested, and sky and terrain then differ by 0.02 counts in
+        255. Star mode exposes for seconds, but serves no RTSP; its frames
+        arrive raw on the imaging channel instead. `start_view("star")` must be
+        active.
+
+        MEDIAN, not mean: hot pixels and streetlights are bright outliers
+        sitting INSIDE terrain, and the mean follows them (M-12). Frames already
+        in flight when the mount arrives were exposed somewhere else, so the
+        stream is drained through one full exposure before the counted frame —
+        skipping that reads the previous pointing's sky at the new pointing's
+        label.
+
+        One silent reconnect: the scope has been seen to reset this socket after
+        a burst of failed gotos, and a dead socket must not poison every later
+        column.
+        """
+        if self.img is None:
+            self._open_imaging()
+        try:
+            deadline = time.time() + exposure_s + 0.5
+            while time.time() < deadline:
+                self._raw16_frame()
+            return float(np.median(self._raw16_frame()))
+        except (ConnectionError, OSError, TimeoutError):
+            self._open_imaging()
+            deadline = time.time() + exposure_s + 0.5
+            while time.time() < deadline:
+                self._raw16_frame()
+            return float(np.median(self._raw16_frame()))
+
     def capture_rgb(self, warmup=1.0, retries=2):
         """One RGB frame (float32 HxWx3) from the scenery RTSP stream via ffmpeg.
 
@@ -279,6 +354,7 @@ class Seestar:
                 os.remove(path)
 
     def close(self):
+        self.close_imaging()
         try:
             self.s.close()
         except OSError:

@@ -47,6 +47,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `M-20` No single photometric primitive separates sky from terrain
 - `M-21` Straight edges in a natural scene mean a pipeline artifact
 - `M-22` Calibrate a control's rate before using it, and do not hill-climb on a drifting signal
+- `M-23` At night the edge is a persistent, unrecovered drop — and only negative steps are roughness
 
 **Fitting and validation**
 
@@ -79,6 +80,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `F-27` Detrending and outlier-robustness are different properties of a noise estimator
 - `F-28` Verify both arms run the current version of every shared component
 - `F-29` A detection that assumes correct pointing cannot be evidence about pointing
+- `F-30` Register the prediction before the measurement arrives
 
 **The instrument**
 
@@ -96,6 +98,8 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `I-12` A fixed terrain edge is a free session-to-session pointing reference
 - `I-13` Per-axis tolerances are unsatisfiable at a coordinate singularity
 - `I-14` There is no still-image path for terrestrial frames; RTSP is not a choice
+- `I-15` The scenery stream is blind at night; star mode sees, on a different channel
+- `I-16` Near due north the mount cannot converge, and failed gotos escalate to connection resets
 
 **Safety**
 
@@ -145,6 +149,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `D-13` Don't re-derive an input the user has said is settled
 - `D-14` After the second refuted hypothesis, stop theorising and go look
 - `D-15` A file at a canonical path is not evidence that it is current
+- `D-16` Checkpoint attempts, not successes — and re-judge saved profiles on load
 
 ---
 
@@ -547,6 +552,29 @@ of your step — the loop reports success while going nowhere.
 
 ---
 
+### M-23 — At night the edge is a persistent, unrecovered drop — and only negative steps are roughness
+
+The day model — two brightness levels — fails at night twice over (M-12's consequence, measured
+2026-08-06): lit terrain patches overlap sky levels across altitudes (terrain at alt 10 read
+brighter than sky at alt 60), and under light pollution the sky is not a level but a smooth
+gradient brightening toward the horizon, accelerating as it goes (+48 counts per step at alt 55,
++192 by alt 30). Three rules came out of live columns breaking their absence, one column each:
+
+- **Only negative steps are roughness.** Bounding step magnitude called two textbook edges
+  "blocked" because the real skyglow gradient exceeded the bound. Sky never darkens 8% in a step;
+  it brightens without limit.
+- **An edge's drop is never recovered.** A single dark sample 52.5° up an open-looking column
+  fired as an edge with the real answer 40° below; below a true horizon everything is terrain, so
+  any later sample climbing back over the old sky level marks the dip as a transient — a bird, a
+  wisp, one bad frame — however many samples it lasted (M-02 at night).
+- **The boundary of the data is not the boundary of the sky.** A drop on the final sample has
+  nothing after it to confirm persistence and must never fire; one such called an edge at 3.75°
+  under an 18°-higher horizon lit by glare.
+
+A glare column — median dragged above the sky trend by a streetlight inside terrain — is
+indistinguishable by shape from a genuinely open one. It reads "open", which carries no
+constraint, so the honest ambiguity costs the fit nothing (M-19).
+
 ## Fitting and validation
 
 ### F-01 — A residual only says a fit is self-consistent
@@ -921,6 +949,20 @@ circularity with error bars. An image of the target beats an inference about the
 
 ---
 
+### F-30 — Register the prediction before the measurement arrives
+
+A ~10° yaw discrepancy between a night fit and the photo reference had a seductive explanation:
+the wedge was knocked ~8° out of alignment two days earlier. The hypothesis was REGISTERED on the
+ticket — with both outcomes spelled out — before Devon plate solved. The solve said 2.1°: refuted,
+cleanly, with no room to absorb the result into the story. The columns then got re-examined as
+detector problems, which they were.
+
+Corollary from the same night: comparing a measurement at az X against a reference at az X±5 is
+only valid where the horizon is flat. At a 6°-of-altitude-per-degree-of-azimuth tree edge, 5° of
+azimuth slack permits 30° of legitimate altitude difference — an expectation check without
+gradient-aware tolerance manufactures disagreements exactly where the horizon is most
+informative (F-21's dark side).
+
 ## The instrument
 
 ### I-01 — The telescope can focus on terrain
@@ -1154,6 +1196,34 @@ star mode *does* feed this channel, so a solve path could read frames here and b
 RTSP failure modes entirely.
 
 ---
+
+### I-15 — The scenery stream is blind at night; star mode sees, on a different channel
+
+Measured 2026-08-06, Bortle 8, Sun at -12: the scenery ISP pins exposure at ~30 ms and gain at
+112.5 whatever `set_setting` asks (every request from gain 5-400 and 30-1000 ms read back
+identical), and 16-frame stacks of known sky versus known terrain differed by 0.02 counts in 255 —
+with terrain the brighter. No statistic fixes a channel with no signal (F-08's sensor-level twin).
+
+Star mode exposes for seconds but kills the RTSP stream. Its frames arrive raw on the imaging
+channel (port 4800, `begin_streaming`, 80-byte headers, raw16 at 1080x1920): 2 s exposures
+separate skyglow from terrain at >100:1. Use the MEDIAN per frame — hot pixels and streetlights
+are bright outliers inside terrain and the mean follows them (M-12) — and drain the stream
+through one full exposure after arriving at a pointing, or the counted frame was exposed at the
+previous one.
+
+### I-16 — Near due north the mount cannot converge, and failed gotos escalate to connection resets
+
+Due north at altitude near the site latitude is the celestial pole (dec = 90 − |alt − lat|), and
+a column walk at az 0 crosses that band mid-column: the mount reaches the right Dec and RA never
+converges (7° short after minutes). Worse, a burst of failed near-pole gotos made the scope RESET
+every connection it held — control and imaging — twice in one night, and a dead imaging socket
+then failed every subsequent column in seconds until reopened. az 20 also produced an
+11.5-hour RA jump between adjacent altitude samples, pier-flip-shaped and not yet understood.
+
+Skip the pole-band SAMPLE inside a column (one altitude is recoverable; a column is not), exclude
+near-north candidates at night outright, and treat imaging-socket death as reopen-and-retry-once,
+never as a column verdict. Daytime sweeps have measured az 0 successfully; the difference is an
+open question.
 
 ## Safety
 
@@ -1743,3 +1813,17 @@ message.
 Read the provenance metadata every derived file carries before editing it or computing statistics
 over it — especially when a second agent is landing work in the same repo. The real finding
 underneath was better than the wrong one: az 0–60 has no current measurement at all.
+
+### D-16 — Checkpoint attempts, not successes — and re-judge saved profiles on load
+
+Chosen while fixing terminus-58, each half after the naive version failed the same night.
+
+The first checkpoint prototype appended a line per SUCCESS; its very first crash came before the
+first success and left nothing — the exact loss it was built to prevent. An append-only line per
+ATTEMPT, with conditions (time, channel, exposure, verdict, profile), survives any crash and is
+cheap to ignore.
+
+On resume, the stored VERDICT is what an old judge thought; the stored PROFILE is what the sky
+did. Re-judging profiles with the current detector turned two wrong verdicts into right ones with
+zero re-observation minutes. Judge is code; data is data. The `--replay` feature is the same
+principle wearing a different hat.

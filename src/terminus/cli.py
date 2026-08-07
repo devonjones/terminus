@@ -33,15 +33,18 @@ from .export import (
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
     MAX_POINTING_MISSES,
+    NIGHT_SUN_ALT,
     Pointer,
     PointingError,
     Sky,
     SunGuard,
     classify,
     column_touches_sun,
+    night_find_edge,
     obstruction_type,
     run_sweep,
     scan_horizon,
+    scan_horizon_night,
     sky_reference,
 )
 
@@ -1087,8 +1090,20 @@ def _scope_measure(sc, cfg, args):
     # Locked before the view starts, for the same reason as in `cmd_sweep`: with
     # auto-exposure the camera renormalises every frame and the sky/terrain
     # difference this depends on disappears.
+    night = False
     if not args.dry_run:
-        _start_locked(sc, sw)
+        night = sky.sun()[1] < NIGHT_SUN_ALT
+        if night:
+            # The scenery stream is blind after dark (its ISP pins exposure at
+            # ~30 ms whatever is asked); the star-mode imaging channel sees.
+            # No exposure lock: the star pipeline manages its own.
+            sc.stop_view()
+            time.sleep(1)
+            sc.start_view("star")
+            time.sleep(6)
+            print(f"night (sun {sky.sun()[1]:.1f} deg): star-mode imaging channel, 2 s frames")
+        else:
+            _start_locked(sc, sw)
     # A column costs about two and a half minutes of clear sky. Keeping nothing
     # from it meant every column orient measured was spent and gone — and it
     # defeated --replay, the feature this loop was built around, since replay
@@ -1103,7 +1118,7 @@ def _scope_measure(sc, cfg, args):
     # terrain from a dim sky with nothing to compare against — and an
     # inconclusive column that was then recorded as a bound would feed the fit a
     # measurement nobody made.
-    if not args.dry_run:
+    if not args.dry_run and not night:
         try:
             saz, _ = sky.sun()
             ptr.point_to((saz + 180.0) % 360.0, 75.0)
@@ -1113,19 +1128,141 @@ def _scope_measure(sc, cfg, args):
             print(f"could not seed the sky reference ({e}); columns will be inconclusive",
                   file=sys.stderr)  # fmt: skip
 
+    # EVERY COLUMN IS CHECKPOINTED AS IT COMPLETES, and a prior run's columns
+    # are served from the checkpoint instead of re-observed (terminus-58). A
+    # guided run on 2026-08-06 measured two columns, was refused on the rest,
+    # ended without a fit, and threw both away — each ~2.5 minutes of clear
+    # sky, and the run consumed an observing window to produce nothing. The
+    # file is append-only, one line per ATTEMPT with its conditions, because
+    # the first prototype of this fix checkpointed only successes and its very
+    # first crash left nothing behind.
+    ckpt_path = (
+        os.path.splitext(getattr(args, "out", None) or getattr(args, "mask", "orient"))[0]
+        + "_fiducials.jsonl"
+    )
+    cache = {}
+    if os.path.exists(ckpt_path):
+        for line in open(ckpt_path):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if "az" not in d or d.get("verdict") in (None, "failed"):
+                continue
+            # NIGHT VERDICTS ARE RE-JUDGED FROM THEIR SAVED PROFILES: the
+            # verdict in the file is what an old detector thought, the profile
+            # is what the sky did, and re-judging turned two wrong verdicts
+            # into right ones the night this was built. Day profiles keep their
+            # stored verdict — their judge needs a sky reference that is not in
+            # the record.
+            prof = [(a, lum) for a, lum in (d.get("profile") or [])]
+            if d.get("channel") == "star4800" and len(prof) >= 3:
+                idx, verdict = night_find_edge(prof)
+                if verdict != d["verdict"]:
+                    print(f"az {d['az']:3d}: checkpoint verdict {d['verdict']} -> {verdict} "
+                          "under the current detector", file=sys.stderr)  # fmt: skip
+                    d = dict(d, verdict=verdict)
+                    if verdict == "edge":
+                        # The bisection never ran: this is the coarse bracket's
+                        # midpoint, and the record says so rather than passing
+                        # it off as a refined value.
+                        d["alt"] = round((prof[idx][0] + prof[idx + 1][0]) / 2.0, 1)
+                        d["coarse_only"] = True
+            cache[int(d["az"])] = d
+        if cache:
+            print(f"resuming {len(cache)} columns from {os.path.basename(ckpt_path)}: "
+                  f"{sorted(cache)}")  # fmt: skip
+
+    def checkpoint(rec):
+        with open(ckpt_path, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def cached_result(d):
+        if d["verdict"] == "edge":
+            return {"alt": d["alt"], "snr": None}, d.get("ceiling", sw["alt_max"]), args.uncertainty
+        if d["verdict"] == "blocked":
+            return None, d.get("ceiling", sw["alt_max"]), args.uncertainty
+        return None  # open / inconclusive: measured, no constraint
+
     def measure(az):
+        if int(az) in cache:
+            d = cache[int(az)]
+            print(f"az {int(az):3d}: from checkpoint ({d['verdict']} {d.get('alt') or ''})")
+            return cached_result(d)
+        t0 = time.time()
         try:
-            alt, status, _typ, profile = scan_horizon(
-                ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
-                sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
-                sun_alt=sky.sun()[1],
-                frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
-            )  # fmt: skip
+            if night:
+                try:
+                    alt, status, _typ, profile = scan_horizon_night(
+                        ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
+                        sw["alt_tol"],
+                        frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                    )  # fmt: skip
+                except (ConnectionError, OSError, TimeoutError, SeestarError) as e:
+                    # THE SECOND SOCKET DEATH MUST NOT LOSE THE NIGHT. The client
+                    # reopens the imaging socket once on its own; when that also
+                    # fails the scope has usually torn down the whole star
+                    # session after a burst of failed gotos (I-16, seen twice on
+                    # 2026-08-06) — so restart the view, and give the COLUMN one
+                    # more try. A second failure checkpoints as failed and the
+                    # loop moves on: one lost column, not a crashed run needing
+                    # a manual rerun, which is the exact loss terminus-58
+                    # exists to prevent.
+                    print(f"az {az:3d}: imaging channel died ({str(e)[:60]}); "
+                          "restarting the star view", file=sys.stderr)  # fmt: skip
+                    try:
+                        sc.close_imaging()
+                        sc.stop_view()
+                        time.sleep(1)
+                        sc.start_view("star")
+                        time.sleep(6)
+                        alt, status, _typ, profile = scan_horizon_night(
+                            ptr, sc, az, sw["alt_min"], sw["alt_max"],
+                            sw.get("coarse_step", 5.0), sw["alt_tol"],
+                            frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                        )  # fmt: skip
+                    except (ConnectionError, OSError, TimeoutError, SeestarError) as e2:
+                        # SeestarError included in BOTH tuples: the recovery's own
+                        # stop_view/start_view route through client.call, which
+                        # raises SeestarError when re-authentication fails after a
+                        # reconnect — and a scope that tore down the star session
+                        # plausibly took the control channel with it. Catching
+                        # only the socket types reintroduced "the same bug one
+                        # exception class over" that the daytime sweep's cleanup
+                        # already documents.
+                        if not args.dry_run:
+                            checkpoint(
+                                {
+                                    "az": int(az),
+                                    "t": time.strftime("%H:%M:%S"),
+                                    "verdict": "failed",
+                                    "error": str(e2)[:200],
+                                }
+                            )
+                        print(f"az {az:3d}: failed after view restart ({str(e2)[:80]})",
+                              file=sys.stderr)  # fmt: skip
+                        return None
+            else:
+                alt, status, _typ, profile = scan_horizon(
+                    ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
+                    sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
+                    sun_alt=sky.sun()[1],
+                    frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                )  # fmt: skip
         except SunGuard as e:
             print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
             return None
         except PointingError as e:
             state["misses"] += 1
+            if not args.dry_run:
+                checkpoint(
+                    {
+                        "az": int(az),
+                        "t": time.strftime("%H:%M:%S"),
+                        "verdict": "failed",
+                        "error": str(e)[:200],
+                    }
+                )
             print(f"az {az:3d}: did not arrive ({e})", file=sys.stderr)
             if state["misses"] >= MAX_POINTING_MISSES:
                 raise SeestarError(
@@ -1136,8 +1273,23 @@ def _scope_measure(sc, cfg, args):
                 ) from e
             return None
         state["misses"] = 0
+        verdict = ("edge" if status.startswith("edge")
+                   else "blocked" if status == "blocked_above"
+                   else "open" if status.startswith("open")
+                   else "inconclusive")  # fmt: skip
+        rec = {"az": int(az), "t": time.strftime("%H:%M:%S"),
+               "secs": round(time.time() - t0, 1), "verdict": verdict,
+               "alt": (alt if verdict == "edge" else None), "ceiling": sw["alt_max"],
+               "channel": ("star4800" if night else "scenery"),
+               "sun_alt": round(sky.sun()[1], 1),
+               "sky_ref": (round(state["sky_ref"], 1) if state["sky_ref"] else None),
+               "profile": profile}  # fmt: skip
+        if not args.dry_run:
+            checkpoint(rec)
+        cache[int(az)] = rec
         if profile:
             state["profiles"][int(az)] = profile
+        if profile and not night:
             peak = max(lum for _, lum in profile)
             state["sky_ref"] = peak if state["sky_ref"] is None else max(state["sky_ref"], peak)
         if status in ("no_reference", "inconclusive"):
@@ -1169,6 +1321,13 @@ def _scope_measure(sc, cfg, args):
     def reachable(az):
         """Is this column worth PLANNING for? Endpoint geometry, not the slew.
 
+        At night, columns near due north are excluded outright: the walk crosses
+        declinations where RA will not converge (dec ~ 90 - |alt - lat|), and on
+        2026-08-06 a burst of those failed gotos made the scope reset every
+        connection it held. One column was unrecoverable at az 0 and cost 206
+        seconds discovering it. Daytime sweeps have measured az 0 successfully,
+        so the exclusion is night-only until the difference is understood.
+
         Deliberately the weaker `column_touches_sun` rather than sweep's
         path-aware `reachable_now`. This predicate only decides which candidates
         the D-optimality criterion gets to choose between, and the real slew is
@@ -1179,6 +1338,8 @@ def _scope_measure(sc, cfg, args):
         history is harder to reason about than one that occasionally proposes a
         column the mount then declines.
         """
+        if night and min(az % 360.0, 360.0 - az % 360.0) <= 8.0:
+            return False
         return not column_touches_sun(sky, az, sw["alt_min"], sw["alt_max"], sw["sun_cone_deg"])
 
     return measure, reachable, _sun_deadline(sky, getattr(args, "stop_above_sun_alt", None)), state
