@@ -5791,6 +5791,238 @@ def test_the_polar_page_is_self_contained_and_layered(tmp_path):
     assert os.path.getsize(path) > 0
 
 
+def test_the_fit_writes_down_which_fiducials_it_used_and_why(tmp_path):
+    """terminus-53: the published fit used 16 of 30 and nothing records which.
+
+    That is not a small gap. Anyone refitting from the same sweeps gets ~29
+    fiducials including the hard columns the published run discarded, and
+    therefore a much worse residual BY CONSTRUCTION rather than by error — then
+    goes looking for bugs in frame registration that are not there. It is also a
+    comparison error waiting to happen: 3.38 on 29 and 0.69 on 16 are not
+    comparable numbers at all (F-25).
+
+    So the fit records the set, not just its size: every column, its value,
+    whether it was one-sided, and for anything excluded, the reason.
+    """
+    import math
+
+    from terminus import guide
+    from terminus.orient import Fiducial, fit
+
+    rows = [
+        (float(az), 20.0 + 6.0 * math.sin(math.radians(az)), "structure") for az in range(0, 360, 5)
+    ]
+    sample = guide.photo_sample(rows)
+    fids = [
+        Fiducial(0.0, 20.0, 60.0),
+        Fiducial(90.0, 26.0, 60.0),
+        Fiducial(180.0, 20.0, 60.0),
+        Fiducial(270.0, 14.0, 60.0),
+        Fiducial(45.0, 59.5, 60.0),  # half a degree of headroom: a manufactured edge
+    ]
+    sol = fit(fids, sample, yaw_step=5.0, tilt_max=3.0, tilt_step=3.0, pitch_range=6.0,
+              min_headroom=2.0)  # fmt: skip
+
+    record = {f["az"]: f for f in sol["fiducials"]}
+    assert set(record) == {0.0, 45.0, 90.0, 180.0, 270.0}, (
+        "every fiducial handed in must appear, used or not — an omitted one is "
+        "indistinguishable from one that was never measured"
+    )
+    assert record[45.0]["used"] is False
+    assert "headroom" in record[45.0]["reason"], "and the reason must say which gate rejected it"
+    assert record[0.0]["used"] is True and record[0.0]["reason"] is None
+    for f in record.values():
+        assert {"az", "alt", "bound", "weight", "sigma"} <= set(
+            f
+        ), "enough to refit from this record alone"
+
+
+def test_a_column_excluded_in_the_mask_is_never_offered_to_the_planner():
+    """The az 60/190 dawn exclusions were folklore: a memory file and a doc.
+
+    Now they live in the mask beside the column, with the reason attached, and
+    `from_mask` both honours and RECORDS them — D-12, a thing that failed must
+    be recorded as failed rather than quietly omitted.
+    """
+    from terminus.orient import from_mask
+
+    mask = {
+        10: {"alt": 12.0, "type": "structure"},
+        20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"},
+        30: {"alt": 8.0, "type": "open"},
+        40: {"alt": 60.0, "type": "unknown"},
+    }
+    excluded = {}
+    fids = {int(f.az): f for f in from_mask(mask, ceiling=60.0, excluded=excluded)}
+
+    assert set(fids) == {10}, f"only the usable column should survive, got {sorted(fids)}"
+    assert excluded[20] == "dawn transition", "the mask's own reason, verbatim"
+    assert "open" in excluded[30], "an open column bounds from below; say so"
+    assert "unknown" in excluded[40] or "failed" in excluded[40]
+    assert 10 not in excluded
+
+
+def test_a_falsy_exclude_is_refused_rather_than_read_as_not_excluded():
+    """E-12: truthiness fails open, and `exclude` is hand-edited.
+
+    `exclude: false`, `exclude: 0` and `exclude: ""` all look like exclusions to
+    the person who typed them; read by truthiness they all silently re-enter the
+    fit. The field's vocabulary is closed — a non-empty string reason — and
+    anything else raises. An excluded column with no altitude records the
+    author's reason, not "no altitude recorded": the hand-written reason is the
+    more informative of the two.
+    """
+    import pytest
+
+    from terminus.orient import exclusion_reason, from_mask
+
+    assert exclusion_reason({"alt": 10.0}) is None
+    assert exclusion_reason({"exclude": " dawn transition "}) == "dawn transition"
+    for bad in (False, True, 0, 1, "", "   ", ["x"]):
+        with pytest.raises(ValueError, match="exclude"):
+            exclusion_reason({"exclude": bad})
+        with pytest.raises(ValueError, match="exclude"):
+            from_mask({20: {"alt": 5.0, "type": "tree", "exclude": bad}})
+
+    excluded = {}
+    from_mask({20: {"exclude": "glare"}}, excluded=excluded)
+    assert excluded[20] == "glare", "the reason outranks 'no altitude recorded'"
+
+
+def test_the_cli_writes_mask_exclusions_into_the_fit_record(tmp_path):
+    """terminus-53 at the CLI layer, where round 1 found it missing twice over.
+
+    `_fiducial_source` filtered excluded columns and printed them to stderr —
+    and nothing else. The written mask's `fit_fiducials` never heard of them,
+    so the one artifact the PR exists to create silently omitted the inputs
+    someone removed; and no test exercised the CLI path at all, so both the
+    filter and the record could be deleted with the suite green (both
+    mutations demonstrated on review round 1). Also pinned here: a used
+    fiducial has NO `reason` key in the file — this meta is serialised via
+    repr, where a literal None round-trips through YAML as the STRING 'None'.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import yaml
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {a: (20.0 + 5.0 * (a % 20 == 0), "structure") for a in range(0, 360, 10)}
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    fid = tmp_path / "sweep.yaml"
+    fid.write_text(
+        yaml.safe_dump(
+            {
+                "meta": {"alt_search": [0, 60]},
+                "horizon": {
+                    0: {"alt": 20.0, "type": "structure"},
+                    90: {"alt": 25.0, "type": "structure"},
+                    180: {"alt": 20.0, "type": "structure"},
+                    270: {"alt": 15.0, "type": "structure"},
+                    20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"},
+                },
+            }
+        )
+    )
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=[str(fid)], seed=3,
+        max_columns=5, window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None,
+        dry_run=False, frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    canned = {
+        "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+        "n": 4, "n_bound": 0, "residuals": {0.0: 0.1},
+        "fiducials": [
+            {"az": 0.0, "alt": 20.0, "bound": False, "weight": 1.0, "sigma": 1.0,
+             "used": True, "residual": 0.1, "reason": None},
+        ],
+    }  # fmt: skip
+    with patch.object(guide, "fit", return_value=canned):
+        cli.cmd_orient(None, {"site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600}}, args)
+
+    meta = yaml.safe_load(out.read_text())["meta"]
+    record = {f["az"]: f for f in meta["fit_fiducials"]}
+    assert 20.0 in record, "the mask's exclusion must reach the written record"
+    assert record[20.0]["used"] is False
+    assert record[20.0]["reason"] == "dawn transition"
+    assert record[20.0]["excluded_by"] == "mask"
+    assert record[20.0]["alt"] == 32.5
+    assert 20.0 not in meta["fit_columns"], "an excluded column must never enter the fit"
+    assert "reason" not in record[0.0], (
+        "a used column carries no reason key: repr-serialised None reads back "
+        "as the string 'None', so absence is the only honest spelling"
+    )
+    assert all(v != "None" for f in meta["fit_fiducials"] for v in f.values())
+
+
+def test_a_malformed_exclude_reaches_the_cli_as_a_clean_maskerror(tmp_path):
+    """The CLI translation is load-bearing, not decorative (round 2, E-12).
+
+    `exclusion_reason` raises ValueError; `main()` reports MaskError. Without
+    the translation in `_fiducial_source`, the one failure with a five-second
+    fix — a typo in a hand-edited `exclude` — arrives as a raw traceback while
+    every legitimate refusal gets a clean sentence. The from_mask layer was
+    tested; this pins the CLI layer's own wrap, which a round-2 mutation
+    showed the suite did not reach.
+    """
+    import pytest
+    import yaml
+
+    from terminus.cli import MaskError, _fiducial_source
+
+    bad = tmp_path / "sweep.yaml"
+    bad.write_text(
+        yaml.safe_dump({"horizon": {20: {"alt": 32.5, "type": "structure", "exclude": False}}})
+    )
+    with pytest.raises(MaskError) as exc:
+        _fiducial_source([str(bad)], None)
+    message = str(exc.value)
+    assert (
+        "sweep.yaml" in message and "20" in message
+    ), "the error must name the file and the column the typo lives in"
+    assert "exclude" in message
+
+
+def test_two_masks_disagreeing_about_a_column_follow_first_wins_either_way(tmp_path):
+    """A column is a measurement OR an exclusion, never both (round 2's P1).
+
+    `columns` had first-file-wins while `excluded` overwrote, so two masks
+    disagreeing about one azimuth left it simultaneously excluded and live —
+    `reachable` said yes, `measure` answered, and the written record carried
+    both verdicts. The two maps are one namespace: the first file to speak
+    about an azimuth wins, whatever it said, exactly as the merged accepted
+    columns already behaved.
+    """
+    import yaml
+
+    from terminus.cli import _fiducial_source
+
+    excludes = tmp_path / "a.yaml"
+    excludes.write_text(
+        yaml.safe_dump(
+            {"horizon": {20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"}}}
+        )
+    )
+    measures = tmp_path / "b.yaml"
+    measures.write_text(yaml.safe_dump({"horizon": {20: {"alt": 30.0, "type": "structure"}}}))
+
+    _measure, reachable, excluded = _fiducial_source([str(excludes), str(measures)], None)
+    assert 20 in excluded and not reachable(
+        20
+    ), "the excluding file spoke first, so the column is excluded — not also live"
+
+    _measure, reachable, excluded = _fiducial_source([str(measures), str(excludes)], None)
+    assert (
+        reachable(20) and 20 not in excluded
+    ), "the measuring file spoke first, so the column is live — not also excluded"
+
+
 def _orient_measure_fixture(tmp_path, sun_alt, scan_stub=None):
     """A `measure` built by `_scope_measure` with the hardware mocked out.
 
@@ -6414,7 +6646,7 @@ def test_orient_keeps_what_it_measured(tmp_path):
                 "n": 4,
                 "n_bound": 0,
                 "residuals": {0.0: 0.1},
-                "dropped": [],
+                "fiducials": [],
             },
         ),
     ):

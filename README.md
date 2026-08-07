@@ -132,7 +132,11 @@ as a hint, not a measurement.
 ## What you get
 
 - A durable, hand-editable **mask** (`horizon_mask.yaml`) with per-azimuth
-  altitude and obstruction type.
+  altitude and obstruction type. A column can carry `exclude: "<reason>"` to
+  keep it out of the orientation fit — for a measurement you know is bad
+  (dawn-contaminated, glare) — and the fit records the exclusion and its
+  reason rather than silently omitting the column. The reason is required:
+  a bare `exclude: true` is refused.
 - **`horizon.hrz`** for N.I.N.A. (Options → General → Horizon) and
   **`horizon.stellarium.txt`** for a Stellarium polygonal landscape.
 - A per-azimuth **review frame** so you can eyeball every measurement.
