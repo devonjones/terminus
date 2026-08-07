@@ -1085,7 +1085,11 @@ def _scope_measure(sc, cfg, args):
                           "under the current detector", file=sys.stderr)  # fmt: skip
                     d = dict(d, verdict=verdict)
                     if verdict == "edge":
+                        # The bisection never ran: this is the coarse bracket's
+                        # midpoint, and the record says so rather than passing
+                        # it off as a refined value.
                         d["alt"] = round((prof[idx][0] + prof[idx + 1][0]) / 2.0, 1)
+                        d["coarse_only"] = True
             cache[int(d["az"])] = d
         if cache:
             print(f"resuming {len(cache)} columns from {os.path.basename(ckpt_path)}: "
@@ -1110,10 +1114,48 @@ def _scope_measure(sc, cfg, args):
         t0 = time.time()
         try:
             if night:
-                alt, status, _typ, profile = scan_horizon_night(
-                    ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
-                    sw["alt_tol"], frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
-                )  # fmt: skip
+                try:
+                    alt, status, _typ, profile = scan_horizon_night(
+                        ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
+                        sw["alt_tol"],
+                        frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                    )  # fmt: skip
+                except (ConnectionError, OSError, TimeoutError) as e:
+                    # THE SECOND SOCKET DEATH MUST NOT LOSE THE NIGHT. The client
+                    # reopens the imaging socket once on its own; when that also
+                    # fails the scope has usually torn down the whole star
+                    # session after a burst of failed gotos (I-16, seen twice on
+                    # 2026-08-06) — so restart the view, and give the COLUMN one
+                    # more try. A second failure checkpoints as failed and the
+                    # loop moves on: one lost column, not a crashed run needing
+                    # a manual rerun, which is the exact loss terminus-58
+                    # exists to prevent.
+                    print(f"az {az:3d}: imaging channel died ({str(e)[:60]}); "
+                          "restarting the star view", file=sys.stderr)  # fmt: skip
+                    try:
+                        sc.close_imaging()
+                        sc.stop_view()
+                        time.sleep(1)
+                        sc.start_view("star")
+                        time.sleep(6)
+                        alt, status, _typ, profile = scan_horizon_night(
+                            ptr, sc, az, sw["alt_min"], sw["alt_max"],
+                            sw.get("coarse_step", 5.0), sw["alt_tol"],
+                            frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                        )  # fmt: skip
+                    except (ConnectionError, OSError, TimeoutError) as e2:
+                        if not args.dry_run:
+                            checkpoint(
+                                {
+                                    "az": int(az),
+                                    "t": time.strftime("%H:%M:%S"),
+                                    "verdict": "failed",
+                                    "error": str(e2)[:200],
+                                }
+                            )
+                        print(f"az {az:3d}: failed after view restart ({str(e2)[:80]})",
+                              file=sys.stderr)  # fmt: skip
+                        return None
             else:
                 alt, status, _typ, profile = scan_horizon(
                     ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),

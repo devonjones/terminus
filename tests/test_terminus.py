@@ -5835,6 +5835,76 @@ def test_the_night_detector_reads_real_profiles_the_way_the_sky_did():
             )
 
 
+def test_a_second_imaging_death_costs_one_column_not_the_night(tmp_path):
+    """The client reopens the socket once on its own; when that also fails the
+    scope has torn down the star session. The column gets a view restart and
+    one more try; a further failure is checkpointed and the LOOP CONTINUES —
+    a crashed run needing a manual rerun is the exact loss terminus-58 removes.
+    Reproduced by review with a flaky-scope mock before this test existed."""
+    import json as _json
+
+    calls = {"n": 0}
+
+    def scan(*a, **k):
+        calls["n"] += 1
+        raise ConnectionError("imaging socket closed")
+
+    (measure, _r, args), patches, _ = _orient_measure_fixture(tmp_path, -30.0, scan)
+    try:
+        got = measure(120)
+        assert got is None, "a dead column yields no constraint, not an exception"
+        assert calls["n"] == 2, "the column gets exactly one view-restart retry"
+        lines = [_json.loads(x) for x in open(tmp_path / "out_fiducials.jsonl")]
+        assert lines and lines[-1]["verdict"] == "failed", (
+            "the attempt must be on disk with its reason"
+        )
+        # and the loop is still alive for the next column
+        assert measure(130) is None
+        assert calls["n"] == 4
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def test_a_night_scan_skips_the_pole_band_sample_and_keeps_the_column():
+    """I-16, the per-sample half: one lost altitude is recoverable, a lost
+    column is not. az 0's walk crosses declinations where RA cannot converge;
+    the failing sample is skipped and the profile keeps its edge."""
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, PointingError, Sky, scan_horizon_night
+
+    class NightSky(Sky):
+        def sun(self, when=None):
+            return 270.0, -30.0
+
+    sky = NightSky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    # A clean skyglow rise with a persistent cliff between 30 and 25.
+    levels = {60: 860, 55: 900, 50: 950, 45: 1000, 40: 1060, 35: 1130,
+              30: 1250, 25: 700, 20: 680, 15: 660, 10: 640, 5: 620, 0: 600}  # fmt: skip
+    at = {"alt": None}
+    ptr = Pointer(sc, sky, 30, 5, False)
+
+    def point_to(az, alt):
+        if abs(alt - 45.0) < 0.6:
+            raise PointingError("pole band: RA will not converge")
+        at["alt"] = alt
+        return az, alt
+
+    ptr.point_to = point_to
+    sc.capture_raw16_median = lambda **k: float(
+        levels[min(levels, key=lambda a: abs(a - at["alt"]))]
+    )
+
+    alt, status, typ, profile = scan_horizon_night(ptr, sc, 0.0, 0, 60, 5.0, 1.5)
+    sampled = [a for a, _ in profile]
+    assert 45.0 not in sampled, "the pole-band sample must be skipped, not fought"
+    assert len(sampled) == 12, "and only that sample is lost"
+    assert status.startswith("edge"), f"the column survives its gap: {status}"
+    assert 25 <= alt <= 30, f"edge in the right bracket, got {alt}"
+
+
 def test_the_night_detector_refuses_what_it_cannot_confirm():
     """The boundary of the data is not the boundary of the sky.
 
