@@ -2076,9 +2076,9 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     plain = tmp_path / "scope.yaml"
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
-    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head), (
-        "a scope mask must not explain fields it does not carry"
-    )
+    assert not any(
+        "clipped" in ln or "gap_fraction" in ln for ln in head
+    ), "a scope mask must not explain fields it does not carry"
     assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
     # The count is still asserted. Dropping it for substring checks alone lost
     # the ability to catch unrelated header bloat, which is what this test was
@@ -3243,9 +3243,9 @@ def test_a_truncated_sweep_is_visible_in_the_file_and_the_exit_code(tmp_path):
     # 3. A complete patch over a truncated mask CLEARS the flag.
     sweep(out, Deadline(fires=False), azimuths="90")
     meta, cols = load_columns(str(out))
-    assert not meta.get("stopped_early"), (
-        "a mask since completed must stop claiming it was cut short"
-    )
+    assert not meta.get(
+        "stopped_early"
+    ), "a mask since completed must stop claiming it was cut short"
     assert 90 in cols, "and the merge still did its actual job"
 
 
@@ -3549,9 +3549,9 @@ def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
     assert cols, "the fixture must produce columns for this to mean anything"
     for az, col in cols.items():
         assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
-        assert col.get("type_source") is None, (
-            f"az {az}: no type was measured, so no source may be claimed"
-        )
+        assert (
+            col.get("type_source") is None
+        ), f"az {az}: no type was measured, so no source may be claimed"
 
 
 def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
@@ -4882,9 +4882,9 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
         reasons[power] = detail["reason"]
     assert "open" in reasons[0.5], f"shallow dimming reads as open, got {reasons[0.5]!r}"
     for power in (1.5, 3.0):
-        assert "no usable sky model" in reasons[power], (
-            f"steep dimming must refuse outright, got {reasons[power]!r}"
-        )
+        assert (
+            "no usable sky model" in reasons[power]
+        ), f"steep dimming must refuse outright, got {reasons[power]!r}"
 
 
 def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
@@ -4929,9 +4929,9 @@ def test_a_steeply_graded_column_is_not_mistaken_for_a_glint():
     # The model must pass through the TOP of the column. A positive slope alone
     # is not enough to prove that — the median screen also produced one, fitted
     # to the tail — so this checks where the line actually sits.
-    assert abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0, (
-        "the fit must pass near the topmost sample, not the flat tail beneath it"
-    )
+    assert (
+        abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0
+    ), "the fit must pass near the topmost sample, not the flat tail beneath it"
     assert n_top >= 4
 
 
@@ -4952,9 +4952,9 @@ def test_one_glint_at_the_top_does_not_discard_the_whole_column():
     for factor in (3.0, 5.0, 10.0):
         glinted = [(prof[0][0], prof[0][1] * factor)] + prof[1:]
         alt, detail = find_horizon(glinted)
-        assert alt == clean, (
-            f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
-        )
+        assert (
+            alt == clean
+        ), f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
 
 
 def test_every_refusal_path_is_exercised_not_merely_written():
@@ -5240,9 +5240,9 @@ def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
 
     stopped = sweep(closes_after_three)
     full = sweep(None)
-    assert len(stopped) < len(full), (
-        f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
-    )
+    assert len(stopped) < len(
+        full
+    ), f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
     assert len(stopped) > 0, "and what was measured before it closed is kept"
     # A sweep that stops is not a sweep that failed.
     assert all("alt" in c for c in stopped.values())
@@ -5395,9 +5395,9 @@ def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
     sky = FixedSky()
     for az in range(0, 360, 5):
         closest = min(ang_sep(az, alt / 2.0, 271.0, 25.5) for alt in range(0, 121))
-        assert column_touches_sun(sky, az, 0, 60, 30) == (closest < 30), (
-            f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
-        )
+        assert column_touches_sun(sky, az, 0, 60, 30) == (
+            closest < 30
+        ), f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
 
     # The two that were wrong, named so a regression is unmistakable.
     assert column_touches_sun(sky, 250, 0, 60, 30), "az 250 passes 19.1 deg from the Sun"
@@ -5517,6 +5517,8 @@ def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     wrong — which is precisely the shape of corruption the coordinate-lookup
     rewrite was written to eliminate, arriving through a different door.
     """
+    from unittest.mock import patch
+
     import pytest
 
     from terminus.mosaic import MosaicError, remap_labels
@@ -5525,7 +5527,11 @@ def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     project.write_text(
         'p f2 w2880 h1440 v360 n"TIFF_m"\nm i0\ni w3000 h4000 f0 n"stage/frame1.jpg"\n'
     )
-    with pytest.raises(MosaicError, match="does not contain"):
+    # The subject is the NAME guard, which fires before nona is ever invoked.
+    # Without this patch the test asserted what the dev box happens to satisfy
+    # (E-04): on a host with no hugin, require_hugin raises first with a
+    # different message, and CI is such a host.
+    with patch("terminus.mosaic.require_hugin"), pytest.raises(MosaicError, match="does not contain"):  # fmt: skip
         # Right file, wrong spelling: no directory prefix.
         remap_labels(str(project), str(tmp_path), {"frame1.jpg": "labels/001.png"})
 
@@ -5565,7 +5571,10 @@ def test_a_label_project_asks_nona_for_coordinates_not_for_pixels(tmp_path):
         seen.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    with patch("terminus.mosaic._run", side_effect=fake_run):
+    # require_hugin is patched for the same reason _run is: the subject is the
+    # project rewrite and the nona ARGUMENTS, and a host with no hugin (CI)
+    # must exercise them identically to one with it (E-04).
+    with patch("terminus.mosaic.require_hugin"), patch("terminus.mosaic._run", side_effect=fake_run):  # fmt: skip
         layers = remap_labels(str(project), str(tmp_path), {"stage/frame1.jpg": "labels/001.png"})
 
     assert seen, "nona was never invoked"
@@ -5640,6 +5649,238 @@ def test_the_polar_page_is_self_contained_and_layered(tmp_path):
 
     path = polar.write_page(str(tmp_path / "p.html"), rows, solution)
     assert os.path.getsize(path) > 0
+
+
+def test_the_fit_writes_down_which_fiducials_it_used_and_why(tmp_path):
+    """terminus-53: the published fit used 16 of 30 and nothing records which.
+
+    That is not a small gap. Anyone refitting from the same sweeps gets ~29
+    fiducials including the hard columns the published run discarded, and
+    therefore a much worse residual BY CONSTRUCTION rather than by error — then
+    goes looking for bugs in frame registration that are not there. It is also a
+    comparison error waiting to happen: 3.38 on 29 and 0.69 on 16 are not
+    comparable numbers at all (F-25).
+
+    So the fit records the set, not just its size: every column, its value,
+    whether it was one-sided, and for anything excluded, the reason.
+    """
+    import math
+
+    from terminus import guide
+    from terminus.orient import Fiducial, fit
+
+    rows = [
+        (float(az), 20.0 + 6.0 * math.sin(math.radians(az)), "structure") for az in range(0, 360, 5)
+    ]
+    sample = guide.photo_sample(rows)
+    fids = [
+        Fiducial(0.0, 20.0, 60.0),
+        Fiducial(90.0, 26.0, 60.0),
+        Fiducial(180.0, 20.0, 60.0),
+        Fiducial(270.0, 14.0, 60.0),
+        Fiducial(45.0, 59.5, 60.0),  # half a degree of headroom: a manufactured edge
+    ]
+    sol = fit(fids, sample, yaw_step=5.0, tilt_max=3.0, tilt_step=3.0, pitch_range=6.0,
+              min_headroom=2.0)  # fmt: skip
+
+    record = {f["az"]: f for f in sol["fiducials"]}
+    assert set(record) == {0.0, 45.0, 90.0, 180.0, 270.0}, (
+        "every fiducial handed in must appear, used or not — an omitted one is "
+        "indistinguishable from one that was never measured"
+    )
+    assert record[45.0]["used"] is False
+    assert "headroom" in record[45.0]["reason"], "and the reason must say which gate rejected it"
+    assert record[0.0]["used"] is True and record[0.0]["reason"] is None
+    for f in record.values():
+        assert {"az", "alt", "bound", "weight", "sigma"} <= set(
+            f
+        ), "enough to refit from this record alone"
+
+
+def test_a_column_excluded_in_the_mask_is_never_offered_to_the_planner():
+    """The az 60/190 dawn exclusions were folklore: a memory file and a doc.
+
+    Now they live in the mask beside the column, with the reason attached, and
+    `from_mask` both honours and RECORDS them — D-12, a thing that failed must
+    be recorded as failed rather than quietly omitted.
+    """
+    from terminus.orient import from_mask
+
+    mask = {
+        10: {"alt": 12.0, "type": "structure"},
+        20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"},
+        30: {"alt": 8.0, "type": "open"},
+        40: {"alt": 60.0, "type": "unknown"},
+    }
+    excluded = {}
+    fids = {int(f.az): f for f in from_mask(mask, ceiling=60.0, excluded=excluded)}
+
+    assert set(fids) == {10}, f"only the usable column should survive, got {sorted(fids)}"
+    assert excluded[20] == "dawn transition", "the mask's own reason, verbatim"
+    assert "open" in excluded[30], "an open column bounds from below; say so"
+    assert "unknown" in excluded[40] or "failed" in excluded[40]
+    assert 10 not in excluded
+
+
+def test_a_falsy_exclude_is_refused_rather_than_read_as_not_excluded():
+    """E-12: truthiness fails open, and `exclude` is hand-edited.
+
+    `exclude: false`, `exclude: 0` and `exclude: ""` all look like exclusions to
+    the person who typed them; read by truthiness they all silently re-enter the
+    fit. The field's vocabulary is closed — a non-empty string reason — and
+    anything else raises. An excluded column with no altitude records the
+    author's reason, not "no altitude recorded": the hand-written reason is the
+    more informative of the two.
+    """
+    import pytest
+
+    from terminus.orient import exclusion_reason, from_mask
+
+    assert exclusion_reason({"alt": 10.0}) is None
+    assert exclusion_reason({"exclude": " dawn transition "}) == "dawn transition"
+    for bad in (False, True, 0, 1, "", "   ", ["x"]):
+        with pytest.raises(ValueError, match="exclude"):
+            exclusion_reason({"exclude": bad})
+        with pytest.raises(ValueError, match="exclude"):
+            from_mask({20: {"alt": 5.0, "type": "tree", "exclude": bad}})
+
+    excluded = {}
+    from_mask({20: {"exclude": "glare"}}, excluded=excluded)
+    assert excluded[20] == "glare", "the reason outranks 'no altitude recorded'"
+
+
+def test_the_cli_writes_mask_exclusions_into_the_fit_record(tmp_path):
+    """terminus-53 at the CLI layer, where round 1 found it missing twice over.
+
+    `_fiducial_source` filtered excluded columns and printed them to stderr —
+    and nothing else. The written mask's `fit_fiducials` never heard of them,
+    so the one artifact the PR exists to create silently omitted the inputs
+    someone removed; and no test exercised the CLI path at all, so both the
+    filter and the record could be deleted with the suite green (both
+    mutations demonstrated on review round 1). Also pinned here: a used
+    fiducial has NO `reason` key in the file — this meta is serialised via
+    repr, where a literal None round-trips through YAML as the STRING 'None'.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import yaml
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {a: (20.0 + 5.0 * (a % 20 == 0), "structure") for a in range(0, 360, 10)}
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    fid = tmp_path / "sweep.yaml"
+    fid.write_text(
+        yaml.safe_dump(
+            {
+                "meta": {"alt_search": [0, 60]},
+                "horizon": {
+                    0: {"alt": 20.0, "type": "structure"},
+                    90: {"alt": 25.0, "type": "structure"},
+                    180: {"alt": 20.0, "type": "structure"},
+                    270: {"alt": 15.0, "type": "structure"},
+                    20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"},
+                },
+            }
+        )
+    )
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=[str(fid)], seed=3,
+        max_columns=5, window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None,
+        dry_run=False, frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    canned = {
+        "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+        "n": 4, "n_bound": 0, "residuals": {0.0: 0.1},
+        "fiducials": [
+            {"az": 0.0, "alt": 20.0, "bound": False, "weight": 1.0, "sigma": 1.0,
+             "used": True, "residual": 0.1, "reason": None},
+        ],
+    }  # fmt: skip
+    with patch.object(guide, "fit", return_value=canned):
+        cli.cmd_orient(None, {"site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600}}, args)
+
+    meta = yaml.safe_load(out.read_text())["meta"]
+    record = {f["az"]: f for f in meta["fit_fiducials"]}
+    assert 20.0 in record, "the mask's exclusion must reach the written record"
+    assert record[20.0]["used"] is False
+    assert record[20.0]["reason"] == "dawn transition"
+    assert record[20.0]["excluded_by"] == "mask"
+    assert record[20.0]["alt"] == 32.5
+    assert 20.0 not in meta["fit_columns"], "an excluded column must never enter the fit"
+    assert "reason" not in record[0.0], (
+        "a used column carries no reason key: repr-serialised None reads back "
+        "as the string 'None', so absence is the only honest spelling"
+    )
+    assert all(v != "None" for f in meta["fit_fiducials"] for v in f.values())
+
+
+def test_a_malformed_exclude_reaches_the_cli_as_a_clean_maskerror(tmp_path):
+    """The CLI translation is load-bearing, not decorative (round 2, E-12).
+
+    `exclusion_reason` raises ValueError; `main()` reports MaskError. Without
+    the translation in `_fiducial_source`, the one failure with a five-second
+    fix — a typo in a hand-edited `exclude` — arrives as a raw traceback while
+    every legitimate refusal gets a clean sentence. The from_mask layer was
+    tested; this pins the CLI layer's own wrap, which a round-2 mutation
+    showed the suite did not reach.
+    """
+    import pytest
+    import yaml
+
+    from terminus.cli import MaskError, _fiducial_source
+
+    bad = tmp_path / "sweep.yaml"
+    bad.write_text(
+        yaml.safe_dump({"horizon": {20: {"alt": 32.5, "type": "structure", "exclude": False}}})
+    )
+    with pytest.raises(MaskError) as exc:
+        _fiducial_source([str(bad)], None)
+    message = str(exc.value)
+    assert (
+        "sweep.yaml" in message and "20" in message
+    ), "the error must name the file and the column the typo lives in"
+    assert "exclude" in message
+
+
+def test_two_masks_disagreeing_about_a_column_follow_first_wins_either_way(tmp_path):
+    """A column is a measurement OR an exclusion, never both (round 2's P1).
+
+    `columns` had first-file-wins while `excluded` overwrote, so two masks
+    disagreeing about one azimuth left it simultaneously excluded and live —
+    `reachable` said yes, `measure` answered, and the written record carried
+    both verdicts. The two maps are one namespace: the first file to speak
+    about an azimuth wins, whatever it said, exactly as the merged accepted
+    columns already behaved.
+    """
+    import yaml
+
+    from terminus.cli import _fiducial_source
+
+    excludes = tmp_path / "a.yaml"
+    excludes.write_text(
+        yaml.safe_dump(
+            {"horizon": {20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"}}}
+        )
+    )
+    measures = tmp_path / "b.yaml"
+    measures.write_text(yaml.safe_dump({"horizon": {20: {"alt": 30.0, "type": "structure"}}}))
+
+    _measure, reachable, excluded = _fiducial_source([str(excludes), str(measures)], None)
+    assert 20 in excluded and not reachable(
+        20
+    ), "the excluding file spoke first, so the column is excluded — not also live"
+
+    _measure, reachable, excluded = _fiducial_source([str(measures), str(excludes)], None)
+    assert (
+        reachable(20) and 20 not in excluded
+    ), "the measuring file spoke first, so the column is live — not also excluded"
 
 
 def _orient_measure_fixture(tmp_path, sun_alt, scan_stub=None):
@@ -5760,9 +6001,9 @@ def test_a_night_checkpoint_is_rejudged_by_the_current_detector(tmp_path):
         got = measure(120)
         assert got is not None, "the re-judged column must be served"
         edge, ceiling, _unc = got
-        assert edge is not None and edge["alt"] == 42.5, (
-            f"blocked -> edge under the current detector, at the bracket midpoint; got {edge}"
-        )
+        assert (
+            edge is not None and edge["alt"] == 42.5
+        ), f"blocked -> edge under the current detector, at the bracket midpoint; got {edge}"
     finally:
         for p in patches:
             p.stop()
@@ -5825,9 +6066,9 @@ def test_the_night_detector_reads_real_profiles_the_way_the_sky_did():
         profile = [(a, lum) for a, lum in fx["profile"]]
         idx, verdict = night_find_edge(profile)
         want_verdict, want_alt = fx["expect"]
-        assert verdict == want_verdict, (
-            f"az {az}: {verdict!r}, want {want_verdict!r} ({fx['ground_truth']})"
-        )
+        assert (
+            verdict == want_verdict
+        ), f"az {az}: {verdict!r}, want {want_verdict!r} ({fx['ground_truth']})"
         if want_alt is not None:
             assert idx is not None and profile[idx][0] == want_alt, (
                 f"az {az}: edge above {profile[idx][0] if idx is not None else None}, "
@@ -5855,9 +6096,9 @@ def test_a_second_imaging_death_costs_one_column_not_the_night(tmp_path):
         assert got is None, "a dead column yields no constraint, not an exception"
         assert calls["n"] == 2, "the column gets exactly one view-restart retry"
         lines = [_json.loads(x) for x in open(tmp_path / "out_fiducials.jsonl")]
-        assert lines and lines[-1]["verdict"] == "failed", (
-            "the attempt must be on disk with its reason"
-        )
+        assert (
+            lines and lines[-1]["verdict"] == "failed"
+        ), "the attempt must be on disk with its reason"
         # and the loop is still alive for the next column
         assert measure(130) is None
         assert calls["n"] == 4
@@ -6002,9 +6243,9 @@ def test_both_ways_round_the_ra_circle_are_offered():
         # No single leg may exceed the split, or a goto could take the short way.
         prev = rd0
         for wp in wps:
-            assert abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
-                f"{name} has a leg a goto could shortcut"
-            )
+            assert (
+                abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+            ), f"{name} has a leg a goto could shortcut"
             prev = wp
 
 
@@ -6068,9 +6309,9 @@ def test_route_waypoints_are_coordinates_the_mount_can_accept():
                 for ra, dec in waypoints:
                     assert 0.0 <= ra < 24.0, f"{name}: RA {ra} is not a coordinate"
                     assert -90.0 <= dec <= 90.0, f"{name}: Dec {dec} is not a coordinate"
-                    assert abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
-                        f"{name}: a leg long enough for a goto to shortcut"
-                    )
+                    assert (
+                        abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+                    ), f"{name}: a leg long enough for a goto to shortcut"
                     prev = (ra, dec)
                 assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
                 assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
@@ -6116,9 +6357,9 @@ def test_one_false_bound_cannot_capture_the_fit():
         good + [false_bound], sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0
     )
     swing = abs(((poisoned["yaw"] - clean["yaw"] + 180) % 360) - 180)
-    assert swing < 15.0, (
-        f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
-    )
+    assert (
+        swing < 15.0
+    ), f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
 
 
 def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
@@ -6157,7 +6398,7 @@ def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
     assert column(7.0, [0.5, 0.6, 0.4]) == "blocked_above"
 
 
-def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
+def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem(tmp_path):
     """On 2026-08-05 a mid-run timeout was reported as:
 
         error: could not read or write beside .../photo_mask.yaml: timed out
@@ -6170,8 +6411,24 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
     import socket
 
     import pytest
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
     from terminus.client import Seestar, SeestarError
+
+    # A throwaway key, because the interop key exists only on the dev box and
+    # this test previously asserted what that box happens to satisfy (E-04):
+    # on a host without the key — CI — the constructor failed on the pem
+    # instead and the error named a file, not the unreachable host.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = tmp_path / "key.pem"
+    pem.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
 
     # A closed local port refuses immediately: the same OSError family as the
     # timeout that caused this, without spending ten seconds waiting for one.
@@ -6181,7 +6438,7 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
     probe.close()
 
     with pytest.raises(SeestarError) as exc:
-        Seestar("127.0.0.1", "~/.seestar/seestar_client_key.pem")
+        Seestar("127.0.0.1", str(pem))
     message = str(exc.value)
     assert "127.0.0.1" in message, "it must name what it could not reach"
     assert "yaml" not in message and "could not write" not in message, "not a file problem"
@@ -6249,7 +6506,7 @@ def test_orient_keeps_what_it_measured(tmp_path):
                 "n": 4,
                 "n_bound": 0,
                 "residuals": {0.0: 0.1},
-                "dropped": [],
+                "fiducials": [],
             },
         ),
     ):
@@ -6304,9 +6561,9 @@ def test_a_tube_inside_the_cone_can_still_be_moved_out():
 
     assert legs, "it must move rather than refuse"
     final = sky.radec_to_altaz(*landed["rd"])
-    assert ang_sep(*final, 270.0, 20.0) >= 30.0, (
-        f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
-    )
+    assert (
+        ang_sep(*final, 270.0, 20.0) >= 30.0
+    ), f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
 
 
 def test_the_way_out_is_a_turn_not_a_descent():
@@ -6344,9 +6601,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
                 here = ang_sep(az, alt, 270.0, sun_alt)
                 cw = ang_sep((az + step) % 360, alt, 270.0, sun_alt)
                 ccw = ang_sep((az - step) % 360, alt, 270.0, sun_alt)
-                assert max(cw, ccw) > here or here > 60.0, (
-                    f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
-                )
+                assert (
+                    max(cw, ccw) > here or here > 60.0
+                ), f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
 
                 target = ptr.escape_target(az, alt)
                 assert ang_sep(*target, 270.0, sun_alt) >= ptr.cone + ptr.ESCAPE_MARGIN_DEG - 1e-9
@@ -6355,9 +6612,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
 
         assert trapped, f"Sun at {sun_alt}: the probe found nothing trapped"
         if sun_alt <= 40.0:
-            assert turned == trapped, (
-                f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
-            )
+            assert (
+                turned == trapped
+            ), f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
         else:
             # A high summer Sun leaves near-zenith pointings where azimuth barely
             # moves the tube. Those fall back to the descent, which is what the
@@ -6409,9 +6666,9 @@ def test_an_escape_that_succeeds_is_verified_against_where_the_tube_ACTUALLY_is(
     ptr, at = trapped(obedient=True)
     assert ang_sep(at["az"], at["alt"], *sky.sun()) < ptr.cone, "the premise: it starts trapped"
     out = ptr.escape()
-    assert ang_sep(*out, *sky.sun()) >= ptr.cone, (
-        f"escape returned {out} which is still inside the cone"
-    )
+    assert (
+        ang_sep(*out, *sky.sun()) >= ptr.cone
+    ), f"escape returned {out} which is still inside the cone"
     assert out == (at["az"], at["alt"]), "it must report where the tube IS, not where it aimed"
 
     # A mount that takes the commands and does not move is the dangerous case,
@@ -6680,9 +6937,9 @@ def test_a_tied_turn_goes_against_the_sun_s_own_drift():
         ptr = Pointer(MagicMock(), sky, 30, 5, True)
         assert (ptr.sun_drift() > 0) == (rate > 0), "the drift must be measured, not guessed"
         # A tube directly above the Sun: both turns are identical by symmetry.
-        assert ptr.escape_turn(270.0, 25.0) == expected, (
-            f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
-        )
+        assert (
+            ptr.escape_turn(270.0, 25.0) == expected
+        ), f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
 
     # And a test double with no clock still gets an answer, from the hemisphere.
     class Frozen(Sky):
@@ -6728,12 +6985,12 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
         ptr._goto_wait(8.604, 60.43, 0.1)
     elapsed = time.time() - started
 
-    assert elapsed < NO_PROGRESS_S + 15, (
-        f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
-    )
-    assert "stopped improving" in str(exc.value), (
-        "it must say the mount moved but would not converge, not that it never moved"
-    )
+    assert (
+        elapsed < NO_PROGRESS_S + 15
+    ), f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+    assert "stopped improving" in str(
+        exc.value
+    ), "it must say the mount moved but would not converge, not that it never moved"
 
 
 def test_a_mount_that_never_moves_is_reported_differently():
