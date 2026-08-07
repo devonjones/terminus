@@ -15,6 +15,7 @@ across the Sun between two safe positions.
 """
 
 import datetime
+import json
 import math
 import os
 import time
@@ -850,6 +851,137 @@ MAX_POINTING_MISSES = 3  # consecutive non-arrivals before a sweep is abandoned
 EDGE_SNR = 2.5  # a step must exceed the column's own sample-to-sample noise by
 #                 this factor; below it, the "step" is indistinguishable from
 #                 measurement scatter and the column is reported as unmeasured
+
+
+# ---- night ----------------------------------------------------------------
+# Below this Sun altitude the scenery stream is blind: measured 2026-08-06, the
+# ISP pins exposure at ~30 ms and gain at 112.5 whatever is requested, and
+# 16-frame stacks of sky and terrain differ by 0.02 counts in 255. Night columns
+# are read from the star-mode imaging channel instead (client.capture_raw16),
+# where 2 s exposures separate Bortle-8 skyglow from terrain at >100:1.
+NIGHT_SUN_ALT = -12.0
+NIGHT_DROP_FRAC = 0.20  # a real edge falls at least this fraction of the running max
+NIGHT_NEG_FRAC = 0.08  # sky never darkens by more than this in one step
+
+
+def night_find_edge(profile):
+    """Locate the sky->terrain boundary in a NIGHT column profile.
+
+    The day model — two brightness levels — fails at night twice over (M-12):
+    lit terrain patches overlap sky levels across altitudes, and under light
+    pollution the sky is not a level at all but a smooth gradient brightening
+    toward the horizon. What separates them is SHAPE. Skyglow only ever
+    brightens downward, and it accelerates doing so; there is no mechanism for
+    open sky to darken 20% in one coarse step. Terrain is rough and
+    sign-flipping. So the edge is the first PERSISTENT drop against the running
+    maximum, and roughness above it is counted only from negative steps —
+    bounding step magnitude called two textbook edges "blocked" because the
+    real skyglow gradient (+160, +192 counts near the horizon) exceeded it.
+
+    Persistence is not optional. A single dark sample recovered 52.5 degrees up
+    an open column on 2026-08-06 — a transient, with the true cliff 40 degrees
+    below it — so one sample is never an edge (M-02): the sample after the drop
+    must stay down too, or the dip is skipped and the walk continues.
+
+    Returns (index_above_edge, verdict): verdict is "edge" with a valid index,
+    or "blocked" / "open" / "short" with index None. A column that brightens
+    smoothly to the floor reads "open" even when glare is the real cause
+    (az 175 that same night); open columns carry no constraint the fit can
+    use, so the honest ambiguity costs nothing.
+    """
+    lums = [lum for _, lum in profile]
+    if len(lums) < 3:
+        return None, "short"
+
+    def rough_above(upto):
+        neg = [
+            j for j in range(upto) if lums[j] - lums[j + 1] > NIGHT_NEG_FRAC * max(lums[: j + 2])
+        ]
+        return len(neg) > max(1, upto // 4)
+
+    run_max = lums[0]
+    for i in range(len(lums) - 1):
+        drop = run_max - lums[i + 1]
+        if drop > NIGHT_DROP_FRAC * run_max:
+            # AN EDGE'S DROP IS NEVER RECOVERED. Below a real horizon everything
+            # is terrain, so no later sample may climb back over the sky's old
+            # level; a dip that recovers was a transient — a bird, a wisp of
+            # cloud, one dark frame — however many samples it lasted. And a drop
+            # on the FINAL sample has nothing after it to confirm, so it can
+            # never fire: a boundary of the data is not a boundary of the sky.
+            recovered = any(v >= run_max - 0.5 * drop for v in lums[i + 2 :])
+            unconfirmed = i + 2 >= len(lums)
+            if recovered or unconfirmed:
+                run_max = max(run_max, lums[i + 1])
+                continue
+            if rough_above(i):
+                return None, "blocked"  # terrain-rough before any edge: blocked all the way up
+            return i, "edge"
+        run_max = max(run_max, lums[i + 1])
+    return (None, "blocked") if rough_above(len(lums) - 1) else (None, "open")
+
+
+def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_dir=None):
+    """Night twin of `scan_horizon`: same walk, same return contract, night eye.
+
+    Differences, each measured on 2026-08-06 rather than assumed:
+      * frames come from the star-mode imaging channel, not the scenery stream
+      * the per-frame statistic is the MEDIAN — hot pixels and streetlights are
+        bright outliers inside terrain, and the mean follows them (M-12)
+      * the judge is `night_find_edge`
+      * a pole-band goto failure skips the SAMPLE, not the column: near due
+        north the column crosses declinations where RA will not converge, and
+        one lost altitude is recoverable where a lost column is not
+      * obstruction type is "" — every silhouette is neutral at night
+    """
+    if ptr.dry:
+        return alt_min, "open_to_min", "open", []
+
+    def sample(alt):
+        ptr.point_to(az, alt)
+        lum = sc.capture_raw16_median()
+        if frames_dir:
+            os.makedirs(frames_dir, exist_ok=True)
+            with open(f"{frames_dir}/az{int(az):03d}_night.jsonl", "a") as fh:
+                fh.write(json.dumps({"alt": round(alt, 2), "median": round(lum, 1)}) + "\n")
+        return lum
+
+    profile = []
+    alt = alt_max
+    while alt >= alt_min - 1e-6:
+        try:
+            lum = sample(alt)
+        except PointingError:
+            alt -= coarse_step
+            continue
+        profile.append((round(alt, 1), round(lum, 1)))
+        alt -= coarse_step
+
+    if len(profile) < 3:
+        return alt_max, "inconclusive", "unknown", profile
+    idx, verdict = night_find_edge(profile)
+    if idx is None:
+        if verdict == "blocked":
+            return alt_max, "blocked_above", "", profile
+        if verdict == "open":
+            return alt_min, "open_to_min", "open", profile
+        return alt_max, "inconclusive", "unknown", profile
+
+    hi_alt, hi_lum = profile[idx]
+    lo_alt, lo_lum = profile[idx + 1]
+    mid_lum = (hi_lum + lo_lum) / 2.0
+    lo, hi = lo_alt, hi_alt
+    while hi - lo > tol:
+        mid = (lo + hi) / 2.0
+        try:
+            lum = sample(mid)
+        except PointingError:
+            break  # keep the bracket rather than lose the column
+        if lum >= mid_lum:
+            hi = mid
+        else:
+            lo = mid
+    return round(hi, 1), "edge(night)", "", profile
 
 
 def find_edge(profile, sky_ref=None):
