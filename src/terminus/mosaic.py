@@ -152,7 +152,16 @@ def solve(
 
 
 def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
-    """Remap to equirectangular layers. Returns the list of TIFF paths."""
+    """Remap to equirectangular layers. Returns (tiff_paths, final_pto).
+
+    THE LAYERS ARE RAW. Per-frame exposure is corrected by `composite()`, which
+    solves and APPLIES a scalar gain per layer before averaging — a caller that
+    averages these TIFFs itself reintroduces the very exposure steps the gains
+    exist to remove, and the manifest's `gains` field is an OUTPUT of that
+    composite, not an input to reapply (terminus-52). If a uniform-looking
+    image is wanted for a figure, that is `render_photometric`, not a naive
+    mean of these layers.
+    """
     require_hugin()
     final = os.path.join(work_dir, "final.pto")
     _run(
@@ -171,6 +180,38 @@ def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
         os.remove(old)
     _run(["nona", "-m", "TIFF_m", "-o", out, final])
     return sorted(glob.glob(out + "*.tif")), final
+
+
+def render_photometric(final_pto, work_dir, prefix="figure"):
+    """Figure-quality layers: exposure, vignetting and response solved by Hugin.
+
+    `autooptimiser -m` fits a photometric model — per-frame exposure, the
+    lens's vignetting falloff, and the camera response curve — which `nona`
+    then applies while remapping. A scalar gain per frame (what `composite`
+    solves) cannot remove a gradient WITHIN a frame; this can, which is why it
+    is the escalation for a uniform-looking mosaic (terminus-52).
+
+    Two boundaries, both deliberate:
+
+      * OFF the numbers path. It changes pixel values, and every published
+        residual and figure so far was produced without it — so it hangs off
+        the SAME geometric solve (the final.pto the diagnostic render used)
+        and writes to its own prefix, and nothing downstream of measurement
+        reads it. Geometry identical, photometry solved: two renders, one
+        solve.
+      * NOT seam feathering. D-08 stands: seams stay hard, because a visible
+        seam is how a person checks the registration. Only the exposure
+        surface is solved, so a step that survives at a boundary means
+        misregistration, not metering.
+    """
+    require_hugin()
+    photo = os.path.join(work_dir, "photometric.pto")
+    _run(["autooptimiser", "-m", "-o", photo, final_pto])
+    out = os.path.join(work_dir, prefix)
+    for old in glob.glob(out + "*.tif"):
+        os.remove(old)
+    _run(["nona", "-m", "TIFF_m", "-o", out, photo])
+    return sorted(glob.glob(out + "*.tif")), photo
 
 
 def source_images(pto):

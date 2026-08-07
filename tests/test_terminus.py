@@ -5647,6 +5647,108 @@ def test_labels_are_voted_not_last_wins_and_never_invented_where_no_frame_looked
     assert (out[:, 8:] == -1).all(), "no frame looked here, so there is no class"
 
 
+def test_composite_applies_the_gains_it_solves(tmp_path):
+    """The gains contract, made unmissable (terminus-52 item 1).
+
+    `render()` returns RAW layers; `composite()` solves a per-frame gain and
+    APPLIES it before averaging. A naive mean of the same layers reintroduces
+    the exposure steps — and the manifest's `gains` field is an output of the
+    composite, not an input to reapply. This is the test the ticket asks for:
+    composite with solved gains must differ from the naive mean, so removing
+    the `* g` in `composite()` fails here and nowhere else.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus.mosaic import composite
+
+    def layer(name, value, box):
+        x0, y0, x1, y1 = box
+        rgba = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+        rgba[..., :3] = value
+        rgba[..., 3] = 255
+        path = str(tmp_path / name)
+        Image.fromarray(rgba, "RGBA").save(
+            path, tiffinfo={286: ((x0, 1),), 287: ((y0, 1),), 282: ((1, 1),), 283: ((1, 1),)}
+        )
+        return path
+
+    # The same patch of sky, metered two stops apart: one frame reads 100,
+    # the other 200. The overlap is total, so the naive mean is exactly 150
+    # everywhere and any deviation from it is the gains at work.
+    paths = [layer("dim.tif", 100, (0, 0, 8, 4)), layer("bright.tif", 200, (0, 0, 8, 4))]
+    img, coverage, gains = composite(paths, 8, 4)
+
+    assert (coverage == 2).all(), "the fixture must overlap fully for the arithmetic to hold"
+    # Geometric-mean-1 gains put both frames at 100*sqrt(2) ~= 141, not 150.
+    assert (
+        abs(gains[0] * 100.0 - gains[1] * 200.0) < 2.0
+    ), f"the gains must make the overlap agree, got {gains}"
+    got = float(img[..., 0].mean())
+    assert (
+        abs(got - 150.0) > 4.0
+    ), f"composite returned the naive mean ({got}): the solved gains were not applied"
+    assert abs(got - 141.4) < 3.0, f"expected ~141 from geometric-mean-1 gains, got {got}"
+
+
+def test_photometric_is_opt_in_and_never_touches_the_measurement_render(tmp_path):
+    """terminus-52 item 2: --photometric is for figures, not for numbers.
+
+    Off by default, and when on it writes a SEPARATE <out>.figure.png from the
+    same geometric solve — the plain render, the coverage, and everything the
+    measurement path reads must be byte-identical with and without the flag,
+    because every published residual was produced without photometric
+    correction and a changed pixel value there is a changed number downstream.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus import cli, mosaic
+
+    plain = np.full((4, 8, 3), 90, np.uint8)
+    pretty = np.full((4, 8, 3), 120, np.uint8)
+    cov = np.ones((4, 8))
+
+    def run(photometric):
+        out = tmp_path / ("with" if photometric else "without")
+        out.mkdir()
+        args = SimpleNamespace(
+            image_dir=str(tmp_path), work=str(out / "w"), out=str(out / "pano"),
+            lens=None, min_points=13, no_celeste=False, width=8, height=4,
+            segment=False, photometric=photometric,
+        )  # fmt: skip
+        fig_render = MagicMock(return_value=(["f0.tif"], "photometric.pto"))
+
+        def fake_composite(tiffs, w, h):
+            return (pretty if tiffs == ["f0.tif"] else plain, cov, [1.0])
+
+        with (
+            patch.object(mosaic, "require_hugin"),
+            patch.object(mosaic, "solve", return_value=("p.pto", set())),
+            patch.object(mosaic, "control_point_counts", return_value={"a.jpg": 20}),
+            patch.object(mosaic, "render", return_value=(["l0.tif"], "final.pto")),
+            patch.object(mosaic, "composite", side_effect=fake_composite),
+            patch.object(mosaic, "render_photometric", fig_render),
+        ):
+            cli.cmd_mosaic(None, {}, args)
+        return out, fig_render
+
+    out_off, fig_off = run(photometric=False)
+    assert not fig_off.called, "photometric must be strictly opt-in"
+    assert not (out_off / "pano.figure.png").exists()
+
+    out_on, fig_on = run(photometric=True)
+    fig_on.assert_called_once_with("final.pto", str(out_on / "w")), (
+        "the figure render must hang off the SAME geometric solve"
+    )
+    assert (out_on / "pano.figure.png").exists(), "the figure render gets its own file"
+    assert (out_on / "pano.png").read_bytes() == (
+        out_off / "pano.png"
+    ).read_bytes(), "the measurement render must be byte-identical with and without the flag"
+
+
 def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     """Silent success is the failure mode this whole path exists to remove.
 

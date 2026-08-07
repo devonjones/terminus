@@ -145,7 +145,12 @@ horizon mask wants.
 Two rules encoded here:
 - **Per-frame exposure is solved before compositing** (gains spanning 0.74–1.11 on this set).
   Shooting toward and away from the Sun makes this unavoidable; without it, overlaps darken
-  wherever a dim frame contributes.
+  wherever a dim frame contributes. A scalar per frame cannot remove a gradient WITHIN a
+  frame, so exposure patches at frame boundaries are expected in this render — and harmless
+  under the segment backend, which never reads absolute brightness (terminus-52). For a
+  uniform-looking image (figures, polar backdrops), `terminus mosaic --photometric` writes a
+  second `<out>.figure.png` from the same solve with Hugin's photometric model applied;
+  measurements always come from the plain render.
 - **Seams are not blended.** A visible seam is how a person checks the fit. `enblend` is
   deliberately not used and is not a dependency.
 

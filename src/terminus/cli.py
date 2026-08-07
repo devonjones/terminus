@@ -1363,6 +1363,17 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
     img, coverage, gains = mosaic.composite(tiffs, args.width, args.height)
     Image.fromarray(img).save(base + ".png")
     np.save(base + ".coverage.npy", coverage)
+    figure_path = None
+    if getattr(args, "photometric", False):
+        # The SAME geometric solve, rendered a second time with Hugin's
+        # photometric model applied — for figures and polar backdrops. The
+        # measurement outputs above are already written and never touch this
+        # (terminus-52: it changes pixel values, and every published residual
+        # was produced without it).
+        fig_tiffs, _photo_pto = mosaic.render_photometric(final, work)
+        fig, _fig_cov, _fig_gains = mosaic.composite(fig_tiffs, args.width, args.height)
+        figure_path = base + ".figure.png"
+        Image.fromarray(fig).save(figure_path)
     mosaic.write_manifest(
         base + ".manifest.json",
         image_dir=os.path.abspath(args.image_dir),
@@ -1374,12 +1385,18 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
         control_points=counts,
         min_points=args.min_points,
         gains={n: float(g) for n, g in zip(sorted(tiffs), gains, strict=False)},
+        photometric_figure=(os.path.abspath(figure_path) if figure_path else None),
     )
     if args.segment:
         _segment_frames(args, mosaic, final, base, work)
     covered = float((coverage > 0).any(axis=0).mean()) * 100.0
     print(f"wrote {base}.png ({args.width}x{args.height}, {covered:.0f}% of azimuth covered)")
     print(f"wrote {base}.coverage.npy and {base}.manifest.json")
+    if figure_path:
+        print(
+            f"wrote {figure_path} (photometric FIGURE render: use it for polar "
+            "backdrops and papers; measurements keep coming from the plain render)"
+        )
 
 
 def _segment_frames(args, mosaic, final, base, work):
@@ -1771,6 +1788,15 @@ def main(argv=None):
         help="segment each FRAME and warp the labels through the same solve, writing "
         "<out>.classes.npy for `terminus skymask --classes`. Needs torch, torchvision "
         "and transformers",
+    )
+    mo.add_argument(
+        "--photometric",
+        action="store_true",
+        help="ALSO write <out>.figure.png: the same geometric solve rendered with "
+        "Hugin's photometric model (exposure, vignetting, response) applied, so "
+        "frame boundaries stop showing exposure steps. For figures and polar "
+        "backdrops only - measurements always come from the plain render, and "
+        "seams stay hard (a visible seam is how you check the registration)",
     )
 
     sk = sub.add_parser("skymask", help="read a horizon off a panorama (UNORIENTED)")
