@@ -817,23 +817,27 @@ def test_floor_pinned_result_is_not_a_measurement():
 
 
 # ---- review round 1 regressions -------------------------------------------
-def test_second_leg_rechecks_the_sun_after_the_waypoint():
-    """A two-hop route must not fire its second leg on a stale clearance.
+def test_a_later_leg_rechecks_the_sun_instead_of_trusting_the_plan():
+    """A multi-leg route must not fire a later leg on a stale clearance.
 
-    GOTO_TIMEOUT is 90s and extends while the mount still reports motion, so the
-    first leg can run for minutes. The clearance was computed before it started;
-    by the time the second leg fires the Sun has moved. It must be recomputed
-    against where the mount actually landed.
+    GOTO_TIMEOUT is 90s and extends while the mount still reports motion, so one
+    leg can run for minutes. The clearance was computed before the route started;
+    by the time a later leg fires the Sun has moved. It must be recomputed
+    against where the mount ACTUALLY landed, not where it was sent.
+
+    Rewritten when routes became explicit. The check it guards is the same, and
+    matters more now: a planned route has more legs than the old two-hop
+    waypoint, so there are more moments at which the plan can go stale.
     """
     from unittest.mock import MagicMock, patch
+
+    import pytest
 
     from terminus.sweep import Pointer, Sky, SunGuard
 
     sky = Sky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.equ_coord.return_value = (12.0, 20.0)
-    # A real frame: scan_horizon short-circuits entirely in dry mode and never
-    # points, so the pointing path can only be exercised with dry=False.
     sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
     ptr = Pointer(sc, sky, 30, 5)
 
@@ -842,18 +846,66 @@ def test_second_leg_rechecks_the_sun_after_the_waypoint():
     def fake_goto(ra, dec, settle):
         legs.append((ra, dec))
 
-    # Direct path blocked -> route via a waypoint; both legs clear when planned;
-    # then the second leg is no longer clear once the waypoint is reached.
-    seps = iter([1.0, 90.0, 90.0, 1.0])
+    # Planning sees every candidate route as clear; then the first leg lands and
+    # the remaining route is no longer clear. Keyed on whether a leg has actually
+    # been driven, NOT on a count of calls — counting broke the moment the
+    # planner gained more candidate routes to evaluate, which is a thing it
+    # should be free to do.
+    def flaky_route_sep(self, rd0, waypoints, samples=None):
+        return 1.0 if legs else 90.0
+
     with (
         patch.object(Pointer, "_goto_wait", side_effect=fake_goto),
         patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
         patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
-        patch.object(Pointer, "path_min_sep", lambda self, a, b: next(seps, 1.0)),
+        patch.object(Pointer, "path_min_sep", lambda self, a, b: 1.0),
+        patch.object(Pointer, "route_min_sep", flaky_route_sep),
     ):
         with pytest.raises(SunGuard, match="Sun has moved"):
-            ptr.point_to(200.0, 20.0)
-    assert len(legs) == 1, "the second leg must not fire once the path is no longer clear"
+            ptr.point_to(200.0, 30.0)
+
+    assert legs, "the route must have started before it was abandoned"
+    assert len(legs) < 4, f"it must stop as soon as the plan goes stale, drove {len(legs)}"
+
+
+def test_a_route_is_driven_leg_by_leg_not_handed_over_as_one_goto():
+    """The whole reason a blocked shape no longer blocks the target.
+
+    The old code gave the mount ONE goto and had no say in the route, so it had
+    to assume the worst of three shapes and refuse if any grazed the Sun. A tube
+    parked in the west could not be moved anywhere: hauling declination up at its
+    own RA passed 18.7 degrees from the Sun, and that hypothetical leg vetoed
+    every target regardless of where the target was.
+
+    Every leg of a planned route changes ONE axis, which the mount can perform in
+    exactly one way — so the route that was checked is the route that happens.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    ptr = Pointer(sc, sky, 30, 5)
+
+    legs = []
+    with (
+        patch.object(Pointer, "_goto_wait", side_effect=lambda ra, dec, s: legs.append((ra, dec))),
+        patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
+        patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
+        patch.object(Pointer, "path_min_sep", lambda self, a, b: 1.0),  # direct is blocked
+        patch.object(Pointer, "route_min_sep", lambda self, a, w, samples=None: 90.0),
+    ):
+        ptr.point_to(200.0, 30.0)
+
+    assert len(legs) >= 2, "a blocked direct path must be driven as an explicit route"
+    # Each leg moves one axis only, which is what makes the route unambiguous.
+    prev = (12.0, 20.0)
+    for ra, dec in legs:
+        moved = (abs(ra - prev[0]) > 1e-9, abs(dec - prev[1]) > 1e-9)
+        assert sum(moved) <= 1, f"leg {(ra, dec)} moves both axes, so its route is not determined"
+        prev = (ra, dec)
 
 
 def test_avoid_pole_nudges_azimuth_not_altitude():
@@ -4400,8 +4452,30 @@ def test_replay_reads_a_saved_night_and_needs_no_telescope():
     # definition is "altitude = lowest clear sky", and the true crossing lies
     # somewhere between 20 and 25 where the replay cannot resolve it.
     assert edge is not None and edge["alt"] == 25, "the step from 59 to 12 counts"
-    # A column with no step is measured-and-found-nothing: a bound, not a skip.
-    assert measure(90)[0] is None
+    # A column with no step is NOT automatically a bound. Which it is depends on
+    # whether the column was dark or bright, and replay must answer that the same
+    # way the live path does or a replayed night manufactures fiducials the real
+    # one refused (terminus-58).
+    #
+    # az 90 is bright all the way down — clear sky to the search floor. That
+    # bounds the horizon from BELOW, which `Fiducial` cannot express, so it is
+    # dropped rather than recorded as "at least 35" (M-19). Reading it as an
+    # upper bound was worth 40 degrees of yaw on real data.
+    assert measure(90) is None, "an open column is not a bound at the ceiling"
+
+    # A column dark throughout IS an upper bound: nothing was found up to the
+    # ceiling, so the horizon is at or above it.
+    blocked = guide.replay(
+        {
+            "0": profiles["0"],
+            "90": profiles["90"],
+            "180": [[35, 8.0], [30, 7.0], [25, 9.0], [20, 8.0], [15, 7.0], [10, 8.0]],
+        },
+        uncertainty=1.0,
+    )
+    edge, ceiling, _unc = blocked(180)
+    assert edge is None and ceiling == 35, "a dark column is a bound at the ceiling"
+
     # A column that night never visited is not attempted at all.
     assert measure(270) is None
 
@@ -4486,7 +4560,7 @@ def test_an_inconclusive_column_is_not_recorded_as_a_bound(tmp_path):
     for status, want in verdicts.items():
         with patch.object(cli, "scan_horizon", return_value=(60.0 if want != "edge" else 22.0,
                                                              status, "", [])):  # fmt: skip
-            measure, _reachable, _stop = cli._scope_measure(sc, cfg, args)
+            measure, _reachable, _stop, _st = cli._scope_measure(sc, cfg, args)
             got = measure(90)
         if want is None:
             assert got is None, f"{status}: must be 'not attempted', got {got}"
@@ -4522,7 +4596,7 @@ def test_a_mount_that_cannot_point_gives_up_instead_of_trying_every_column():
     args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
 
     with patch.object(cli, "scan_horizon", side_effect=PointingError("arm closed")):
-        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        measure, _r, _s, _state = cli._scope_measure(sc, cfg, args)
         for i in range(MAX_POINTING_MISSES - 1):
             assert measure(10 * i) is None, "one miss is a skip, not a verdict on the mount"
         with pytest.raises(cli.SeestarError, match="did not arrive"):
@@ -4624,7 +4698,7 @@ def test_a_column_open_to_the_floor_is_not_an_edge_at_the_floor(tmp_path):
     args = SimpleNamespace(dry_run=True, uncertainty=None, stop_above_sun_alt=None)
 
     with patch.object(cli, "scan_horizon", return_value=(0.0, "open_to_min", "open", [])):
-        measure, _r, _s = cli._scope_measure(sc, cfg, args)
+        measure, _r, _s, _state = cli._scope_measure(sc, cfg, args)
         assert measure(90) is None, "an open column must not become an edge at alt_min"
 
 
@@ -5080,7 +5154,20 @@ def test_a_blocked_column_reaches_the_mask_as_a_bound(tmp_path):
     from terminus.orient import from_mask
     from terminus.sweep import Sky, run_sweep
 
-    sky = Sky(39.7917, -104.894, 1600)
+    class NightSky(Sky):
+        """The Sun pinned below the horizon.
+
+        This test used a real `Sky` at wall-clock time and so depended on the
+        hour it was run: it passed at 21:00 with the Sun down and failed at 09:09
+        the next morning, when az 120 became genuinely Sun-blocked and never
+        reached the mask. A test about how a BOUND is recorded should not have an
+        opinion about the time of day.
+        """
+
+        def sun(self):
+            return 270.0, -30.0
+
+    sky = NightSky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.equ_coord.return_value = (12.0, 20.0)
     sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
@@ -5325,3 +5412,1038 @@ def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
             return 271.0, -20.0
 
     assert not column_touches_sun(NightSky(), 271, 0, 60, 30)
+
+
+def test_a_mask_written_from_real_instruments_is_still_yaml(tmp_path):
+    """Found by running the CLI on the actual scope, not by any test here.
+
+    `write_mask` serialises meta as a Python repr, which is YAML only by
+    coincidence: it holds for str, int, float, bool, list and dict, and breaks
+    for anything else. Numpy 2 changed scalar repr from `39.7917` to
+    `np.float64(39.7917)`, and lat/lon reach `default_meta` from astropy as
+    numpy scalars — so every mask written by a real sweep since that numpy
+    release had a lat and lon that `yaml.safe_load` reads back as a STRING.
+
+    `float()` on that raises, which means `cli._check_mergeable` — whose whole
+    job is refusing a merge across a tripod move — could not run without a
+    traceback. The guard was inoperative on exactly the files it guards.
+
+    Every test in this suite builds meta from Python literals, which is why none
+    of them saw it.
+    """
+    import numpy as np
+    import yaml
+
+    from terminus.export import load_columns, write_mask
+
+    path = str(tmp_path / "m.yaml")
+    write_mask(
+        path,
+        {0: (60.0, "structure"), 90: (12.5, "tree")},
+        [],
+        {
+            "measured": "2026-08-05 18:03",
+            "lat": np.float64(39.7917),  # as astropy hands it over
+            "lon": np.float64(-104.894),
+            "alt_search": [np.int64(0), np.int64(60)],
+            "clear_thresh": np.float32(0.85),
+        },
+    )
+    raw = yaml.safe_load(open(path))
+    for key in ("lat", "lon", "clear_thresh"):
+        value = raw["meta"][key]
+        assert isinstance(value, float), f"{key} came back as {type(value).__name__}"
+        float(value)  # the operation _check_mergeable performs
+    assert raw["meta"]["alt_search"] == [0, 60]
+    assert all(isinstance(v, int) for v in raw["meta"]["alt_search"])
+
+    # And the guard that could not run now can.
+    from types import SimpleNamespace
+
+    from terminus.cli import _check_mergeable
+
+    meta, _cols = load_columns(path)
+    here = SimpleNamespace(loc=SimpleNamespace(lat=SimpleNamespace(deg=39.7917),
+                                               lon=SimpleNamespace(deg=-104.894)))  # fmt: skip
+    _check_mergeable(dict(meta, oriented=True), here)  # same spot: allowed, no traceback
+
+
+def test_labels_are_voted_not_last_wins_and_never_invented_where_no_frame_looked():
+    """Combining remapped label layers, which is where a class can be fabricated.
+
+    Two frames overlapping may disagree, and the answer more of the evidence
+    supports beats the one that happened to be stitched second — the same
+    reasoning `segment_classes` already uses across tiles. And a pixel no frame
+    covered has no class at all: -1, not a guess.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus.mosaic import combine_labels
+
+    def layer(tmp, name, value, box):
+        """A remapped layer: class `value` inside `box`, transparent elsewhere."""
+        x0, y0, x1, y1 = box
+        rgb = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+        rgb[..., :3] = value
+        rgb[..., 3] = 255
+        path = os.path.join(tmp, name)
+        im = Image.fromarray(rgb, "RGBA")
+        im.save(path, tiffinfo={286: ((x0, 1),), 287: ((y0, 1),), 282: ((1, 1),), 283: ((1, 1),)})
+        return path
+
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
+    # Two frames call the same strip 'tree' (4); one calls it 'building' (1).
+    paths = [
+        layer(tmp, "a.tif", 4, (0, 0, 6, 4)),
+        layer(tmp, "b.tif", 4, (2, 0, 8, 4)),
+        layer(tmp, "c.tif", 1, (2, 0, 8, 4)),
+    ]
+    out = combine_labels(paths, 10, 4)
+    assert out[0, 3] == 4, "two votes for tree beat one for building"
+    assert out[0, 0] == 4, "a pixel only one frame saw takes that frame's answer"
+    assert (out[:, 8:] == -1).all(), "no frame looked here, so there is no class"
+
+
+def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
+    """Silent success is the failure mode this whole path exists to remove.
+
+    `remap_labels` swaps filenames by matching the project's own spelling. A
+    caller whose keys differ by so much as a directory prefix rewrites nothing,
+    nona cheerfully warps the PHOTOGRAPHS, and `combine_labels` then reads RGB
+    brightness as ADE20K class ids. Exit code 0, plausible output, completely
+    wrong — which is precisely the shape of corruption the coordinate-lookup
+    rewrite was written to eliminate, arriving through a different door.
+    """
+    import pytest
+
+    from terminus.mosaic import MosaicError, remap_labels
+
+    project = tmp_path / "final.pto"
+    project.write_text(
+        'p f2 w2880 h1440 v360 n"TIFF_m"\nm i0\ni w3000 h4000 f0 n"stage/frame1.jpg"\n'
+    )
+    with pytest.raises(MosaicError, match="does not contain"):
+        # Right file, wrong spelling: no directory prefix.
+        remap_labels(str(project), str(tmp_path), {"frame1.jpg": "labels/001.png"})
+
+
+def test_a_label_project_asks_nona_for_coordinates_not_for_pixels(tmp_path):
+    """A class id must never pass through nona's pixel pipeline.
+
+    THIS TEST USED TO ASSERT THE WRONG THING. It checked that the project's `m`
+    line said `i6` — nearest neighbour — on the theory that poly3 would average
+    tree (4) and building (1) into a class neither frame contained. The reasoning
+    was right and the mechanism was not: **nona ignores the `m` line's
+    interpolator entirely**, and `i0`, `i5` and `i6` produce byte-identical
+    output. The guard had never once worked, and this test reported that it had,
+    which is E-02 — a test pinning a bug instead of catching it. On the real
+    2026-08-03 set, 75% of one frame's pixels came back holding a class that was
+    never in the source.
+
+    So the property to assert is the one that now makes it exact: nona is asked
+    for COORDINATES (`-c`), and the ids are looked up afterwards in the
+    full-resolution label frame.
+    """
+    import subprocess
+    from unittest.mock import patch
+
+    from terminus.mosaic import remap_labels
+
+    project = tmp_path / "final.pto"
+    project.write_text(
+        'p f2 w2880 h1440 v360 E14.08 n"TIFF_m"\n'
+        "m i0\n"
+        'i w3000 h4000 f0 Eev15.0 n"stage/frame1.jpg"\n'
+        'i w3000 h4000 f0 Eev13.1 n"stage/frame2.jpg"\n'
+    )
+    seen = []
+
+    def fake_run(cmd, *a, **kw):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch("terminus.mosaic._run", side_effect=fake_run):
+        layers = remap_labels(str(project), str(tmp_path), {"stage/frame1.jpg": "labels/001.png"})
+
+    assert seen, "nona was never invoked"
+    assert "-c" in seen[0], f"nona must be asked for coordinate images:\n{seen[0]}"
+    assert layers == [], "no coordinate images on disk means no layers, not a crash"
+
+    written = (tmp_path / "label.pto").read_text()
+    assert 'n"labels/001.png"' in written, "the label image must replace the photograph"
+    assert 'n"stage/frame2.jpg"' in written, "a frame with no label given is left alone"
+    assert "w3000 h4000" in written, "geometry must be copied through untouched"
+
+
+def test_the_inverse_rotation_undoes_the_forward_one():
+    """`polar.project` draws the photograph by asking the inverse question.
+
+    Forward-mapping — carry each panorama pixel to where it lands — leaves
+    scatter holes that look exactly like missing data, and missing data is a real
+    and separately meaningful thing in these renders. So the disc is inverse
+    mapped, and the inverse has to actually be one.
+    """
+    import numpy as np
+
+    from terminus.orient import rotate, rotate_inverse
+
+    pitch, tilt_mag, tilt_dir = 4.5, 7.0, 210.0
+    az = np.array([0.0, 37.0, 129.0, 251.0, 359.0])
+    alt = np.array([-15.0, 0.0, 22.0, 61.0, 84.0])
+
+    out_az, out_alt = rotate(az, alt, pitch, tilt_mag, tilt_dir)
+    back_az, back_alt = rotate_inverse(out_az, out_alt, pitch, tilt_mag, tilt_dir)
+
+    # Compare azimuth on the circle: 359.9 and 0.1 are two tenths apart.
+    delta = (back_az - az + 180.0) % 360.0 - 180.0
+    assert np.allclose(delta, 0.0, atol=1e-9), f"azimuth did not come back: {delta}"
+    assert np.allclose(back_alt, alt, atol=1e-9), f"altitude did not come back: {back_alt - alt}"
+
+
+def test_the_polar_page_is_self_contained_and_layered(tmp_path):
+    """One file, no network, and the claims separable from each other.
+
+    The page is the artifact a person actually looks at and forwards, so it may
+    not depend on a CDN, a font host, or a sibling image that will not travel
+    with it. And the horizon, the telescope's own columns and the unphotographed
+    region are three different claims about the same sky: "does the yellow line
+    follow the roofline" cannot be answered while the yellow line covers it.
+    """
+    import re
+
+    from terminus import polar
+    from terminus.orient import Fiducial
+
+    rows = [(float(az), 20.0 + 5.0 * (az % 3), "structure") for az in range(0, 360, 10)]
+    solution = {"yaw": 130.0, "pitch": 2.0, "tilt_mag": 3.0, "tilt_dir": 180.0}
+    fids = [Fiducial(10.0, 30.0, 60.0), Fiducial(200.0, 60.0, 60.0, bound=True)]
+
+    html = polar.page(rows, solution, fiducials=fids, meta={"yaw": 130.0, "fit_rms": 0.8})
+
+    external = [
+        m
+        for m in re.findall(r'(?:src|href)="([^"]+)"', html)
+        if not m.startswith("data:") and not m.startswith("#")
+    ]
+    assert not external, f"the page reaches outside itself: {external}"
+
+    for layer in ("gap", "grid", "hz", "pts"):
+        assert f'data-layer="{layer}"' in html, f"missing the {layer} layer"
+        assert f'data-t="{layer}"' in html, f"missing the {layer} toggle"
+
+    # A bound is not a measurement, and must not be drawn as one.
+    assert html.count('class="edg"') == 1, "the ordinary column should be a circle"
+    assert 'class="bnd"' in html, "the ceiling-limited column needs its own marker"
+
+    path = polar.write_page(str(tmp_path / "p.html"), rows, solution)
+    assert os.path.getsize(path) > 0
+
+
+def test_a_column_at_its_ceiling_is_a_bound_however_it_is_typed():
+    """M-09, applied to the masks that are actually on disk.
+
+    A sweep with a 60 degree ceiling cannot report a horizon above 60, so a
+    column reading exactly 60.0 means the search ran out of sky — not that the
+    horizon is at 60. The 2026-08-03 evening masks predate the explicit `bound`
+    field and record four such columns as ordinary edges; read that way the fit
+    scores them TWO-sided, so a photo horizon genuinely above the ceiling is
+    penalised for being too high.
+    """
+    from terminus.orient import from_mask
+
+    mask = {
+        10: {"alt": 60.0, "type": "structure"},  # sitting on the ceiling
+        20: {"alt": 59.5, "type": "structure"},  # close, but a real measurement
+        30: {"alt": 12.0, "type": "tree"},
+    }
+    fids = {int(f.az): f for f in from_mask(mask, ceiling=60.0)}
+
+    assert fids[10].bound, "a column at the ceiling is a bound, whatever its type says"
+    assert not fids[20].bound, "half a degree of headroom is still a measurement"
+    assert not fids[30].bound
+
+    # Without a ceiling there is nothing to compare against and nothing to infer.
+    loose = {int(f.az): f for f in from_mask(mask)}
+    assert not loose[10].bound, "no ceiling given, no inference possible"
+
+
+def test_both_ways_round_the_ra_circle_are_offered():
+    """There are always two, and only one may be clear.
+
+    `wrap_ra` gives the SHORT way, and the old check only ever considered that
+    one — so a slew whose short route grazes the Sun was refused outright, with
+    no way to express "go the other way round". Measured on 2026-08-05 the long
+    way was the worse of the two, which is exactly why it has to be evaluated
+    rather than assumed either way.
+
+    The long way is split into legs so a single goto cannot quietly shortcut it
+    back to the short way, which would silently drive the route that was
+    rejected.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, wrap_ra
+
+    sky = Sky(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    rd0, rd1 = (2.0, 10.0), (14.0, 40.0)
+
+    names = [name for name, _ in ptr.routes(rd0, rd1)]
+    assert any(n.endswith("/short") for n in names) and any(n.endswith("/long") for n in names)
+    assert len(names) == len(set(names)), "each route offered once"
+
+    for name, wps in ptr.routes(rd0, rd1):
+        assert wps[-1][0] % 24.0 == pytest.approx(rd1[0] % 24.0, abs=1e-9), f"{name} misses in RA"
+        assert wps[-1][1] == pytest.approx(rd1[1]), f"{name} misses in declination"
+        # No single leg may exceed the split, or a goto could take the short way.
+        prev = rd0
+        for wp in wps:
+            assert abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
+                f"{name} has a leg a goto could shortcut"
+            )
+            prev = wp
+
+
+def test_the_cheapest_safe_route_wins_and_an_unsafe_one_is_never_chosen():
+    """Plan every shape, discard what grazes the Sun, take the shortest of the rest.
+
+    Requiring that ALL shapes be safe is a test no route has to pass once we are
+    the one driving. What must never happen is choosing a cheap route that is not
+    safe.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    rd0, rd1 = (2.0, 10.0), (8.0, 40.0)
+    all_routes = ptr.routes(rd0, rd1)
+
+    # Only the most expensive route is safe: it must still be the one chosen.
+    costs = {name: ptr.route_cost(rd0, wps) for name, wps in all_routes}
+    dearest = max(costs, key=costs.get)
+    ptr.route_min_sep = lambda a, w, samples=None, _d=dearest: (
+        90.0 if w == dict(all_routes)[_d] else 1.0
+    )
+    name, wps, cost = ptr.plan_route(rd0, rd1)
+    assert name == dearest, f"chose {name} over the only safe route {dearest}"
+
+    # Nothing safe at all is a refusal, not a fallback to the cheapest.
+    ptr.route_min_sep = lambda a, w, samples=None: 1.0
+    assert ptr.plan_route(rd0, rd1) is None
+
+
+def test_route_waypoints_are_coordinates_the_mount_can_accept():
+    """RA -3.795 was commanded to a real mount on 2026-08-05, three times.
+
+    `routes` built waypoints as `ra0 + dra * t` and never wrapped. The geometry
+    was fine — `route_min_sep` wraps before converting — so the SAFETY maths was
+    right and the value handed to the mount was not. It reported never arriving,
+    the miss counter read three of those as a broken mount, and abandoned a run
+    that had already solved its orientation.
+
+    Wrapping is safe only because the legs are split: a step under MAX_RA_LEG_H
+    has an unambiguous shortest direction, so wrapping cannot quietly turn a
+    deliberate long way round back into the short one. That is asserted here
+    too, because the two properties have to hold together or neither is worth
+    anything.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, wrap_ra
+
+    ptr = Pointer(MagicMock(), Sky(39.7917, -104.894, 1600), 30, 5, True)
+    starts = [(1.0, 20.0), (23.5, 10.0), (12.0, -30.0), (0.1, 5.0)]
+    targets = [(22.0, 40.0), (2.0, 60.0), (13.0, -5.0), (23.9, 0.0)]
+
+    for rd0 in starts:
+        for rd1 in targets:
+            for name, waypoints in ptr.routes(rd0, rd1):
+                prev = rd0
+                for ra, dec in waypoints:
+                    assert 0.0 <= ra < 24.0, f"{name}: RA {ra} is not a coordinate"
+                    assert -90.0 <= dec <= 90.0, f"{name}: Dec {dec} is not a coordinate"
+                    assert abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
+                        f"{name}: a leg long enough for a goto to shortcut"
+                    )
+                    prev = (ra, dec)
+                assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
+                assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
+
+
+def test_one_false_bound_cannot_capture_the_fit():
+    """The property that matters, and it failed on real hardware.
+
+    az 140 read a clean edge at 26.2 with the sky reference at 49.3, and an hour
+    later — same roofline, darker sky — the same column read "blocked above 60".
+    That one false bound moved the solved yaw by 164 degrees and the RMS from
+    0.18 to 1.63.
+
+    A bound is scored ONE-SIDED: a photo above the ceiling confirms it for free,
+    only falling short contradicts it. So a false bound is not a symmetric error
+    the robust loss can absorb — it is a lever, and the fit can only reduce that
+    residual by rotating the whole sphere. This asserts the damage is bounded.
+    """
+    import math
+
+    from terminus import guide, orient
+    from terminus.orient import Fiducial
+
+    rows = [
+        (a, 20.0 + 12.0 * math.sin(math.radians(2 * a)) + 6.0 * math.cos(math.radians(a)), "structure")
+        for a in range(0, 360, 5)
+    ]  # fmt: skip
+    sample = guide.photo_sample(rows)
+    truth = {"yaw": 40.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+
+    def honest(az):
+        phi, raw = orient.native_column(sample, az, truth["yaw"], 0.0, 0.0)
+        _, alt = orient.rotate(phi + truth["yaw"], raw, truth["pitch"], 0.0, 0.0)
+        return Fiducial(az, float(alt), ceiling=60.0, weight=1.0, sigma=1.0)
+
+    good = [honest(az) for az in (0, 70, 140, 210, 280)]
+    clean = orient.fit(good, sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0)
+    assert abs(((clean["yaw"] - 40.0 + 180) % 360) - 180) < 3.0, "precondition: the truth is found"
+
+    # Now one column that saw nothing and said "at least 60" instead.
+    false_bound = Fiducial(175, 60.0, ceiling=60.0, bound=True, weight=1.0, sigma=1.0)
+    poisoned = orient.fit(
+        good + [false_bound], sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0
+    )
+    swing = abs(((poisoned["yaw"] - clean["yaw"] + 180) % 360) - 180)
+    assert swing < 15.0, (
+        f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
+    )
+
+
+def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
+    """ "I cannot see a step" is not "there is terrain above the ceiling".
+
+    As the sky falls toward the terrain's own brightness the two overlap, and a
+    non-detection stops being evidence of anything. The test is self-calibrating
+    rather than a threshold: at a bright reference the gap is enormous and this
+    passes trivially; at twilight it cannot be made.
+    """
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from terminus.sweep import scan_horizon
+
+    def column(sky_ref, values):
+        """A column whose brightness cycles through `values` as it descends."""
+        ptr = MagicMock()
+        ptr.dry = False
+        sc = MagicMock()
+        seq = iter(values * 40)
+        sc.capture_rgb.side_effect = lambda **kw: np.full((8, 8, 3), next(seq), dtype=np.float32)
+        return scan_horizon(ptr, sc, 140, 0, 60, 5.0, 1.5, sky_ref)[1]
+
+    # Daylight: terrain at 6 against a reference of 100. Unmistakable.
+    assert column(100.0, [6.0, 7.0, 5.0]) == "blocked_above"
+
+    # Twilight: the same terrain, but the sky is now as dark as it is. The gap
+    # between the column and half the reference is smaller than the column's own
+    # scatter, so no bound may be asserted.
+    assert column(7.0, [2.0, 5.0, 3.0]) == "inconclusive"
+
+    # Genuinely dark terrain under a dark sky is still a bound: contrast is what
+    # matters, not absolute brightness.
+    assert column(7.0, [0.5, 0.6, 0.4]) == "blocked_above"
+
+
+def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem():
+    """On 2026-08-05 a mid-run timeout was reported as:
+
+        error: could not read or write beside .../photo_mask.yaml: timed out
+
+    Nothing was wrong with that file. `socket.timeout` is an `OSError`, so a
+    network fault was caught by whatever file-handling wrapper happened to be
+    outermost — sending the operator to inspect a healthy file, at night, with
+    the mount possibly mid-slew.
+    """
+    import socket
+
+    import pytest
+
+    from terminus.client import Seestar, SeestarError
+
+    # A closed local port refuses immediately: the same OSError family as the
+    # timeout that caused this, without spending ten seconds waiting for one.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    with pytest.raises(SeestarError) as exc:
+        Seestar("127.0.0.1", "~/.seestar/seestar_client_key.pem")
+    message = str(exc.value)
+    assert "127.0.0.1" in message, "it must name what it could not reach"
+    assert "yaml" not in message and "could not write" not in message, "not a file problem"
+    assert port is not None
+
+
+def test_orient_keeps_what_it_measured(tmp_path):
+    """A column costs minutes of clear sky; discarding it after one use is waste.
+
+    `cmd_orient` passed `frames_dir=None` and dropped the returned profile, so
+    the loop that `--replay` was built around was the one command saving nothing
+    to replay. It also made terminus-58 undiagnosable: the column that poisoned
+    the fit left no record of what it actually saw.
+    """
+    import json
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, seed=3, max_columns=5, window=3,
+        yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False, frames=None,
+        stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    with (
+        patch.object(cli, "scan_horizon", return_value=(25.0, "edge(rel 3.0)", "tree", prof)),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(
+            guide,
+            "fit",
+            return_value={
+                "yaw": 10.0,
+                "pitch": 0.0,
+                "tilt_mag": 0.0,
+                "tilt_dir": 0.0,
+                "rms": 0.1,
+                "n": 4,
+                "n_bound": 0,
+                "residuals": {0.0: 0.1},
+                "dropped": [],
+            },
+        ),
+    ):
+        cli.cmd_orient(sc, cfg, args)
+
+    saved = tmp_path / "solved_profiles.json"
+    assert saved.exists(), "the columns it measured must survive the run"
+    data = json.loads(saved.read_text())
+    assert data, "and must not be empty"
+    # And what it saved is the shape --replay consumes.
+    measure = guide.replay(data)
+    assert measure(int(next(iter(data)))) is not None
+
+
+def test_a_tube_inside_the_cone_can_still_be_moved_out():
+    """Devon asked whether the mount could get trapped inside its own banned wedge.
+
+    It could, completely. `point_to` Sun-checked the CURRENT pointing and raised
+    before doing anything, so a tube 5.1 degrees from the Sun refused every slew
+    — including one straight away from it. The refusal even named the current
+    position rather than the target. That is not caution, it is the software
+    welding the instrument in the one place it must not stay.
+
+    And it arrives on its own: the Sun moves 15 degrees an hour, so a tube parked
+    outside the cone and left alone is overtaken.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky, ang_sep
+
+    class FixedSky(Sky):
+        def sun(self):
+            return 270.0, 20.0
+
+    sky = FixedSky(39.7917, -104.894, 1600)
+    trapped = (265.0, 22.0)
+    assert ang_sep(*trapped, 270.0, 20.0) < 30.0, "precondition: it is inside the cone"
+
+    sc = MagicMock()
+    landed = {"rd": sky.altaz_to_radec(*trapped)}
+    sc.equ_coord.side_effect = lambda: landed["rd"]
+    ptr = Pointer(sc, sky, 30, 5)
+
+    legs = []
+
+    def fake_goto(ra, dec, settle):
+        legs.append((ra, dec))
+        landed["rd"] = (ra, dec)
+
+    with patch.object(Pointer, "_goto_wait", side_effect=fake_goto):
+        ptr.point_to(90.0, 45.0)
+
+    assert legs, "it must move rather than refuse"
+    final = sky.radec_to_altaz(*landed["rd"])
+    assert ang_sep(*final, 270.0, 20.0) >= 30.0, (
+        f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
+    )
+
+
+def test_the_way_out_is_a_turn_not_a_descent():
+    """Devon's rule, and it is provable rather than heuristic.
+
+    From ANY trapped pointing at least one azimuth direction increases
+    separation from the Sun. Verified exhaustively here; there is no case where
+    neither helps. The only pointings where turning changes nothing are near the
+    zenith, and those are already tens of degrees clear.
+
+    Better than the descent this replaced, because it asks the mount for nothing
+    it has not been seen to do — how far below the horizon it can point is still
+    unknown, and an escape that depends on an unmeasured limit is not one.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, ang_sep
+
+    for sun_alt in (5.0, 20.0, 40.0, 60.0):
+
+        class FixedSky(Sky):
+            def sun(self, _s=sun_alt):
+                return 270.0, _s
+
+        ptr = Pointer(MagicMock(), FixedSky(39.79, -104.89, 1600), 30, 5, True)
+        trapped = turned = 0
+        for az in range(0, 360, 7):
+            for alt in range(-20, 86, 7):
+                if ang_sep(az, alt, 270.0, sun_alt) >= ptr.cone:
+                    continue
+                trapped += 1
+
+                # One direction must always help.
+                step = max(1.0, float(ptr.slew_step))
+                here = ang_sep(az, alt, 270.0, sun_alt)
+                cw = ang_sep((az + step) % 360, alt, 270.0, sun_alt)
+                ccw = ang_sep((az - step) % 360, alt, 270.0, sun_alt)
+                assert max(cw, ccw) > here or here > 60.0, (
+                    f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
+                )
+
+                target = ptr.escape_target(az, alt)
+                assert ang_sep(*target, 270.0, sun_alt) >= ptr.cone + ptr.ESCAPE_MARGIN_DEG - 1e-9
+                if abs(target[1] - alt) < 1e-9:
+                    turned += 1
+
+        assert trapped, f"Sun at {sun_alt}: the probe found nothing trapped"
+        if sun_alt <= 40.0:
+            assert turned == trapped, (
+                f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
+            )
+        else:
+            # A high summer Sun leaves near-zenith pointings where azimuth barely
+            # moves the tube. Those fall back to the descent, which is what the
+            # corridor depth is for.
+            assert turned > trapped * 0.8
+
+
+def test_an_escape_that_succeeds_is_verified_against_where_the_tube_ACTUALLY_is():
+    """The last thing `escape` does is check it worked. Nothing tested that.
+
+    Both of the other escape tests raise before the final check is reached, and
+    both mock `current_azalt` as a constant — so they could not tell a successful
+    escape from a broken one, because the mock keeps reporting the trapped
+    starting position whatever the mount was told.
+
+    This one moves. `current_azalt` reflects each `_goto_wait`, so the turn
+    genuinely walks the tube out of the cone and the final verification runs on a
+    real answer. Then the same scenario is run with the mount IGNORING commands —
+    which is the fault that matters, since a goto that quietly fails to arrive
+    voids every Sun-safety guarantee: the caller believes the scope is where it
+    asked and plans the next path from a position the mount never reached.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import Pointer, Sky, SunGuard, ang_sep
+
+    class LowSun(Sky):
+        def sun(self, when=None):
+            return 90.0, 15.0
+
+    sky = LowSun(39.7917, -104.894, 1600)
+
+    def trapped(obedient):
+        sc = MagicMock()
+        ptr = Pointer(sc, sky, 30, 5, False)
+        at = {"az": 70.0, "alt": 20.0}  # 20 deg from the Sun: inside the cone
+        ptr.current_azalt = lambda: (at["az"], at["alt"])
+
+        def goto(ra, dec, *a, **k):
+            if obedient:
+                az, alt = sky.radec_to_altaz(ra, dec)
+                at["az"], at["alt"] = az, alt
+
+        ptr._goto_wait = goto
+        return ptr, at
+
+    ptr, at = trapped(obedient=True)
+    assert ang_sep(at["az"], at["alt"], *sky.sun()) < ptr.cone, "the premise: it starts trapped"
+    out = ptr.escape()
+    assert ang_sep(*out, *sky.sun()) >= ptr.cone, (
+        f"escape returned {out} which is still inside the cone"
+    )
+    assert out == (at["az"], at["alt"]), "it must report where the tube IS, not where it aimed"
+
+    # A mount that takes the commands and does not move is the dangerous case,
+    # and the only thing standing between it and a false all-clear is that final
+    # check. It must refuse rather than return a pointing nobody reached.
+    ptr, _at = trapped(obedient=False)
+    with pytest.raises(SunGuard, match="Cover the aperture"):
+        ptr.escape()
+
+
+def test_the_escape_descent_actually_steps_the_mount_down():
+    """The descent branch executes, rather than being skipped or refused.
+
+    It is the fallback for the case turning cannot solve, and no test had ever
+    run its body: the two that reach it are both refused first by the floor
+    guard. A wrong step direction or an off-by-one on the loop bound would have
+    been caught by nothing here, and only discovered by wasting real goto time.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, ang_sep
+
+    class NoonSun(Sky):
+        def sun(self, when=None):
+            return 180.0, 80.0
+
+    sky = NoonSun(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    # safe_depth = (30 + 5) - 80 -> 0, so the corridor is the horizon itself and
+    # the descent target is comfortably above the floor.
+    ptr = Pointer(sc, sky, 30, 5, False)
+    at = {"az": 180.0, "alt": 88.0}  # near the zenith, so turning cannot help
+    ptr.current_azalt = lambda: (at["az"], at["alt"])
+    steps = []
+
+    def goto(ra, dec, *a, **k):
+        az, alt = sky.radec_to_altaz(ra, dec)
+        at["az"], at["alt"] = az, alt
+        steps.append(round(alt, 1))
+
+    ptr._goto_wait = goto
+    out = ptr.escape()
+
+    assert steps, "the descent loop never issued a goto"
+    assert steps == sorted(steps, reverse=True), f"the descent must go DOWN, got {steps}"
+    assert ang_sep(*out, *sky.sun()) >= ptr.cone, "and it must end clear of the Sun"
+
+
+def test_an_escape_turn_never_walks_through_the_pole():
+    """Every other slew respects MAX_VIA_DEC; the escape turn did not.
+
+    RA is singular near a pole and this mount has already stalled at Dec 89.8,
+    which is why `point_to` routes through `avoid_pole` and the over-the-top
+    fallback refuses any waypoint past MAX_VIA_DEC. `escape()`'s turn loop
+    stepped raw, and turning north at a mid-latitude site climbs in declination
+    fast: from az 25 alt 38 at 39.8N, five 5-degree steps reach Dec 85.6. The
+    step that finally cleared the Sun cone was the one that crossed the limit —
+    stalling the one manoeuvre whose whole job is guaranteeing an exit.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import MAX_VIA_DEC, Pointer, Sky
+
+    class MorningSun(Sky):
+        def sun(self, when=None):
+            return 45.0, 25.0
+
+    sky = MorningSun(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    visited = []
+
+    ptr = Pointer(sc, sky, 30, 5, False)
+    ptr.current_azalt = lambda: (25.0, 38.0)
+
+    def record(ra, dec, *a, **k):
+        visited.append((ra, dec))
+
+    ptr._goto_wait = record
+    try:
+        ptr.escape()
+    except Exception:
+        pass  # refusing is a legal outcome; commanding the pole is not
+
+    over = [(ra, dec) for ra, dec in visited if abs(dec) > MAX_VIA_DEC]
+    assert not over, f"escape commanded {len(over)} pointing(s) past the pole limit: {over}"
+
+
+def test_an_escape_that_cannot_reach_its_depth_refuses_instead_of_trying():
+    """`corridor_alt` already guards this; `escape_target` did not.
+
+    When turning cannot clear the cone the fallback descends, and the depth it
+    wants is `-safe_depth()`. With a wide cone and a high Sun that can be below
+    anything this mount has ever been shown to reach. Commanding it anyway is
+    the thing `cli._pointer`'s docstring says the design will not do: say
+    plainly when the corridor is unavailable rather than issue a slew the mount
+    may refuse.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import Pointer, Sky, SunGuard
+
+    class HighSun(Sky):
+        def sun(self, when=None):
+            return 180.0, 44.0
+
+    sky = HighSun(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    # A wide cone is a legal config: nothing enforces an upper bound, and an
+    # operator may reasonably widen it for margin.
+    #
+    # Both tube and Sun have to sit near the zenith for turning to be useless —
+    # at 1 degree from zenith the far side of the sky is only 47 degrees away,
+    # short of the 51 the cone plus margin demands — while the Sun stays low
+    # enough that the depth needed to clear it, 7 degrees below the horizon, is
+    # past the floor. That is the exact corner escape_target's fallback exists
+    # for, and the corner it commanded blind.
+    ptr = Pointer(sc, sky, 46, 5, False)
+    ptr.current_azalt = lambda: (180.0, 89.0)
+    commanded = []
+    ptr._goto_wait = lambda ra, dec, *a, **k: commanded.append((ra, dec))
+
+    with pytest.raises(SunGuard, match="below this mount's floor"):
+        ptr.escape()
+    assert not commanded, "it must refuse before commanding anything, not part way through"
+
+
+def test_a_sweep_honours_the_measured_below_horizon_floor():
+    """terminus-64's config knob was live for `point` and dead for `sweep`.
+
+    `cli._pointer` applied `min_alt_deg`; `run_sweep` built its own Pointer and
+    never read it. So the operator's measurement of how far this mount can
+    actually point below the horizon was ignored by the one command that runs
+    unattended for hours, and by the corridor and escape machinery most likely
+    to need it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 90, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6, "min_alt_deg": -1.0,
+    }  # fmt: skip
+
+    seen = {}
+
+    def capture(ptr, *a, **k):
+        seen["floor"] = ptr.MIN_ALT_DEG
+        return 20.0, "edge", "tree", []
+
+    with patch("terminus.sweep.scan_horizon", side_effect=capture):
+        run_sweep(sc, sky, cfg, az_start=0, az_end=270, dry=True, log=lambda *a, **k: None)
+
+    assert seen.get("floor") == -1.0, (
+        f"run_sweep ignored min_alt_deg and used {seen.get('floor')}; the default is a "
+        "guess and the config exists to replace it with a measurement"
+    )
+
+
+def test_the_below_horizon_corridor_is_safe_at_every_azimuth():
+    """Devon's route: get below the horizon and the whole circle opens up.
+
+    Descending at a fixed azimuth moves monotonically away from a Sun that is
+    above; travelling below the horizon is clear at every azimuth by
+    construction; ascending is the descent in reverse at an azimuth already
+    chosen to be safe. Three legs, each safe for its own reason.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    class HighSun(Sky):
+        def sun(self):
+            return 270.0, 40.0
+
+    sky = HighSun(39.7917, -104.894, 1600)
+    ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    assert ptr.corridor_alt() is not None, "a high Sun leaves the horizon itself clear"
+
+    start, end = (230.0, 25.0), (310.0, 25.0)
+    rd0 = sky.altaz_to_radec(*start)
+    for clockwise in (True, False):
+        wps = ptr.corridor_route(*start, *end, clockwise)
+        assert wps, "both directions exist"
+        assert ptr.route_min_sep(rd0, wps) >= ptr.cone, "and both are clear of the Sun"
+        # It ends where it was asked to.
+        final = sky.radec_to_altaz(*wps[-1])
+        assert final[0] == pytest.approx(end[0], abs=0.5)
+        assert final[1] == pytest.approx(end[1], abs=0.5)
+
+    # The corridor is a CANDIDATE, not a default: when something shorter is
+    # clear, the cost comparison picks that instead.
+    chosen = ptr.plan_route(rd0, sky.altaz_to_radec(*end))
+    assert chosen is not None
+
+
+def test_the_corridor_says_when_the_mount_cannot_reach_it():
+    """The depth depends on the Sun's altitude; the floor is hardware.
+
+    How far below the horizon this mount can point is NOT KNOWN — observed at
+    -1.1 degrees and no further. So the corridor is unavailable for a low Sun
+    until that is measured, and the code says so rather than commanding a slew
+    the mount may refuse.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky
+
+    def pointer(sun_alt, floor):
+        class F(Sky):
+            def sun(self, _s=sun_alt):
+                return 270.0, _s
+
+        p = Pointer(MagicMock(), F(39.7917, -104.894, 1600), 30, 5, True)
+        p.MIN_ALT_DEG = floor
+        return p
+
+    # A high Sun needs no depth at all: the horizon is already 40 degrees away.
+    assert pointer(40.0, -5.0).corridor_alt() is not None
+    # A low Sun needs real depth, and a shallow mount cannot provide it.
+    assert pointer(20.0, -5.0).corridor_alt() is None
+    assert pointer(20.0, -15.0).corridor_alt() is not None
+    # Deepest ever demanded, and only with the Sun on the horizon.
+    assert pointer(0.0, -35.0).corridor_alt() == pytest.approx(-35.0)
+    assert pointer(0.0, -34.0).corridor_alt() is None
+
+
+def test_a_tied_turn_goes_against_the_sun_s_own_drift():
+    """When the tube shares the Sun's azimuth, neither turn is momentarily better.
+
+    Devon's tiebreak, and it is the one with physics behind it: turn AGAINST the
+    Sun's motion. Turning the way it is already going lets it follow, eroding
+    what the turn just bought; turning the other way opens the gap from both
+    ends.
+
+    The drift is measured rather than assumed from the hemisphere, because the
+    assumption has exceptions — inside the tropics the Sun can pass north and
+    its azimuth motion is not monotonic through the day.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, _now
+
+    class DriftingSky(Sky):
+        """A Sun whose azimuth moves at a chosen rate."""
+
+        def __init__(self, rate, *a, **kw):
+            super().__init__(*a, **kw)
+            self.rate = rate  # degrees per minute
+            self.t0 = _now()
+
+        def sun(self, when=None):
+            minutes = ((when or self.t0) - self.t0).to_value("min") if when else 0.0
+            return (270.0 + self.rate * minutes) % 360.0, 20.0
+
+    for rate, expected in ((0.2, -1.0), (-0.2, 1.0)):
+        sky = DriftingSky(rate, 39.7917, -104.894, 1600)
+        ptr = Pointer(MagicMock(), sky, 30, 5, True)
+        assert (ptr.sun_drift() > 0) == (rate > 0), "the drift must be measured, not guessed"
+        # A tube directly above the Sun: both turns are identical by symmetry.
+        assert ptr.escape_turn(270.0, 25.0) == expected, (
+            f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
+        )
+
+    # And a test double with no clock still gets an answer, from the hemisphere.
+    class Frozen(Sky):
+        def sun(self):
+            return 270.0, 20.0
+
+    north = Pointer(MagicMock(), Frozen(39.79, -104.89, 1600), 30, 5, True)
+    south = Pointer(MagicMock(), Frozen(-33.87, 151.21, 1600), 30, 5, True)
+    assert north.sun_drift() > 0 and south.sun_drift() < 0
+    assert north.escape_turn(270.0, 25.0) == -1.0
+    assert south.escape_turn(270.0, 25.0) == 1.0
+
+
+def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_forever():
+    """Measured 2026-08-06: one goto spent 288 seconds not arriving.
+
+    The deadline extended whenever the mount reported MOTION, so a mount that
+    moves without converging renewed it indefinitely. The failing gotos reached
+    the right declination exactly and never the right RA — so they were moving
+    the whole time, and the run spent minutes per column discovering nothing.
+
+    Progress is the right test, not motion. It also distinguishes two faults that
+    read identically today: a stowed mount that never moves, and a reachable-
+    looking target the mount will not converge on.
+    """
+    import time
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import NO_PROGRESS_S, Pointer, PointingError, Sky
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.goto.return_value = None
+    # Dec arrives; RA never does — exactly what the mount did.
+    sc.equ_coord.return_value = (4.551, 60.43)
+    sc.call.return_value = {"result": {"mount": {"move_type": "ScopeGoto"}}}
+    ptr = Pointer(sc, sky, 30, 5)
+
+    started = time.time()
+    with pytest.raises(PointingError) as exc:
+        ptr._goto_wait(8.604, 60.43, 0.1)
+    elapsed = time.time() - started
+
+    assert elapsed < NO_PROGRESS_S + 15, (
+        f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+    )
+    assert "stopped improving" in str(exc.value), (
+        "it must say the mount moved but would not converge, not that it never moved"
+    )
+
+
+def test_a_mount_that_never_moves_is_reported_differently():
+    """The other fault, which used to produce the same message.
+
+    A stowed mount answers every query and never moves. Saying so plainly is the
+    difference between opening the arm and hunting for a pointing bug.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import Pointer, PointingError, Sky
+
+    sc = MagicMock()
+    sc.equ_coord.return_value = (5.759, -90.0)  # parked at the pole, stowed
+    sc.call.return_value = {"result": {"mount": {"move_type": "none"}}}
+    ptr = Pointer(sc, Sky(39.7917, -104.894, 1600), 30, 5)
+
+    with pytest.raises(PointingError, match="never moved toward it at all"):
+        ptr._goto_wait(8.604, 60.43, 0.1)

@@ -51,7 +51,15 @@ its own frame).
 | Scope sweep, mask, exports, `Horizon` queries | **Working, on the CLI** |
 | Photo registration and segmentation | **Working, on the CLI** (`mosaic`, `skymask`) |
 | Orientation fit and adaptive column choice | **Working, on the CLI** (`orient`) |
-| Night detection | **Implemented and tested, not yet on the CLI** |
+| Night detection | **Implemented and tested, nothing calls it** |
+
+Run end to end on real hardware for the first time on 2026-08-05: nineteen phone
+frames to a solved orientation, with the yaw reproducing exactly across two
+independent runs an hour apart. That run also found four bugs that 211 passing
+tests had not — every mask a real sweep wrote was unparseable, the Sun-cone
+check tested only a column's endpoints, the Sun guard could refuse to move the
+mount *away* from the Sun, and a darkening sky manufactured false measurements.
+All four are fixed. Read **What breaks**, below, before relying on a result.
 
 `terminus mosaic` and `terminus skymask` build a horizon from photographs and
 need no telescope, no network and no `config.toml`. What they produce is
@@ -188,6 +196,117 @@ cp config.example.toml config.toml   # then edit host + pem path
 ```
 
 ## Use
+
+### Start to finish, the way it was actually run
+
+This is the sequence run end to end on 2026-08-05, with the numbers that run
+produced. Read the **What breaks** section below before trusting the result of
+the last step.
+
+**1. Photograph the horizon.** Individual overlapping frames, held roughly
+level, all the way round. Nineteen shots two seconds apart worked; eighteen of
+them registered.
+
+> Frames, **not** your phone's panorama mode. A finished panorama cannot be
+> matched to another finished panorama, and `mosaic` will spend twenty minutes
+> discovering that before it tells you.
+
+**2. Register them into one equirectangular canvas, and segment while you are
+there.**
+
+```bash
+terminus mosaic ~/horizon-frames --out pano --segment
+```
+
+`--segment` runs SegFormer on each **frame** and warps the labels through the
+same solve, rather than segmenting the stitched result. That matters more than
+it sounds: segmenting the finished canvas labels 44% of it — the black region
+nobody photographed — as walls, grass and hills, and 3% of it as *sky*.
+
+**3. Read a horizon off the panorama.**
+
+```bash
+terminus skymask pano.png --coverage pano.coverage.npy --classes pano.classes.npy
+```
+
+Out comes a mask with a per-column altitude, an obstruction type, and an
+uncertainty — about 1° for structure, 3° for foliage. It is **unoriented**: the
+azimuth is the panorama's own, and it refuses to export until that is solved.
+
+**4. Solve where that horizon sits on the sky.** This is the step that needs the
+telescope, and the only one that does.
+
+```bash
+terminus orient pano_mask.yaml --out oriented.yaml
+```
+
+It measures a few evenly spaced columns, then chooses each next column by how
+much it will shrink the uncertainty in the fit, refits after every one, and
+stops when the solved yaw stops moving. Roughly **2.5 minutes per column**, so
+eight chosen columns is about **20 minutes** — against ~95 minutes for a blind
+36-column circle.
+
+Every column it measures is saved, so `--replay <profiles.json>` will re-run the
+whole loop later with no telescope and no sky.
+
+**5. Export it.**
+
+```bash
+terminus export oriented.yaml --skysafari --landscape --pvsyst
+```
+
+**6. Look at it.**
+
+```bash
+terminus polar oriented.yaml
+```
+
+One self-contained HTML file — no network, no assets, nothing to serve — showing
+the whole sky as a disc with north up and the photograph reprojected through the
+solved rotation. The layers toggle: the horizon ring, the telescope's own
+columns, the region no photograph covered, and the altitude grid.
+
+This is the check that catches what a residual cannot. A wrong yaw stops being a
+number and becomes the neighbour's house in the wrong place. Turn the horizon
+layer off and on and see whether the yellow line follows the roofline; turn on
+"not photographed" and see whether the gaps are where you think they are.
+
+```bash
+# draw the telescope's measured columns over the photograph too
+terminus polar oriented.yaml --fiducials horizon_part2.yaml
+
+# the disc reaches 20 degrees below the horizon by default, so the deck and
+# fence are in frame; --floor 0 stops at the horizon
+terminus polar oriented.yaml --floor -35 --size 1600
+```
+
+Columns that reached the sweep's altitude ceiling are drawn as upward chevrons
+rather than dots, because the scope stopped at its tilt limit: the horizon there
+is *at least* that high, not exactly that high. Without a panorama the command
+still works and draws the measured horizon on a plain disc, which is all a
+scope-only sweep can honestly support.
+
+### What breaks
+
+Written down because it will bite you, and because it is being worked on rather
+than hidden.
+
+**Do not trust a run that crosses dusk or dawn.** As the sky darkens, a column
+that the detector can no longer resolve is recorded as *blocked above the search
+ceiling* — a one-sided claim the fit treats as strong evidence. One such column
+moved a solved yaw by **164°**. The fix is to select the detector from the
+measured sky brightness (`night.py` exists for this and is not yet wired in);
+until then, run in daylight or under a settled dark sky, not across the change.
+
+**A sweep interrupted loses everything it measured.** The mask is written once,
+at the end. Ctrl-C forty minutes in and forty minutes are gone.
+
+**The Sun is checked for where it is now, not where it will be.** A column can be
+clear when it is chosen and not by the time it is measured. At dusk this errs
+safe; at dawn it does not.
+
+**Pointing is only as good as the polar alignment**, and nothing yet measures
+that for you — see *Plate solve first* below.
 
 ```bash
 terminus preflight                 # connect, show Sun + which azimuths it blocks

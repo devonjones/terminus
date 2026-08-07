@@ -173,6 +173,154 @@ def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
     return sorted(glob.glob(out + "*.tif")), final
 
 
+def source_images(pto):
+    """The image filenames a project references, in image-line order."""
+    names = []
+    with open(pto) as fh:
+        for line in fh:
+            if line.startswith("i "):
+                m = re.search(r'n"([^"]*)"', line)
+                if m:
+                    names.append(m.group(1))
+    return names
+
+
+def remap_labels(pto, work_dir, label_for, prefix="label"):
+    """Warp per-frame LABEL images through the same solve as the photographs.
+
+    This is the point of the whole arrangement, and doing it the other way round
+    is a mistake worth naming. Segmenting the finished panorama asks the model to
+    read an equirectangular projection: downsampled from eighteen 12-megapixel
+    frames to one 2880x1440 canvas, seamed where frames blend, and stretched
+    without limit toward the poles. SegFormer was trained on photographs. A
+    photograph is what each frame still is.
+
+    So segment the frames — full resolution, native projection, exactly the
+    input the model expects — and then push the LABELS through the identical
+    warp, so they land wherever their pixels landed.
+
+    NONA NEVER TOUCHES A CLASS ID. It is asked for COORDINATES (`-c`, which
+    writes `_x` and `_y` images naming the source pixel behind every output
+    pixel) and the ids are then looked up in the full-resolution label frame.
+    Anything else corrupts them, and it took three attempts to accept that:
+
+      * poly3 resampling averages two ids into a third, so class 2 beside class
+        4 becomes class 3. Setting the project's interpolator to nearest does
+        NOT prevent this — nona ignores the `m` line's `i` value entirely, and
+        `i0`, `i5` and `i6` produce byte-identical output. The guard that was
+        supposed to stop this had never once worked.
+      * the frames are 12 megapixels and the canvas is 2880 wide, so nearly
+        every output pixel straddles a class boundary. On the 2026-08-03 set
+        that was 75% of them, not some thin edge case.
+      * photometric correction applies exposure, white balance and a response
+        curve to whatever the file holds. Neutralising every coefficient is not
+        enough while the correction MODE is set, and even then the sRGB round
+        trip perturbs small integers.
+
+    A resampling kernel and an exposure curve are both arithmetic, and
+    arithmetic on an identifier is meaningless. Looking the id up by coordinate
+    is not a better approximation, it is an exact answer.
+
+    `label_for` maps a source filename (as the project spells it) to a label
+    image on disk. Returns the remapped layer paths.
+    """
+    import numpy as np
+    from PIL import Image
+
+    require_hugin()
+    out_pto = os.path.join(work_dir, prefix + ".pto")
+    names = source_images(pto)
+    with open(pto) as fh, open(out_pto, "w") as out:
+        for line in fh:
+            if line.startswith("i "):
+                m = re.search(r'n"([^"]*)"', line)
+                if m and m.group(1) in label_for:
+                    line = line.replace(m.group(0), f'n"{label_for[m.group(1)]}"')
+            out.write(line)
+    # EVERY LABEL MUST HAVE ACTUALLY REPLACED A PHOTOGRAPH. The substitution
+    # matches on the project's own spelling of the filename, so a caller whose
+    # keys differ by a directory prefix — "frame1.jpg" against
+    # "stage/frame1.jpg" — silently rewrites nothing. nona then warps the
+    # PHOTOGRAPHS, exits 0, and `combine_labels` reads RGB brightness as class
+    # ids: a wrong-but-successful run, indistinguishable from a correct one, and
+    # the same silent corruption this function was rewritten to eliminate
+    # reached through a different door. A reviewer hit exactly this while
+    # building a harness for it.
+    missing = set(label_for) - set(names)
+    if missing:
+        raise MosaicError(
+            "these label images name frames the project does not contain: "
+            + ", ".join(sorted(missing))
+            + f". The project spells its images {sorted(names)[:3]}... — the keys of "
+            "`label_for` must match that spelling exactly, or the photographs get "
+            "warped instead of the labels and nothing says so."
+        )
+    stem = os.path.join(work_dir, prefix)
+    for old in glob.glob(stem + "*.tif"):
+        os.remove(old)
+    _run(["nona", "-c", "-m", "TIFF_m", "-o", stem, out_pto])
+
+    written = []
+    for index, name in enumerate(names):
+        layer = f"{stem}{index:04d}.tif"
+        xpath, ypath = f"{stem}{index:04d}_x.tif", f"{stem}{index:04d}_y.tif"
+        if not (os.path.exists(layer) and os.path.exists(xpath)):
+            continue  # nona placed no pixels for this frame
+        label_path = os.path.join(os.path.dirname(pto), label_for[name])
+        source = np.asarray(Image.open(label_path).convert("RGB"))[..., 0]
+        height, width = source.shape
+        xs = np.asarray(Image.open(xpath)).astype(np.int64)
+        ys = np.asarray(Image.open(ypath)).astype(np.int64)
+        with Image.open(layer) as im:
+            tags = im.tag_v2
+            alpha = np.asarray(im.convert("RGBA"))[..., 3] > 0
+            # Uncovered pixels carry a sentinel rather than a coordinate, so the
+            # bounds test is what separates "no source pixel" from "pixel 0,0".
+            ok = alpha & (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+            ids = np.zeros(xs.shape, np.uint8)
+            ids[ok] = source[ys[ok], xs[ok]]
+            rgba = np.dstack([ids, ids, ids, np.where(ok, 255, 0).astype(np.uint8)])
+            keep = {t: tags[t] for t in (282, 283, 286, 287) if t in tags}
+        Image.fromarray(rgba, "RGBA").save(layer, tiffinfo=keep)
+        os.remove(xpath)
+        os.remove(ypath)
+        written.append(layer)
+    return sorted(written)
+
+
+def combine_labels(layer_paths, width, height):
+    """Majority vote per pixel across the remapped label layers.
+
+    Majority, not last-wins, for the same reason `segment_classes` votes across
+    tiles: where two frames overlap they may disagree, and the answer that more
+    of the evidence supports is better than the answer that happened to be
+    stitched second.
+
+    Returns an int array of ADE20K classes, -1 where no frame covered.
+    """
+    votes = {}
+    covered = np.zeros((height, width), bool)
+    for path in layer_paths:
+        rgb, mask, ox, oy = _layer(path)
+        lab = rgb[..., 0].astype(int)  # class id stored in every channel
+        h, w = lab.shape
+        ys, xs = np.mgrid[0:h, 0:w]
+        Y, X = ys[mask] + oy, xs[mask] + ox
+        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
+        Y, X, L = Y[ok], X[ok], lab[mask][ok]
+        covered[Y, X] = True
+        for cls in np.unique(L):
+            box = votes.setdefault(int(cls), np.zeros((height, width), np.int32))
+            sel = L == cls
+            np.add.at(box, (Y[sel], X[sel]), 1)
+    if not votes:
+        return np.full((height, width), -1, dtype=int)
+    labels = sorted(votes)
+    stack = np.stack([votes[c] for c in labels], axis=0)
+    out = np.asarray(labels, dtype=int)[np.argmax(stack, axis=0)]
+    return np.where(covered, out, -1)
+
+
 def _layer(path):
     from PIL import Image
 

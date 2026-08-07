@@ -29,7 +29,7 @@ and only once there is redundancy — so the yaw settling is the signal.
 import numpy as np
 
 from . import plan as planner
-from .orient import Fiducial, fit, native_column
+from .orient import PARAMS, Fiducial, effective_constraints, fit, native_column
 from .orient import rotate as _rotate
 
 
@@ -128,6 +128,7 @@ def run(
     max_columns=12,
     window=3,
     yaw_tol=1.0,
+    min_dof=2,
     reachable=None,
     should_stop=None,
     log=print,
@@ -168,15 +169,33 @@ def run(
     is the only reason this is reachable.
     """
     sample = photo_sample(rows)
-    gradient_at = planner.horizon_gradient([(float(az), float(alt)) for az, alt, *_ in rows])
+    # THE GRADIENT MUST BE READ IN THE PHOTO'S OWN FRAME. The mask is in the
+    # panorama's azimuth and the scope points in true azimuth, so the slope that
+    # decides whether a column carries yaw information sits at `az - yaw`, not at
+    # `az`. Asking for it at the true azimuth read the horizon from a completely
+    # different part of the sky: with a solved yaw of 161, true az 140 looked
+    # like a gradient of -5.6 (steep, and worth measuring) when the slope there
+    # is really +0.19 — flat, and nearly worthless for pinning the yaw. The
+    # planner spent the whole run choosing columns on a horizon it was not
+    # pointing at.
+    #
+    # Before the first fit there is no yaw to correct by, which is exactly why
+    # the seeds are evenly spaced rather than chosen: with nothing solved there
+    # is nothing to be optimal about.
+    photo_gradient = planner.horizon_gradient([(float(az), float(alt)) for az, alt, *_ in rows])
+
+    def gradient_at(true_az):
+        yaw = solution["yaw"] if solution else 0.0
+        return photo_gradient(true_az - yaw)
+
     if candidates is None:
         candidates = sorted({int(round(float(az))) % 360 for az, *_ in rows})
     if not candidates:
         raise ValueError("no candidate azimuths to measure")
 
+    solution = None
     fids, measured, history, steps = [], [], [], []
     queue = planner.seed_columns(min(seed, len(candidates)), candidates)
-    solution = None
 
     while len(measured) < max_columns:
         if should_stop is not None and should_stop():
@@ -218,12 +237,32 @@ def run(
         solution = fit(fids, sample, min_headroom=min_headroom, **(fit_kw or {}))
         history.append(solution)
         stable, spread = planner.is_stable(history, window=window, yaw_tol=yaw_tol)
+        # STABILITY IS NOT ENOUGH ON ITS OWN. With as many free parameters as
+        # constraints the fit interpolates: the yaw can sit perfectly still
+        # across refits while being undetermined, and the residual stays small
+        # because it has to. Two runs on the same photo mask settled on 130 and
+        # 160 that way, each reporting a small RMS and neither having a single
+        # degree of freedom.
+        #
+        # A BOUND usually contributes nothing — scored one-sided, it is satisfied
+        # for free whenever the photo already exceeds its ceiling — so the count
+        # that matters is of constraints that actually hold something down, not
+        # of columns visited.
+        dof = effective_constraints(fids, sample, solution) - PARAMS
+        solution["dof"] = dof
+        if stable and dof < min_dof:
+            stable = False
+            log(
+                f"   yaw is holding still but the fit has {dof} degree(s) of freedom; "
+                f"measuring on until it has {min_dof}",
+                flush=True,
+            )
         steps.append(Step(az, f, solution, spread))
         log(
             f"az {az:3d}: alt {f.alt:5.1f}{' (bound)' if f.bound else ''}  "
             f"yaw {solution['yaw']:6.2f}  pitch {solution['pitch']:5.2f}  "
             f"tilt {solution['tilt_mag']:4.1f}@{solution['tilt_dir']:5.1f}  "
-            f"rms {solution['rms']:4.2f}  n {solution['n']}"
+            f"rms {solution['rms']:4.2f}  n {solution['n']} dof {solution['dof']:+d}"
             + (f"  spread {spread:.2f}" if spread is not None else "  spread -"),
             flush=True,
         )
@@ -276,12 +315,21 @@ def replay(profiles, uncertainty=None, sky_ref=None):
     `sky_ref` gates the absolute step size. Defaults to the brightest sample in
     the whole run, which is what `run_sweep` converges on as it goes.
     """
-    from .sweep import find_edge
+    import numpy as np
+
+    from .sweep import classify_no_edge, find_edge
 
     prof = {int(az): [(float(a), float(lum)) for a, lum in rows] for az, rows in profiles.items()}
     if sky_ref is None:
+        # THE MEDIAN OF THE PER-COLUMN PEAKS, not the brightest sample anywhere.
+        # The maximum picks whatever is brightest in the whole run, and in
+        # daylight that is a sunlit wall rather than open sky: on 2026-08-06 it
+        # chose 253.4 where the run itself had measured 119.3 near the zenith,
+        # more than doubling the absolute-step gate and turning two real edges
+        # (az 40 and az 275) into false bounds. The median is robust to a bright
+        # surface in one or two columns, which the maximum is not.
         peaks = [max(lum for _, lum in rows) for rows in prof.values() if rows]
-        sky_ref = max(peaks) if peaks else None
+        sky_ref = float(np.median(peaks)) if peaks else None
 
     def measure(az):
         rows = prof.get(int(az) % 360)
@@ -290,9 +338,15 @@ def replay(profiles, uncertainty=None, sky_ref=None):
         ceiling = max(a for a, _ in rows)
         k, _step, snr = find_edge(rows, sky_ref)
         if k is None:
-            # Measured and found nothing is a BOUND at the ceiling, which
-            # `as_fiducial` records. Only a column never attempted is None.
-            return None, ceiling, uncertainty
+            # The SAME question the live path asks, answered the same way. It was
+            # not: this returned a bound for every non-detection while
+            # `scan_horizon` had learned to demand contrast first, so replaying a
+            # night manufactured exactly the false bounds the live path had
+            # stopped producing — and a false bound is a lever on the fit.
+            verdict = classify_no_edge(rows, sky_ref)
+            if verdict == "blocked":
+                return None, ceiling, uncertainty
+            return None  # open, or unreadable: no constraint the fit can use
         return {"alt": rows[k][0], "snr": snr}, ceiling, uncertainty
 
     return measure
