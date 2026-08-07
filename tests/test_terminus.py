@@ -5821,6 +5821,68 @@ def test_the_cli_writes_mask_exclusions_into_the_fit_record(tmp_path):
     assert all(v != "None" for f in meta["fit_fiducials"] for v in f.values())
 
 
+def test_a_malformed_exclude_reaches_the_cli_as_a_clean_maskerror(tmp_path):
+    """The CLI translation is load-bearing, not decorative (round 2, E-12).
+
+    `exclusion_reason` raises ValueError; `main()` reports MaskError. Without
+    the translation in `_fiducial_source`, the one failure with a five-second
+    fix — a typo in a hand-edited `exclude` — arrives as a raw traceback while
+    every legitimate refusal gets a clean sentence. The from_mask layer was
+    tested; this pins the CLI layer's own wrap, which a round-2 mutation
+    showed the suite did not reach.
+    """
+    import pytest
+    import yaml
+
+    from terminus.cli import MaskError, _fiducial_source
+
+    bad = tmp_path / "sweep.yaml"
+    bad.write_text(
+        yaml.safe_dump({"horizon": {20: {"alt": 32.5, "type": "structure", "exclude": False}}})
+    )
+    with pytest.raises(MaskError) as exc:
+        _fiducial_source([str(bad)], None)
+    message = str(exc.value)
+    assert (
+        "sweep.yaml" in message and "20" in message
+    ), "the error must name the file and the column the typo lives in"
+    assert "exclude" in message
+
+
+def test_two_masks_disagreeing_about_a_column_follow_first_wins_either_way(tmp_path):
+    """A column is a measurement OR an exclusion, never both (round 2's P1).
+
+    `columns` had first-file-wins while `excluded` overwrote, so two masks
+    disagreeing about one azimuth left it simultaneously excluded and live —
+    `reachable` said yes, `measure` answered, and the written record carried
+    both verdicts. The two maps are one namespace: the first file to speak
+    about an azimuth wins, whatever it said, exactly as the merged accepted
+    columns already behaved.
+    """
+    import yaml
+
+    from terminus.cli import _fiducial_source
+
+    excludes = tmp_path / "a.yaml"
+    excludes.write_text(
+        yaml.safe_dump(
+            {"horizon": {20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"}}}
+        )
+    )
+    measures = tmp_path / "b.yaml"
+    measures.write_text(yaml.safe_dump({"horizon": {20: {"alt": 30.0, "type": "structure"}}}))
+
+    _measure, reachable, excluded = _fiducial_source([str(excludes), str(measures)], None)
+    assert 20 in excluded and not reachable(
+        20
+    ), "the excluding file spoke first, so the column is excluded — not also live"
+
+    _measure, reachable, excluded = _fiducial_source([str(measures), str(excludes)], None)
+    assert (
+        reachable(20) and 20 not in excluded
+    ), "the measuring file spoke first, so the column is live — not also excluded"
+
+
 def test_a_column_at_its_ceiling_is_a_bound_however_it_is_typed():
     """M-09, applied to the masks that are actually on disk.
 

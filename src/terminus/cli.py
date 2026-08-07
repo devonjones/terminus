@@ -878,32 +878,7 @@ def _orient(sc, cfg, args):
             # the fit and cannot even tell which columns it disagrees about: the
             # published run used 16 of 30 and nothing on disk says which, so its
             # 0.69 deg is unreachable and incomparable (terminus-53, F-25).
-            # Rounded, because this is a record for a person to read and diff,
-            # not a serialisation format. None-valued fields are OMITTED, reason
-            # included: this meta is serialised via repr, where a literal None
-            # round-trips through YAML as the STRING 'None' — an absent key is
-            # the honest spelling of "no reason: used cleanly" (E-06). Columns
-            # the MASK excluded appear too, marked excluded_by, because a record
-            # of the fit's inputs that silently omits the inputs someone removed
-            # is exactly the unreproducibility this field exists to end.
-            fit_fiducials=[
-                {
-                    k: (round(v, 3) if isinstance(v, float) else v)
-                    for k, v in f.items()
-                    if v is not None
-                }  # noqa: E501
-                for f in solution.get("fiducials", [])
-            ]
-            + [
-                {
-                    "az": float(az),
-                    **({"alt": round(float(e["alt"]), 3)} if e.get("alt") is not None else {}),
-                    "used": False,
-                    "reason": e["reason"],
-                    "excluded_by": "mask",
-                }
-                for az, e in sorted(excluded_by_mask.items())
-            ],
+            fit_fiducials=_fit_fiducials_record(solution, excluded_by_mask),
             source_mask=os.path.abspath(args.mask),
         ),
     )
@@ -915,6 +890,33 @@ def _orient(sc, cfg, args):
             else "(marked UNORIENTED: the yaw was still moving when the run stopped)"
         )
     )
+
+
+def _fit_fiducials_record(solution, excluded_by_mask):
+    """The written form of the fit's fiducial set, mask exclusions included.
+
+    Rounded, because this is a record for a person to read and diff, not a
+    serialisation format. None-valued fields are OMITTED, reason included: the
+    meta this lands in is serialised via repr, where a literal None round-trips
+    through YAML as the STRING 'None' — an absent key is the honest spelling of
+    "no reason: used cleanly" (E-06). Columns the MASK excluded appear too,
+    marked excluded_by, because a record of the fit's inputs that silently
+    omits the inputs someone removed is exactly the unreproducibility this
+    field exists to end.
+    """
+    return [
+        {k: (round(v, 3) if isinstance(v, float) else v) for k, v in f.items() if v is not None}
+        for f in solution.get("fiducials", [])
+    ] + [
+        {
+            "az": float(az),
+            **({"alt": round(float(e["alt"]), 3)} if e.get("alt") is not None else {}),
+            "used": False,
+            "reason": e["reason"],
+            "excluded_by": "mask",
+        }
+        for az, e in sorted(excluded_by_mask.items())
+    ]
 
 
 def _fiducial_source(paths, uncertainty):
@@ -963,6 +965,15 @@ def _fiducial_source(paths, uncertainty):
         search = (doc.get("meta") or {}).get("alt_search") or []
         ceiling = float(search[1]) if len(search) > 1 else None
         for az, entry in block.items():
+            # FIRST FILE TO SPEAK ABOUT AN AZIMUTH WINS — whatever it said.
+            # `columns` alone had first-wins while `excluded` overwrote, so two
+            # masks disagreeing about one column left it simultaneously excluded
+            # and live, and the written record carried both verdicts (round 2's
+            # P1). The two maps are one namespace: a column is a measurement OR
+            # an exclusion, never both, and the earlier file's verdict stands —
+            # exactly the rule the accepted columns already follow.
+            if int(az) in columns or int(az) in excluded:
+                continue
             # AN EXCLUDED COLUMN IS NOT A CANDIDATE. Leaving it in and refusing
             # it at measure time makes the planner spend a slot discovering what
             # the mask already said — and `reachable` would be lying, which is
@@ -979,7 +990,7 @@ def _fiducial_source(paths, uncertainty):
             if reason is not None:
                 excluded[int(az)] = {"alt": entry.get("alt"), "reason": reason}
                 continue
-            columns.setdefault(int(az), (entry, ceiling))
+            columns[int(az)] = (entry, ceiling)
 
     def measure(az):
         got = columns.get(int(az))
