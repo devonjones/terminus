@@ -237,6 +237,24 @@ def remap_labels(pto, work_dir, label_for, prefix="label"):
                 if m and m.group(1) in label_for:
                     line = line.replace(m.group(0), f'n"{label_for[m.group(1)]}"')
             out.write(line)
+    # EVERY LABEL MUST HAVE ACTUALLY REPLACED A PHOTOGRAPH. The substitution
+    # matches on the project's own spelling of the filename, so a caller whose
+    # keys differ by a directory prefix — "frame1.jpg" against
+    # "stage/frame1.jpg" — silently rewrites nothing. nona then warps the
+    # PHOTOGRAPHS, exits 0, and `combine_labels` reads RGB brightness as class
+    # ids: a wrong-but-successful run, indistinguishable from a correct one, and
+    # the same silent corruption this function was rewritten to eliminate
+    # reached through a different door. A reviewer hit exactly this while
+    # building a harness for it.
+    missing = set(label_for) - set(names)
+    if missing:
+        raise MosaicError(
+            "these label images name frames the project does not contain: "
+            + ", ".join(sorted(missing))
+            + f". The project spells its images {sorted(names)[:3]}... — the keys of "
+            "`label_for` must match that spelling exactly, or the photographs get "
+            "warped instead of the labels and nothing says so."
+        )
     stem = os.path.join(work_dir, prefix)
     for old in glob.glob(stem + "*.tif"):
         os.remove(old)

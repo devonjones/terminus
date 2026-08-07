@@ -5507,6 +5507,29 @@ def test_labels_are_voted_not_last_wins_and_never_invented_where_no_frame_looked
     assert (out[:, 8:] == -1).all(), "no frame looked here, so there is no class"
 
 
+def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
+    """Silent success is the failure mode this whole path exists to remove.
+
+    `remap_labels` swaps filenames by matching the project's own spelling. A
+    caller whose keys differ by so much as a directory prefix rewrites nothing,
+    nona cheerfully warps the PHOTOGRAPHS, and `combine_labels` then reads RGB
+    brightness as ADE20K class ids. Exit code 0, plausible output, completely
+    wrong — which is precisely the shape of corruption the coordinate-lookup
+    rewrite was written to eliminate, arriving through a different door.
+    """
+    import pytest
+
+    from terminus.mosaic import MosaicError, remap_labels
+
+    project = tmp_path / "final.pto"
+    project.write_text(
+        'p f2 w2880 h1440 v360 n"TIFF_m"\nm i0\ni w3000 h4000 f0 n"stage/frame1.jpg"\n'
+    )
+    with pytest.raises(MosaicError, match="does not contain"):
+        # Right file, wrong spelling: no directory prefix.
+        remap_labels(str(project), str(tmp_path), {"frame1.jpg": "labels/001.png"})
+
+
 def test_a_label_project_asks_nona_for_coordinates_not_for_pixels(tmp_path):
     """A class id must never pass through nona's pixel pipeline.
 
@@ -6032,6 +6055,101 @@ def test_the_way_out_is_a_turn_not_a_descent():
             # moves the tube. Those fall back to the descent, which is what the
             # corridor depth is for.
             assert turned > trapped * 0.8
+
+
+def test_an_escape_that_succeeds_is_verified_against_where_the_tube_ACTUALLY_is():
+    """The last thing `escape` does is check it worked. Nothing tested that.
+
+    Both of the other escape tests raise before the final check is reached, and
+    both mock `current_azalt` as a constant — so they could not tell a successful
+    escape from a broken one, because the mock keeps reporting the trapped
+    starting position whatever the mount was told.
+
+    This one moves. `current_azalt` reflects each `_goto_wait`, so the turn
+    genuinely walks the tube out of the cone and the final verification runs on a
+    real answer. Then the same scenario is run with the mount IGNORING commands —
+    which is the fault that matters, since a goto that quietly fails to arrive
+    voids every Sun-safety guarantee: the caller believes the scope is where it
+    asked and plans the next path from a position the mount never reached.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import Pointer, Sky, SunGuard, ang_sep
+
+    class LowSun(Sky):
+        def sun(self, when=None):
+            return 90.0, 15.0
+
+    sky = LowSun(39.7917, -104.894, 1600)
+
+    def trapped(obedient):
+        sc = MagicMock()
+        ptr = Pointer(sc, sky, 30, 5, False)
+        at = {"az": 70.0, "alt": 20.0}  # 20 deg from the Sun: inside the cone
+        ptr.current_azalt = lambda: (at["az"], at["alt"])
+
+        def goto(ra, dec, *a, **k):
+            if obedient:
+                az, alt = sky.radec_to_altaz(ra, dec)
+                at["az"], at["alt"] = az, alt
+
+        ptr._goto_wait = goto
+        return ptr, at
+
+    ptr, at = trapped(obedient=True)
+    assert ang_sep(at["az"], at["alt"], *sky.sun()) < ptr.cone, "the premise: it starts trapped"
+    out = ptr.escape()
+    assert ang_sep(*out, *sky.sun()) >= ptr.cone, (
+        f"escape returned {out} which is still inside the cone"
+    )
+    assert out == (at["az"], at["alt"]), "it must report where the tube IS, not where it aimed"
+
+    # A mount that takes the commands and does not move is the dangerous case,
+    # and the only thing standing between it and a false all-clear is that final
+    # check. It must refuse rather than return a pointing nobody reached.
+    ptr, _at = trapped(obedient=False)
+    with pytest.raises(SunGuard, match="Cover the aperture"):
+        ptr.escape()
+
+
+def test_the_escape_descent_actually_steps_the_mount_down():
+    """The descent branch executes, rather than being skipped or refused.
+
+    It is the fallback for the case turning cannot solve, and no test had ever
+    run its body: the two that reach it are both refused first by the floor
+    guard. A wrong step direction or an off-by-one on the loop bound would have
+    been caught by nothing here, and only discovered by wasting real goto time.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import Pointer, Sky, ang_sep
+
+    class NoonSun(Sky):
+        def sun(self, when=None):
+            return 180.0, 80.0
+
+    sky = NoonSun(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    # safe_depth = (30 + 5) - 80 -> 0, so the corridor is the horizon itself and
+    # the descent target is comfortably above the floor.
+    ptr = Pointer(sc, sky, 30, 5, False)
+    at = {"az": 180.0, "alt": 88.0}  # near the zenith, so turning cannot help
+    ptr.current_azalt = lambda: (at["az"], at["alt"])
+    steps = []
+
+    def goto(ra, dec, *a, **k):
+        az, alt = sky.radec_to_altaz(ra, dec)
+        at["az"], at["alt"] = az, alt
+        steps.append(round(alt, 1))
+
+    ptr._goto_wait = goto
+    out = ptr.escape()
+
+    assert steps, "the descent loop never issued a goto"
+    assert steps == sorted(steps, reverse=True), f"the descent must go DOWN, got {steps}"
+    assert ang_sep(*out, *sky.sun()) >= ptr.cone, "and it must end clear of the Sun"
 
 
 def test_an_escape_turn_never_walks_through_the_pole():
