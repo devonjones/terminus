@@ -1554,7 +1554,16 @@ def main(argv=None):
     pp.add_argument("alt", type=float)
     pp.add_argument("--dry-run", action="store_true")
     sub.add_parser("classify")
-    sw = sub.add_parser("sweep")
+    sw = sub.add_parser(
+        "sweep",
+        help="full horizon sweep -> mask YAML (day and twilight only)",
+        description="Full horizon sweep -> mask YAML (+ review frames). Day and "
+        "twilight only: the sweep reads the scenery stream, which goes blind once "
+        "the Sun is well down (the ISP pins its exposure), so a sweep run into "
+        "full dark returns confident darkness, not measurements. Night columns "
+        "belong to `terminus orient`, which switches to the star-mode imaging "
+        "channel and the night detector.",
+    )
     sw.add_argument("--az-start", type=float, default=0)
     sw.add_argument("--az-end", type=float, default=350)
     sw.add_argument("--out", default=None)
@@ -1574,7 +1583,17 @@ def main(argv=None):
     )
     sw.add_argument("--dry-run", action="store_true")
     orp = sub.add_parser(
-        "orient", help="solve where a photo horizon sits on the sky, column by column"
+        "orient",
+        help="solve where a photo horizon sits on the sky, column by column",
+        description="Solve where a photo horizon sits on the sky, column by column. "
+        "With the scope, the measurement channel is chosen from the Sun's altitude "
+        "at run start: below -12 deg the run measures on the star-mode imaging "
+        "channel with the night detector (the scenery stream is blind after dark), "
+        "otherwise on the scenery stream with a locked exposure. The choice is per "
+        "run, not per column, so do not start a run that will straddle the "
+        "twilight boundary. Every attempt is checkpointed to <out>_fiducials.jsonl "
+        "as it completes; rerunning resumes from it, and saved night profiles are "
+        "re-judged by the current detector.",
     )
     orp.add_argument("mask", help="the UNORIENTED photo mask from `terminus skymask`")
     orp.add_argument("--out", help="where to write the oriented mask")

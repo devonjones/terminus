@@ -48,6 +48,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `M-21` Straight edges in a natural scene mean a pipeline artifact
 - `M-22` Calibrate a control's rate before using it, and do not hill-climb on a drifting signal
 - `M-23` At night the edge is a persistent, unrecovered drop — and only negative steps are roughness
+- `M-24` Overhead wires read as sky through the segmentation — and the unguarded number is `top`, not the skyline
 
 **Fitting and validation**
 
@@ -574,6 +575,38 @@ gradient brightening toward the horizon, accelerating as it goes (+48 counts per
 A glare column — median dragged above the sky trend by a streetlight inside terrain — is
 indistinguishable by shape from a genuinely open one. It reads "open", which carries no
 constraint, so the honest ambiguity costs the fit nothing (M-19).
+
+### M-24 — Overhead wires read as sky through the segmentation — and the unguarded number is `top`, not the skyline
+
+Measured 2026-08-07 on a 15-frame yard set crossed by mains and service drops, run through
+`mosaic --segment` → `skymask`. The policy question came first: wires are largely not worth
+avoiding with a telescope, so wires-as-sky is the *desired* reading, not a defect.
+
+The segment backend already delivers it, by an accident worth knowing about: SegFormer's
+processor resizes every frame to its 512 px input before inference, and at that scale a wire
+is sub-pixel. Of 99,997 dark pixels in covered open sky across the whole panorama, 99,949
+came back class 2 (sky); the blocked map held **2** genuine wire pixels, and they hit none of
+the 360 mask columns. No filtering was needed, and none was added.
+
+Where the exposure actually lives, found by trying to break it:
+
+- `horizon_rows`' run-of-6 rule fully guards `first` — under a wire-removal filter, **zero**
+  columns moved. But the mask records `band["top"]`, which fires on the first blocked pixel
+  anywhere in the column with **no persistence requirement**. `top` is safe today only
+  because the segmentation never hands it a wire pixel.
+- The **heuristic backend has no such luck**: a wire is dark and neutral, so it reads as
+  terrain (750 of those same pixels). A heuristic-backend mask of a wired yard will hang
+  columns on the wires — the Raspberry Pi path is the vulnerable one.
+- Per-column thinness is the wrong wire test. A first attempt reclassified any isolated
+  blocked run ≤4 rows as sky, and it ate a house eave tip and a branch tip — both thin in
+  their own column, both attached to a parent mass a degree or two over. The discriminator
+  that works is *thin AND no thick blocked mass within ~2° of azimuth / ~0.75° of altitude*:
+  a wire spans tens of degrees with nothing solid near it, an eave tip does not.
+
+**Do:** prefer the segment backend for any site with visible wires. If the heuristic must
+produce the mask, filter thin runs by proximity-to-mass before `horizon_band` — not by
+thinness alone. And any future guard on `top` gets its mutation test against `top`, not
+`first`; the two are protected by different rules and only one of them currently has one.
 
 ## Fitting and validation
 

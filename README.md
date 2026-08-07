@@ -51,7 +51,7 @@ its own frame).
 | Scope sweep, mask, exports, `Horizon` queries | **Working, on the CLI** |
 | Photo registration and segmentation | **Working, on the CLI** (`mosaic`, `skymask`) |
 | Orientation fit and adaptive column choice | **Working, on the CLI** (`orient`) |
-| Night detection | **Implemented and tested, nothing calls it** |
+| Night measurement channel | **Working, on the CLI** — `orient` selects it by Sun altitude; `sweep` is still day-eye only |
 
 Run end to end on real hardware for the first time on 2026-08-05: nineteen phone
 frames to a solved orientation, with the yaw reproducing exactly across two
@@ -94,7 +94,29 @@ know the azimuths are already true — if you set north by hand, say. Otherwise
 the exported horizon is rotated by an unknown amount, which a planner cannot
 detect.
 
-`night` is still library-only.
+**At night, `orient` switches eyes on its own.** At run start, Sun below −12°
+selects the night channel: the scenery stream is blind after dark (its ISP pins
+exposure at ~30 ms whatever is asked — measured, sky vs terrain differed by 0.02
+counts in 255), so frames come from the star-mode imaging channel at 2 s
+instead. Under heavy light pollution that channel separates Bortle-8 skyglow
+from terrain at better than 100:1, and the night detector fits the skyglow
+gradient rather than assuming two brightness levels — under a light dome the
+sky *brightens* toward the horizon, so a two-level rule has nothing to find.
+The channel is chosen once per run, not per column, so start the run on the
+side of the twilight boundary you intend to measure on. Two night behaviours to
+expect: near due north the mount cannot converge (the column crosses the
+celestial pole), so individual samples there are skipped and a burst of failed
+gotos may reset the imaging socket — the run restarts the view and retries the
+column once; and a glare-washed column reports "open", which carries no
+constraint, rather than a plausible number.
+
+**Every `orient` attempt is checkpointed as it completes** — one append-only
+line in `<out>_fiducials.jsonl`, conditions included. Kill the run and run it
+again: cached columns are served without re-observation, and saved night
+profiles are re-judged by the *current* detector, so a detector fix improves an
+old night for free. Heading into dawn, `--stop-above-sun-alt -18` stops cleanly
+before any column once the Sun passes astronomical twilight, checked inside the
+loop rather than at launch.
 
 ```python
 from terminus import mosaic, skymask, orient, plan
@@ -192,7 +214,20 @@ are responsible for your use.
 git clone https://github.com/devonjones/terminus
 cd terminus
 uv sync            # or: pip install -e .
-cp config.example.toml config.toml   # then edit host + pem path
+
+# system tools: ffmpeg for the scope's RTSP preview, hugin-tools for `mosaic`
+sudo apt install ffmpeg hugin-tools        # macOS: brew install ffmpeg hugin
+
+# optional, the segmentation backend for `skymask`/`mosaic --segment`;
+# without it the colour heuristic stands in, which is markedly worse.
+# The CPU wheels are ~200 MB; plain `pip install torch` pulls the CUDA
+# build, which is gigabytes.
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+uv pip install transformers
+
+cp config.example.toml config.toml   # edit host + pem path. Scope commands
+                                     # only: mosaic/skymask/orient --fiducials/
+                                     # export/polar run without a config.toml
 ```
 
 ## Use
@@ -366,12 +401,16 @@ and typically wants seven or eight of them.
 Written down because it will bite you, and because it is being worked on rather
 than hidden.
 
-**Do not trust a run that crosses dusk or dawn.** As the sky darkens, a column
-that the detector can no longer resolve is recorded as *blocked above the search
+**Do not let a run straddle dusk or dawn.** As the sky darkens, a column the
+day detector can no longer resolve is recorded as *blocked above the search
 ceiling* — a one-sided claim the fit treats as strong evidence. One such column
-moved a solved yaw by **164°**. The fix is to select the detector from the
-measured sky brightness (`night.py` exists for this and is not yet wired in);
-until then, run in daylight or under a settled dark sky, not across the change.
+moved a solved yaw by **164°**. `orient` now picks its eye from the Sun's
+altitude at run start — below −12° it measures on the night channel — but the
+choice is per run, not per column, so a run that starts in daylight and ends
+after dark still crosses regimes with the wrong detector. Run in daylight, in
+twilight, or under a settled dark sky, not across the change; heading into
+dawn, `--stop-above-sun-alt -18` ends the run before the sky turns. `sweep`
+has no night eye at all — see **When to run it**.
 
 **A sweep interrupted loses everything it measured.** The mask is written once,
 at the end. Ctrl-C forty minutes in and forty minutes are gone.
@@ -458,7 +497,19 @@ Two things matter:
   fastest. `az_step = 10` halves it, more coarsely. Within a column the scan is
   not a fixed ladder — it walks down from `alt_max` and bisects onto the
   brightness step to `alt_tol`. The open-sky reference is re-measured as the run
-  proceeds, so a sweep may safely span twilight into full dark.
+  proceeds, so a sweep rides the fading light through twilight — but **not into
+  full dark**. `sweep` reads the scenery stream, and that stream goes blind
+  once the Sun is well down (the ISP pins its exposure whatever is asked;
+  measured at Sun −12°, sky and terrain differed by 0.02 counts in 255). A
+  sweep that runs past that point returns confident darkness, not
+  measurements. Stop there; night columns belong to `terminus orient`, which
+  is the command with the night eye.
+- **Under a strong light dome, order matters.** Directions facing away from
+  town are legitimately darker and are the first to fail as twilight fades —
+  and a circular sweep visits azimuths in time order, so those failures
+  masquerade as properties of the direction. Measure the dark directions in
+  twilight and leave the bright ones for later; after full dark, the night
+  channel separates Bortle-8 skyglow from terrain at better than 100:1.
 
 ### As a library
 
