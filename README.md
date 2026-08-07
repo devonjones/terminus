@@ -204,8 +204,9 @@ produced. Read the **What breaks** section below before trusting the result of
 the last step.
 
 **1. Photograph the horizon.** Individual overlapping frames, held roughly
-level, all the way round. Nineteen shots two seconds apart worked; eighteen of
-them registered.
+level, all the way round. Nineteen shots two seconds apart worked; seventeen to
+eighteen of them register, the exact count varying with what `cpfind` finds on
+the day.
 
 > Frames, **not** your phone's panorama mode. A finished panorama cannot be
 > matched to another finished panorama, and `mosaic` will spend twenty minutes
@@ -233,8 +234,8 @@ Out comes a mask with a per-column altitude, an obstruction type, and an
 uncertainty — about 1° for structure, 3° for foliage. It is **unoriented**: the
 azimuth is the panorama's own, and it refuses to export until that is solved.
 
-**4. Solve where that horizon sits on the sky.** This is the step that needs the
-telescope, and the only one that does.
+**4. Solve where that horizon sits on the sky.** This is the step that needs
+telescope measurements — though not necessarily a telescope tonight.
 
 ```bash
 terminus orient pano_mask.yaml --out oriented.yaml
@@ -242,12 +243,32 @@ terminus orient pano_mask.yaml --out oriented.yaml
 
 It measures a few evenly spaced columns, then chooses each next column by how
 much it will shrink the uncertainty in the fit, refits after every one, and
-stops when the solved yaw stops moving. Roughly **2.5 minutes per column**, so
+stops when the solved yaw stops moving.
+
+> The opening columns are spaced evenly and chosen **before** the Sun's position
+> is consulted, so in daylight some of them can be unreachable and the run
+> spends time discovering that. Worse, a run that ends without a fit currently
+> discards the columns it did measure. Both are terminus-58, and until it lands
+> a daylight run can lose an observing window. Roughly **2.5 minutes per column**, so
 eight chosen columns is about **20 minutes** — against ~95 minutes for a blind
 36-column circle.
 
 Every column it measures is saved, so `--replay <profiles.json>` will re-run the
 whole loop later with no telescope and no sky.
+
+If you already have measured columns — a sweep from a previous night, or someone
+else's — `--fiducials` takes them straight from the mask a sweep wrote:
+
+```bash
+terminus orient pano_mask.yaml \
+  --fiducials horizon_part2.yaml --fiducials horizon_west.yaml \
+  --out oriented.yaml
+```
+
+Repeatable and merged first-wins, because a sweep is routinely split across arcs
+and nights. The planner still chooses the order by information gain — it is
+confined to azimuths a fiducial exists for, not handed a fixed list — so this
+also exercises the loop itself without spending a clear night on it.
 
 **5. Export it.**
 
@@ -285,6 +306,58 @@ rather than dots, because the scope stopped at its tilt limit: the horizon there
 is *at least* that high, not exactly that high. Without a panorama the command
 still works and draws the measured horizon on a plain disc, which is all a
 scope-only sweep can honestly support.
+
+### Reproduce it without a telescope
+
+The whole pipeline, photographs to a page you can look at, with no hardware and
+no clear night. Every command below is the real one; the numbers are what this
+produced on 2026-08-06 from the 19 frames in `captures/panoramas/2026-08-03-frames/`
+and the telescope sweeps in `captures/2026-08-03-evening/`.
+
+```bash
+# 1. register the frames and segment each one  (~4 minutes)
+terminus mosaic captures/panoramas/2026-08-03-frames --out pano --segment
+
+# 2. read the skyline off the result  (~1 minute)
+terminus skymask pano.png --coverage pano.coverage.npy --classes pano.classes.npy \
+  --out photo_mask.yaml
+
+# 3. solve the rotation against columns the telescope already measured
+terminus orient photo_mask.yaml \
+  --fiducials captures/2026-08-03-evening/horizon_part2.yaml \
+  --fiducials captures/2026-08-03-evening/horizon_west.yaml \
+  --out oriented.yaml
+
+# 4. look at it
+terminus polar oriented.yaml --fiducials captures/2026-08-03-evening/horizon_part2.yaml
+```
+
+What each step should tell you:
+
+| Step | Expect |
+|---|---|
+| `mosaic` | `registered 17 frames, dropped 2` — the dropped ones have 0 control points |
+| `mosaic --segment` | `55% of pixels labelled` (the rest is sky nobody photographed) |
+| `skymask` | `360 columns, 0 clipped`, and a refusal to export: the mask is **unoriented** |
+| `orient` | `yaw settled within 1 deg over 3 refits`, seven columns |
+| `polar` | one self-contained HTML file, ~460 KB |
+
+```
+yaw 133.69 (+/- 2 deg)  pitch 0.93  tilt 2.62 toward 120.0
+rms 0.22 over 7 columns (1 of them bounds, +2 degrees of freedom)
+```
+
+**Do not read that 0.22 as better than the published 0.69.** It is a fit to seven
+columns where the published one used sixteen, and the extra nine are the ones
+that were hardest to measure — a smaller fiducial set will almost always show a
+smaller residual whether or not it is closer to the truth. What is comparable is
+the geometry: tilt lands within 0.2° of the published 2.81°, and yaw within
+about 2° of 135.81°.
+
+The step that would need a telescope is the one supplying `--fiducials`. Those
+columns came from two evening sweeps; measuring your own is `terminus sweep`, or
+`terminus orient` with no `--fiducials` at all, which chooses columns adaptively
+and typically wants seven or eight of them.
 
 ### What breaks
 
