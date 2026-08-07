@@ -114,8 +114,36 @@ class Fiducial:
 CEILING_EPS = 0.1
 
 
+def exclusion_reason(entry):
+    """The mask's exclusion reason for this column, or None when not excluded.
+
+    `exclude` is a hand-editable field in a durable file, so E-12 applies: a
+    closed vocabulary and a typed error. The only accepted value is a non-empty
+    string saying WHY — the reason is the point of the field (D-12: a thing
+    rejected must be recorded as rejected, and "excluded because true" records
+    nothing). Anything else raises rather than reading as "not excluded",
+    because truthiness fails open: `exclude: false`, `exclude: 0` and
+    `exclude: ""` all LOOK like exclusions to the person who typed them, and a
+    column someone tried to remove would silently re-enter the fit.
+    """
+    if "exclude" not in entry:
+        return None
+    reason = entry["exclude"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            f"exclude must be a non-empty string reason, got {reason!r}. "
+            "Say why, e.g. exclude: 'dawn transition'."
+        )
+    return reason.strip()
+
+
 def from_mask(mask, ceiling=None, excluded=None):
-    """Build fiducials from a mask dict ({az: {alt, type, bound?}}).
+    """Build fiducials from a mask dict ({az: {alt, type, bound?, exclude?}}).
+
+    `exclude: "<reason>"` on a column removes it from the fit, with the reason
+    recorded (see `exclusion_reason` for what the field accepts and why). This
+    is where the az 60 / az 190 dawn exclusions live — in the mask, beside the
+    column — rather than in folklore every rerun must be told by hand.
 
     THE MASK MUST SAY WHICH COLUMNS ARE BOUNDS, and for a long time it did so by
     accident. This function matched `type == "edge"` and `type.startswith
@@ -143,19 +171,21 @@ def from_mask(mask, ceiling=None, excluded=None):
     # and died with the session (terminus-53).
     note = excluded if excluded is not None else {}
     for az, entry in mask.items():
+        # The exclusion is checked FIRST: an excluded column with no altitude
+        # should record the author's reason, not "no altitude recorded" — the
+        # hand-written reason is the more informative of the two. This is where
+        # az 60 and az 190 belong — dawn-contaminated, worth 3.4 degrees of
+        # residual between them.
+        reason = exclusion_reason(entry)
+        if reason is not None:
+            note[int(az)] = reason
+            continue
         if entry.get("alt") is None:
             note[int(az)] = "no altitude recorded"
             continue
         typ = str(entry.get("type", "") or "")
         alt = float(entry["alt"])
         ceil = float(entry.get("ceiling", ceiling)) if (entry.get("ceiling") or ceiling) else None
-        # An explicit exclusion in the mask, with its reason attached. This is
-        # where az 60 and az 190 belong — dawn-contaminated, worth 3.4 degrees of
-        # residual between them — rather than in a memory file and a paragraph of
-        # prose that every rerun has to be told about by hand.
-        if entry.get("exclude"):
-            note[int(az)] = str(entry["exclude"])
-            continue
         if typ == "unknown":
             # A failed measurement carries no information at all: it is neither
             # an edge nor a bound, and must not enter the fit as either.
@@ -492,6 +522,20 @@ def yaw_uncertainty(fids, sample, solution, tol=None, span=60.0, step=1.0):
     return None  # still consistent `span` degrees away: not bounded at all
 
 
+def _record(f, used, residual, reason):
+    """One fiducial's line in the solution record — the same five facts either way."""
+    return {
+        "az": float(f.az),
+        "alt": float(f.alt),
+        "bound": bool(f.bound),
+        "weight": float(f.weight),
+        "sigma": float(f.sigma),
+        "used": used,
+        "residual": residual,
+        "reason": reason,
+    }
+
+
 def fit(
     fids,
     sample,
@@ -585,37 +629,18 @@ def fit(
         "n": int(ok.sum()),
         "n_bound": int(sum(1 for f in used if f.bound)),
         "residuals": {used[i].az: float(r[i]) for i in range(len(used)) if ok[i]},
-        "dropped": sorted(why),
         # The set itself, not just its size. Enough to refit from this record
         # alone: az, the value, whether it was one-sided, and its weighting.
         # A column the photo could not predict at all is marked too — it counts
         # in `used` but contributes no residual, which is the difference
-        # between "agreed" and "was never asked".
+        # between "agreed" and "was never asked". The unused entries carry the
+        # gate that rejected them; there is deliberately no separate "dropped"
+        # list — a second spelling of the same set is a disagreement waiting to
+        # happen, and nothing ever read it.
         "fiducials": [
-            {
-                "az": float(f.az),
-                "alt": float(f.alt),
-                "bound": bool(f.bound),
-                "weight": float(f.weight),
-                "sigma": float(f.sigma),
-                "used": True,
-                "residual": (float(r[i]) if ok[i] else None),
-                "reason": (None if ok[i] else "the photo has no horizon at this azimuth"),
-            }
+            _record(f, used=True, residual=(float(r[i]) if ok[i] else None),
+                    reason=(None if ok[i] else "the photo has no horizon at this azimuth"))
             for i, f in enumerate(used)
-        ]
-        + [
-            {
-                "az": float(f.az),
-                "alt": float(f.alt),
-                "bound": bool(f.bound),
-                "weight": float(f.weight),
-                "sigma": float(f.sigma),
-                "used": False,
-                "residual": None,
-                "reason": why[f.az],
-            }
-            for f in fids
-            if f.az in why
-        ],
+        ]  # fmt: skip
+        + [_record(f, used=False, residual=None, reason=why[f.az]) for f in fids if f.az in why],
     }

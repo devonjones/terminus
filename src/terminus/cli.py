@@ -586,7 +586,11 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
         if ceiling is None:
             search = fid_meta.get("alt_search") or []
             ceiling = float(search[1]) if len(search) > 1 else None
-        fiducials = orient_mod.from_mask(doc, ceiling=ceiling)
+        try:
+            fiducials = orient_mod.from_mask(doc, ceiling=ceiling)
+        except ValueError as e:
+            # A malformed hand-edited `exclude` gets the clean sentence (E-12).
+            raise MaskError(f"{args.fiducials}: {e}") from e
         n_bound = sum(1 for f in fiducials if f.bound)
         print(f"{len(fiducials)} fiducials from {args.fiducials} ({n_bound} at the ceiling)")
 
@@ -774,8 +778,9 @@ def _orient(sc, cfg, args):
         raise MaskError(f"{args.mask} has no columns to orient")
 
     fiducials = getattr(args, "fiducials", None)
+    excluded_by_mask = {}
     if fiducials:
-        measure, reachable = _fiducial_source(fiducials, args.uncertainty)
+        measure, reachable, excluded_by_mask = _fiducial_source(fiducials, args.uncertainty)
         should_stop = None
         state = {"profiles": {}}
         print(f"orienting against {len(fiducials)} fiducial mask(s): no telescope, no sky")
@@ -874,14 +879,30 @@ def _orient(sc, cfg, args):
             # published run used 16 of 30 and nothing on disk says which, so its
             # 0.69 deg is unreachable and incomparable (terminus-53, F-25).
             # Rounded, because this is a record for a person to read and diff,
-            # not a serialisation format.
+            # not a serialisation format. None-valued fields are OMITTED, reason
+            # included: this meta is serialised via repr, where a literal None
+            # round-trips through YAML as the STRING 'None' — an absent key is
+            # the honest spelling of "no reason: used cleanly" (E-06). Columns
+            # the MASK excluded appear too, marked excluded_by, because a record
+            # of the fit's inputs that silently omits the inputs someone removed
+            # is exactly the unreproducibility this field exists to end.
             fit_fiducials=[
                 {
                     k: (round(v, 3) if isinstance(v, float) else v)
                     for k, v in f.items()
-                    if v is not None or k == "reason"
-                }
+                    if v is not None
+                }  # noqa: E501
                 for f in solution.get("fiducials", [])
+            ]
+            + [
+                {
+                    "az": float(az),
+                    **({"alt": round(float(e["alt"]), 3)} if e.get("alt") is not None else {}),
+                    "used": False,
+                    "reason": e["reason"],
+                    "excluded_by": "mask",
+                }
+                for az, e in sorted(excluded_by_mask.items())
             ],
             source_mask=os.path.abspath(args.mask),
         ),
@@ -913,13 +934,17 @@ def _fiducial_source(paths, uncertainty):
     is routinely split across arcs and nights — az 70-250 in one file and 260-350
     in another is the shape actually on disk.
 
-    Returns (measure, reachable). `reachable` confines the planner to azimuths a
-    fiducial exists for, so the adaptive chooser still does its real job of
-    ordering them by information gain rather than being handed a fixed list.
+    Returns (measure, reachable, excluded). `reachable` confines the planner to
+    azimuths a fiducial exists for, so the adaptive chooser still does its real
+    job of ordering them by information gain rather than being handed a fixed
+    list. `excluded` is {az: {"alt", "reason"}} for the columns the mask itself
+    removed — returned rather than merely printed, because the caller writes
+    the fit record and an exclusion that never reaches the file defeats the
+    record's whole purpose (terminus-53).
     """
     import yaml
 
-    from .orient import CEILING_EPS
+    from .orient import CEILING_EPS, exclusion_reason
 
     columns = {}
     excluded = {}
@@ -944,8 +969,15 @@ def _fiducial_source(paths, uncertainty):
             # the ordering SAFE-03 exists to get right: filter for feasibility
             # BEFORE ranking, so the criterion picks the best feasible
             # configuration rather than the best infeasible one plus a fallback.
-            if entry.get("exclude"):
-                excluded[int(az)] = str(entry["exclude"])
+            try:
+                reason = exclusion_reason(entry)
+            except ValueError as e:
+                # The typo gets the clean sentence too (E-12): main() reports
+                # MaskError; a bare ValueError would be the one failure with a
+                # five-second fix arriving as a raw traceback.
+                raise MaskError(f"{path}: az {az}: {e}") from e
+            if reason is not None:
+                excluded[int(az)] = {"alt": entry.get("alt"), "reason": reason}
                 continue
             columns.setdefault(int(az), (entry, ceiling))
 
@@ -979,12 +1011,12 @@ def _fiducial_source(paths, uncertainty):
         return {"alt": alt}, ceiling, uncertainty
 
     if excluded:
-        for az, reason in sorted(excluded.items()):
-            short = " ".join(reason.split())
+        for az, exc in sorted(excluded.items()):
+            short = " ".join(exc["reason"].split())
             if len(short) > 88:
                 short = short[:85] + "..."
             print(f"az {az:3d}: excluded by the mask — {short}", file=sys.stderr)
-    return measure, (lambda az: int(az) in columns)
+    return measure, (lambda az: int(az) in columns), excluded
 
 
 def _replay_source(args):

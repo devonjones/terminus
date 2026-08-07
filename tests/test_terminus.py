@@ -5713,6 +5713,105 @@ def test_a_column_excluded_in_the_mask_is_never_offered_to_the_planner():
     assert 10 not in excluded
 
 
+def test_a_falsy_exclude_is_refused_rather_than_read_as_not_excluded():
+    """E-12: truthiness fails open, and `exclude` is hand-edited.
+
+    `exclude: false`, `exclude: 0` and `exclude: ""` all look like exclusions to
+    the person who typed them; read by truthiness they all silently re-enter the
+    fit. The field's vocabulary is closed — a non-empty string reason — and
+    anything else raises. An excluded column with no altitude records the
+    author's reason, not "no altitude recorded": the hand-written reason is the
+    more informative of the two.
+    """
+    import pytest
+
+    from terminus.orient import exclusion_reason, from_mask
+
+    assert exclusion_reason({"alt": 10.0}) is None
+    assert exclusion_reason({"exclude": " dawn transition "}) == "dawn transition"
+    for bad in (False, True, 0, 1, "", "   ", ["x"]):
+        with pytest.raises(ValueError, match="exclude"):
+            exclusion_reason({"exclude": bad})
+        with pytest.raises(ValueError, match="exclude"):
+            from_mask({20: {"alt": 5.0, "type": "tree", "exclude": bad}})
+
+    excluded = {}
+    from_mask({20: {"exclude": "glare"}}, excluded=excluded)
+    assert excluded[20] == "glare", "the reason outranks 'no altitude recorded'"
+
+
+def test_the_cli_writes_mask_exclusions_into_the_fit_record(tmp_path):
+    """terminus-53 at the CLI layer, where round 1 found it missing twice over.
+
+    `_fiducial_source` filtered excluded columns and printed them to stderr —
+    and nothing else. The written mask's `fit_fiducials` never heard of them,
+    so the one artifact the PR exists to create silently omitted the inputs
+    someone removed; and no test exercised the CLI path at all, so both the
+    filter and the record could be deleted with the suite green (both
+    mutations demonstrated on review round 1). Also pinned here: a used
+    fiducial has NO `reason` key in the file — this meta is serialised via
+    repr, where a literal None round-trips through YAML as the STRING 'None'.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import yaml
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {a: (20.0 + 5.0 * (a % 20 == 0), "structure") for a in range(0, 360, 10)}
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    fid = tmp_path / "sweep.yaml"
+    fid.write_text(
+        yaml.safe_dump(
+            {
+                "meta": {"alt_search": [0, 60]},
+                "horizon": {
+                    0: {"alt": 20.0, "type": "structure"},
+                    90: {"alt": 25.0, "type": "structure"},
+                    180: {"alt": 20.0, "type": "structure"},
+                    270: {"alt": 15.0, "type": "structure"},
+                    20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"},
+                },
+            }
+        )
+    )
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=[str(fid)], seed=3,
+        max_columns=5, window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None,
+        dry_run=False, frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    canned = {
+        "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+        "n": 4, "n_bound": 0, "residuals": {0.0: 0.1},
+        "fiducials": [
+            {"az": 0.0, "alt": 20.0, "bound": False, "weight": 1.0, "sigma": 1.0,
+             "used": True, "residual": 0.1, "reason": None},
+        ],
+    }  # fmt: skip
+    with patch.object(guide, "fit", return_value=canned):
+        cli.cmd_orient(None, {"site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600}}, args)
+
+    meta = yaml.safe_load(out.read_text())["meta"]
+    record = {f["az"]: f for f in meta["fit_fiducials"]}
+    assert 20.0 in record, "the mask's exclusion must reach the written record"
+    assert record[20.0]["used"] is False
+    assert record[20.0]["reason"] == "dawn transition"
+    assert record[20.0]["excluded_by"] == "mask"
+    assert record[20.0]["alt"] == 32.5
+    assert 20.0 not in meta["fit_columns"], "an excluded column must never enter the fit"
+    assert "reason" not in record[0.0], (
+        "a used column carries no reason key: repr-serialised None reads back "
+        "as the string 'None', so absence is the only honest spelling"
+    )
+    assert all(v != "None" for f in meta["fit_fiducials"] for v in f.values())
+
+
 def test_a_column_at_its_ceiling_is_a_bound_however_it_is_typed():
     """M-09, applied to the masks that are actually on disk.
 
@@ -6012,7 +6111,7 @@ def test_orient_keeps_what_it_measured(tmp_path):
                 "n": 4,
                 "n_bound": 0,
                 "residuals": {0.0: 0.1},
-                "dropped": [],
+                "fiducials": [],
             },
         ),
     ):
