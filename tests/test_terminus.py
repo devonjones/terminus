@@ -1206,7 +1206,9 @@ def _sweep_with_failures(fail_azimuths):
         return az, alt
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),  # night: guard stands down
+        patch.object(
+            Sky, "sun", lambda self: (297.0, -5.0)
+        ),  # dusk: guard stands down, day channel
         patch.object(Pointer, "point_to", point_to),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
     ):
@@ -1374,7 +1376,7 @@ def test_the_refine_loop_also_survives_a_pointing_failure():
         return (10.0 if az % 120 == 0 else 40.0), "edge", "tree", []
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", point_to),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
         patch("terminus.sweep.scan_horizon", fake_scan),
@@ -1491,7 +1493,7 @@ def test_the_sky_reference_seeding_swallows_a_pointing_failure():
         return az, alt
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", point_to),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
     ):
@@ -2076,9 +2078,9 @@ def test_a_scope_mask_gains_no_photo_field_header(tmp_path):
     plain = tmp_path / "scope.yaml"
     write_mask(str(plain), {0: (12.0, "tree"), 90: (30.5, "structure")}, [180], {"lat": 40})
     head = [ln for ln in plain.read_text().splitlines() if ln.startswith("#")]
-    assert not any("clipped" in ln or "gap_fraction" in ln for ln in head), (
-        "a scope mask must not explain fields it does not carry"
-    )
+    assert not any(
+        "clipped" in ln or "gap_fraction" in ln for ln in head
+    ), "a scope mask must not explain fields it does not carry"
     assert any("POSITION-SPECIFIC" in ln for ln in head), "the position note is universal"
     # The count is still asserted. Dropping it for substring checks alone lost
     # the ability to catch unrelated header bloat, which is what this test was
@@ -2977,7 +2979,7 @@ def test_run_sweep_scans_an_explicit_list_not_a_grid():
         return 20.0, "edge", "tree", []
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
         patch("terminus.sweep.scan_horizon", fake_scan),
@@ -2987,6 +2989,141 @@ def test_run_sweep_scans_an_explicit_list_not_a_grid():
         )
     assert seen == [55, 57, 82, 172], f"scanned {seen}"
     assert sorted(mask) == [55, 57, 82, 172]
+
+
+def test_the_sweep_measures_with_the_night_eye_when_the_sun_is_down():
+    """I-15 wired into the sweep: after dark the scenery stream is blind.
+
+    Before this, `run_sweep` measured every column with the day detector on the
+    scenery stream whatever the clock said, and a sweep run after dark returned
+    confident darkness rather than measurements (S-04's direction). Now the
+    channel follows the Sun: below NIGHT_SUN_ALT the star-mode imaging channel
+    and `scan_horizon_night` carry the column, and the profile is recorded WITH
+    its channel so a replay cannot judge raw16 medians with the RGB judge (F-13).
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    night_seen, day_seen = [], []
+    prof = [(45.0, 900.0), (40.0, 880.0), (35.0, 100.0)]
+
+    def fake_night(ptr, sc_, az, *a, **k):
+        night_seen.append(az)
+        return 37.5, "edge(night)", "", list(prof)
+
+    def fake_day(ptr, sc_, az, *a, **k):
+        day_seen.append(az)
+        return 20.0, "edge", "tree", []
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),  # full dark
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch("terminus.sweep.scan_horizon_night", fake_night),
+        patch("terminus.sweep.scan_horizon", fake_day),
+    ):
+        mask, _, profiles = run_sweep(
+            sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[55, 82]
+        )
+
+    assert night_seen == [55, 82], f"night scanner must carry the columns, saw {night_seen}"
+    assert day_seen == [], "the day detector must never touch a night column"
+    sc.start_view.assert_called_with("star")
+    sc.lock_exposure.assert_not_called()  # star mode manages its own exposure
+    assert profiles[55] == {
+        "channel": "star4800",
+        "profile": prof,
+    }, "a night profile must carry its channel, or replay judges raw16 with the RGB judge"
+    assert mask[55] == {"alt": 37.5, "type": "", "bound": False}
+
+
+def test_a_sweep_crossing_twilight_switches_channels_mid_run():
+    """The regime is re-decided per column, because a sweep spans hours.
+
+    A run that starts at dusk and ends in the dark must not carry the day eye
+    across the boundary (M-17's confound, S-04's failure direction) — and the
+    switch must happen ONCE, at the boundary, not per column.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    # One Sun reading at run start, then one per column: dusk, dusk, dark.
+    suns = iter([(297.0, -8.0), (297.0, -8.0), (297.0, -13.0)])
+    night_seen, day_seen = [], []
+
+    with (
+        patch.object(Sky, "sun", lambda self: next(suns)),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch(
+            "terminus.sweep.scan_horizon_night",
+            lambda ptr, sc_, az, *a, **k: (night_seen.append(az), (30.0, "edge(night)", "", []))[1],
+        ),
+        patch(
+            "terminus.sweep.scan_horizon",
+            lambda ptr, sc_, az, *a, **k: (day_seen.append(az), (20.0, "edge", "tree", []))[1],
+        ),
+    ):
+        run_sweep(sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[10, 20])
+
+    assert day_seen == [10], f"the dusk column belongs to the day eye, saw {day_seen}"
+    assert night_seen == [20], f"the dark column belongs to the night eye, saw {night_seen}"
+    started = [c.args[0] for c in sc.start_view.call_args_list]
+    assert started == ["scenery", "star"], f"one switch, at the boundary, not per column: {started}"
+
+
+def test_replay_judges_a_night_column_with_the_night_judge():
+    """F-13 for profiles: a raw16 night median judged by the RGB day rule is wrong.
+
+    The night column here is a Bortle-8 shape the day judge mishandles — skyglow
+    brightening toward the horizon, then a persistent unrecovered drop (M-23).
+    The channel travels with the profile, so replay re-judges it with
+    `night_find_edge` (D-16: judge is code, data is data) and lands on the
+    coarse bracket's midpoint. A plain-list column keeps the day judge, so old
+    profiles files replay unchanged.
+    """
+    import pytest
+
+    from terminus import guide
+
+    night_rows = [
+        [50.0, 200.0], [45.0, 210.0], [40.0, 225.0], [35.0, 245.0],
+        [30.0, 270.0], [25.0, 60.0], [20.0, 55.0], [15.0, 50.0], [10.0, 45.0],
+    ]  # fmt: skip
+    day_rows = [[50.0, 120.0], [45.0, 118.0], [40.0, 20.0], [35.0, 18.0]]
+    measure = guide.replay(
+        {"90": {"channel": "star4800", "profile": night_rows}, "100": day_rows},
+        uncertainty=1.0,
+    )
+
+    got = measure(90)
+    assert got is not None and got[0] is not None, "the night edge must be found"
+    assert (
+        got[0]["alt"] == 27.5
+    ), f"the coarse bracket's midpoint, judged by night_find_edge, got {got[0]}"
+    day = measure(100)
+    assert (
+        day is not None and day[0] is not None and "alt" in day[0]
+    ), "a plain-list column must keep the day judge and still resolve"
+    with pytest.raises(ValueError, match="channel"):
+        guide.replay({"90": {"channel": "rtsp", "profile": night_rows}})
 
 
 def test_an_explicit_sweep_merges_rather_than_replaces(tmp_path, monkeypatch):
@@ -3243,9 +3380,9 @@ def test_a_truncated_sweep_is_visible_in_the_file_and_the_exit_code(tmp_path):
     # 3. A complete patch over a truncated mask CLEARS the flag.
     sweep(out, Deadline(fires=False), azimuths="90")
     meta, cols = load_columns(str(out))
-    assert not meta.get("stopped_early"), (
-        "a mask since completed must stop claiming it was cut short"
-    )
+    assert not meta.get(
+        "stopped_early"
+    ), "a mask since completed must stop claiming it was cut short"
     assert 90 in cols, "and the merge still did its actual job"
 
 
@@ -3272,7 +3409,7 @@ def test_duplicate_azimuths_are_measured_once():
         return 20.0, "edge", "tree", []
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
         patch("terminus.sweep.scan_horizon", fake_scan),
@@ -3549,9 +3686,9 @@ def test_a_heuristic_mask_claims_no_photo_type_it_never_segmented(tmp_path):
     assert cols, "the fixture must produce columns for this to mean anything"
     for az, col in cols.items():
         assert col["type"] == "", f"az {az}: the heuristic backend names nothing"
-        assert col.get("type_source") is None, (
-            f"az {az}: no type was measured, so no source may be claimed"
-        )
+        assert (
+            col.get("type_source") is None
+        ), f"az {az}: no type was measured, so no source may be claimed"
 
 
 def test_a_scope_measured_column_records_that_the_scope_named_it(tmp_path):
@@ -4882,9 +5019,9 @@ def test_a_curved_but_open_sky_is_not_mistaken_for_terrain():
         reasons[power] = detail["reason"]
     assert "open" in reasons[0.5], f"shallow dimming reads as open, got {reasons[0.5]!r}"
     for power in (1.5, 3.0):
-        assert "no usable sky model" in reasons[power], (
-            f"steep dimming must refuse outright, got {reasons[power]!r}"
-        )
+        assert (
+            "no usable sky model" in reasons[power]
+        ), f"steep dimming must refuse outright, got {reasons[power]!r}"
 
 
 def test_a_lit_wall_filling_the_frame_is_not_sky_with_a_horizon_under_it():
@@ -4929,9 +5066,9 @@ def test_a_steeply_graded_column_is_not_mistaken_for_a_glint():
     # The model must pass through the TOP of the column. A positive slope alone
     # is not enough to prove that — the median screen also produced one, fitted
     # to the tail — so this checks where the line actually sits.
-    assert abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0, (
-        "the fit must pass near the topmost sample, not the flat tail beneath it"
-    )
+    assert (
+        abs(model["slope"] * 60.0 + model["intercept"] - 100.0) < 10.0
+    ), "the fit must pass near the topmost sample, not the flat tail beneath it"
     assert n_top >= 4
 
 
@@ -4952,9 +5089,9 @@ def test_one_glint_at_the_top_does_not_discard_the_whole_column():
     for factor in (3.0, 5.0, 10.0):
         glinted = [(prof[0][0], prof[0][1] * factor)] + prof[1:]
         alt, detail = find_horizon(glinted)
-        assert alt == clean, (
-            f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
-        )
+        assert (
+            alt == clean
+        ), f"a {factor}x glint in the top sample changed the answer to {alt} ({detail['reason']})"
 
 
 def test_every_refusal_path_is_exercised_not_merely_written():
@@ -5165,7 +5302,10 @@ def test_a_blocked_column_reaches_the_mask_as_a_bound(tmp_path):
         """
 
         def sun(self):
-            return 270.0, -30.0
+            # -5: below SUN_SAFE_ALT so the guard stands down, above
+            # NIGHT_SUN_ALT so the sweep keeps the day channel this test's
+            # patched scanner belongs to.
+            return 270.0, -5.0
 
     sky = NightSky(39.7917, -104.894, 1600)
     sc = MagicMock()
@@ -5240,9 +5380,9 @@ def test_the_sweep_stops_itself_when_the_window_closes(tmp_path):
 
     stopped = sweep(closes_after_three)
     full = sweep(None)
-    assert len(stopped) < len(full), (
-        f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
-    )
+    assert len(stopped) < len(
+        full
+    ), f"the deadline must shorten the run: {len(stopped)} measured with it, {len(full)} without"
     assert len(stopped) > 0, "and what was measured before it closed is kept"
     # A sweep that stops is not a sweep that failed.
     assert all("alt" in c for c in stopped.values())
@@ -5395,9 +5535,9 @@ def test_a_column_is_checked_along_its_whole_length_not_just_its_ends():
     sky = FixedSky()
     for az in range(0, 360, 5):
         closest = min(ang_sep(az, alt / 2.0, 271.0, 25.5) for alt in range(0, 121))
-        assert column_touches_sun(sky, az, 0, 60, 30) == (closest < 30), (
-            f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
-        )
+        assert column_touches_sun(sky, az, 0, 60, 30) == (
+            closest < 30
+        ), f"az {az}: closest approach {closest:.1f} deg disagrees with the guard"
 
     # The two that were wrong, named so a regression is unmistakable.
     assert column_touches_sun(sky, 250, 0, 60, 30), "az 250 passes 19.1 deg from the Sun"
@@ -5760,9 +5900,9 @@ def test_a_night_checkpoint_is_rejudged_by_the_current_detector(tmp_path):
         got = measure(120)
         assert got is not None, "the re-judged column must be served"
         edge, ceiling, _unc = got
-        assert edge is not None and edge["alt"] == 42.5, (
-            f"blocked -> edge under the current detector, at the bracket midpoint; got {edge}"
-        )
+        assert (
+            edge is not None and edge["alt"] == 42.5
+        ), f"blocked -> edge under the current detector, at the bracket midpoint; got {edge}"
     finally:
         for p in patches:
             p.stop()
@@ -5825,9 +5965,9 @@ def test_the_night_detector_reads_real_profiles_the_way_the_sky_did():
         profile = [(a, lum) for a, lum in fx["profile"]]
         idx, verdict = night_find_edge(profile)
         want_verdict, want_alt = fx["expect"]
-        assert verdict == want_verdict, (
-            f"az {az}: {verdict!r}, want {want_verdict!r} ({fx['ground_truth']})"
-        )
+        assert (
+            verdict == want_verdict
+        ), f"az {az}: {verdict!r}, want {want_verdict!r} ({fx['ground_truth']})"
         if want_alt is not None:
             assert idx is not None and profile[idx][0] == want_alt, (
                 f"az {az}: edge above {profile[idx][0] if idx is not None else None}, "
@@ -5855,9 +5995,9 @@ def test_a_second_imaging_death_costs_one_column_not_the_night(tmp_path):
         assert got is None, "a dead column yields no constraint, not an exception"
         assert calls["n"] == 2, "the column gets exactly one view-restart retry"
         lines = [_json.loads(x) for x in open(tmp_path / "out_fiducials.jsonl")]
-        assert lines and lines[-1]["verdict"] == "failed", (
-            "the attempt must be on disk with its reason"
-        )
+        assert (
+            lines and lines[-1]["verdict"] == "failed"
+        ), "the attempt must be on disk with its reason"
         # and the loop is still alive for the next column
         assert measure(130) is None
         assert calls["n"] == 4
@@ -6002,9 +6142,9 @@ def test_both_ways_round_the_ra_circle_are_offered():
         # No single leg may exceed the split, or a goto could take the short way.
         prev = rd0
         for wp in wps:
-            assert abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
-                f"{name} has a leg a goto could shortcut"
-            )
+            assert (
+                abs(wrap_ra(wp[0] - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+            ), f"{name} has a leg a goto could shortcut"
             prev = wp
 
 
@@ -6068,9 +6208,9 @@ def test_route_waypoints_are_coordinates_the_mount_can_accept():
                 for ra, dec in waypoints:
                     assert 0.0 <= ra < 24.0, f"{name}: RA {ra} is not a coordinate"
                     assert -90.0 <= dec <= 90.0, f"{name}: Dec {dec} is not a coordinate"
-                    assert abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9, (
-                        f"{name}: a leg long enough for a goto to shortcut"
-                    )
+                    assert (
+                        abs(wrap_ra(ra - prev[0])) <= ptr.MAX_RA_LEG_H + 1e-9
+                    ), f"{name}: a leg long enough for a goto to shortcut"
                     prev = (ra, dec)
                 assert abs(wrap_ra(waypoints[-1][0] - rd1[0])) < 1e-9, f"{name} misses in RA"
                 assert abs(waypoints[-1][1] - rd1[1]) < 1e-9, f"{name} misses in declination"
@@ -6116,9 +6256,9 @@ def test_one_false_bound_cannot_capture_the_fit():
         good + [false_bound], sample, yaw_step=2.0, tilt_max=6.0, tilt_step=3.0, pitch_range=6.0
     )
     swing = abs(((poisoned["yaw"] - clean["yaw"] + 180) % 360) - 180)
-    assert swing < 15.0, (
-        f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
-    )
+    assert (
+        swing < 15.0
+    ), f"one false bound moved the yaw by {swing:.0f} deg; on 2026-08-05 it moved it by 164"
 
 
 def test_a_bound_needs_contrast_that_stands_clear_of_the_column_s_own_scatter():
@@ -6304,9 +6444,9 @@ def test_a_tube_inside_the_cone_can_still_be_moved_out():
 
     assert legs, "it must move rather than refuse"
     final = sky.radec_to_altaz(*landed["rd"])
-    assert ang_sep(*final, 270.0, 20.0) >= 30.0, (
-        f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
-    )
+    assert (
+        ang_sep(*final, 270.0, 20.0) >= 30.0
+    ), f"ended at {final} — still {ang_sep(*final, 270.0, 20.0):.1f} deg from the Sun"
 
 
 def test_the_way_out_is_a_turn_not_a_descent():
@@ -6344,9 +6484,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
                 here = ang_sep(az, alt, 270.0, sun_alt)
                 cw = ang_sep((az + step) % 360, alt, 270.0, sun_alt)
                 ccw = ang_sep((az - step) % 360, alt, 270.0, sun_alt)
-                assert max(cw, ccw) > here or here > 60.0, (
-                    f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
-                )
+                assert (
+                    max(cw, ccw) > here or here > 60.0
+                ), f"neither turn helps at az {az} alt {alt}, {here:.1f} deg out"
 
                 target = ptr.escape_target(az, alt)
                 assert ang_sep(*target, 270.0, sun_alt) >= ptr.cone + ptr.ESCAPE_MARGIN_DEG - 1e-9
@@ -6355,9 +6495,9 @@ def test_the_way_out_is_a_turn_not_a_descent():
 
         assert trapped, f"Sun at {sun_alt}: the probe found nothing trapped"
         if sun_alt <= 40.0:
-            assert turned == trapped, (
-                f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
-            )
+            assert (
+                turned == trapped
+            ), f"Sun at {sun_alt}: {trapped - turned} of {trapped} needed more than a turn"
         else:
             # A high summer Sun leaves near-zenith pointings where azimuth barely
             # moves the tube. Those fall back to the descent, which is what the
@@ -6409,9 +6549,9 @@ def test_an_escape_that_succeeds_is_verified_against_where_the_tube_ACTUALLY_is(
     ptr, at = trapped(obedient=True)
     assert ang_sep(at["az"], at["alt"], *sky.sun()) < ptr.cone, "the premise: it starts trapped"
     out = ptr.escape()
-    assert ang_sep(*out, *sky.sun()) >= ptr.cone, (
-        f"escape returned {out} which is still inside the cone"
-    )
+    assert (
+        ang_sep(*out, *sky.sun()) >= ptr.cone
+    ), f"escape returned {out} which is still inside the cone"
     assert out == (at["az"], at["alt"]), "it must report where the tube IS, not where it aimed"
 
     # A mount that takes the commands and does not move is the dangerous case,
@@ -6680,9 +6820,9 @@ def test_a_tied_turn_goes_against_the_sun_s_own_drift():
         ptr = Pointer(MagicMock(), sky, 30, 5, True)
         assert (ptr.sun_drift() > 0) == (rate > 0), "the drift must be measured, not guessed"
         # A tube directly above the Sun: both turns are identical by symmetry.
-        assert ptr.escape_turn(270.0, 25.0) == expected, (
-            f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
-        )
+        assert (
+            ptr.escape_turn(270.0, 25.0) == expected
+        ), f"with the Sun drifting {rate:+} deg/min the tie must turn {expected:+}"
 
     # And a test double with no clock still gets an answer, from the hemisphere.
     class Frozen(Sky):
@@ -6728,12 +6868,12 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
         ptr._goto_wait(8.604, 60.43, 0.1)
     elapsed = time.time() - started
 
-    assert elapsed < NO_PROGRESS_S + 15, (
-        f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
-    )
-    assert "stopped improving" in str(exc.value), (
-        "it must say the mount moved but would not converge, not that it never moved"
-    )
+    assert (
+        elapsed < NO_PROGRESS_S + 15
+    ), f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+    assert "stopped improving" in str(
+        exc.value
+    ), "it must say the mount moved but would not converge, not that it never moved"
 
 
 def test_a_mount_that_never_moves_is_reported_differently():

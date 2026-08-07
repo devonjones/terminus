@@ -51,7 +51,7 @@ its own frame).
 | Scope sweep, mask, exports, `Horizon` queries | **Working, on the CLI** |
 | Photo registration and segmentation | **Working, on the CLI** (`mosaic`, `skymask`) |
 | Orientation fit and adaptive column choice | **Working, on the CLI** (`orient`) |
-| Night measurement channel | **Working, on the CLI** — `orient` selects it by Sun altitude; `sweep` is still day-eye only |
+| Night measurement channel | **Working, on the CLI** — `orient` picks it at run start; `sweep` re-picks per column as the Sun crosses −12° |
 
 Run end to end on real hardware for the first time on 2026-08-05: nineteen phone
 frames to a solved orientation, with the yaw reproducing exactly across two
@@ -220,10 +220,10 @@ sudo apt install ffmpeg hugin-tools        # macOS: brew install ffmpeg hugin
 
 # optional, the segmentation backend for `skymask`/`mosaic --segment`;
 # without it the colour heuristic stands in, which is markedly worse.
-# The CPU wheels are ~200 MB; plain `pip install torch` pulls the CUDA
-# build, which is gigabytes.
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install transformers
+# The extra is pinned to CPU wheels (~200 MB) on Linux/Windows; plain
+# `pip install torch` would pull the CUDA build, which is gigabytes.
+uv sync --extra segment    # pip users: pip install -e '.[segment]' --extra-index-url
+                           #   https://download.pytorch.org/whl/cpu
 
 cp config.example.toml config.toml   # edit host + pem path. Scope commands
                                      # only: mosaic/skymask/orient --fiducials/
@@ -346,29 +346,32 @@ scope-only sweep can honestly support.
 ### Reproduce it without a telescope
 
 The whole pipeline, photographs to a page you can look at, with no hardware and
-no clear night. Every command below is the real one; the numbers are what this
-produced on 2026-08-06 from the 19 frames in `captures/panoramas/2026-08-03-frames/`
-and the telescope sweeps in `captures/2026-08-03-evening/`.
+no clear night — provided a sweep has already measured some columns for the same
+spot (yours from an earlier night, or someone else's). The capture data behind
+the published run is deliberately **not** in the repo: `captures/` is
+git-ignored, because photographs of a home and the horizon of one backyard are
+position-specific and private. So the commands below take *your* frames and
+*your* sweep masks; the numbers in the table are what our 2026-08-06 run
+produced, to shape-check yours against.
 
 ```bash
 # 1. register the frames and segment each one  (~4 minutes)
-terminus mosaic captures/panoramas/2026-08-03-frames --out pano --segment
+terminus mosaic ~/horizon-frames --out pano --segment
 
 # 2. read the skyline off the result  (~1 minute)
 terminus skymask pano.png --coverage pano.coverage.npy --classes pano.classes.npy \
   --out photo_mask.yaml
 
-# 3. solve the rotation against columns the telescope already measured
+# 3. solve the rotation against columns a sweep already measured
 terminus orient photo_mask.yaml \
-  --fiducials captures/2026-08-03-evening/horizon_part2.yaml \
-  --fiducials captures/2026-08-03-evening/horizon_west.yaml \
+  --fiducials sweep_east.yaml --fiducials sweep_west.yaml \
   --out oriented.yaml
 
 # 4. look at it
-terminus polar oriented.yaml --fiducials captures/2026-08-03-evening/horizon_part2.yaml
+terminus polar oriented.yaml --fiducials sweep_east.yaml
 ```
 
-What each step should tell you:
+What each step told us on the published data:
 
 | Step | Expect |
 |---|---|
@@ -389,7 +392,7 @@ that were hardest to measure — a smaller fiducial set will almost always show 
 smaller residual whether or not it is closer to the truth. What is comparable is
 the geometry: tilt lands within 0.2° of the published 2.81°, and yaw within
 about 2° of 135.81°. Those published figures, and how that run was built, are
-in [PANORAMA-PIPELINE.md](PANORAMA-PIPELINE.md).
+in [docs/PANORAMA-PIPELINE.md](docs/PANORAMA-PIPELINE.md).
 
 The step that would need a telescope is the one supplying `--fiducials`. Those
 columns came from two evening sweeps; measuring your own is `terminus sweep`, or
@@ -404,13 +407,12 @@ than hidden.
 **Do not let a run straddle dusk or dawn.** As the sky darkens, a column the
 day detector can no longer resolve is recorded as *blocked above the search
 ceiling* — a one-sided claim the fit treats as strong evidence. One such column
-moved a solved yaw by **164°**. `orient` now picks its eye from the Sun's
-altitude at run start — below −12° it measures on the night channel — but the
-choice is per run, not per column, so a run that starts in daylight and ends
-after dark still crosses regimes with the wrong detector. Run in daylight, in
-twilight, or under a settled dark sky, not across the change; heading into
-dawn, `--stop-above-sun-alt -18` ends the run before the sky turns. `sweep`
-has no night eye at all — see **When to run it**.
+moved a solved yaw by **164°**. Both commands now pick their eye from the
+Sun's altitude, differently: `sweep` re-decides per column and switches
+channels at the −12° boundary mid-run, so a dusk-into-dark circle is the
+supported case; `orient` chooses once at run start, so an orient run should
+stay on one side of the boundary. Heading into dawn, `--stop-above-sun-alt
+-18` ends either run cleanly before the sky turns.
 
 **A sweep interrupted loses everything it measured.** The mask is written once,
 at the end. Ctrl-C forty minutes in and forty minutes are gone.
@@ -497,13 +499,12 @@ Two things matter:
   fastest. `az_step = 10` halves it, more coarsely. Within a column the scan is
   not a fixed ladder — it walks down from `alt_max` and bisects onto the
   brightness step to `alt_tol`. The open-sky reference is re-measured as the run
-  proceeds, so a sweep rides the fading light through twilight — but **not into
-  full dark**. `sweep` reads the scenery stream, and that stream goes blind
-  once the Sun is well down (the ISP pins its exposure whatever is asked;
-  measured at Sun −12°, sky and terrain differed by 0.02 counts in 255). A
-  sweep that runs past that point returns confident darkness, not
-  measurements. Stop there; night columns belong to `terminus orient`, which
-  is the command with the night eye.
+  proceeds, so a sweep rides the fading light through twilight — and **when the
+  Sun crosses −12° it switches to the night channel** (star-mode imaging, 2 s
+  frames, the skyglow-gradient detector) rather than letting the scenery
+  stream go blind under it. Night columns carry no obstruction type — every
+  silhouette is neutral after dark — and their saved profiles are marked with
+  the channel so a replay judges them with the night judge.
 - **Under a strong light dome, order matters.** Directions facing away from
   town are legitimately darker and are the first to fail as twilight fades —
   and a circular sweep visits azimuths in time order, so those failures
@@ -551,40 +552,12 @@ Azimuth is true-north, increasing toward east.
 
 ## Prior art
 
-Photographing a skyline to get an obstruction profile is not new.
-
-- **[Georg Zotti's Stellarium landscape tutorial](https://www.archeoastronomy.org/assets/downloads/slides/ast/ast-12_seac2025-stellarium-landscape-course-notes.pdf)**
-  (SEAC2025) documents the Hugin sequence terminus automates, and is the
-  authoritative reference for `polygonal_horizon_list`, `angle_rotatez` and
-  `maptex_top`/`bottom`.
-- **`.hrz` generators**: [HRZ-Creator](https://neuronburner.com/hrz-creator/) and
-  [panorama-horizon-maker](https://github.com/danngalann/panorama-horizon-maker).
-  Both trace the skyline manually and set north by hand.
-- **The N.I.N.A. Horizon Creator plugin** — phone frames at horizon inflections,
-  angles from a phone alt/az app, skyline read by eye.
-- **The solar industry, commercially, twenty years ago.** The
-  [Solmetric SunEye 210](https://www.solmetric.com/product/suneye-210-shade-tool/)
-  is a calibrated fisheye with compass, tilt sensor and GPS producing horizon
-  altitude per degree of azimuth, exported as `.HOR` for PVsyst. Also
-  HORIcatcher/Meteonorm and Solar Pathfinder.
-- **Ecosystem neighbours**:
-  [clear-horizons](https://github.com/njefferson/clear-horizons) solves north from
-  the Sun; [seestar-mcp](https://github.com/OrangeAgente/seestar-mcp) infers
-  obstruction arcs from where plate solving fails.
-- **Closest published work**: Mephisto unobservable-region segmentation and
-  LenghuSky-8 — all-sky cameras with star-based calibration, where the static
-  obstructions are a *hand-drawn* mask rather than a segmentation output.
-
-What this project has not found elsewhere is the combination: segmentation as the
-sky/terrain decision with obstruction **type** carried into the export; a
-telescope used as a fiducial source for a three-parameter orientation solve;
-information-gain choice of the next column with a stopping rule on parameter
-*stability* rather than residual; ceiling-limited columns as one-sided censored
-bounds; and a night detector built *on* the skyglow gradient rather than
-subtracting it.
-
-That search was not exhaustive — the amateur-forum record was only sampled. If
-you know of prior work here, please open an issue.
+Photographing a skyline to get an obstruction profile is not new — the solar
+industry sold calibrated fisheye horizon tools twenty years ago, and Stellarium
+documents the Hugin sequence terminus automates. What we have not found
+elsewhere is the combination terminus is built on; the survey, and what makes
+this one different, is in [docs/prior-art.md](docs/prior-art.md). If you know of
+prior work, please open an issue.
 
 ## Credits
 

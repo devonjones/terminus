@@ -34,7 +34,7 @@ PR branch, and never mix code + beads in one commit. Create issues with
   `uv run pytest -q`.
 - uv-managed: `uv sync --dev`; the lockfile (`uv.lock`) is committed.
 - Review conventions live in `AGENT-REVIEWERS.md` (consumed by pr-review-loop).
-- `PANORAMA-PIPELINE.md` reconstructs how the published photo mosaic and orientation
+- `docs/PANORAMA-PIPELINE.md` reconstructs how the published photo mosaic and orientation
   fit were actually built — inputs, code state, parameters and traps. Read it before
   attempting to rebuild the mosaic. The source frames are the 19 individual photos in
   `captures/panoramas/2026-08-03-frames/`, **not** the stitched panoramas in

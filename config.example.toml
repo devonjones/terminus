@@ -2,13 +2,13 @@
 # Only [scope] is required. [site] can be omitted (read from the scope).
 
 [scope]
-host = "10.5.2.65"                            # your Seestar's IP (a static lease helps)
+host = "192.168.1.50"                         # your Seestar's IP (a static lease helps)
 pem  = "~/.seestar/seestar_client_key.pem"   # interop key; see README (never commit this)
 
 [site]                       # optional — omit to use the location stored on the scope
-# lat = 39.7917              # degrees north
-# lon = -104.894            # degrees east (west is negative)
-# elev_m = 1600
+# lat = 31.9583              # degrees north            (example: Kitt Peak)
+# lon = -111.5967           # degrees east (west is negative)
+# elev_m = 2096
 
 [sweep]
 az_step       = 5     # azimuth step, degrees (5 = 72 spokes; 10 is quicker/coarser)

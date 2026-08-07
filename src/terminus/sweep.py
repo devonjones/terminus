@@ -864,6 +864,36 @@ NIGHT_DROP_FRAC = 0.20  # a real edge falls at least this fraction of the runnin
 NIGHT_NEG_FRAC = 0.08  # sky never darkens by more than this in one step
 
 
+def set_channel(sc, night, sw=None, log=print):
+    """Switch the camera to the channel that can see the current sky.
+
+    Night: the star-mode imaging channel — the scenery stream is blind after
+    dark (see NIGHT_SUN_ALT above), and star mode's own pipeline manages
+    exposure, so no lock is set. Day: the scenery stream with the exposure
+    LOCKED, because auto-exposure renormalises every frame toward mid-grey and
+    cancels the sky-versus-terrain difference the measurement depends on.
+
+    THE ORDER IS NOT THE OBVIOUS ONE and cost a run to find. The lock must be
+    set while the view is RUNNING: with the view stopped the scope accepts the
+    call and silently keeps auto-exposure, reporting the -999000 sentinel. And
+    the stop before the start is needed for a different reason — an existing
+    lock cannot be CHANGED in place; a second lock_exposure in the same session
+    keeps the first value, so the view has to be cycled to clear it.
+    """
+    sc.stop_view()
+    time.sleep(1)
+    if night:
+        sc.start_view("star")
+        time.sleep(6)
+        log("channel: star-mode imaging (night), 2 s frames", flush=True)
+    else:
+        sw = sw or {}
+        sc.start_view("scenery")
+        time.sleep(3)
+        locked = sc.lock_exposure(exp_ms=sw.get("exp_ms"), gain=sw.get("gain"))
+        log(f"channel: scenery (day), exposure locked: {locked}", flush=True)
+
+
 def night_find_edge(profile):
     """Locate the sky->terrain boundary in a NIGHT column profile.
 
@@ -1291,12 +1321,21 @@ def run_sweep(
     saz, salt = sky.sun()
     log(f"Sun az {saz:.0f} alt {salt:.0f}", flush=True)
     mask, skipped, profiles = {}, [], {}
+    # THE CHANNEL FOLLOWS THE SUN, per column rather than per run: a sweep spans
+    # hours and legitimately crosses twilight, which is exactly when the scenery
+    # stream goes blind (NIGHT_SUN_ALT above). The day detector on the night sky
+    # returns confident darkness, not measurements — a whole hemisphere was once
+    # recorded as blocked that way (S-04).
+    night = bool(salt < NIGHT_SUN_ALT)
+    if not dry:
+        set_channel(sc, night, cfg, log)
     # Seed the open-sky brightness from a near-zenith frame, opposite the Sun.
     # Without it the first column has nothing to compare against, and a fully
-    # blocked column is indistinguishable from a clear one.
+    # blocked column is indistinguishable from a clear one. Day only: the night
+    # judge works from each column's own gradient and needs no reference.
     sky_ref = None
     misses = 0  # consecutive pointing failures; see MAX_POINTING_MISSES
-    if not dry:
+    if not dry and not night:
         try:
             zen_az = (saz + 180.0) % 360.0
             ptr.point_to(zen_az, 75.0)
@@ -1329,7 +1368,8 @@ def run_sweep(
         # once-measured reference stays pinned at its daylight value. Everything
         # is then judged against a sky that no longer exists, and every remaining
         # column reports "blocked" — a whole hemisphere lost to a stale number.
-        if sky_ref is not None and time.time() - ref_taken > SKY_REF_MAX_AGE:
+        # (Day only: the night channel carries no sky reference at all.)
+        if not night and sky_ref is not None and time.time() - ref_taken > SKY_REF_MAX_AGE:
             try:
                 saz_now, _ = sky.sun()
                 ptr.point_to((saz_now + 180.0) % 360.0, 75.0)
@@ -1357,27 +1397,56 @@ def run_sweep(
             salt = sky.sun()[1]
         except (OSError, ValueError) as e:
             log(f"az {az:3d}: could not re-read the Sun ({e}); keeping alt {salt:.1f}", flush=True)
+        # The regime is re-decided per column from the Sun just read, so a sweep
+        # that starts in daylight and runs into the dark switches channels at
+        # the boundary instead of measuring darkness with the day eye.
+        want_night = bool(salt < NIGHT_SUN_ALT)
+        if want_night != night:
+            log(f"az {az:3d}: sun alt {salt:.1f} — switching channel", flush=True)
+            if not dry:
+                set_channel(sc, want_night, cfg, log)
+            night = want_night
         try:
-            alt, status, typ, profile = scan_horizon(
-                ptr,
-                sc,
-                az,
-                cfg["alt_min"],
-                cfg["alt_max"],
-                cfg.get("coarse_step", 5.0),
-                cfg["alt_tol"],
-                sky_ref,
-                frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
-                repeats=cfg.get("samples_per_point", 1),
-                sun_alt=salt,
-            )
-            if profile:
-                profiles[az] = profile
-                peak = max(lum for _, lum in profile)
-                sky_ref = peak if sky_ref is None else max(sky_ref, peak)
+            if night:
+                alt, status, typ, profile = scan_horizon_night(
+                    ptr,
+                    sc,
+                    az,
+                    cfg["alt_min"],
+                    cfg["alt_max"],
+                    cfg.get("coarse_step", 5.0),
+                    cfg["alt_tol"],
+                    frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
+                )
+                if profile:
+                    # The channel travels WITH the profile. Night medians are
+                    # raw16 counts, day means are RGB — the same numbers under
+                    # a different unit — and a replay that judged one with the
+                    # other's judge would be confidently wrong (F-13). Plain
+                    # lists stay the day shape, so old profiles files replay
+                    # unchanged.
+                    profiles[az] = {"channel": "star4800", "profile": profile}
+            else:
+                alt, status, typ, profile = scan_horizon(
+                    ptr,
+                    sc,
+                    az,
+                    cfg["alt_min"],
+                    cfg["alt_max"],
+                    cfg.get("coarse_step", 5.0),
+                    cfg["alt_tol"],
+                    sky_ref,
+                    frames_dir=(f"{save_dir}/scan" if (save_dir and not dry) else None),
+                    repeats=cfg.get("samples_per_point", 1),
+                    sun_alt=salt,
+                )
+                if profile:
+                    profiles[az] = profile
+                    peak = max(lum for _, lum in profile)
+                    sky_ref = peak if sky_ref is None else max(sky_ref, peak)
             frame = (
                 save_boundary_frame(sc, ptr, az, alt, typ, save_dir, sky_ref)
-                if (save_dir and not dry)
+                if (save_dir and not dry and not night)
                 else "-"
             )
             mask[az] = {"alt": alt, "type": typ, "bound": status == "blocked_above"}

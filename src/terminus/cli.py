@@ -45,6 +45,7 @@ from .sweep import (
     run_sweep,
     scan_horizon,
     scan_horizon_night,
+    set_channel,
     sky_reference,
 )
 
@@ -69,27 +70,12 @@ def _sky(sc, cfg):
 def _start_locked(sc, sw):
     """Start the scenery view with exposure locked, in the order that works.
 
-    THE ORDER IS NOT THE OBVIOUS ONE and cost a run to find. The lock must be set
-    while the view is RUNNING: with the view stopped the scope accepts the call
-    and silently keeps auto-exposure, reporting the -999000 sentinel. The old
-    sequence locked first and started second, which worked every time it was
-    tried because some earlier command had left the stream up — and failed the
-    first time it ran from cold.
-
-    The stop before the start is still needed, and for a different reason: an
-    existing lock cannot be CHANGED in place. A second lock_exposure in the same
-    session keeps the first value, so the view has to be cycled to clear it.
-
-    Locking matters at all because with auto-exposure the camera renormalises
-    every frame toward mid-grey, which cancels the sky-versus-terrain difference
-    the whole measurement depends on.
+    The ordering knowledge (lock only while the view runs; cycle the view to
+    clear an old lock) lives on `sweep.set_channel`, which owns channel
+    switching for the sweep's own day/night transitions. This wrapper is the
+    day-only entry point the CLI commands share.
     """
-    sc.stop_view()
-    time.sleep(1)
-    sc.start_view("scenery")
-    time.sleep(3)
-    locked = sc.lock_exposure(exp_ms=sw.get("exp_ms"), gain=sw.get("gain"))
-    print(f"exposure locked: {locked}")
+    set_channel(sc, night=False, sw=sw)
 
 
 def is_stowed(rd):
@@ -408,8 +394,9 @@ def cmd_sweep(sc, cfg, args):
     sky = _sky(sc, cfg)
     out = args.out or "horizon_mask.yaml"
     frames = args.frames or (os.path.splitext(out)[0] + "_frames")
-    if not args.dry_run:
-        _start_locked(sc, cfg["sweep"])
+    # The view is NOT started here: run_sweep owns the channel now, choosing
+    # scenery or the star-mode imaging channel per column from the Sun's
+    # altitude, and re-choosing at the twilight boundary mid-run.
     # getattr, matching cmd_export: several tests build an args namespace by
     # hand, and a new flag should not break tests of unrelated behaviour.
     requested = getattr(args, "azimuths", None)
@@ -1016,14 +1003,8 @@ def _scope_measure(sc, cfg, args):
     if not args.dry_run:
         night = sky.sun()[1] < NIGHT_SUN_ALT
         if night:
-            # The scenery stream is blind after dark (its ISP pins exposure at
-            # ~30 ms whatever is asked); the star-mode imaging channel sees.
-            # No exposure lock: the star pipeline manages its own.
-            sc.stop_view()
-            time.sleep(1)
-            sc.start_view("star")
-            time.sleep(6)
             print(f"night (sun {sky.sun()[1]:.1f} deg): star-mode imaging channel, 2 s frames")
+            set_channel(sc, night=True)
         else:
             _start_locked(sc, sw)
     # A column costs about two and a half minutes of clear sky. Keeping nothing
@@ -1556,13 +1537,14 @@ def main(argv=None):
     sub.add_parser("classify")
     sw = sub.add_parser(
         "sweep",
-        help="full horizon sweep -> mask YAML (day and twilight only)",
-        description="Full horizon sweep -> mask YAML (+ review frames). Day and "
-        "twilight only: the sweep reads the scenery stream, which goes blind once "
-        "the Sun is well down (the ISP pins its exposure), so a sweep run into "
-        "full dark returns confident darkness, not measurements. Night columns "
-        "belong to `terminus orient`, which switches to the star-mode imaging "
-        "channel and the night detector.",
+        help="full horizon sweep -> mask YAML (day or night)",
+        description="Full horizon sweep -> mask YAML (+ review frames). The "
+        "measurement channel follows the Sun per column: above -12 deg the "
+        "scenery stream with a locked exposure, below it the star-mode imaging "
+        "channel with the night detector (the scenery stream is blind after "
+        "dark), switching at the boundary mid-run. Night columns carry no "
+        "obstruction type, and their profiles are saved with the channel so "
+        "`orient --replay` judges them with the night judge.",
     )
     sw.add_argument("--az-start", type=float, default=0)
     sw.add_argument("--az-end", type=float, default=350)

@@ -317,9 +317,24 @@ def replay(profiles, uncertainty=None, sky_ref=None):
     """
     import numpy as np
 
-    from .sweep import classify_no_edge, find_edge
+    from .sweep import classify_no_edge, find_edge, night_find_edge
 
-    prof = {int(az): [(float(a), float(lum)) for a, lum in rows] for az, rows in profiles.items()}
+    # A profile carries its channel, because the numbers change meaning with
+    # it: night medians are raw16 counts off the star-mode imaging channel, day
+    # means are RGB off the scenery stream, and judging one with the other's
+    # judge is confidently wrong (F-13). Night columns arrive as
+    # {"channel": "star4800", "profile": [[alt, lum], ...]}; a plain list is
+    # the day shape, so profiles files from before the night channel replay
+    # unchanged.
+    prof, night_cols = {}, set()
+    for az, rows in profiles.items():
+        if isinstance(rows, dict):
+            channel = rows.get("channel")
+            if channel != "star4800":
+                raise ValueError(f"az {az}: unknown profile channel {channel!r}")
+            night_cols.add(int(az) % 360)
+            rows = rows.get("profile") or []
+        prof[int(az) % 360] = [(float(a), float(lum)) for a, lum in rows]
     if sky_ref is None:
         # THE MEDIAN OF THE PER-COLUMN PEAKS, not the brightest sample anywhere.
         # The maximum picks whatever is brightest in the whole run, and in
@@ -327,8 +342,13 @@ def replay(profiles, uncertainty=None, sky_ref=None):
         # chose 253.4 where the run itself had measured 119.3 near the zenith,
         # more than doubling the absolute-step gate and turning two real edges
         # (az 40 and az 275) into false bounds. The median is robust to a bright
-        # surface in one or two columns, which the maximum is not.
-        peaks = [max(lum for _, lum in rows) for rows in prof.values() if rows]
+        # surface in one or two columns, which the maximum is not. Night columns
+        # stay out of it: raw16 counts are not in the day reference's units.
+        peaks = [
+            max(lum for _, lum in rows)
+            for az, rows in prof.items()
+            if rows and az not in night_cols
+        ]
         sky_ref = float(np.median(peaks)) if peaks else None
 
     def measure(az):
@@ -336,6 +356,21 @@ def replay(profiles, uncertainty=None, sky_ref=None):
         if not rows:
             return None  # not attempted that night: different from finding nothing
         ceiling = max(a for a, _ in rows)
+        if int(az) % 360 in night_cols:
+            # Re-judged by the CURRENT night detector, exactly as orient's
+            # checkpoint resume does (D-16): the stored verdict is what an old
+            # judge thought, the profile is what the sky did. The edge lands on
+            # the coarse bracket's midpoint — the bisection samples were never
+            # saved, so that is the honest resolution.
+            if len(rows) < 3:
+                return None
+            idx, verdict = night_find_edge(rows)
+            if idx is None:
+                if verdict == "blocked":
+                    return None, ceiling, uncertainty
+                return None  # open, or unreadable: no constraint the fit can use
+            mid = round((rows[idx][0] + rows[idx + 1][0]) / 2.0, 1)
+            return {"alt": mid}, ceiling, uncertainty
         k, _step, snr = find_edge(rows, sky_ref)
         if k is None:
             # The SAME question the live path asks, answered the same way. It was
