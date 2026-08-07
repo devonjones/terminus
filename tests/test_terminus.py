@@ -5642,6 +5642,77 @@ def test_the_polar_page_is_self_contained_and_layered(tmp_path):
     assert os.path.getsize(path) > 0
 
 
+def test_the_fit_writes_down_which_fiducials_it_used_and_why(tmp_path):
+    """terminus-53: the published fit used 16 of 30 and nothing records which.
+
+    That is not a small gap. Anyone refitting from the same sweeps gets ~29
+    fiducials including the hard columns the published run discarded, and
+    therefore a much worse residual BY CONSTRUCTION rather than by error — then
+    goes looking for bugs in frame registration that are not there. It is also a
+    comparison error waiting to happen: 3.38 on 29 and 0.69 on 16 are not
+    comparable numbers at all (F-25).
+
+    So the fit records the set, not just its size: every column, its value,
+    whether it was one-sided, and for anything excluded, the reason.
+    """
+    import math
+
+    from terminus import guide
+    from terminus.orient import Fiducial, fit
+
+    rows = [
+        (float(az), 20.0 + 6.0 * math.sin(math.radians(az)), "structure") for az in range(0, 360, 5)
+    ]
+    sample = guide.photo_sample(rows)
+    fids = [
+        Fiducial(0.0, 20.0, 60.0),
+        Fiducial(90.0, 26.0, 60.0),
+        Fiducial(180.0, 20.0, 60.0),
+        Fiducial(270.0, 14.0, 60.0),
+        Fiducial(45.0, 59.5, 60.0),  # half a degree of headroom: a manufactured edge
+    ]
+    sol = fit(fids, sample, yaw_step=5.0, tilt_max=3.0, tilt_step=3.0, pitch_range=6.0,
+              min_headroom=2.0)  # fmt: skip
+
+    record = {f["az"]: f for f in sol["fiducials"]}
+    assert set(record) == {0.0, 45.0, 90.0, 180.0, 270.0}, (
+        "every fiducial handed in must appear, used or not — an omitted one is "
+        "indistinguishable from one that was never measured"
+    )
+    assert record[45.0]["used"] is False
+    assert "headroom" in record[45.0]["reason"], "and the reason must say which gate rejected it"
+    assert record[0.0]["used"] is True and record[0.0]["reason"] is None
+    for f in record.values():
+        assert {"az", "alt", "bound", "weight", "sigma"} <= set(f), (
+            "enough to refit from this record alone"
+        )
+
+
+def test_a_column_excluded_in_the_mask_is_never_offered_to_the_planner():
+    """The az 60/190 dawn exclusions were folklore: a memory file and a doc.
+
+    Now they live in the mask beside the column, with the reason attached, and
+    `from_mask` both honours and RECORDS them — D-12, a thing that failed must
+    be recorded as failed rather than quietly omitted.
+    """
+    from terminus.orient import from_mask
+
+    mask = {
+        10: {"alt": 12.0, "type": "structure"},
+        20: {"alt": 32.5, "type": "structure", "exclude": "dawn transition"},
+        30: {"alt": 8.0, "type": "open"},
+        40: {"alt": 60.0, "type": "unknown"},
+    }
+    excluded = {}
+    fids = {int(f.az): f for f in from_mask(mask, ceiling=60.0, excluded=excluded)}
+
+    assert set(fids) == {10}, f"only the usable column should survive, got {sorted(fids)}"
+    assert excluded[20] == "dawn transition", "the mask's own reason, verbatim"
+    assert "open" in excluded[30], "an open column bounds from below; say so"
+    assert "unknown" in excluded[40] or "failed" in excluded[40]
+    assert 10 not in excluded
+
+
 def test_a_column_at_its_ceiling_is_a_bound_however_it_is_typed():
     """M-09, applied to the masks that are actually on disk.
 

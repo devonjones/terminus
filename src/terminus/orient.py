@@ -114,7 +114,7 @@ class Fiducial:
 CEILING_EPS = 0.1
 
 
-def from_mask(mask, ceiling=None):
+def from_mask(mask, ceiling=None, excluded=None):
     """Build fiducials from a mask dict ({az: {alt, type, bound?}}).
 
     THE MASK MUST SAY WHICH COLUMNS ARE BOUNDS, and for a long time it did so by
@@ -136,15 +136,37 @@ def from_mask(mask, ceiling=None):
     `alt` at all is not a measurement and is skipped.
     """
     out = []
+    # EVERY SKIP IS RECORDED WITH ITS REASON, not silently omitted. D-12: a
+    # thing that failed must be recorded as failed. The published fit used 16 of
+    # 30 available columns and nothing on disk says which 16 or why, so nobody
+    # can reproduce it — the selection lived in a detector's runtime judgement
+    # and died with the session (terminus-53).
+    note = excluded if excluded is not None else {}
     for az, entry in mask.items():
         if entry.get("alt") is None:
+            note[int(az)] = "no altitude recorded"
             continue
         typ = str(entry.get("type", "") or "")
         alt = float(entry["alt"])
         ceil = float(entry.get("ceiling", ceiling)) if (entry.get("ceiling") or ceiling) else None
+        # An explicit exclusion in the mask, with its reason attached. This is
+        # where az 60 and az 190 belong — dawn-contaminated, worth 3.4 degrees of
+        # residual between them — rather than in a memory file and a paragraph of
+        # prose that every rerun has to be told about by hand.
+        if entry.get("exclude"):
+            note[int(az)] = str(entry["exclude"])
+            continue
         if typ == "unknown":
             # A failed measurement carries no information at all: it is neither
             # an edge nor a bound, and must not enter the fit as either.
+            note[int(az)] = "the measurement failed: type is 'unknown'"
+            continue
+        if typ == "open":
+            # No obstruction found down to the search floor. That bounds the
+            # horizon from BELOW, which Fiducial cannot express, so it is not a
+            # measurement the fit can use — and scoring it as an exact edge at
+            # the floor was worth 40 degrees of yaw on real data (terminus-50).
+            note[int(az)] = "open to the search floor: a downward bound the fit cannot express"
             continue
         # `clipped` is the PHOTO's version of the same statement — the
         # obstruction ran off the top of the frame, so the altitude beside it is
@@ -490,7 +512,19 @@ def fit(
     min_headroom, if given, drops exact fiducials whose result sits closer than
     that to their own ceiling — the signature of a manufactured edge.
     """
-    used = [f for f in fids if min_headroom is None or f.headroom() >= min_headroom]
+    # WHY EACH COLUMN WAS OR WAS NOT USED, recorded alongside the answer. The
+    # published fit used 16 of 30 available columns and nothing on disk records
+    # which 16: the selection was a detector's per-column judgement at runtime
+    # and is unrecoverable, so nobody can reproduce 0.69 and anyone refitting
+    # from the same sweeps gets a much worse residual BY CONSTRUCTION rather
+    # than by error (terminus-53, and F-25 on comparing the two).
+    why = {}
+    used = []
+    for f in fids:
+        if min_headroom is not None and f.headroom() < min_headroom:
+            why[f.az] = f"headroom {f.headroom():.1f} < {min_headroom:g} deg of its own ceiling"
+        else:
+            used.append(f)
     if len(used) < 4:
         raise ValueError(f"need at least 4 usable fiducials, have {len(used)}")
 
@@ -551,5 +585,37 @@ def fit(
         "n": int(ok.sum()),
         "n_bound": int(sum(1 for f in used if f.bound)),
         "residuals": {used[i].az: float(r[i]) for i in range(len(used)) if ok[i]},
-        "dropped": [f.az for f in fids if f not in used],
+        "dropped": sorted(why),
+        # The set itself, not just its size. Enough to refit from this record
+        # alone: az, the value, whether it was one-sided, and its weighting.
+        # A column the photo could not predict at all is marked too — it counts
+        # in `used` but contributes no residual, which is the difference
+        # between "agreed" and "was never asked".
+        "fiducials": [
+            {
+                "az": float(f.az),
+                "alt": float(f.alt),
+                "bound": bool(f.bound),
+                "weight": float(f.weight),
+                "sigma": float(f.sigma),
+                "used": True,
+                "residual": (float(r[i]) if ok[i] else None),
+                "reason": (None if ok[i] else "the photo has no horizon at this azimuth"),
+            }
+            for i, f in enumerate(used)
+        ]
+        + [
+            {
+                "az": float(f.az),
+                "alt": float(f.alt),
+                "bound": bool(f.bound),
+                "weight": float(f.weight),
+                "sigma": float(f.sigma),
+                "used": False,
+                "residual": None,
+                "reason": why[f.az],
+            }
+            for f in fids
+            if f.az in why
+        ],
     }

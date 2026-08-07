@@ -869,6 +869,20 @@ def _orient(sc, cfg, args):
             fit_rms=round(solution["rms"], 3),
             fit_columns=sorted(solution["residuals"]),
             fit_settled=settled,
+            # THE SET, not just its size. Without this a rerun cannot reproduce
+            # the fit and cannot even tell which columns it disagrees about: the
+            # published run used 16 of 30 and nothing on disk says which, so its
+            # 0.69 deg is unreachable and incomparable (terminus-53, F-25).
+            # Rounded, because this is a record for a person to read and diff,
+            # not a serialisation format.
+            fit_fiducials=[
+                {
+                    k: (round(v, 3) if isinstance(v, float) else v)
+                    for k, v in f.items()
+                    if v is not None or k == "reason"
+                }
+                for f in solution.get("fiducials", [])
+            ],
             source_mask=os.path.abspath(args.mask),
         ),
     )
@@ -908,6 +922,7 @@ def _fiducial_source(paths, uncertainty):
     from .orient import CEILING_EPS
 
     columns = {}
+    excluded = {}
     for path in paths:
         try:
             with open(path) as fh:
@@ -923,6 +938,15 @@ def _fiducial_source(paths, uncertainty):
         search = (doc.get("meta") or {}).get("alt_search") or []
         ceiling = float(search[1]) if len(search) > 1 else None
         for az, entry in block.items():
+            # AN EXCLUDED COLUMN IS NOT A CANDIDATE. Leaving it in and refusing
+            # it at measure time makes the planner spend a slot discovering what
+            # the mask already said — and `reachable` would be lying, which is
+            # the ordering SAFE-03 exists to get right: filter for feasibility
+            # BEFORE ranking, so the criterion picks the best feasible
+            # configuration rather than the best infeasible one plus a fallback.
+            if entry.get("exclude"):
+                excluded[int(az)] = str(entry["exclude"])
+                continue
             columns.setdefault(int(az), (entry, ceiling))
 
     def measure(az):
@@ -934,6 +958,11 @@ def _fiducial_source(paths, uncertainty):
         typ = str(entry.get("type", "") or "")
         if alt is None or typ == "unknown":
             return None  # measured and found nothing; not an edge, not a bound
+        if typ == "open":
+            # Open to the search floor bounds the horizon from BELOW, which
+            # Fiducial cannot express. Scoring it as an exact edge at the floor
+            # was worth 40 degrees of yaw on real data.
+            return None
         alt = float(alt)
         # A column at its ceiling is a BOUND however it is typed: the scope
         # cannot tilt past its search ceiling, so the horizon is at least that
@@ -949,6 +978,12 @@ def _fiducial_source(paths, uncertainty):
             return None, alt, uncertainty
         return {"alt": alt}, ceiling, uncertainty
 
+    if excluded:
+        for az, reason in sorted(excluded.items()):
+            short = " ".join(reason.split())
+            if len(short) > 88:
+                short = short[:85] + "..."
+            print(f"az {az:3d}: excluded by the mask — {short}", file=sys.stderr)
     return measure, (lambda az: int(az) in columns)
 
 
