@@ -20,3 +20,4 @@ build/
 
 # measured horizon captures (large; kept on disk, not in git)
 captures/
+scratch/

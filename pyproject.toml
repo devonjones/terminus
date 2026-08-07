@@ -15,6 +15,12 @@ dependencies = [
     "pyyaml",
 ]
 
+[project.optional-dependencies]
+# The segmentation backend for `skymask` / `mosaic --segment`. Deliberately an
+# extra: importing terminus must never pull in torch, and a Raspberry Pi host
+# runs fine on the heuristic without it.
+segment = ["torch", "torchvision", "transformers"]
+
 [project.urls]
 Homepage = "https://github.com/devonjones/terminus"
 
@@ -31,6 +37,19 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "terminus"
 module-root = "src"
+
+# CPU wheels for the segment extra: plain `torch` from PyPI resolves to the
+# CUDA build on Linux, which is gigabytes nobody here needs — SegFormer runs
+# in ~2 s/frame on CPU. macOS wheels on PyPI are already CPU-only, so the
+# index override applies only where CUDA is the default.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 
 [tool.black]
 line-length = 100

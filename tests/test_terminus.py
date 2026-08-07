@@ -1206,7 +1206,9 @@ def _sweep_with_failures(fail_azimuths):
         return az, alt
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),  # night: guard stands down
+        patch.object(
+            Sky, "sun", lambda self: (297.0, -5.0)
+        ),  # dusk: guard stands down, day channel
         patch.object(Pointer, "point_to", point_to),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
     ):
@@ -1374,7 +1376,7 @@ def test_the_refine_loop_also_survives_a_pointing_failure():
         return (10.0 if az % 120 == 0 else 40.0), "edge", "tree", []
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", point_to),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
         patch("terminus.sweep.scan_horizon", fake_scan),
@@ -1491,7 +1493,7 @@ def test_the_sky_reference_seeding_swallows_a_pointing_failure():
         return az, alt
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", point_to),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
     ):
@@ -2977,7 +2979,7 @@ def test_run_sweep_scans_an_explicit_list_not_a_grid():
         return 20.0, "edge", "tree", []
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
         patch("terminus.sweep.scan_horizon", fake_scan),
@@ -2987,6 +2989,141 @@ def test_run_sweep_scans_an_explicit_list_not_a_grid():
         )
     assert seen == [55, 57, 82, 172], f"scanned {seen}"
     assert sorted(mask) == [55, 57, 82, 172]
+
+
+def test_the_sweep_measures_with_the_night_eye_when_the_sun_is_down():
+    """I-15 wired into the sweep: after dark the scenery stream is blind.
+
+    Before this, `run_sweep` measured every column with the day detector on the
+    scenery stream whatever the clock said, and a sweep run after dark returned
+    confident darkness rather than measurements (S-04's direction). Now the
+    channel follows the Sun: below NIGHT_SUN_ALT the star-mode imaging channel
+    and `scan_horizon_night` carry the column, and the profile is recorded WITH
+    its channel so a replay cannot judge raw16 medians with the RGB judge (F-13).
+    """
+    from unittest.mock import MagicMock, patch
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    night_seen, day_seen = [], []
+    prof = [(45.0, 900.0), (40.0, 880.0), (35.0, 100.0)]
+
+    def fake_night(ptr, sc_, az, *a, **k):
+        night_seen.append(az)
+        return 37.5, "edge(night)", "", list(prof)
+
+    def fake_day(ptr, sc_, az, *a, **k):
+        day_seen.append(az)
+        return 20.0, "edge", "tree", []
+
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),  # full dark
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch("terminus.sweep.scan_horizon_night", fake_night),
+        patch("terminus.sweep.scan_horizon", fake_day),
+    ):
+        mask, _, profiles = run_sweep(
+            sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[55, 82]
+        )
+
+    assert night_seen == [55, 82], f"night scanner must carry the columns, saw {night_seen}"
+    assert day_seen == [], "the day detector must never touch a night column"
+    sc.start_view.assert_called_with("star")
+    sc.lock_exposure.assert_not_called()  # star mode manages its own exposure
+    assert profiles[55] == {
+        "channel": "star4800",
+        "profile": prof,
+    }, "a night profile must carry its channel, or replay judges raw16 with the RGB judge"
+    assert mask[55] == {"alt": 37.5, "type": "", "bound": False}
+
+
+def test_a_sweep_crossing_twilight_switches_channels_mid_run():
+    """The regime is re-decided per column, because a sweep spans hours.
+
+    A run that starts at dusk and ends in the dark must not carry the day eye
+    across the boundary (M-17's confound, S-04's failure direction) — and the
+    switch must happen ONCE, at the boundary, not per column.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    # One Sun reading at run start, then one per column: dusk, dusk, dark.
+    suns = iter([(297.0, -8.0), (297.0, -8.0), (297.0, -13.0)])
+    night_seen, day_seen = [], []
+
+    with (
+        patch.object(Sky, "sun", lambda self: next(suns)),
+        patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
+        patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
+        patch(
+            "terminus.sweep.scan_horizon_night",
+            lambda ptr, sc_, az, *a, **k: (night_seen.append(az), (30.0, "edge(night)", "", []))[1],
+        ),
+        patch(
+            "terminus.sweep.scan_horizon",
+            lambda ptr, sc_, az, *a, **k: (day_seen.append(az), (20.0, "edge", "tree", []))[1],
+        ),
+    ):
+        run_sweep(sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[10, 20])
+
+    assert day_seen == [10], f"the dusk column belongs to the day eye, saw {day_seen}"
+    assert night_seen == [20], f"the dark column belongs to the night eye, saw {night_seen}"
+    started = [c.args[0] for c in sc.start_view.call_args_list]
+    assert started == ["scenery", "star"], f"one switch, at the boundary, not per column: {started}"
+
+
+def test_replay_judges_a_night_column_with_the_night_judge():
+    """F-13 for profiles: a raw16 night median judged by the RGB day rule is wrong.
+
+    The night column here is a Bortle-8 shape the day judge mishandles — skyglow
+    brightening toward the horizon, then a persistent unrecovered drop (M-23).
+    The channel travels with the profile, so replay re-judges it with
+    `night_find_edge` (D-16: judge is code, data is data) and lands on the
+    coarse bracket's midpoint. A plain-list column keeps the day judge, so old
+    profiles files replay unchanged.
+    """
+    import pytest
+
+    from terminus import guide
+
+    night_rows = [
+        [50.0, 200.0], [45.0, 210.0], [40.0, 225.0], [35.0, 245.0],
+        [30.0, 270.0], [25.0, 60.0], [20.0, 55.0], [15.0, 50.0], [10.0, 45.0],
+    ]  # fmt: skip
+    day_rows = [[50.0, 120.0], [45.0, 118.0], [40.0, 20.0], [35.0, 18.0]]
+    measure = guide.replay(
+        {"90": {"channel": "star4800", "profile": night_rows}, "100": day_rows},
+        uncertainty=1.0,
+    )
+
+    got = measure(90)
+    assert got is not None and got[0] is not None, "the night edge must be found"
+    assert (
+        got[0]["alt"] == 27.5
+    ), f"the coarse bracket's midpoint, judged by night_find_edge, got {got[0]}"
+    day = measure(100)
+    assert (
+        day is not None and day[0] is not None and "alt" in day[0]
+    ), "a plain-list column must keep the day judge and still resolve"
+    with pytest.raises(ValueError, match="channel"):
+        guide.replay({"90": {"channel": "rtsp", "profile": night_rows}})
 
 
 def test_an_explicit_sweep_merges_rather_than_replaces(tmp_path, monkeypatch):
@@ -3272,7 +3409,7 @@ def test_duplicate_azimuths_are_measured_once():
         return 20.0, "edge", "tree", []
 
     with (
-        patch.object(Sky, "sun", lambda self: (297.0, -20.0)),
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),
         patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
         patch("terminus.sweep.column_touches_sun", lambda *a, **k: False),
         patch("terminus.sweep.scan_horizon", fake_scan),
@@ -5165,7 +5302,10 @@ def test_a_blocked_column_reaches_the_mask_as_a_bound(tmp_path):
         """
 
         def sun(self):
-            return 270.0, -30.0
+            # -5: below SUN_SAFE_ALT so the guard stands down, above
+            # NIGHT_SUN_ALT so the sweep keeps the day channel this test's
+            # patched scanner belongs to.
+            return 270.0, -5.0
 
     sky = NightSky(39.7917, -104.894, 1600)
     sc = MagicMock()
