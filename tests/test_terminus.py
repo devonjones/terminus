@@ -5865,6 +5865,27 @@ def test_a_second_imaging_death_costs_one_column_not_the_night(tmp_path):
         for p in patches:
             p.stop()
 
+    # THE RECOVERY ITSELF CAN FAIL WITH A DIFFERENT TYPE. stop_view/start_view
+    # route through client.call, which raises SeestarError when re-auth fails
+    # after a reconnect — a scope that tore down the star session plausibly
+    # took the control channel with it. Catching only the socket types
+    # reintroduced "the same bug one exception class over" (the daytime
+    # sweep's own comment); review reproduced it against the real client.
+    from terminus.client import SeestarError
+
+    def scan_control_death(*a, **k):
+        raise SeestarError("reconnected but authentication failed")
+
+    (measure2, _r2, _a2), patches2, _ = _orient_measure_fixture(tmp_path, -30.0, scan_control_death)
+    try:
+        got = measure2(140)  # must not raise
+        assert got is None
+        lines = [_json.loads(x) for x in open(tmp_path / "out_fiducials.jsonl")]
+        assert lines[-1]["verdict"] == "failed" and lines[-1]["az"] == 140
+    finally:
+        for p in patches2:
+            p.stop()
+
 
 def test_a_night_scan_skips_the_pole_band_sample_and_keeps_the_column():
     """I-16, the per-sample half: one lost altitude is recoverable, a lost

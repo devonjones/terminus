@@ -1120,7 +1120,7 @@ def _scope_measure(sc, cfg, args):
                         sw["alt_tol"],
                         frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
                     )  # fmt: skip
-                except (ConnectionError, OSError, TimeoutError) as e:
+                except (ConnectionError, OSError, TimeoutError, SeestarError) as e:
                     # THE SECOND SOCKET DEATH MUST NOT LOSE THE NIGHT. The client
                     # reopens the imaging socket once on its own; when that also
                     # fails the scope has usually torn down the whole star
@@ -1143,7 +1143,15 @@ def _scope_measure(sc, cfg, args):
                             sw.get("coarse_step", 5.0), sw["alt_tol"],
                             frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
                         )  # fmt: skip
-                    except (ConnectionError, OSError, TimeoutError) as e2:
+                    except (ConnectionError, OSError, TimeoutError, SeestarError) as e2:
+                        # SeestarError included in BOTH tuples: the recovery's own
+                        # stop_view/start_view route through client.call, which
+                        # raises SeestarError when re-authentication fails after a
+                        # reconnect — and a scope that tore down the star session
+                        # plausibly took the control channel with it. Catching
+                        # only the socket types reintroduced "the same bug one
+                        # exception class over" that the daytime sweep's cleanup
+                        # already documents.
                         if not args.dry_run:
                             checkpoint(
                                 {
