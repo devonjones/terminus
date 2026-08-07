@@ -773,11 +773,12 @@ def _orient(sc, cfg, args):
     if not rows:
         raise MaskError(f"{args.mask} has no columns to orient")
 
-    if args.fiducials:
-        measure, reachable = _fiducial_source(args.fiducials, args.uncertainty)
+    fiducials = getattr(args, "fiducials", None)
+    if fiducials:
+        measure, reachable = _fiducial_source(fiducials, args.uncertainty)
         should_stop = None
         state = {"profiles": {}}
-        print(f"orienting against {len(args.fiducials)} fiducial mask(s): no telescope, no sky")
+        print(f"orienting against {len(fiducials)} fiducial mask(s): no telescope, no sky")
     elif args.replay:
         measure = _replay_source(args)
         reachable = should_stop = None
@@ -1370,13 +1371,13 @@ def _is_offline(args):
     replay exists to serve.
     """
     if args.cmd == "orient":
-        return bool(args.replay or args.fiducials)
+        return bool(args.replay or getattr(args, "fiducials", None))
     return args.cmd in OFFLINE
 
 
 def _needs_scope(args):
     if args.cmd == "orient":
-        return not (args.replay or args.fiducials)
+        return not (args.replay or getattr(args, "fiducials", None))
     return args.cmd in NEEDS_SCOPE
 
 

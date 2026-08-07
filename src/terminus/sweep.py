@@ -320,19 +320,45 @@ class Pointer:
         here_sep = ang_sep(az, alt, saz, salt)
         target_az, target_alt = self.escape_target(az, alt)
         step = max(1.0, float(self.slew_step))
+        cleared = False
         if abs(target_alt - alt) < 1e-9:
             turn = self.escape_turn(az, alt)
             here, turned = az, 0.0
+            cleared = True
             while ang_sep(here, alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:
                 here = (here + turn * step) % 360.0
                 turned += step
-                self._goto_wait(*self.sky.altaz_to_radec(here, alt), 0.3)
-                if turned > 360.0:
+                # THE TURN OBEYS THE POLE LIMIT LIKE EVERY OTHER MOTION. Every
+                # slew elsewhere routes through `avoid_pole`, and the route-over-
+                # the-top fallback refuses any waypoint past MAX_VIA_DEC, because
+                # RA is singular there and a live sweep has already stalled at
+                # Dec 89.8. This loop stepped raw. Turning north at a mid-latitude
+                # site walks straight up in declination: from az 25 alt 38 at
+                # 39.8N, five 5-degree steps reach Dec 85.6 — and the step that
+                # finally clears the cone is the one that crosses the limit.
+                # Stalling there strands the tube mid-escape, in the one manoeuvre
+                # whose whole job is guaranteeing an exit, so the turn gives up
+                # and the descent takes over.
+                _, dec = self.sky.altaz_to_radec(here, alt)
+                if abs(dec) > MAX_VIA_DEC or turned > 360.0:
+                    cleared = False
                     break
-        else:
+                self._goto_wait(*self.sky.altaz_to_radec(here, alt), 0.3)
+        if not cleared:
+            # Descending is the escape that asks the mount for nothing exotic:
+            # the ground is never in the way of pointing at the ground. But the
+            # floor is real, so this refuses rather than commanding a slew the
+            # mount cannot make — the same guard `corridor_alt` already applies.
+            want = target_alt if abs(target_alt - alt) >= 1e-9 else -self.safe_depth()
+            if want < self.MIN_ALT_DEG:
+                raise SunGuard(
+                    f"cannot get clear: turning is blocked and clearing the cone needs "
+                    f"altitude {want:.1f}, below this mount's floor of {self.MIN_ALT_DEG:.1f}. "
+                    "Cover the aperture and move it by hand."
+                )
             alt_now = alt
-            while alt_now > target_alt + 1e-9:
-                alt_now = max(target_alt, alt_now - step)
+            while alt_now > want + 1e-9:
+                alt_now = max(want, alt_now - step)
                 self._goto_wait(*self.sky.altaz_to_radec(az, alt_now), 0.3)
         out = self.current_azalt()
         if ang_sep(*out, *self.sky.sun()) < self.cone:
@@ -439,16 +465,30 @@ class Pointer:
         return out
 
     def route_min_sep(self, rd0, waypoints, samples=PATH_SAMPLES):
-        """Smallest Sun separation along an explicit route. Sun read at call time."""
+        """Smallest Sun separation along an explicit route. Sun read at call time.
+
+        RA IS INTERPOLATED THE SHORT WAY ROUND, via `wrap_ra`, exactly as
+        `path_min_sep` below already did. Without it a leg crossing 0h/24h — say
+        23.64h to 0.10h, a real 0.46h step — was walked as a 23.5h journey
+        BACKWARDS through the whole opposite sky, and every sample in between was
+        a pointing the mount never visits.
+
+        Both directions of that are wrong, and the dangerous one is not the
+        obvious one. It invents close approaches, which merely refuses a safe
+        route; but it equally samples the long way round past a leg whose REAL
+        path grazes the Sun, and clears it. SAFE-01 failing on a technicality —
+        it did check a path, just not the one the mount flies.
+        """
         saz, salt = self.sky.sun()
         if salt < SUN_SAFE_ALT:
             return 180.0
         worst = 180.0
         a = rd0
         for b in waypoints:
+            dra = wrap_ra(b[0] - a[0])
             for i in range(samples + 1):
                 t = i / samples
-                ra = a[0] + (b[0] - a[0]) * t
+                ra = a[0] + dra * t
                 dec = a[1] + (b[1] - a[1]) * t
                 az, alt = self.sky.radec_to_altaz(ra % 24.0, dec)
                 worst = min(worst, ang_sep(az, alt, saz, salt))
@@ -552,7 +592,6 @@ class Pointer:
                     return
                 if sep < best - PROGRESS_DEG:
                     best, last_progress = sep, time.time()
-                    moved = True
             # Extend while the mount is still CLOSING ON THE TARGET. Extending on
             # motion alone was wrong: a mount that moves without converging
             # renews the deadline forever, and on 2026-08-06 one spent 288
@@ -561,7 +600,17 @@ class Pointer:
             # 25 second failure and, more usefully, tells the difference between
             # "still slewing" and "moving but not arriving".
             stalled = time.time() - last_progress > NO_PROGRESS_S
-            if self._moving() and not stalled:
+            # "Moved" is the MOUNT'S OWN motion report, not an inference from
+            # the separation. Deriving it from `sep < best` made a stowed mount
+            # look like it had moved, because `best` starts at infinity so the
+            # first reading always beat it — and the failure then blamed a
+            # convergence problem for a closed arm. A stowed mount answers every
+            # query and reports move_type "none"; one that is genuinely slewing
+            # and failing to converge reports motion the whole time. That is the
+            # difference between opening the arm and hunting a pointing bug.
+            is_moving = self._moving()
+            moved = moved or is_moving
+            if is_moving and not stalled:
                 deadline = max(deadline, time.time() + GOTO_TIMEOUT)
             elif stalled:
                 break
@@ -1098,6 +1147,15 @@ def run_sweep(
     and the estimate degrades in the direction that matters.
     """
     ptr = Pointer(sc, sky, cfg["sun_cone_deg"], cfg["slew_step_deg"], dry)
+    # HOW FAR BELOW THE HORIZON THIS MOUNT CAN POINT IS AN OPERATOR MEASUREMENT,
+    # and it has to reach the Pointer that actually runs the sweep. `cli._pointer`
+    # applied it and this constructor did not, so `min_alt_deg` was live for
+    # `point` and `orient` and silently dead for `sweep` — the one command that
+    # runs unattended for hours, and the one where the corridor and escape
+    # machinery is most likely to fire. The default is a guess (terminus-64);
+    # the config exists precisely to replace it with a measurement.
+    if cfg.get("min_alt_deg") is not None:
+        ptr.MIN_ALT_DEG = float(cfg["min_alt_deg"])
     saz, salt = sky.sun()
     log(f"Sun az {saz:.0f} alt {salt:.0f}", flush=True)
     mask, skipped, profiles = {}, [], {}

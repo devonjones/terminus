@@ -4452,8 +4452,30 @@ def test_replay_reads_a_saved_night_and_needs_no_telescope():
     # definition is "altitude = lowest clear sky", and the true crossing lies
     # somewhere between 20 and 25 where the replay cannot resolve it.
     assert edge is not None and edge["alt"] == 25, "the step from 59 to 12 counts"
-    # A column with no step is measured-and-found-nothing: a bound, not a skip.
-    assert measure(90)[0] is None
+    # A column with no step is NOT automatically a bound. Which it is depends on
+    # whether the column was dark or bright, and replay must answer that the same
+    # way the live path does or a replayed night manufactures fiducials the real
+    # one refused (terminus-58).
+    #
+    # az 90 is bright all the way down — clear sky to the search floor. That
+    # bounds the horizon from BELOW, which `Fiducial` cannot express, so it is
+    # dropped rather than recorded as "at least 35" (M-19). Reading it as an
+    # upper bound was worth 40 degrees of yaw on real data.
+    assert measure(90) is None, "an open column is not a bound at the ceiling"
+
+    # A column dark throughout IS an upper bound: nothing was found up to the
+    # ceiling, so the horizon is at or above it.
+    blocked = guide.replay(
+        {
+            "0": profiles["0"],
+            "90": profiles["90"],
+            "180": [[35, 8.0], [30, 7.0], [25, 9.0], [20, 8.0], [15, 7.0], [10, 8.0]],
+        },
+        uncertainty=1.0,
+    )
+    edge, ceiling, _unc = blocked(180)
+    assert edge is None and ceiling == 35, "a dark column is a bound at the ceiling"
+
     # A column that night never visited is not attempted at all.
     assert measure(270) is None
 
@@ -6010,6 +6032,125 @@ def test_the_way_out_is_a_turn_not_a_descent():
             # moves the tube. Those fall back to the descent, which is what the
             # corridor depth is for.
             assert turned > trapped * 0.8
+
+
+def test_an_escape_turn_never_walks_through_the_pole():
+    """Every other slew respects MAX_VIA_DEC; the escape turn did not.
+
+    RA is singular near a pole and this mount has already stalled at Dec 89.8,
+    which is why `point_to` routes through `avoid_pole` and the over-the-top
+    fallback refuses any waypoint past MAX_VIA_DEC. `escape()`'s turn loop
+    stepped raw, and turning north at a mid-latitude site climbs in declination
+    fast: from az 25 alt 38 at 39.8N, five 5-degree steps reach Dec 85.6. The
+    step that finally cleared the Sun cone was the one that crossed the limit —
+    stalling the one manoeuvre whose whole job is guaranteeing an exit.
+    """
+    from unittest.mock import MagicMock
+
+    from terminus.sweep import MAX_VIA_DEC, Pointer, Sky
+
+    class MorningSun(Sky):
+        def sun(self, when=None):
+            return 45.0, 25.0
+
+    sky = MorningSun(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    visited = []
+
+    ptr = Pointer(sc, sky, 30, 5, False)
+    ptr.current_azalt = lambda: (25.0, 38.0)
+
+    def record(ra, dec, *a, **k):
+        visited.append((ra, dec))
+
+    ptr._goto_wait = record
+    try:
+        ptr.escape()
+    except Exception:
+        pass  # refusing is a legal outcome; commanding the pole is not
+
+    over = [(ra, dec) for ra, dec in visited if abs(dec) > MAX_VIA_DEC]
+    assert not over, f"escape commanded {len(over)} pointing(s) past the pole limit: {over}"
+
+
+def test_an_escape_that_cannot_reach_its_depth_refuses_instead_of_trying():
+    """`corridor_alt` already guards this; `escape_target` did not.
+
+    When turning cannot clear the cone the fallback descends, and the depth it
+    wants is `-safe_depth()`. With a wide cone and a high Sun that can be below
+    anything this mount has ever been shown to reach. Commanding it anyway is
+    the thing `cli._pointer`'s docstring says the design will not do: say
+    plainly when the corridor is unavailable rather than issue a slew the mount
+    may refuse.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from terminus.sweep import Pointer, Sky, SunGuard
+
+    class HighSun(Sky):
+        def sun(self, when=None):
+            return 180.0, 44.0
+
+    sky = HighSun(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    # A wide cone is a legal config: nothing enforces an upper bound, and an
+    # operator may reasonably widen it for margin.
+    #
+    # Both tube and Sun have to sit near the zenith for turning to be useless —
+    # at 1 degree from zenith the far side of the sky is only 47 degrees away,
+    # short of the 51 the cone plus margin demands — while the Sun stays low
+    # enough that the depth needed to clear it, 7 degrees below the horizon, is
+    # past the floor. That is the exact corner escape_target's fallback exists
+    # for, and the corner it commanded blind.
+    ptr = Pointer(sc, sky, 46, 5, False)
+    ptr.current_azalt = lambda: (180.0, 89.0)
+    commanded = []
+    ptr._goto_wait = lambda ra, dec, *a, **k: commanded.append((ra, dec))
+
+    with pytest.raises(SunGuard, match="below this mount's floor"):
+        ptr.escape()
+    assert not commanded, "it must refuse before commanding anything, not part way through"
+
+
+def test_a_sweep_honours_the_measured_below_horizon_floor():
+    """terminus-64's config knob was live for `point` and dead for `sweep`.
+
+    `cli._pointer` applied `min_alt_deg`; `run_sweep` built its own Pointer and
+    never read it. So the operator's measurement of how far this mount can
+    actually point below the horizon was ignored by the one command that runs
+    unattended for hours, and by the corridor and escape machinery most likely
+    to need it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 90, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6, "min_alt_deg": -1.0,
+    }  # fmt: skip
+
+    seen = {}
+
+    def capture(ptr, *a, **k):
+        seen["floor"] = ptr.MIN_ALT_DEG
+        return 20.0, "edge", "tree", []
+
+    with patch("terminus.sweep.scan_horizon", side_effect=capture):
+        run_sweep(sc, sky, cfg, az_start=0, az_end=270, dry=True, log=lambda *a, **k: None)
+
+    assert seen.get("floor") == -1.0, (
+        f"run_sweep ignored min_alt_deg and used {seen.get('floor')}; the default is a "
+        "guess and the config exists to replace it with a measurement"
+    )
 
 
 def test_the_below_horizon_corridor_is_safe_at_every_azimuth():
