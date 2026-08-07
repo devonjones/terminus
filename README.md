@@ -353,7 +353,8 @@ columns where the published one used sixteen, and the extra nine are the ones
 that were hardest to measure — a smaller fiducial set will almost always show a
 smaller residual whether or not it is closer to the truth. What is comparable is
 the geometry: tilt lands within 0.2° of the published 2.81°, and yaw within
-about 2° of 135.81°.
+about 2° of 135.81°. Those published figures, and how that run was built, are
+in [PANORAMA-PIPELINE.md](PANORAMA-PIPELINE.md).
 
 The step that would need a telescope is the one supplying `--fiducials`. Those
 columns came from two evening sweeps; measuring your own is `terminus sweep`, or
