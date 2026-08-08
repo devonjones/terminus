@@ -5560,9 +5560,10 @@ def test_refinement_checks_the_deadline_before_every_column():
         asked["n"] += 1
         return asked["n"] > 13
 
-    from terminus.sweep import Pointer
+    from terminus.sweep import Pointer, Sky
 
     with (
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: pin the channel
         patch("terminus.sweep.scan_horizon", side_effect=alternating),
         patch("terminus.sweep.save_boundary_frame"),
         patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
@@ -6898,6 +6899,7 @@ def test_a_twilight_day_verdict_is_discarded_on_resume_and_refused_live(tmp_path
     sc.is_eq_mode.return_value = True
     scans = MagicMock()
     with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: day channel
         patch.object(cli, "scan_horizon", scans),
         patch.object(cli, "sky_reference", return_value=21.3),  # a floored evening
         patch.object(cli, "Pointer"),
@@ -6984,6 +6986,7 @@ def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
 
     restarts = MagicMock()
     with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: day channel
         patch.object(cli, "scan_horizon", side_effect=dying_scan),
         patch.object(cli, "_start_locked", restarts),
         patch.object(cli, "sky_reference", return_value=80.0),
@@ -7395,7 +7398,10 @@ def test_a_sweep_honours_the_measured_below_horizon_floor():
         seen["floor"] = ptr.MIN_ALT_DEG
         return 20.0, "edge", "tree", []
 
-    with patch("terminus.sweep.scan_horizon", side_effect=capture):
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: pin the channel
+        patch("terminus.sweep.scan_horizon", side_effect=capture),
+    ):
         run_sweep(sc, sky, cfg, az_start=0, az_end=270, dry=True, log=lambda *a, **k: None)
 
     assert seen.get("floor") == -1.0, (
