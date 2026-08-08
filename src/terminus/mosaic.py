@@ -151,6 +151,18 @@ def solve(
     return solved, dropped
 
 
+def _nona_render(pto, work_dir, prefix):
+    # Clear the prefix's stale layers, remap, return the fresh set - the shared
+    # tail of both renders. The stale-file sweep matters: a frame count that
+    # shrank between runs would otherwise leave orphan layers that composite
+    # happily averages in.
+    out = os.path.join(work_dir, prefix)
+    for old in glob.glob(out + "*.tif"):
+        os.remove(old)
+    _run(["nona", "-m", "TIFF_m", "-o", out, pto])
+    return sorted(glob.glob(out + "*.tif"))
+
+
 def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
     """Remap to equirectangular layers. Returns (tiff_paths, final_pto).
 
@@ -175,11 +187,7 @@ def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
             pto,
         ]
     )
-    out = os.path.join(work_dir, prefix)
-    for old in glob.glob(out + "*.tif"):
-        os.remove(old)
-    _run(["nona", "-m", "TIFF_m", "-o", out, final])
-    return sorted(glob.glob(out + "*.tif")), final
+    return _nona_render(final, work_dir, prefix), final
 
 
 def render_photometric(final_pto, work_dir, prefix="figure"):
@@ -207,11 +215,7 @@ def render_photometric(final_pto, work_dir, prefix="figure"):
     require_hugin()
     photo = os.path.join(work_dir, "photometric.pto")
     _run(["autooptimiser", "-m", "-o", photo, final_pto])
-    out = os.path.join(work_dir, prefix)
-    for old in glob.glob(out + "*.tif"):
-        os.remove(old)
-    _run(["nona", "-m", "TIFF_m", "-o", out, photo])
-    return sorted(glob.glob(out + "*.tif")), photo
+    return _nona_render(photo, work_dir, prefix), photo
 
 
 def source_images(pto):

@@ -198,6 +198,11 @@ class Pointer:
 
     def __init__(self, sc, sky, cone, slew_step, dry=False):
         self.sc, self.sky, self.cone, self.slew_step, self.dry = sc, sky, cone, slew_step, dry
+        # Consecutive never-moved gotos reclassified as the mount's own solar
+        # protection. Reset by any observed motion; capped, because the same
+        # motionless signature belongs to a stowed or jammed arm, and near
+        # local noon the reclass band covers most of the sky (round 1's P2).
+        self._sun_refusals = 0
 
     def current_azalt(self):
         rd = self.sc.equ_coord()
@@ -593,6 +598,7 @@ class Pointer:
             if rd:
                 sep = ang_sep(rd[0] * 15.0, rd[1], ra * 15.0, dec)
                 if sep < ARRIVE_DEG:
+                    self._sun_refusals = 0
                     time.sleep(settle)
                     return
                 if sep < best - PROGRESS_DEG:
@@ -636,6 +642,8 @@ class Pointer:
         # while the mount had not moved at all.
         rd = self.sc.equ_coord()
         where = f"RA {rd[0]:.3f} Dec {rd[1]:.2f}" if rd else "unreadable"
+        if moved:
+            self._sun_refusals = 0
         if not moved:
             # A mount that never moved toward a Sun-adjacent target has
             # plausibly refused it ITSELF: the Seestar's own solar protection
@@ -650,10 +658,25 @@ class Pointer:
             saz, salt = self.sky.sun()
             sun_sep = ang_sep(taz, talt, saz, salt)
             if salt >= SUN_SAFE_ALT and sun_sep < self.cone + FIRMWARE_SUN_MARGIN:
-                raise SunGuard(
-                    f"the mount refused to move toward ({taz:.1f},{talt:.1f}), "
-                    f"{sun_sep:.1f} deg from the Sun — its own solar protection "
-                    "appears wider than the configured cone; treating as Sun-blocked"
+                # CAPPED. A frozen mount shares this signature, and near local
+                # noon the reclass band can cover most of the reachable sky —
+                # unlimited reclassification would log a jammed arm as ordinary
+                # Sun-skips for the rest of the run, evading the stuck-mount
+                # abort that exists because exactly that has cost sessions.
+                # Three in a row with no motion in between stops being solar
+                # protection and starts being a mount that cannot move.
+                self._sun_refusals += 1
+                if self._sun_refusals < 3:
+                    raise SunGuard(
+                        f"the mount refused to move toward ({taz:.1f},{talt:.1f}), "
+                        f"{sun_sep:.1f} deg from the Sun — its own solar protection "
+                        "appears wider than the configured cone; treating as Sun-blocked"
+                    )
+                raise PointingError(
+                    f"{self._sun_refusals} consecutive gotos never moved, all near the "
+                    "Sun. Solar protection could explain one or two, but a mount whose "
+                    "every attempt sits motionless is stowed, jammed or not tracking — "
+                    "check the arm."
                 )
         why = (
             f"closed to {best:.1f} deg and then stopped improving"
@@ -903,6 +926,12 @@ NIGHT_NEG_FRAC = 0.08  # sky never darkens by more than this in one step
 DAY_REF_FLOOR = 30.0
 
 
+def below_day_floor(sky_ref):
+    # One spelling of the floor test, shared by the live gate and the resume
+    # purge so the comparison cannot drift between them.
+    return sky_ref is not None and float(sky_ref) < DAY_REF_FLOOR
+
+
 def set_channel(sc, night, sw=None, log=print):
     """Switch the camera to the channel that can see the current sky.
 
@@ -1020,7 +1049,13 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
     while alt >= alt_min - 1e-6:
         try:
             lum = sample(alt)
-        except PointingError:
+        except (SunGuard, PointingError):
+            # SunGuard is defensively included: today it cannot fire here (the
+            # night channel needs sun < NIGHT_SUN_ALT, the goto reclass needs
+            # sun >= SUN_SAFE_ALT, 9 degrees apart) — but that gap is held by
+            # two constants in two files with nothing coupling them, and a
+            # SunGuard escaping this loop would abort the COLUMN where a
+            # skipped sample is recoverable.
             alt -= coarse_step
             continue
         profile.append((round(alt, 1), round(lum, 1)))
@@ -1044,7 +1079,7 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
         mid = (lo + hi) / 2.0
         try:
             lum = sample(mid)
-        except PointingError:
+        except (SunGuard, PointingError):
             break  # keep the bracket rather than lose the column
         if lum >= mid_lum:
             hi = mid

@@ -35,10 +35,12 @@ from .sweep import (
     DAY_REF_FLOOR,
     MAX_POINTING_MISSES,
     NIGHT_SUN_ALT,
+    SKY_REF_MAX_AGE,
     Pointer,
     PointingError,
     Sky,
     SunGuard,
+    below_day_floor,
     classify,
     column_touches_sun,
     night_find_edge,
@@ -1051,6 +1053,22 @@ def _replay_source(args):
         raise MaskError(f"{args.replay} is not shaped like a sweep's profiles: {e}") from e
 
 
+def _fail_column(checkpoint, dry_run, az, error, message):
+    """Checkpoint a column as failed and say why. The shared tail of every
+    give-this-column-up path — identical dict, identical shape, four sites."""
+    if not dry_run:
+        checkpoint(
+            {
+                "az": int(az),
+                "t": time.strftime("%H:%M:%S"),
+                "verdict": "failed",
+                "error": str(error)[:200],
+            }
+        )
+    print(f"az {az:3d}: {message}", file=sys.stderr)
+    return None
+
+
 def _scope_measure(sc, cfg, args):
     """A `measure(az)` that points the telescope, and the reachability predicate.
 
@@ -1069,7 +1087,7 @@ def _scope_measure(sc, cfg, args):
     sky = _sky(sc, cfg)
     sw = cfg["sweep"]
     ptr = _pointer(sc, sky, sw, args.dry_run)
-    state = {"sky_ref": None, "misses": 0, "profiles": {}}
+    state = {"sky_ref": None, "misses": 0, "profiles": {}, "lock_ok": True, "ref_taken": 0.0}
 
     # START THE VIEW. `orient` never did, and got away with it because a sweep
     # run earlier in the same session had left the scenery stream up — so it
@@ -1105,6 +1123,7 @@ def _scope_measure(sc, cfg, args):
             saz, _ = sky.sun()
             ptr.point_to((saz + 180.0) % 360.0, 75.0)
             state["sky_ref"] = sky_reference(sc.capture_rgb(warmup=0.3))
+            state["ref_taken"] = time.time()
             print(f"sky reference: {state['sky_ref']:.1f}")
         except (SunGuard, PointingError, OSError) as e:
             print(f"could not seed the sky reference ({e}); columns will be inconclusive",
@@ -1147,8 +1166,7 @@ def _scope_measure(sc, cfg, args):
             if (
                 d.get("channel") != "star4800"
                 and d.get("verdict") in ("edge", "blocked")
-                and d.get("sky_ref") is not None
-                and float(d["sky_ref"]) < DAY_REF_FLOOR
+                and below_day_floor(d.get("sky_ref"))
             ):
                 print(f"az {d['az']:3d}: checkpoint {d['verdict']} discarded - measured at "
                       f"sky_ref {d['sky_ref']}, below the day floor {DAY_REF_FLOOR:g}; "
@@ -1228,38 +1246,64 @@ def _scope_measure(sc, cfg, args):
                         # only the socket types reintroduced "the same bug one
                         # exception class over" that the daytime sweep's cleanup
                         # already documents.
-                        if not args.dry_run:
-                            checkpoint(
-                                {
-                                    "az": int(az),
-                                    "t": time.strftime("%H:%M:%S"),
-                                    "verdict": "failed",
-                                    "error": str(e2)[:200],
-                                }
-                            )
-                        print(f"az {az:3d}: failed after view restart ({str(e2)[:80]})",
-                              file=sys.stderr)  # fmt: skip
-                        return None
+                        return _fail_column(
+                            checkpoint,
+                            args.dry_run,
+                            az,
+                            e2,
+                            f"failed after view restart ({str(e2)[:80]})",
+                        )
             else:
-                if state["sky_ref"] is not None and state["sky_ref"] < DAY_REF_FLOOR:
+                # THE REFERENCE MUST BE ALLOWED TO FALL. Within a run sky_ref
+                # only ratchets up (max over profile peaks), so a run that
+                # began in daylight sailed past the floor gate below however
+                # dark the sky got - the gate read 250 while the sky read 12
+                # (round 1's P1). Same cure as run_sweep: past
+                # SKY_REF_MAX_AGE, re-measure and REPLACE.
+                if (
+                    not args.dry_run
+                    and state["sky_ref"] is not None
+                    and time.time() - state["ref_taken"] > SKY_REF_MAX_AGE
+                ):
+                    try:
+                        saz_now, _ = sky.sun()
+                        ptr.point_to((saz_now + 180.0) % 360.0, 75.0)
+                        new_ref = sky_reference(sc.capture_rgb(warmup=0.3))
+                        print(f"sky reference refreshed: {state['sky_ref']:.1f} -> {new_ref:.1f}")
+                        state["sky_ref"], state["ref_taken"] = new_ref, time.time()
+                    except (SunGuard, PointingError, OSError, SeestarError) as e:
+                        print(f"sky reference refresh failed ({e}); keeping "
+                              f"{state['sky_ref']:.1f}", file=sys.stderr)  # fmt: skip
+                if below_day_floor(state["sky_ref"]):
                     # Below the floor the day judge does not refuse, it invents
                     # (M-19's worst case, seen live tonight). Checkpointed as
                     # failed so a resume RE-ATTEMPTS it - by then the Sun may
                     # have crossed NIGHT_SUN_ALT and the night eye can answer.
-                    if not args.dry_run:
-                        checkpoint(
-                            {
-                                "az": int(az),
-                                "t": time.strftime("%H:%M:%S"),
-                                "verdict": "failed",
-                                "error": f"day reference {state['sky_ref']:.1f} below floor "
-                                f"{DAY_REF_FLOOR:g}: too dark for the day channel",
-                            }
+                    return _fail_column(
+                        checkpoint, args.dry_run, az,
+                        f"day reference {state['sky_ref']:.1f} below floor "
+                        f"{DAY_REF_FLOOR:g}: too dark for the day channel",
+                        f"too dark for the day channel (ref {state['sky_ref']:.1f} < "
+                        f"{DAY_REF_FLOOR:g}); wait for the night channel (sun < -12)",
+                    )  # fmt: skip
+                # AN UNVERIFIED LOCK MEASURES NOTHING (M-06). A failed re-lock
+                # in the retry below leaves the exposure state unknown, and a
+                # column measured under auto-exposure is a plausible wrong
+                # number, not a measurement (round 1's other P1). Re-establish
+                # it before every day column or refuse the column.
+                if not args.dry_run and not state["lock_ok"]:
+                    try:
+                        _start_locked(sc, sw)
+                        state["lock_ok"] = True
+                    except (ConnectionError, OSError, TimeoutError, SeestarError) as e:
+                        return _fail_column(
+                            checkpoint,
+                            args.dry_run,
+                            az,
+                            e,
+                            f"exposure lock still unverified ({str(e)[:60]}); refusing to "
+                            "measure under auto-exposure",
                         )
-                    print(f"az {az:3d}: too dark for the day channel (ref "
-                          f"{state['sky_ref']:.1f} < {DAY_REF_FLOOR:g}); wait for the night "
-                          "channel (sun < -12)", file=sys.stderr)  # fmt: skip
-                    return None
                 try:
                     alt, status, _typ, profile = scan_horizon(
                         ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
@@ -1287,18 +1331,18 @@ def _scope_measure(sc, cfg, args):
                             frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
                         )  # fmt: skip
                     except (ConnectionError, OSError, TimeoutError, SeestarError) as e2:
-                        if not args.dry_run:
-                            checkpoint(
-                                {
-                                    "az": int(az),
-                                    "t": time.strftime("%H:%M:%S"),
-                                    "verdict": "failed",
-                                    "error": str(e2)[:200],
-                                }
-                            )
-                        print(f"az {az:3d}: failed after view restart ({str(e2)[:80]})",
-                              file=sys.stderr)  # fmt: skip
-                        return None
+                        # The failure may have been _start_locked itself, so
+                        # the exposure state is now UNKNOWN. Marked unverified;
+                        # the precondition above re-establishes it before the
+                        # next day column measures anything.
+                        state["lock_ok"] = False
+                        return _fail_column(
+                            checkpoint,
+                            args.dry_run,
+                            az,
+                            e2,
+                            f"failed after view restart ({str(e2)[:80]})",
+                        )
         except SunGuard as e:
             print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
             return None
@@ -1438,11 +1482,20 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
         # photometric model applied — for figures and polar backdrops. The
         # measurement outputs above are already written and never touch this
         # (terminus-52: it changes pixel values, and every published residual
-        # was produced without it).
-        fig_tiffs, _photo_pto = mosaic.render_photometric(final, work)
-        fig, _fig_cov, _fig_gains = mosaic.composite(fig_tiffs, args.width, args.height)
-        figure_path = base + ".figure.png"
-        Image.fromarray(fig).save(figure_path)
+        # was produced without it). GUARDED, because the photometric fit is a
+        # separate optimisation that can fail after the geometric one
+        # succeeded — and an aborted command here lost the manifest for a
+        # cosmetic failure (round 1's P2). The figure is the one output whose
+        # absence costs nothing downstream.
+        try:
+            fig_tiffs, _photo_pto = mosaic.render_photometric(final, work)
+            fig, _fig_cov, _fig_gains = mosaic.composite(fig_tiffs, args.width, args.height)
+            figure_path = base + ".figure.png"
+            Image.fromarray(fig).save(figure_path)
+        except mosaic.MosaicError as e:
+            print(f"photometric render failed ({e}); the measurement outputs are "
+                  "unaffected and the manifest still records the run", file=sys.stderr)  # fmt: skip
+            figure_path = None
     mosaic.write_manifest(
         base + ".manifest.json",
         image_dir=os.path.abspath(args.image_dir),

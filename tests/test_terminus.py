@@ -922,6 +922,24 @@ def test_a_mount_that_refuses_a_sun_adjacent_goto_is_sun_blocked_not_broken():
         near = sky.altaz_to_radec(259.0, 25.0)
         with pytest.raises(SunGuard, match="solar protection"):
             ptr._goto_wait(*near, settle=0.5)
+        # The margin is 10, not less: a target out at ~cone + 9 must still be
+        # reclassified (round 1 found the constant unpinned at ~3.5).
+        wide = sky.altaz_to_radec(259.0, 32.0)
+        from terminus.sweep import FIRMWARE_SUN_MARGIN, ang_sep
+
+        taz, talt = sky.radec_to_altaz(*wide)
+        sep = ang_sep(taz, talt, 287.0, 5.0)
+        assert (
+            30.0 + FIRMWARE_SUN_MARGIN - 3.0 < sep < 30.0 + FIRMWARE_SUN_MARGIN
+        ), f"fixture must sit just inside the margin band, got {sep:.1f}"
+        with pytest.raises(SunGuard, match="solar protection"):
+            ptr._goto_wait(*wide, settle=0.5)
+        # THE RECLASSIFICATION IS CAPPED (round 1's P2): a frozen mount shares
+        # the motionless signature, and near noon the band covers most of the
+        # sky. The third consecutive refusal with no motion in between is a
+        # mount fault again, so the stuck-mount abort can see it.
+        with pytest.raises(PointingError, match="consecutive"):
+            ptr._goto_wait(*near, settle=0.5)
 
     clock = FakeTime()
     with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
@@ -5874,6 +5892,84 @@ def test_photometric_is_opt_in_and_never_touches_the_measurement_render(tmp_path
     ).read_bytes(), "the measurement render must be byte-identical with and without the flag"
 
 
+def test_a_failed_photometric_render_does_not_cost_the_manifest(tmp_path):
+    """Round 1 P2: the figure block ran before write_manifest with no guard.
+
+    The photometric fit is a separate optimisation that can fail after the
+    geometric one succeeded; aborting there lost the manifest — the run's
+    reprocessing record — for a purely cosmetic failure. The figure is the one
+    output whose absence costs nothing, so its failure costs a warning.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus import cli, mosaic
+
+    out = tmp_path / "pano"
+    args = SimpleNamespace(
+        image_dir=str(tmp_path), work=str(tmp_path / "w"), out=str(out), lens=None,
+        min_points=13, no_celeste=False, width=8, height=4, segment=False, photometric=True,
+    )  # fmt: skip
+    with (
+        patch.object(mosaic, "require_hugin"),
+        patch.object(mosaic, "solve", return_value=("p.pto", set())),
+        patch.object(mosaic, "control_point_counts", return_value={"a.jpg": 20}),
+        patch.object(mosaic, "render", return_value=(["l0.tif"], "final.pto")),
+        patch.object(
+            mosaic,
+            "composite",
+            return_value=(np.zeros((4, 8, 3), np.uint8), np.ones((4, 8)), [1.0]),
+        ),
+        patch.object(
+            mosaic,
+            "render_photometric",
+            MagicMock(side_effect=mosaic.MosaicError("autooptimiser -m failed")),
+        ),
+    ):
+        cli.cmd_mosaic(None, {}, args)  # must not raise
+
+    assert (
+        tmp_path / "pano.manifest.json"
+    ).exists(), "the manifest is the run's reprocessing record; a cosmetic failure must not cost it"
+    assert not (tmp_path / "pano.figure.png").exists()
+
+
+def test_the_figure_render_feeds_nona_the_photometric_solve(tmp_path):
+    """Round 1's sharpest surviving mutation: nona fed final.pto, silently.
+
+    render_photometric's whole job is the second pto - autooptimiser -m writes
+    photometric.pto and nona must render FROM IT. Feeding nona the original
+    final.pto skips the photometric model entirely while producing an
+    identical-looking figure file, which nothing downstream can detect.
+    """
+    import subprocess
+    from unittest.mock import patch
+
+    from terminus.mosaic import render_photometric
+
+    seen = []
+
+    def fake_run(cmd, *a, **kw):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with (
+        patch("terminus.mosaic.require_hugin"),
+        patch("terminus.mosaic._run", side_effect=fake_run),
+    ):
+        _tiffs, photo = render_photometric(str(tmp_path / "final.pto"), str(tmp_path))
+
+    assert seen[0][0] == "autooptimiser" and "-m" in seen[0], seen[0]
+    assert seen[0][-1].endswith("final.pto"), "the photometric solve starts from the geometry"
+    assert seen[1][0] == "nona", seen[1]
+    assert seen[1][-1].endswith(
+        "photometric.pto"
+    ), f"nona must render FROM the photometric solve, got {seen[1][-1]}"
+    assert photo.endswith("photometric.pto")
+
+
 def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     """Silent success is the failure mode this whole path exists to remove.
 
@@ -6005,10 +6101,22 @@ def test_the_polar_page_lists_the_fit_columns_with_their_fates(tmp_path):
     }  # fmt: skip
     html_page = polar.page(rows, sol, meta=meta, size=200)
     assert "Telescope columns (2 used of 4 offered)" in html_page
-    assert "dawn transition" in html_page and "excluded" in html_page
     assert "&lt;profile&gt;" in html_page, "hand-written reasons must be escaped"
-    assert "-0.12" in html_page, "a used column shows its residual"
-    assert "bound" in html_page, "a ceiling-limited column says so"
+
+    # PER ROW, not page-wide substrings: round 1 showed swapped bound/edge and
+    # excluded/not-used labels survive containment checks, because some row
+    # somewhere always says each word.
+    import re
+
+    table_rows = {}
+    for m in re.finditer(r"<tr[^>]*>(<td>.*?)</tr>", html_page):
+        cells = re.findall(r"<td>(.*?)</td>", m.group(1))
+        table_rows[cells[0]] = cells
+    assert table_rows["0"][2] == "bound" and table_rows["0"][3] == "used"
+    assert table_rows["90"][2] == "edge" and table_rows["90"][3] == "used"
+    assert table_rows["90"][4] == "-0.12&deg;", "a used column shows its own residual"
+    assert table_rows["20"][3] == "excluded" and "dawn transition" in table_rows["20"][4]
+    assert table_rows["33"][3] == "not used"
 
     bare = polar.page(rows, sol, meta={"yaw": 133.0}, size=200)
     assert "Telescope columns (" not in bare, "no record, no table"
@@ -6937,6 +7045,159 @@ def test_a_twilight_day_verdict_is_discarded_on_resume_and_refused_live(tmp_path
     ), "the cached twilight edge must be discarded and re-attempted, not served"
 
 
+def test_the_reference_is_allowed_to_fall_and_the_floor_then_catches_it(tmp_path):
+    """Round 1's P1: within a run sky_ref only ratcheted up, so the floor gate
+    could never fire in the exact bright-into-dark run it was built for — the
+    gate read the daylight 250 while the sky read 12. The day branch now
+    refreshes the reference past SKY_REF_MAX_AGE, REPLACING it as run_sweep
+    does, and the gate reads the fresh value.
+    """
+    import json
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli, guide
+    from terminus.export import MaskError, write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=4,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    scans = MagicMock()
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "SKY_REF_MAX_AGE", -1.0),  # every column finds the seed stale
+        patch.object(cli, "scan_horizon", scans),
+        # Daylight at the seed, 12 counts at the refresh: the run has gone dark.
+        patch.object(cli, "sky_reference", MagicMock(side_effect=[250.0] + [12.0] * 60)),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(guide, "fit", return_value={
+            "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+            "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+        }),  # fmt: skip
+    ):
+        with pytest.raises(MaskError, match="needs four"):
+            cli.cmd_orient(sc, cfg, args)
+
+    assert not scans.called, (
+        "with the refreshed reference under the floor, no column may be scanned "
+        "into a plausible wrong number — the old ratchet let every one through"
+    )
+    lines = [json.loads(x) for x in (tmp_path / "solved_fiducials.jsonl").read_text().splitlines()]
+    assert any(
+        d.get("error", "").startswith("day reference") for d in lines
+    ), "the floored columns must be checkpointed as failed for a night re-attempt"
+
+
+def test_an_unverified_exposure_lock_blocks_the_next_column(tmp_path):
+    """Round 1's other P1: a failed re-lock left later columns silently
+    measuring under auto-exposure (M-06's exact sin). The lock is now a
+    precondition: after any relock failure, every day column re-establishes it
+    or is refused — never measured unverified.
+    """
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.client import SeestarError
+    from terminus.export import MaskError, write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=3,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    scan_calls = {"n": 0, "locks_at_scan": []}
+
+    def scans(*a, **k):
+        scan_calls["n"] += 1
+        scan_calls["locks_at_scan"].append(relocks["n"])
+        if scan_calls["n"] == 1:
+            raise SeestarError("RTSP capture failed: timed out")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    # The retry's relock fails, the next column's re-establishment fails, the
+    # one after that heals.
+    relocks = {"n": 0}
+
+    def flaky_lock(*a, **k):
+        relocks["n"] += 1
+        # Call 1 is the unguarded run-start lock: it succeeds. The RETRY's
+        # relock (2) and the next column's re-establishment (3) fail; 4 heals.
+        if relocks["n"] in (2, 3):
+            raise SeestarError("lock refused" if relocks["n"] == 2 else "still dead")
+
+    restarts = MagicMock(side_effect=flaky_lock)
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scans),
+        patch.object(cli, "_start_locked", restarts),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(guide, "fit", return_value={
+            "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+            "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+        }),  # fmt: skip
+    ):
+        try:
+            cli.cmd_orient(sc, cfg, args)
+        except MaskError:
+            pass  # too few columns is a legitimate outcome of the refusals
+
+    assert (
+        restarts.call_count >= 4
+    ), f"the lock must be re-attempted before each day column, saw {restarts.call_count}"
+    # THE INVARIANT: no scan while the lock is unverified. Relock calls 2 and 3
+    # fail, call 4 heals — so every scan after the first (which triggered the
+    # failure) must observe the healed lock. A scan seeing relock state 2 or 3
+    # is a column measured under auto-exposure.
+    assert all(n >= 4 for n in scan_calls["locks_at_scan"][1:]), (
+        f"a column measured under an unverified lock: relock states at scan "
+        f"time were {scan_calls['locks_at_scan']}"
+    )
+    assert len(scan_calls["locks_at_scan"]) >= 2, "the healed run must resume measuring"
+
+
 def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
     """Live 2026-08-07: the RTSP stream died at column ten and killed the orient.
 
@@ -7012,7 +7273,10 @@ def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
         cli.cmd_orient(sc, cfg, args)
 
     assert calls["n"] >= 2, "the failed column must be retried, not abandoned"
-    assert restarts.called, "the retry must cycle the view first (and re-lock exposure)"
+    restarts.assert_called_with(sc, cfg["sweep"]), (
+        "the retry must cycle the view with the scope and the sweep config, in "
+        "that order - round 1 found swapped arguments survive a bare .called"
+    )
     assert out.exists(), "the run must survive to write its mask"
 
 
