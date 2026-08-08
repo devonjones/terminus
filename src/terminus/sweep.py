@@ -895,6 +895,12 @@ EDGE_SNR = 2.5  # a step must exceed the column's own sample-to-sample noise by
 NIGHT_SUN_ALT = -12.0
 NIGHT_DROP_FRAC = 0.20  # a real edge falls at least this fraction of the running max
 NIGHT_NEG_FRAC = 0.08  # sky never darkens by more than this in one step
+# Below this open-sky reference the day judge manufactures edges rather than
+# refusing: measured 2026-08-07, three columns in a treeline the sweeps put
+# above 60 deg came back as confident 13.8-15.0 deg edges at ref 21.3, exactly
+# the after-midnight failure M-08 describes (~20 counts, scatter swamps the
+# step). A day column measured below this floor is unmeasurable, not an edge.
+DAY_REF_FLOOR = 30.0
 
 
 def set_channel(sc, night, sw=None, log=print):

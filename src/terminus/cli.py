@@ -32,6 +32,7 @@ from .export import (
 )
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
 from .sweep import (
+    DAY_REF_FLOOR,
     MAX_POINTING_MISSES,
     NIGHT_SUN_ALT,
     Pointer,
@@ -1137,6 +1138,22 @@ def _scope_measure(sc, cfg, args):
             # stored verdict — their judge needs a sky reference that is not in
             # the record.
             prof = [(a, lum) for a, lum in (d.get("profile") or [])]
+            # A DAY VERDICT FROM A DEAD SKY IS DISCARDED, NOT SERVED. Three
+            # twilight columns (2026-08-07, ref 21.3) came back as confident
+            # low edges in a treeline the sweeps put above 60 deg; serving
+            # them from the checkpoint would feed the night resume the very
+            # numbers the floor exists to refuse (M-08, M-13). Dropped from
+            # the cache entirely so the current channel re-measures them.
+            if (
+                d.get("channel") != "star4800"
+                and d.get("verdict") in ("edge", "blocked")
+                and d.get("sky_ref") is not None
+                and float(d["sky_ref"]) < DAY_REF_FLOOR
+            ):
+                print(f"az {d['az']:3d}: checkpoint {d['verdict']} discarded - measured at "
+                      f"sky_ref {d['sky_ref']}, below the day floor {DAY_REF_FLOOR:g}; "
+                      "will re-measure", file=sys.stderr)  # fmt: skip
+                continue
             if d.get("channel") == "star4800" and len(prof) >= 3:
                 idx, verdict = night_find_edge(prof)
                 if verdict != d["verdict"]:
@@ -1224,6 +1241,25 @@ def _scope_measure(sc, cfg, args):
                               file=sys.stderr)  # fmt: skip
                         return None
             else:
+                if state["sky_ref"] is not None and state["sky_ref"] < DAY_REF_FLOOR:
+                    # Below the floor the day judge does not refuse, it invents
+                    # (M-19's worst case, seen live tonight). Checkpointed as
+                    # failed so a resume RE-ATTEMPTS it - by then the Sun may
+                    # have crossed NIGHT_SUN_ALT and the night eye can answer.
+                    if not args.dry_run:
+                        checkpoint(
+                            {
+                                "az": int(az),
+                                "t": time.strftime("%H:%M:%S"),
+                                "verdict": "failed",
+                                "error": f"day reference {state['sky_ref']:.1f} below floor "
+                                f"{DAY_REF_FLOOR:g}: too dark for the day channel",
+                            }
+                        )
+                    print(f"az {az:3d}: too dark for the day channel (ref "
+                          f"{state['sky_ref']:.1f} < {DAY_REF_FLOOR:g}); wait for the night "
+                          "channel (sun < -12)", file=sys.stderr)  # fmt: skip
+                    return None
                 try:
                     alt, status, _typ, profile = scan_horizon(
                         ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),

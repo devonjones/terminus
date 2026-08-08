@@ -6846,6 +6846,95 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem(tmp_pat
     assert port is not None
 
 
+def test_a_twilight_day_verdict_is_discarded_on_resume_and_refused_live(tmp_path):
+    """M-08 wired into orient: below DAY_REF_FLOOR the day judge invents edges.
+
+    Live 2026-08-07: three columns in a treeline the sweeps put above 60 deg
+    came back as confident 13.8-15.0 deg edges at sky_ref 21.3. Two teeth, both
+    here: a cached day edge recorded below the floor is DISCARDED on resume so
+    the current channel re-measures it (serving it would feed the night fit the
+    exact numbers the floor refuses), and a live day column under a floored
+    reference is checkpointed failed without ever slewing.
+    """
+    import json
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    ckpt.write_text(
+        json.dumps({"az": 320, "verdict": "edge", "alt": 13.8, "ceiling": 60,
+                    "channel": "scenery", "sky_ref": 21.3, "profile": []}) + "\n"
+        + json.dumps({"az": 90, "verdict": "edge", "alt": 6.2, "ceiling": 60,
+                      "channel": "scenery", "sky_ref": 245.7, "profile": []}) + "\n"
+    )  # fmt: skip
+
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=4,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    import pytest
+
+    from terminus.export import MaskError
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    scans = MagicMock()
+    with (
+        patch.object(cli, "scan_horizon", scans),
+        patch.object(cli, "sky_reference", return_value=21.3),  # a floored evening
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(
+            guide,
+            "fit",
+            return_value={
+                "yaw": 10.0,
+                "pitch": 0.0,
+                "tilt_mag": 0.0,
+                "tilt_dir": 0.0,
+                "rms": 0.1,
+                "n": 4,
+                "n_bound": 0,
+                "residuals": {0.0: 0.1},
+                "fiducials": [],
+            },
+        ),
+    ):
+        # Only the one healthy cached column survives, so the run rightly
+        # refuses to fit — the floor's job is exactly to shrink a twilight run
+        # to what was actually measurable.
+        with pytest.raises(MaskError, match="needs four"):
+            cli.cmd_orient(sc, cfg, args)
+
+    lines = [json.loads(x) for x in ckpt.read_text().splitlines()]
+    floored = [d for d in lines if d.get("error", "").startswith("day reference")]
+    assert floored, "live columns under a floored reference must checkpoint as failed"
+    assert not scans.called, "and must never be scanned into a plausible wrong number"
+    retried = [d for d in lines if d["az"] == 320]
+    assert (
+        len(retried) > 1
+    ), "the cached twilight edge must be discarded and re-attempted, not served"
+
+
 def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
     """Live 2026-08-07: the RTSP stream died at column ten and killed the orient.
 
