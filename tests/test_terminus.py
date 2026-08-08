@@ -941,6 +941,32 @@ def test_a_mount_that_refuses_a_sun_adjacent_goto_is_sun_blocked_not_broken():
         with pytest.raises(PointingError, match="consecutive"):
             ptr._goto_wait(*near, settle=0.5)
 
+    # AND THE CAP RESETS ON REAL MOTION (round 2): a healthy mount that
+    # legitimately gets Sun-refused three times across a long session must not
+    # be branded stuck. After an ARRIVING goto, a fresh near-Sun refusal is a
+    # clean SunGuard again, not an instant PointingError.
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
+        arriving = MagicMock()
+        state = {"ra": 8.0}
+        arriving.equ_coord = MagicMock(side_effect=lambda: (state["ra"], 0.0))
+        moving = {"on": False}
+        arriving.call = MagicMock(
+            side_effect=lambda m, *a, **k: {
+                "result": {"mount": {"move_type": ("goto" if moving["on"] else "none")}}
+            }
+        )
+        ptr = Pointer(arriving, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
+        near = ptr.sky.altaz_to_radec(259.0, 25.0)
+        for _ in range(2):
+            with pytest.raises(SunGuard):
+                ptr._goto_wait(*near, settle=0.1)
+        # a goto that ARRIVES: point at the current position
+        ptr._goto_wait(8.0, 0.0, settle=0.1)
+        with pytest.raises(SunGuard, match="solar protection"):
+            # reset by the arrival: refusal number three counts as one again
+            ptr._goto_wait(*near, settle=0.1)
+
     clock = FakeTime()
     with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
         ptr = frozen_pointer()
@@ -7108,6 +7134,105 @@ def test_the_reference_is_allowed_to_fall_and_the_floor_then_catches_it(tmp_path
     assert any(
         d.get("error", "").startswith("day reference") for d in lines
     ), "the floored columns must be checkpointed as failed for a night re-attempt"
+
+
+def test_a_failed_reference_refresh_backs_off_instead_of_retrying_every_column(tmp_path):
+    """Round 2's P2: the refresh fix forgot run_sweep's failure backoff.
+
+    On failure the clock must advance anyway — without it the very next column
+    finds the reference stale again, and every remaining day column pays a
+    failed anti-Sun slew before being measured, for the rest of the run. The
+    discriminator: with backoff the anti-Sun goto fails a bounded number of
+    times (the seed plus one refresh); without it, once per column.
+    """
+    import math
+    import time as real_time
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.export import MaskError, write_mask
+    from terminus.sweep import PointingError
+
+    class FakeTime:
+        def __init__(self, t):
+            self.t = t
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=3,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    clock = FakeTime(20_000.0)
+    anti_sun = {"n": 0}
+
+    # EVERY anti-Sun goto fails tonight — the seed and any refresh alike.
+    # sky_ref still gets set by the first column's own profile peak, so the
+    # refresh machinery arms, attempts once, and must then back off.
+    def flaky_point_to(az, alt):
+        if alt == 75.0:
+            anti_sun["n"] += 1
+            raise PointingError("anti-Sun target unreachable tonight")
+        return az, alt
+
+    ptr = MagicMock()
+    ptr.point_to = MagicMock(side_effect=flaky_point_to)
+
+    def cheap_scan(*a, **k):
+        clock.t += 10.0  # columns far cheaper than SKY_REF_MAX_AGE
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli, "time", clock),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=cheap_scan),
+        patch.object(cli, "sky_reference", return_value=250.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(cli, "SKY_REF_MAX_AGE", 100.0),
+        patch.object(guide, "fit", return_value={
+            "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+            "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+        }),  # fmt: skip
+    ):
+        try:
+            cli.cmd_orient(sc, cfg, args)
+        except MaskError:
+            pass
+
+    # Failed seed (1) + one armed refresh attempt (2), then backoff holds for
+    # SKY_REF_MAX_AGE across the remaining cheap columns. Without the backoff,
+    # the count grows by one per column after the ratchet arms the refresh.
+    assert 1 <= anti_sun["n"] <= 2, (
+        f"a failed refresh must back off for SKY_REF_MAX_AGE, not retry every "
+        f"column: {anti_sun['n']} anti-Sun attempts"
+    )
 
 
 def test_an_unverified_exposure_lock_blocks_the_next_column(tmp_path):

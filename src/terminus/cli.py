@@ -1272,6 +1272,12 @@ def _scope_measure(sc, cfg, args):
                         print(f"sky reference refreshed: {state['sky_ref']:.1f} -> {new_ref:.1f}")
                         state["sky_ref"], state["ref_taken"] = new_ref, time.time()
                     except (SunGuard, PointingError, OSError, SeestarError) as e:
+                        # The clock advances on FAILURE too, exactly as
+                        # run_sweep's twin does: without it the very next
+                        # column finds the reference stale again and every
+                        # remaining column pays a failed slew before measuring
+                        # (round 2's P2).
+                        state["ref_taken"] = time.time()
                         print(f"sky reference refresh failed ({e}); keeping "
                               f"{state['sky_ref']:.1f}", file=sys.stderr)  # fmt: skip
                 if below_day_floor(state["sky_ref"]):

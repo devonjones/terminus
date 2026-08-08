@@ -23,6 +23,8 @@ import warnings
 
 import numpy as np
 
+from .client import SeestarError
+
 warnings.filterwarnings("ignore")
 import astropy.units as u  # noqa: E402
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun  # noqa: E402
@@ -1450,7 +1452,7 @@ def run_sweep(
                 new_ref = sky_reference(sc.capture_rgb(warmup=0.3))
                 log(f"sky reference refreshed: {sky_ref:.1f} -> {new_ref:.1f}", flush=True)
                 sky_ref, ref_taken = new_ref, time.time()
-            except (SunGuard, PointingError, OSError) as e:
+            except (SunGuard, PointingError, OSError, SeestarError) as e:
                 log(f"sky reference refresh failed ({e}); keeping {sky_ref:.1f}", flush=True)
                 ref_taken = time.time()
         # The Sun is re-read per column rather than reused from the seed: a full
