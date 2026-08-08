@@ -1224,12 +1224,45 @@ def _scope_measure(sc, cfg, args):
                               file=sys.stderr)  # fmt: skip
                         return None
             else:
-                alt, status, _typ, profile = scan_horizon(
-                    ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
-                    sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
-                    sun_alt=sky.sun()[1],
-                    frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
-                )  # fmt: skip
+                try:
+                    alt, status, _typ, profile = scan_horizon(
+                        ptr, sc, az, sw["alt_min"], sw["alt_max"], sw.get("coarse_step", 5.0),
+                        sw["alt_tol"], state["sky_ref"], repeats=sw.get("samples_per_point", 1),
+                        sun_alt=sky.sun()[1],
+                        frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                    )  # fmt: skip
+                except (ConnectionError, OSError, TimeoutError, SeestarError) as e:
+                    # THE DAY CHANNEL DIES TOO. On 2026-08-07 the scenery RTSP
+                    # stream stopped serving mid-run and the ffmpeg timeout
+                    # crashed the whole orient at column ten — nine measured
+                    # columns stranded in the checkpoint, an observing window
+                    # spent for no fit. Same recovery as the night branch:
+                    # cycle the view (which also re-locks the exposure, M-06),
+                    # give the COLUMN one more try, and a second failure is one
+                    # lost column rather than a dead run (D-12).
+                    print(f"az {az:3d}: scenery stream died ({str(e)[:60]}); "
+                          "restarting the view", file=sys.stderr)  # fmt: skip
+                    try:
+                        _start_locked(sc, sw)
+                        alt, status, _typ, profile = scan_horizon(
+                            ptr, sc, az, sw["alt_min"], sw["alt_max"],
+                            sw.get("coarse_step", 5.0), sw["alt_tol"], state["sky_ref"],
+                            repeats=sw.get("samples_per_point", 1), sun_alt=sky.sun()[1],
+                            frames_dir=(f"{frames_dir}/scan" if not args.dry_run else None),
+                        )  # fmt: skip
+                    except (ConnectionError, OSError, TimeoutError, SeestarError) as e2:
+                        if not args.dry_run:
+                            checkpoint(
+                                {
+                                    "az": int(az),
+                                    "t": time.strftime("%H:%M:%S"),
+                                    "verdict": "failed",
+                                    "error": str(e2)[:200],
+                                }
+                            )
+                        print(f"az {az:3d}: failed after view restart ({str(e2)[:80]})",
+                              file=sys.stderr)  # fmt: skip
+                        return None
         except SunGuard as e:
             print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
             return None

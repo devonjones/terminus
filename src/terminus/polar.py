@@ -149,6 +149,16 @@ PAGE = """<!doctype html>
            vertical-align:baseline; }}
   footer {{ color:var(--dim); font-size:13px; margin-top:22px; padding-top:14px;
            border-top:1px solid var(--rule); }}
+  details.cols {{ margin-top:18px; }}
+  details.cols summary {{ cursor:pointer; font:600 14px ui-sans-serif,system-ui,sans-serif;
+                          color:var(--dim); }}
+  .cols table {{ border-collapse:collapse; margin-top:10px; width:100%;
+                font:13px/1.5 ui-monospace,Menlo,Consolas,monospace; }}
+  .cols th {{ text-align:left; color:var(--dim); font-weight:600; padding:3px 14px 3px 0;
+             border-bottom:1px solid var(--rule); }}
+  .cols td {{ padding:3px 14px 3px 0; border-bottom:1px solid var(--rule);
+             vertical-align:top; }}
+  .cols tr.unused td {{ color:var(--dim); }}
 </style>
 <div class="wrap">
 <h1>{title}</h1>
@@ -175,6 +185,7 @@ PAGE = """<!doctype html>
   <span><i style="background:{edge}"></i>telescope edge</span>
   <span><i style="background:{bound}"></i>at the scope's tilt ceiling: horizon is <em>at least</em> this high</span>
 </p>
+{columns}
 <footer>{footer}</footer>
 </div>
 <script>
@@ -197,6 +208,43 @@ PAGE = """<!doctype html>
 }})();
 </script>
 """
+
+
+def _columns_table(meta):
+    """The fit's own fiducial record, as a table a person can audit.
+
+    Built from `meta.fit_fiducials` — the record `orient` writes of every
+    column it was offered: the value, whether it was one-sided, whether the
+    fit used it, and the reason when it did not (terminus-53). A mask without
+    the record (pre-record runs, plain sweeps) simply has no table; inventing
+    rows from the horizon block would show numbers the fit never saw.
+    """
+    fids = meta.get("fit_fiducials") or []
+    if not fids:
+        return ""
+    body = []
+    used_n = sum(1 for f in fids if f.get("used"))
+    for f in sorted(fids, key=lambda d: float(d.get("az", 0.0))):
+        alt = f.get("alt")
+        kind = "bound" if f.get("bound") else ("edge" if alt is not None else "&#8212;")
+        res = f.get("residual")
+        if f.get("used"):
+            status, note = "used", (f"{float(res):+.2f}&deg;" if res is not None else "&#8212;")
+        else:
+            status = "excluded" if f.get("excluded_by") == "mask" else "not used"
+            note = html.escape(str(f.get("reason") or ""))
+        cls = "" if f.get("used") else ' class="unused"'
+        alt_s = f"{float(alt):.1f}" if alt is not None else "&#8212;"
+        body.append(
+            f"<tr{cls}><td>{float(f.get('az', 0.0)):g}</td><td>{alt_s}</td>"
+            f"<td>{kind}</td><td>{status}</td><td>{note}</td></tr>"
+        )
+    return (
+        f'<details class="cols" open><summary>Telescope columns '
+        f"({used_n} used of {len(fids)} offered)</summary><table>"
+        "<tr><th>az</th><th>alt</th><th>kind</th><th>in fit</th>"
+        "<th>residual / reason</th></tr>" + "".join(body) + "</table></details>"
+    )
 
 
 def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
@@ -288,6 +336,7 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         horizon_points=" ".join(pts),
         markers="".join(markers),
         pts_pressed="true" if markers else "false",
+        columns=_columns_table(meta),
         footer=footer,
         horizon=HORIZON_COLOUR,
         edge=EDGE_COLOUR,

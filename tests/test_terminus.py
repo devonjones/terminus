@@ -816,6 +816,130 @@ def test_floor_pinned_result_is_not_a_measurement():
     assert "open" in detail["reason"]
 
 
+def test_a_goto_that_doglegs_is_not_reported_failed_while_the_mount_still_moves():
+    """Live failure 2026-08-07: two consecutive gotos 'failed' and both landed.
+
+    A large arm reconfiguration doglegs: closure on the target paused for more
+    than NO_PROGRESS_S mid-path while the mount kept reporting motion, the old
+    rule broke out at the stall, and the mount arrived seconds later — so the
+    NEXT goto's failure message blamed the position the first had just reached.
+    The rule now is: a stall stops EXTENDING the deadline but only a stall with
+    the mount HALTED ends the attempt early. The 2026-08-06 case the stall rule
+    was built for — moving the whole time, never converging, 288 s unbounded —
+    must still fail, within GOTO_TIMEOUT of its last real progress.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import sweep as sweep_mod
+    from terminus.sweep import Pointer, PointingError, Sky
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    def make_pointer(ra_at, moving_at):
+        sc = MagicMock()
+        sc.goto = MagicMock()
+        sc.equ_coord = MagicMock(side_effect=lambda: (ra_at(clock.t), 0.0))
+        sc.call = MagicMock(
+            side_effect=lambda m, *a, **k: {
+                "result": {"mount": {"move_type": ("goto" if moving_at(clock.t) else "none")}}
+            }
+        )
+        return Pointer(sc, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
+
+    # Dogleg: closes for 10 s, pauses 35 s (still moving), then closes and
+    # lands ~55 s in — inside the deadline the closing phase earned.
+    clock = FakeTime()
+
+    def dogleg_ra(t):
+        if t < 10:
+            return 0.2 * t  # closing: 3 deg/s toward RA 4h
+        if t < 45:
+            return 2.0  # paused mid-reconfiguration
+        return min(4.0, 2.0 + 0.2 * (t - 45.0))
+
+    with patch.object(sweep_mod, "time", clock):
+        ptr = make_pointer(dogleg_ra, lambda t: True)
+        ptr._goto_wait(4.0, 0.0, settle=0.5)  # must NOT raise
+    assert clock.t < 90, f"the dogleg must land within the un-extended deadline, took {clock.t}"
+
+    # Halted short: stops moving 9 deg out. Fails fast at the stall.
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock):
+        ptr = make_pointer(lambda t: min(3.4, 0.2 * t), lambda t: t < 20)
+        with pytest.raises(PointingError, match="stopped improving"):
+            ptr._goto_wait(4.0, 0.0, settle=0.5)
+    assert clock.t < 60, f"a halted mount must fail fast, took {clock.t}"
+
+
+def test_a_mount_that_refuses_a_sun_adjacent_goto_is_sun_blocked_not_broken():
+    """Live 2026-08-07: the mount sat motionless on a goto ~35 deg from the Sun.
+
+    Our cone (30) had cleared the target; the Seestar's own solar protection is
+    evidently wider, and it refused by simply not moving. That must surface as
+    SunGuard — a clean skip every loop already handles without counting a miss —
+    not as PointingError, which charges the mount's good judgement toward
+    MAX_POINTING_MISSES and can abort a healthy run. A never-moved goto AWAY
+    from the Sun keeps the PointingError: that is the stowed-arm signature.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import sweep as sweep_mod
+    from terminus.sweep import Pointer, PointingError, Sky, SunGuard
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    def frozen_pointer():
+        sc = MagicMock()
+        sc.equ_coord = MagicMock(return_value=(8.0, 30.0))  # never changes
+        sc.call = MagicMock(return_value={"result": {"mount": {"move_type": "none"}}})
+        return Pointer(sc, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
+
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
+        ptr = frozen_pointer()
+        sky = ptr.sky
+        # A target ~35 deg from the Sun (inside cone + FIRMWARE_SUN_MARGIN).
+        near = sky.altaz_to_radec(259.0, 25.0)
+        with pytest.raises(SunGuard, match="solar protection"):
+            ptr._goto_wait(*near, settle=0.5)
+
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
+        ptr = frozen_pointer()
+        far = ptr.sky.altaz_to_radec(90.0, 25.0)  # nowhere near the Sun
+        with pytest.raises(PointingError, match="never moved"):
+            ptr._goto_wait(*far, settle=0.5)
+
+    # With the Sun harmlessly below SUN_SAFE_ALT, a frozen mount is a broken
+    # mount whatever direction the target is (SAFE-07 in reverse).
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, -10.0)):
+        ptr = frozen_pointer()
+        near = ptr.sky.altaz_to_radec(259.0, 25.0)
+        with pytest.raises(PointingError, match="never moved"):
+            ptr._goto_wait(*near, settle=0.5)
+
+
 # ---- review round 1 regressions -------------------------------------------
 def test_a_later_leg_rechecks_the_sun_instead_of_trusting_the_plan():
     """A multi-leg route must not fire a later leg on a stale clearance.
@@ -5854,6 +5978,41 @@ def test_the_inverse_rotation_undoes_the_forward_one():
     assert np.allclose(back_alt, alt, atol=1e-9), f"altitude did not come back: {back_alt - alt}"
 
 
+def test_the_polar_page_lists_the_fit_columns_with_their_fates(tmp_path):
+    """Devon asked for the columns ON the report, not only in the mask meta.
+
+    The table is built from `meta.fit_fiducials` — the record the fit writes of
+    every column it was offered (terminus-53) — so the page shows the value,
+    the kind, whether the fit used it, and the reason when it did not. A mask
+    without the record gets no table: inventing rows from the horizon block
+    would show numbers the fit never saw. Reasons are hand-written strings in a
+    hand-editable file, so they are escaped.
+    """
+    from terminus import polar
+
+    rows = [(a, 20.0, "structure") for a in range(0, 360, 10)]
+    sol = {"yaw": 133.0, "pitch": 1.0, "tilt_mag": 2.0, "tilt_dir": 100.0}
+    meta = {
+        "yaw": 133.19, "fit_rms": 0.31,
+        "fit_fiducials": [
+            {"az": 90.0, "alt": 6.2, "bound": False, "used": True, "residual": -0.12},
+            {"az": 0.0, "alt": 60.0, "bound": True, "used": True, "residual": None},
+            {"az": 20.0, "alt": 32.5, "used": False, "reason": "dawn transition",
+             "excluded_by": "mask"},
+            {"az": 33.0, "used": False, "reason": "inconclusive <profile>"},
+        ],
+    }  # fmt: skip
+    html_page = polar.page(rows, sol, meta=meta, size=200)
+    assert "Telescope columns (2 used of 4 offered)" in html_page
+    assert "dawn transition" in html_page and "excluded" in html_page
+    assert "&lt;profile&gt;" in html_page, "hand-written reasons must be escaped"
+    assert "-0.12" in html_page, "a used column shows its residual"
+    assert "bound" in html_page, "a ceiling-limited column says so"
+
+    bare = polar.page(rows, sol, meta={"yaw": 133.0}, size=200)
+    assert "Telescope columns (" not in bare, "no record, no table"
+
+
 def test_the_polar_page_is_self_contained_and_layered(tmp_path):
     """One file, no network, and the claims separable from each other.
 
@@ -6687,6 +6846,84 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem(tmp_pat
     assert port is not None
 
 
+def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
+    """Live 2026-08-07: the RTSP stream died at column ten and killed the orient.
+
+    Nine measured columns sat stranded in the checkpoint while the command
+    exited with a raw error — an observing window spent for no fit. The day
+    branch now recovers like the night branch always did: cycle the view
+    (which re-locks the exposure, M-06), retry the column once, and only a
+    second failure gives the column up — as a checkpointed failure, not a
+    crashed run (D-12).
+    """
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.client import SeestarError
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=5,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    calls = {"n": 0}
+
+    def dying_scan(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise SeestarError("RTSP capture failed (is scenery view running?): timed out")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    restarts = MagicMock()
+    with (
+        patch.object(cli, "scan_horizon", side_effect=dying_scan),
+        patch.object(cli, "_start_locked", restarts),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(
+            guide,
+            "fit",
+            return_value={
+                "yaw": 10.0,
+                "pitch": 0.0,
+                "tilt_mag": 0.0,
+                "tilt_dir": 0.0,
+                "rms": 0.1,
+                "n": 4,
+                "n_bound": 0,
+                "residuals": {0.0: 0.1},
+                "fiducials": [],
+            },
+        ),
+    ):
+        cli.cmd_orient(sc, cfg, args)
+
+    assert calls["n"] >= 2, "the failed column must be retried, not abandoned"
+    assert restarts.called, "the retry must cycle the view first (and re-lock exposure)"
+    assert out.exists(), "the run must survive to write its mask"
+
+
 def test_orient_keeps_what_it_measured(tmp_path):
     """A column costs minutes of clear sky; discarding it after one use is waste.
 
@@ -7203,17 +7440,33 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
     the right declination exactly and never the right RA — so they were moving
     the whole time, and the run spent minutes per column discovering nothing.
 
-    Progress is the right test, not motion. It also distinguishes two faults that
-    read identically today: a stowed mount that never moves, and a reachable-
-    looking target the mount will not converge on.
+    The bound has MOVED once since, deliberately. The first fix failed this
+    case at NO_PROGRESS_S (~25 s); 2026-08-07 showed that misreads a healthy
+    mount mid-reconfiguration — a large slew doglegs, pausing closure for more
+    than that while still moving, and two gotos were reported failed that both
+    landed. So a stall now stops EXTENDING the deadline rather than ending the
+    attempt: the pathological case still fails, bounded by the un-extended
+    deadline (GOTO_TIMEOUT past its last progress) instead of running to 288 s
+    or forever. Fake clock: the bound is about modelled time, not suite time.
     """
-    import time
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
 
     import pytest
 
-    from terminus.sweep import NO_PROGRESS_S, Pointer, PointingError, Sky
+    from terminus import sweep as sweep_mod
+    from terminus.sweep import GOTO_TIMEOUT, NO_PROGRESS_S, Pointer, PointingError, Sky
 
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    clock = FakeTime()
     sky = Sky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.goto.return_value = None
@@ -7222,14 +7475,13 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
     sc.call.return_value = {"result": {"mount": {"move_type": "ScopeGoto"}}}
     ptr = Pointer(sc, sky, 30, 5)
 
-    started = time.time()
-    with pytest.raises(PointingError) as exc:
-        ptr._goto_wait(8.604, 60.43, 0.1)
-    elapsed = time.time() - started
+    with patch.object(sweep_mod, "time", clock):
+        with pytest.raises(PointingError) as exc:
+            ptr._goto_wait(8.604, 60.43, 0.1)
 
     assert (
-        elapsed < NO_PROGRESS_S + 15
-    ), f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+        clock.t < GOTO_TIMEOUT + NO_PROGRESS_S + 30
+    ), f"took {clock.t:.0f}s to give up; extending on motion alone took 288"
     assert "stopped improving" in str(
         exc.value
     ), "it must say the mount moved but would not converge, not that it never moved"

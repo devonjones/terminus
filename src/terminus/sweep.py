@@ -34,6 +34,10 @@ SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
 ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
 PROGRESS_DEG = 0.5  # a closing of at least this much counts as progress
 NO_PROGRESS_S = 25.0  # ...and this long without any ends the attempt
+# A never-moved goto whose target sits within cone + this of the Sun reads as
+# the mount's OWN solar protection refusing (observed 2026-08-07 at ~35 deg
+# with a 30 deg cone), and is treated as Sun-blocked rather than a mount fault.
+FIRMWARE_SUN_MARGIN = 10.0
 MAX_TARGET_DEC = 88.5  # never command a goto nearer a pole than this
 MAX_VIA_DEC = 80.0  # a waypoint nearer a pole than this is unreachable: RA is
 #                     singular there and the mount cannot converge
@@ -613,8 +617,18 @@ class Pointer:
             moved = moved or is_moving
             if is_moving and not stalled:
                 deadline = max(deadline, time.time() + GOTO_TIMEOUT)
-            elif stalled:
+            elif stalled and not is_moving:
                 break
+            # Stalled AND still moving: stop EXTENDING the deadline, but let
+            # the attempt run to it. A large arm reconfiguration doglegs — on
+            # 2026-08-07 a ~120 degree RA swing paused its closure for more
+            # than NO_PROGRESS_S mid-path and landed seconds after the old rule
+            # gave up, so two consecutive gotos were reported failed while both
+            # in fact arrived, and the second failure blamed the position the
+            # FIRST goto had just reached. The 2026-08-06 case this rule was
+            # built for — moving the whole time, never converging, 288 s —
+            # still fails: no progress means no extension, so it ends within
+            # GOTO_TIMEOUT of its last real progress instead of unbounded.
         # Never fall through silently. A goto that quietly fails to arrive voids
         # every Sun-safety guarantee: the caller believes the scope is where it
         # asked, and plans the next path from a position the mount never reached.
@@ -622,6 +636,25 @@ class Pointer:
         # while the mount had not moved at all.
         rd = self.sc.equ_coord()
         where = f"RA {rd[0]:.3f} Dec {rd[1]:.2f}" if rd else "unreadable"
+        if not moved:
+            # A mount that never moved toward a Sun-adjacent target has
+            # plausibly refused it ITSELF: the Seestar's own solar protection
+            # is wider than our cone, and on 2026-08-07 it sat motionless on a
+            # goto ~35 deg from the Sun that the configured 30 deg cone had
+            # cleared. That is a refusal to respect — the firmware agreeing
+            # with the guard's purpose — not a mount fault to count toward
+            # aborting the run. Gated on the Sun actually being up: a mount
+            # that will not move toward a target with the Sun below SAFE_ALT
+            # is broken or stowed, whatever direction it faces.
+            taz, talt = self.sky.radec_to_altaz(ra, dec)
+            saz, salt = self.sky.sun()
+            sun_sep = ang_sep(taz, talt, saz, salt)
+            if salt >= SUN_SAFE_ALT and sun_sep < self.cone + FIRMWARE_SUN_MARGIN:
+                raise SunGuard(
+                    f"the mount refused to move toward ({taz:.1f},{talt:.1f}), "
+                    f"{sun_sep:.1f} deg from the Sun — its own solar protection "
+                    "appears wider than the configured cone; treating as Sun-blocked"
+                )
         why = (
             f"closed to {best:.1f} deg and then stopped improving"
             if moved
