@@ -9,6 +9,12 @@ what you can actually image — and exports it for planning tools like **N.I.N.A
 The horizon comes from **photographs**. A [Seestar S50](https://www.seestar.com/)
 is used to **orient** them.
 
+**[See a real report](https://devonjones.github.io/terminus/example-horizon.html)** —
+the author's backyard, solved to true north at rms 0.31°: the photographed sky
+as a polar disc, the horizon ring, the telescope's own columns with their
+residuals, and one column excluded with its reason on the page. Self-contained
+HTML, exactly as `terminus polar` wrote it.
+
 > Companion to [uranometria](https://github.com/devonjones/uranometria) (star
 > charts and annotated astrophotos). terminus is the horizon; uranometria is the
 > sky above it.

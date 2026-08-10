@@ -23,6 +23,8 @@ import warnings
 
 import numpy as np
 
+from .client import SeestarError
+
 warnings.filterwarnings("ignore")
 import astropy.units as u  # noqa: E402
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun  # noqa: E402
@@ -34,6 +36,10 @@ SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
 ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
 PROGRESS_DEG = 0.5  # a closing of at least this much counts as progress
 NO_PROGRESS_S = 25.0  # ...and this long without any ends the attempt
+# A never-moved goto whose target sits within cone + this of the Sun reads as
+# the mount's OWN solar protection refusing (observed 2026-08-07 at ~35 deg
+# with a 30 deg cone), and is treated as Sun-blocked rather than a mount fault.
+FIRMWARE_SUN_MARGIN = 10.0
 MAX_TARGET_DEC = 88.5  # never command a goto nearer a pole than this
 MAX_VIA_DEC = 80.0  # a waypoint nearer a pole than this is unreachable: RA is
 #                     singular there and the mount cannot converge
@@ -194,6 +200,11 @@ class Pointer:
 
     def __init__(self, sc, sky, cone, slew_step, dry=False):
         self.sc, self.sky, self.cone, self.slew_step, self.dry = sc, sky, cone, slew_step, dry
+        # Consecutive never-moved gotos reclassified as the mount's own solar
+        # protection. Reset by any observed motion; capped, because the same
+        # motionless signature belongs to a stowed or jammed arm, and near
+        # local noon the reclass band covers most of the sky (round 1's P2).
+        self._sun_refusals = 0
 
     def current_azalt(self):
         rd = self.sc.equ_coord()
@@ -589,6 +600,7 @@ class Pointer:
             if rd:
                 sep = ang_sep(rd[0] * 15.0, rd[1], ra * 15.0, dec)
                 if sep < ARRIVE_DEG:
+                    self._sun_refusals = 0
                     time.sleep(settle)
                     return
                 if sep < best - PROGRESS_DEG:
@@ -613,8 +625,18 @@ class Pointer:
             moved = moved or is_moving
             if is_moving and not stalled:
                 deadline = max(deadline, time.time() + GOTO_TIMEOUT)
-            elif stalled:
+            elif stalled and not is_moving:
                 break
+            # Stalled AND still moving: stop EXTENDING the deadline, but let
+            # the attempt run to it. A large arm reconfiguration doglegs — on
+            # 2026-08-07 a ~120 degree RA swing paused its closure for more
+            # than NO_PROGRESS_S mid-path and landed seconds after the old rule
+            # gave up, so two consecutive gotos were reported failed while both
+            # in fact arrived, and the second failure blamed the position the
+            # FIRST goto had just reached. The 2026-08-06 case this rule was
+            # built for — moving the whole time, never converging, 288 s —
+            # still fails: no progress means no extension, so it ends within
+            # GOTO_TIMEOUT of its last real progress instead of unbounded.
         # Never fall through silently. A goto that quietly fails to arrive voids
         # every Sun-safety guarantee: the caller believes the scope is where it
         # asked, and plans the next path from a position the mount never reached.
@@ -622,6 +644,42 @@ class Pointer:
         # while the mount had not moved at all.
         rd = self.sc.equ_coord()
         where = f"RA {rd[0]:.3f} Dec {rd[1]:.2f}" if rd else "unreadable"
+        if moved:
+            self._sun_refusals = 0
+        if not moved:
+            # A mount that never moved toward a Sun-adjacent target has
+            # plausibly refused it ITSELF: the Seestar's own solar protection
+            # is wider than our cone, and on 2026-08-07 it sat motionless on a
+            # goto ~35 deg from the Sun that the configured 30 deg cone had
+            # cleared. That is a refusal to respect — the firmware agreeing
+            # with the guard's purpose — not a mount fault to count toward
+            # aborting the run. Gated on the Sun actually being up: a mount
+            # that will not move toward a target with the Sun below SAFE_ALT
+            # is broken or stowed, whatever direction it faces.
+            taz, talt = self.sky.radec_to_altaz(ra, dec)
+            saz, salt = self.sky.sun()
+            sun_sep = ang_sep(taz, talt, saz, salt)
+            if salt >= SUN_SAFE_ALT and sun_sep < self.cone + FIRMWARE_SUN_MARGIN:
+                # CAPPED. A frozen mount shares this signature, and near local
+                # noon the reclass band can cover most of the reachable sky —
+                # unlimited reclassification would log a jammed arm as ordinary
+                # Sun-skips for the rest of the run, evading the stuck-mount
+                # abort that exists because exactly that has cost sessions.
+                # Three in a row with no motion in between stops being solar
+                # protection and starts being a mount that cannot move.
+                self._sun_refusals += 1
+                if self._sun_refusals < 3:
+                    raise SunGuard(
+                        f"the mount refused to move toward ({taz:.1f},{talt:.1f}), "
+                        f"{sun_sep:.1f} deg from the Sun — its own solar protection "
+                        "appears wider than the configured cone; treating as Sun-blocked"
+                    )
+                raise PointingError(
+                    f"{self._sun_refusals} consecutive gotos never moved, all near the "
+                    "Sun. Solar protection could explain one or two, but a mount whose "
+                    "every attempt sits motionless is stowed, jammed or not tracking — "
+                    "check the arm."
+                )
         why = (
             f"closed to {best:.1f} deg and then stopped improving"
             if moved
@@ -862,6 +920,18 @@ EDGE_SNR = 2.5  # a step must exceed the column's own sample-to-sample noise by
 NIGHT_SUN_ALT = -12.0
 NIGHT_DROP_FRAC = 0.20  # a real edge falls at least this fraction of the running max
 NIGHT_NEG_FRAC = 0.08  # sky never darkens by more than this in one step
+# Below this open-sky reference the day judge manufactures edges rather than
+# refusing: measured 2026-08-07, three columns in a treeline the sweeps put
+# above 60 deg came back as confident 13.8-15.0 deg edges at ref 21.3, exactly
+# the after-midnight failure M-08 describes (~20 counts, scatter swamps the
+# step). A day column measured below this floor is unmeasurable, not an edge.
+DAY_REF_FLOOR = 30.0
+
+
+def below_day_floor(sky_ref):
+    # One spelling of the floor test, shared by the live gate and the resume
+    # purge so the comparison cannot drift between them.
+    return sky_ref is not None and float(sky_ref) < DAY_REF_FLOOR
 
 
 def set_channel(sc, night, sw=None, log=print):
@@ -981,7 +1051,13 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
     while alt >= alt_min - 1e-6:
         try:
             lum = sample(alt)
-        except PointingError:
+        except (SunGuard, PointingError):
+            # SunGuard is defensively included: today it cannot fire here (the
+            # night channel needs sun < NIGHT_SUN_ALT, the goto reclass needs
+            # sun >= SUN_SAFE_ALT, 9 degrees apart) — but that gap is held by
+            # two constants in two files with nothing coupling them, and a
+            # SunGuard escaping this loop would abort the COLUMN where a
+            # skipped sample is recoverable.
             alt -= coarse_step
             continue
         profile.append((round(alt, 1), round(lum, 1)))
@@ -1005,7 +1081,7 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
         mid = (lo + hi) / 2.0
         try:
             lum = sample(mid)
-        except PointingError:
+        except (SunGuard, PointingError):
             break  # keep the bracket rather than lose the column
         if lum >= mid_lum:
             hi = mid
@@ -1376,7 +1452,7 @@ def run_sweep(
                 new_ref = sky_reference(sc.capture_rgb(warmup=0.3))
                 log(f"sky reference refreshed: {sky_ref:.1f} -> {new_ref:.1f}", flush=True)
                 sky_ref, ref_taken = new_ref, time.time()
-            except (SunGuard, PointingError, OSError) as e:
+            except (SunGuard, PointingError, OSError, SeestarError) as e:
                 log(f"sky reference refresh failed ({e}); keeping {sky_ref:.1f}", flush=True)
                 ref_taken = time.time()
         # The Sun is re-read per column rather than reused from the seed: a full

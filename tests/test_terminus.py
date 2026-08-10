@@ -816,6 +816,174 @@ def test_floor_pinned_result_is_not_a_measurement():
     assert "open" in detail["reason"]
 
 
+def test_a_goto_that_doglegs_is_not_reported_failed_while_the_mount_still_moves():
+    """Live failure 2026-08-07: two consecutive gotos 'failed' and both landed.
+
+    A large arm reconfiguration doglegs: closure on the target paused for more
+    than NO_PROGRESS_S mid-path while the mount kept reporting motion, the old
+    rule broke out at the stall, and the mount arrived seconds later — so the
+    NEXT goto's failure message blamed the position the first had just reached.
+    The rule now is: a stall stops EXTENDING the deadline but only a stall with
+    the mount HALTED ends the attempt early. The 2026-08-06 case the stall rule
+    was built for — moving the whole time, never converging, 288 s unbounded —
+    must still fail, within GOTO_TIMEOUT of its last real progress.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import sweep as sweep_mod
+    from terminus.sweep import Pointer, PointingError, Sky
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    def make_pointer(ra_at, moving_at):
+        sc = MagicMock()
+        sc.goto = MagicMock()
+        sc.equ_coord = MagicMock(side_effect=lambda: (ra_at(clock.t), 0.0))
+        sc.call = MagicMock(
+            side_effect=lambda m, *a, **k: {
+                "result": {"mount": {"move_type": ("goto" if moving_at(clock.t) else "none")}}
+            }
+        )
+        return Pointer(sc, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
+
+    # Dogleg: closes for 10 s, pauses 35 s (still moving), then closes and
+    # lands ~55 s in — inside the deadline the closing phase earned.
+    clock = FakeTime()
+
+    def dogleg_ra(t):
+        if t < 10:
+            return 0.2 * t  # closing: 3 deg/s toward RA 4h
+        if t < 45:
+            return 2.0  # paused mid-reconfiguration
+        return min(4.0, 2.0 + 0.2 * (t - 45.0))
+
+    with patch.object(sweep_mod, "time", clock):
+        ptr = make_pointer(dogleg_ra, lambda t: True)
+        ptr._goto_wait(4.0, 0.0, settle=0.5)  # must NOT raise
+    assert clock.t < 90, f"the dogleg must land within the un-extended deadline, took {clock.t}"
+
+    # Halted short: stops moving 9 deg out. Fails fast at the stall.
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock):
+        ptr = make_pointer(lambda t: min(3.4, 0.2 * t), lambda t: t < 20)
+        with pytest.raises(PointingError, match="stopped improving"):
+            ptr._goto_wait(4.0, 0.0, settle=0.5)
+    assert clock.t < 60, f"a halted mount must fail fast, took {clock.t}"
+
+
+def test_a_mount_that_refuses_a_sun_adjacent_goto_is_sun_blocked_not_broken():
+    """Live 2026-08-07: the mount sat motionless on a goto ~35 deg from the Sun.
+
+    Our cone (30) had cleared the target; the Seestar's own solar protection is
+    evidently wider, and it refused by simply not moving. That must surface as
+    SunGuard — a clean skip every loop already handles without counting a miss —
+    not as PointingError, which charges the mount's good judgement toward
+    MAX_POINTING_MISSES and can abort a healthy run. A never-moved goto AWAY
+    from the Sun keeps the PointingError: that is the stowed-arm signature.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import sweep as sweep_mod
+    from terminus.sweep import Pointer, PointingError, Sky, SunGuard
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    def frozen_pointer():
+        sc = MagicMock()
+        sc.equ_coord = MagicMock(return_value=(8.0, 30.0))  # never changes
+        sc.call = MagicMock(return_value={"result": {"mount": {"move_type": "none"}}})
+        return Pointer(sc, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
+
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
+        ptr = frozen_pointer()
+        sky = ptr.sky
+        # A target ~35 deg from the Sun (inside cone + FIRMWARE_SUN_MARGIN).
+        near = sky.altaz_to_radec(259.0, 25.0)
+        with pytest.raises(SunGuard, match="solar protection"):
+            ptr._goto_wait(*near, settle=0.5)
+        # The margin is 10, not less: a target out at ~cone + 9 must still be
+        # reclassified (round 1 found the constant unpinned at ~3.5).
+        wide = sky.altaz_to_radec(259.0, 32.0)
+        from terminus.sweep import FIRMWARE_SUN_MARGIN, ang_sep
+
+        taz, talt = sky.radec_to_altaz(*wide)
+        sep = ang_sep(taz, talt, 287.0, 5.0)
+        assert (
+            30.0 + FIRMWARE_SUN_MARGIN - 3.0 < sep < 30.0 + FIRMWARE_SUN_MARGIN
+        ), f"fixture must sit just inside the margin band, got {sep:.1f}"
+        with pytest.raises(SunGuard, match="solar protection"):
+            ptr._goto_wait(*wide, settle=0.5)
+        # THE RECLASSIFICATION IS CAPPED (round 1's P2): a frozen mount shares
+        # the motionless signature, and near noon the band covers most of the
+        # sky. The third consecutive refusal with no motion in between is a
+        # mount fault again, so the stuck-mount abort can see it.
+        with pytest.raises(PointingError, match="consecutive"):
+            ptr._goto_wait(*near, settle=0.5)
+
+    # AND THE CAP RESETS ON REAL MOTION (round 2): a healthy mount that
+    # legitimately gets Sun-refused three times across a long session must not
+    # be branded stuck. After an ARRIVING goto, a fresh near-Sun refusal is a
+    # clean SunGuard again, not an instant PointingError.
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
+        arriving = MagicMock()
+        state = {"ra": 8.0}
+        arriving.equ_coord = MagicMock(side_effect=lambda: (state["ra"], 0.0))
+        moving = {"on": False}
+        arriving.call = MagicMock(
+            side_effect=lambda m, *a, **k: {
+                "result": {"mount": {"move_type": ("goto" if moving["on"] else "none")}}
+            }
+        )
+        ptr = Pointer(arriving, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
+        near = ptr.sky.altaz_to_radec(259.0, 25.0)
+        for _ in range(2):
+            with pytest.raises(SunGuard):
+                ptr._goto_wait(*near, settle=0.1)
+        # a goto that ARRIVES: point at the current position
+        ptr._goto_wait(8.0, 0.0, settle=0.1)
+        with pytest.raises(SunGuard, match="solar protection"):
+            # reset by the arrival: refusal number three counts as one again
+            ptr._goto_wait(*near, settle=0.1)
+
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, 5.0)):
+        ptr = frozen_pointer()
+        far = ptr.sky.altaz_to_radec(90.0, 25.0)  # nowhere near the Sun
+        with pytest.raises(PointingError, match="never moved"):
+            ptr._goto_wait(*far, settle=0.5)
+
+    # With the Sun harmlessly below SUN_SAFE_ALT, a frozen mount is a broken
+    # mount whatever direction the target is (SAFE-07 in reverse).
+    clock = FakeTime()
+    with patch.object(sweep_mod, "time", clock), patch.object(Sky, "sun", lambda s: (287.0, -10.0)):
+        ptr = frozen_pointer()
+        near = ptr.sky.altaz_to_radec(259.0, 25.0)
+        with pytest.raises(PointingError, match="never moved"):
+            ptr._goto_wait(*near, settle=0.5)
+
+
 # ---- review round 1 regressions -------------------------------------------
 def test_a_later_leg_rechecks_the_sun_instead_of_trusting_the_plan():
     """A multi-leg route must not fire a later leg on a stale clearance.
@@ -5436,9 +5604,10 @@ def test_refinement_checks_the_deadline_before_every_column():
         asked["n"] += 1
         return asked["n"] > 13
 
-    from terminus.sweep import Pointer
+    from terminus.sweep import Pointer, Sky
 
     with (
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: pin the channel
         patch("terminus.sweep.scan_horizon", side_effect=alternating),
         patch("terminus.sweep.save_boundary_frame"),
         patch.object(Pointer, "point_to", lambda self, az, alt: (az, alt)),
@@ -5647,6 +5816,186 @@ def test_labels_are_voted_not_last_wins_and_never_invented_where_no_frame_looked
     assert (out[:, 8:] == -1).all(), "no frame looked here, so there is no class"
 
 
+def test_composite_applies_the_gains_it_solves(tmp_path):
+    """The gains contract, made unmissable (terminus-52 item 1).
+
+    `render()` returns RAW layers; `composite()` solves a per-frame gain and
+    APPLIES it before averaging. A naive mean of the same layers reintroduces
+    the exposure steps — and the manifest's `gains` field is an output of the
+    composite, not an input to reapply. This is the test the ticket asks for:
+    composite with solved gains must differ from the naive mean, so removing
+    the `* g` in `composite()` fails here and nowhere else.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus.mosaic import composite
+
+    def layer(name, value, box):
+        x0, y0, x1, y1 = box
+        rgba = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+        rgba[..., :3] = value
+        rgba[..., 3] = 255
+        path = str(tmp_path / name)
+        Image.fromarray(rgba, "RGBA").save(
+            path, tiffinfo={286: ((x0, 1),), 287: ((y0, 1),), 282: ((1, 1),), 283: ((1, 1),)}
+        )
+        return path
+
+    # The same patch of sky, metered two stops apart: one frame reads 100,
+    # the other 200. The overlap is total, so the naive mean is exactly 150
+    # everywhere and any deviation from it is the gains at work.
+    paths = [layer("dim.tif", 100, (0, 0, 8, 4)), layer("bright.tif", 200, (0, 0, 8, 4))]
+    img, coverage, gains = composite(paths, 8, 4)
+
+    assert (coverage == 2).all(), "the fixture must overlap fully for the arithmetic to hold"
+    # Geometric-mean-1 gains put both frames at 100*sqrt(2) ~= 141, not 150.
+    assert (
+        abs(gains[0] * 100.0 - gains[1] * 200.0) < 2.0
+    ), f"the gains must make the overlap agree, got {gains}"
+    got = float(img[..., 0].mean())
+    assert (
+        abs(got - 150.0) > 4.0
+    ), f"composite returned the naive mean ({got}): the solved gains were not applied"
+    assert abs(got - 141.4) < 3.0, f"expected ~141 from geometric-mean-1 gains, got {got}"
+
+
+def test_photometric_is_opt_in_and_never_touches_the_measurement_render(tmp_path):
+    """terminus-52 item 2: --photometric is for figures, not for numbers.
+
+    Off by default, and when on it writes a SEPARATE <out>.figure.png from the
+    same geometric solve — the plain render, the coverage, and everything the
+    measurement path reads must be byte-identical with and without the flag,
+    because every published residual was produced without photometric
+    correction and a changed pixel value there is a changed number downstream.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus import cli, mosaic
+
+    plain = np.full((4, 8, 3), 90, np.uint8)
+    pretty = np.full((4, 8, 3), 120, np.uint8)
+    cov = np.ones((4, 8))
+
+    def run(photometric):
+        out = tmp_path / ("with" if photometric else "without")
+        out.mkdir()
+        args = SimpleNamespace(
+            image_dir=str(tmp_path), work=str(out / "w"), out=str(out / "pano"),
+            lens=None, min_points=13, no_celeste=False, width=8, height=4,
+            segment=False, photometric=photometric,
+        )  # fmt: skip
+        fig_render = MagicMock(return_value=(["f0.tif"], "photometric.pto"))
+
+        def fake_composite(tiffs, w, h):
+            return (pretty if tiffs == ["f0.tif"] else plain, cov, [1.0])
+
+        with (
+            patch.object(mosaic, "require_hugin"),
+            patch.object(mosaic, "solve", return_value=("p.pto", set())),
+            patch.object(mosaic, "control_point_counts", return_value={"a.jpg": 20}),
+            patch.object(mosaic, "render", return_value=(["l0.tif"], "final.pto")),
+            patch.object(mosaic, "composite", side_effect=fake_composite),
+            patch.object(mosaic, "render_photometric", fig_render),
+        ):
+            cli.cmd_mosaic(None, {}, args)
+        return out, fig_render
+
+    out_off, fig_off = run(photometric=False)
+    assert not fig_off.called, "photometric must be strictly opt-in"
+    assert not (out_off / "pano.figure.png").exists()
+
+    out_on, fig_on = run(photometric=True)
+    fig_on.assert_called_once_with("final.pto", str(out_on / "w")), (
+        "the figure render must hang off the SAME geometric solve"
+    )
+    assert (out_on / "pano.figure.png").exists(), "the figure render gets its own file"
+    assert (out_on / "pano.png").read_bytes() == (
+        out_off / "pano.png"
+    ).read_bytes(), "the measurement render must be byte-identical with and without the flag"
+
+
+def test_a_failed_photometric_render_does_not_cost_the_manifest(tmp_path):
+    """Round 1 P2: the figure block ran before write_manifest with no guard.
+
+    The photometric fit is a separate optimisation that can fail after the
+    geometric one succeeded; aborting there lost the manifest — the run's
+    reprocessing record — for a purely cosmetic failure. The figure is the one
+    output whose absence costs nothing, so its failure costs a warning.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus import cli, mosaic
+
+    out = tmp_path / "pano"
+    args = SimpleNamespace(
+        image_dir=str(tmp_path), work=str(tmp_path / "w"), out=str(out), lens=None,
+        min_points=13, no_celeste=False, width=8, height=4, segment=False, photometric=True,
+    )  # fmt: skip
+    with (
+        patch.object(mosaic, "require_hugin"),
+        patch.object(mosaic, "solve", return_value=("p.pto", set())),
+        patch.object(mosaic, "control_point_counts", return_value={"a.jpg": 20}),
+        patch.object(mosaic, "render", return_value=(["l0.tif"], "final.pto")),
+        patch.object(
+            mosaic,
+            "composite",
+            return_value=(np.zeros((4, 8, 3), np.uint8), np.ones((4, 8)), [1.0]),
+        ),
+        patch.object(
+            mosaic,
+            "render_photometric",
+            MagicMock(side_effect=mosaic.MosaicError("autooptimiser -m failed")),
+        ),
+    ):
+        cli.cmd_mosaic(None, {}, args)  # must not raise
+
+    assert (
+        tmp_path / "pano.manifest.json"
+    ).exists(), "the manifest is the run's reprocessing record; a cosmetic failure must not cost it"
+    assert not (tmp_path / "pano.figure.png").exists()
+
+
+def test_the_figure_render_feeds_nona_the_photometric_solve(tmp_path):
+    """Round 1's sharpest surviving mutation: nona fed final.pto, silently.
+
+    render_photometric's whole job is the second pto - autooptimiser -m writes
+    photometric.pto and nona must render FROM IT. Feeding nona the original
+    final.pto skips the photometric model entirely while producing an
+    identical-looking figure file, which nothing downstream can detect.
+    """
+    import subprocess
+    from unittest.mock import patch
+
+    from terminus.mosaic import render_photometric
+
+    seen = []
+
+    def fake_run(cmd, *a, **kw):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with (
+        patch("terminus.mosaic.require_hugin"),
+        patch("terminus.mosaic._run", side_effect=fake_run),
+    ):
+        _tiffs, photo = render_photometric(str(tmp_path / "final.pto"), str(tmp_path))
+
+    assert seen[0][0] == "autooptimiser" and "-m" in seen[0], seen[0]
+    assert seen[0][-1].endswith("final.pto"), "the photometric solve starts from the geometry"
+    assert seen[1][0] == "nona", seen[1]
+    assert seen[1][-1].endswith(
+        "photometric.pto"
+    ), f"nona must render FROM the photometric solve, got {seen[1][-1]}"
+    assert photo.endswith("photometric.pto")
+
+
 def test_a_label_whose_name_does_not_match_the_project_is_refused(tmp_path):
     """Silent success is the failure mode this whole path exists to remove.
 
@@ -5750,6 +6099,53 @@ def test_the_inverse_rotation_undoes_the_forward_one():
     delta = (back_az - az + 180.0) % 360.0 - 180.0
     assert np.allclose(delta, 0.0, atol=1e-9), f"azimuth did not come back: {delta}"
     assert np.allclose(back_alt, alt, atol=1e-9), f"altitude did not come back: {back_alt - alt}"
+
+
+def test_the_polar_page_lists_the_fit_columns_with_their_fates(tmp_path):
+    """Devon asked for the columns ON the report, not only in the mask meta.
+
+    The table is built from `meta.fit_fiducials` — the record the fit writes of
+    every column it was offered (terminus-53) — so the page shows the value,
+    the kind, whether the fit used it, and the reason when it did not. A mask
+    without the record gets no table: inventing rows from the horizon block
+    would show numbers the fit never saw. Reasons are hand-written strings in a
+    hand-editable file, so they are escaped.
+    """
+    from terminus import polar
+
+    rows = [(a, 20.0, "structure") for a in range(0, 360, 10)]
+    sol = {"yaw": 133.0, "pitch": 1.0, "tilt_mag": 2.0, "tilt_dir": 100.0}
+    meta = {
+        "yaw": 133.19, "fit_rms": 0.31,
+        "fit_fiducials": [
+            {"az": 90.0, "alt": 6.2, "bound": False, "used": True, "residual": -0.12},
+            {"az": 0.0, "alt": 60.0, "bound": True, "used": True, "residual": None},
+            {"az": 20.0, "alt": 32.5, "used": False, "reason": "dawn transition",
+             "excluded_by": "mask"},
+            {"az": 33.0, "used": False, "reason": "inconclusive <profile>"},
+        ],
+    }  # fmt: skip
+    html_page = polar.page(rows, sol, meta=meta, size=200)
+    assert "Telescope columns (2 used of 4 offered)" in html_page
+    assert "&lt;profile&gt;" in html_page, "hand-written reasons must be escaped"
+
+    # PER ROW, not page-wide substrings: round 1 showed swapped bound/edge and
+    # excluded/not-used labels survive containment checks, because some row
+    # somewhere always says each word.
+    import re
+
+    table_rows = {}
+    for m in re.finditer(r"<tr[^>]*>(<td>.*?)</tr>", html_page):
+        cells = re.findall(r"<td>(.*?)</td>", m.group(1))
+        table_rows[cells[0]] = cells
+    assert table_rows["0"][2] == "bound" and table_rows["0"][3] == "used"
+    assert table_rows["90"][2] == "edge" and table_rows["90"][3] == "used"
+    assert table_rows["90"][4] == "-0.12&deg;", "a used column shows its own residual"
+    assert table_rows["20"][3] == "excluded" and "dawn transition" in table_rows["20"][4]
+    assert table_rows["33"][3] == "not used"
+
+    bare = polar.page(rows, sol, meta={"yaw": 133.0}, size=200)
+    assert "Telescope columns (" not in bare, "no record, no table"
 
 
 def test_the_polar_page_is_self_contained_and_layered(tmp_path):
@@ -6585,6 +6981,430 @@ def test_a_scope_that_stops_responding_is_not_reported_as_a_file_problem(tmp_pat
     assert port is not None
 
 
+def test_a_twilight_day_verdict_is_discarded_on_resume_and_refused_live(tmp_path):
+    """M-08 wired into orient: below DAY_REF_FLOOR the day judge invents edges.
+
+    Live 2026-08-07: three columns in a treeline the sweeps put above 60 deg
+    came back as confident 13.8-15.0 deg edges at sky_ref 21.3. Two teeth, both
+    here: a cached day edge recorded below the floor is DISCARDED on resume so
+    the current channel re-measures it (serving it would feed the night fit the
+    exact numbers the floor refuses), and a live day column under a floored
+    reference is checkpointed failed without ever slewing.
+    """
+    import json
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    ckpt.write_text(
+        json.dumps({"az": 320, "verdict": "edge", "alt": 13.8, "ceiling": 60,
+                    "channel": "scenery", "sky_ref": 21.3, "profile": []}) + "\n"
+        + json.dumps({"az": 90, "verdict": "edge", "alt": 6.2, "ceiling": 60,
+                      "channel": "scenery", "sky_ref": 245.7, "profile": []}) + "\n"
+    )  # fmt: skip
+
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=4,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    import pytest
+
+    from terminus.export import MaskError
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    scans = MagicMock()
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: day channel
+        patch.object(cli, "scan_horizon", scans),
+        patch.object(cli, "sky_reference", return_value=21.3),  # a floored evening
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(
+            guide,
+            "fit",
+            return_value={
+                "yaw": 10.0,
+                "pitch": 0.0,
+                "tilt_mag": 0.0,
+                "tilt_dir": 0.0,
+                "rms": 0.1,
+                "n": 4,
+                "n_bound": 0,
+                "residuals": {0.0: 0.1},
+                "fiducials": [],
+            },
+        ),
+    ):
+        # Only the one healthy cached column survives, so the run rightly
+        # refuses to fit — the floor's job is exactly to shrink a twilight run
+        # to what was actually measurable.
+        with pytest.raises(MaskError, match="needs four"):
+            cli.cmd_orient(sc, cfg, args)
+
+    lines = [json.loads(x) for x in ckpt.read_text().splitlines()]
+    floored = [d for d in lines if d.get("error", "").startswith("day reference")]
+    assert floored, "live columns under a floored reference must checkpoint as failed"
+    assert not scans.called, "and must never be scanned into a plausible wrong number"
+    retried = [d for d in lines if d["az"] == 320]
+    assert (
+        len(retried) > 1
+    ), "the cached twilight edge must be discarded and re-attempted, not served"
+
+
+def test_the_reference_is_allowed_to_fall_and_the_floor_then_catches_it(tmp_path):
+    """Round 1's P1: within a run sky_ref only ratcheted up, so the floor gate
+    could never fire in the exact bright-into-dark run it was built for — the
+    gate read the daylight 250 while the sky read 12. The day branch now
+    refreshes the reference past SKY_REF_MAX_AGE, REPLACING it as run_sweep
+    does, and the gate reads the fresh value.
+    """
+    import json
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli, guide
+    from terminus.export import MaskError, write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=4,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    scans = MagicMock()
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "SKY_REF_MAX_AGE", -1.0),  # every column finds the seed stale
+        patch.object(cli, "scan_horizon", scans),
+        # Daylight at the seed, 12 counts at the refresh: the run has gone dark.
+        patch.object(cli, "sky_reference", MagicMock(side_effect=[250.0] + [12.0] * 60)),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(guide, "fit", return_value={
+            "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+            "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+        }),  # fmt: skip
+    ):
+        with pytest.raises(MaskError, match="needs four"):
+            cli.cmd_orient(sc, cfg, args)
+
+    assert not scans.called, (
+        "with the refreshed reference under the floor, no column may be scanned "
+        "into a plausible wrong number — the old ratchet let every one through"
+    )
+    lines = [json.loads(x) for x in (tmp_path / "solved_fiducials.jsonl").read_text().splitlines()]
+    assert any(
+        d.get("error", "").startswith("day reference") for d in lines
+    ), "the floored columns must be checkpointed as failed for a night re-attempt"
+
+
+def test_a_failed_reference_refresh_backs_off_instead_of_retrying_every_column(tmp_path):
+    """Round 2's P2: the refresh fix forgot run_sweep's failure backoff.
+
+    On failure the clock must advance anyway — without it the very next column
+    finds the reference stale again, and every remaining day column pays a
+    failed anti-Sun slew before being measured, for the rest of the run. The
+    discriminator: with backoff the anti-Sun goto fails a bounded number of
+    times (the seed plus one refresh); without it, once per column.
+    """
+    import math
+    import time as real_time
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.export import MaskError, write_mask
+    from terminus.sweep import PointingError
+
+    class FakeTime:
+        def __init__(self, t):
+            self.t = t
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=3,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    clock = FakeTime(20_000.0)
+    anti_sun = {"n": 0}
+
+    # EVERY anti-Sun goto fails tonight — the seed and any refresh alike.
+    # sky_ref still gets set by the first column's own profile peak, so the
+    # refresh machinery arms, attempts once, and must then back off.
+    def flaky_point_to(az, alt):
+        if alt == 75.0:
+            anti_sun["n"] += 1
+            raise PointingError("anti-Sun target unreachable tonight")
+        return az, alt
+
+    ptr = MagicMock()
+    ptr.point_to = MagicMock(side_effect=flaky_point_to)
+
+    def cheap_scan(*a, **k):
+        clock.t += 10.0  # columns far cheaper than SKY_REF_MAX_AGE
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli, "time", clock),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=cheap_scan),
+        patch.object(cli, "sky_reference", return_value=250.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(cli, "SKY_REF_MAX_AGE", 100.0),
+        patch.object(guide, "fit", return_value={
+            "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+            "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+        }),  # fmt: skip
+    ):
+        try:
+            cli.cmd_orient(sc, cfg, args)
+        except MaskError:
+            pass
+
+    # Failed seed (1) + one armed refresh attempt (2), then backoff holds for
+    # SKY_REF_MAX_AGE across the remaining cheap columns. Without the backoff,
+    # the count grows by one per column after the ratchet arms the refresh.
+    assert 1 <= anti_sun["n"] <= 2, (
+        f"a failed refresh must back off for SKY_REF_MAX_AGE, not retry every "
+        f"column: {anti_sun['n']} anti-Sun attempts"
+    )
+
+
+def test_an_unverified_exposure_lock_blocks_the_next_column(tmp_path):
+    """Round 1's other P1: a failed re-lock left later columns silently
+    measuring under auto-exposure (M-06's exact sin). The lock is now a
+    precondition: after any relock failure, every day column re-establishes it
+    or is refused — never measured unverified.
+    """
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.client import SeestarError
+    from terminus.export import MaskError, write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=3,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    scan_calls = {"n": 0, "locks_at_scan": []}
+
+    def scans(*a, **k):
+        scan_calls["n"] += 1
+        scan_calls["locks_at_scan"].append(relocks["n"])
+        if scan_calls["n"] == 1:
+            raise SeestarError("RTSP capture failed: timed out")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    # The retry's relock fails, the next column's re-establishment fails, the
+    # one after that heals.
+    relocks = {"n": 0}
+
+    def flaky_lock(*a, **k):
+        relocks["n"] += 1
+        # Call 1 is the unguarded run-start lock: it succeeds. The RETRY's
+        # relock (2) and the next column's re-establishment (3) fail; 4 heals.
+        if relocks["n"] in (2, 3):
+            raise SeestarError("lock refused" if relocks["n"] == 2 else "still dead")
+
+    restarts = MagicMock(side_effect=flaky_lock)
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scans),
+        patch.object(cli, "_start_locked", restarts),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(guide, "fit", return_value={
+            "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+            "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+        }),  # fmt: skip
+    ):
+        try:
+            cli.cmd_orient(sc, cfg, args)
+        except MaskError:
+            pass  # too few columns is a legitimate outcome of the refusals
+
+    assert (
+        restarts.call_count >= 4
+    ), f"the lock must be re-attempted before each day column, saw {restarts.call_count}"
+    # THE INVARIANT: no scan while the lock is unverified. Relock calls 2 and 3
+    # fail, call 4 heals — so every scan after the first (which triggered the
+    # failure) must observe the healed lock. A scan seeing relock state 2 or 3
+    # is a column measured under auto-exposure.
+    assert all(n >= 4 for n in scan_calls["locks_at_scan"][1:]), (
+        f"a column measured under an unverified lock: relock states at scan "
+        f"time were {scan_calls['locks_at_scan']}"
+    )
+    assert len(scan_calls["locks_at_scan"]) >= 2, "the healed run must resume measuring"
+
+
+def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
+    """Live 2026-08-07: the RTSP stream died at column ten and killed the orient.
+
+    Nine measured columns sat stranded in the checkpoint while the command
+    exited with a raw error — an observing window spent for no fit. The day
+    branch now recovers like the night branch always did: cycle the view
+    (which re-locks the exposure, M-06), retry the column once, and only a
+    second failure gives the column up — as a checkpointed failure, not a
+    crashed run (D-12).
+    """
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli, guide
+    from terminus.client import SeestarError
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+
+    out = tmp_path / "solved.yaml"
+    args = SimpleNamespace(
+        mask=str(photo), out=str(out), replay=None, fiducials=None, seed=3, max_columns=5,
+        window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None, dry_run=False,
+        frames=None, stop_above_sun_alt=None,
+    )  # fmt: skip
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    calls = {"n": 0}
+
+    def dying_scan(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise SeestarError("RTSP capture failed (is scenery view running?): timed out")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    restarts = MagicMock()
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: day channel
+        patch.object(cli, "scan_horizon", side_effect=dying_scan),
+        patch.object(cli, "_start_locked", restarts),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(
+            guide,
+            "fit",
+            return_value={
+                "yaw": 10.0,
+                "pitch": 0.0,
+                "tilt_mag": 0.0,
+                "tilt_dir": 0.0,
+                "rms": 0.1,
+                "n": 4,
+                "n_bound": 0,
+                "residuals": {0.0: 0.1},
+                "fiducials": [],
+            },
+        ),
+    ):
+        cli.cmd_orient(sc, cfg, args)
+
+    assert calls["n"] >= 2, "the failed column must be retried, not abandoned"
+    restarts.assert_called_with(sc, cfg["sweep"]), (
+        "the retry must cycle the view with the scope and the sweep config, in "
+        "that order - round 1 found swapped arguments survive a bare .called"
+    )
+    assert out.exists(), "the run must survive to write its mask"
+
+
 def test_orient_keeps_what_it_measured(tmp_path):
     """A column costs minutes of clear sky; discarding it after one use is waste.
 
@@ -6967,7 +7787,10 @@ def test_a_sweep_honours_the_measured_below_horizon_floor():
         seen["floor"] = ptr.MIN_ALT_DEG
         return 20.0, "edge", "tree", []
 
-    with patch("terminus.sweep.scan_horizon", side_effect=capture):
+    with (
+        patch.object(Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63: pin the channel
+        patch("terminus.sweep.scan_horizon", side_effect=capture),
+    ):
         run_sweep(sc, sky, cfg, az_start=0, az_end=270, dry=True, log=lambda *a, **k: None)
 
     assert seen.get("floor") == -1.0, (
@@ -7101,17 +7924,33 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
     the right declination exactly and never the right RA — so they were moving
     the whole time, and the run spent minutes per column discovering nothing.
 
-    Progress is the right test, not motion. It also distinguishes two faults that
-    read identically today: a stowed mount that never moves, and a reachable-
-    looking target the mount will not converge on.
+    The bound has MOVED once since, deliberately. The first fix failed this
+    case at NO_PROGRESS_S (~25 s); 2026-08-07 showed that misreads a healthy
+    mount mid-reconfiguration — a large slew doglegs, pausing closure for more
+    than that while still moving, and two gotos were reported failed that both
+    landed. So a stall now stops EXTENDING the deadline rather than ending the
+    attempt: the pathological case still fails, bounded by the un-extended
+    deadline (GOTO_TIMEOUT past its last progress) instead of running to 288 s
+    or forever. Fake clock: the bound is about modelled time, not suite time.
     """
-    import time
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
 
     import pytest
 
-    from terminus.sweep import NO_PROGRESS_S, Pointer, PointingError, Sky
+    from terminus import sweep as sweep_mod
+    from terminus.sweep import GOTO_TIMEOUT, NO_PROGRESS_S, Pointer, PointingError, Sky
 
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    clock = FakeTime()
     sky = Sky(39.7917, -104.894, 1600)
     sc = MagicMock()
     sc.goto.return_value = None
@@ -7120,14 +7959,13 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
     sc.call.return_value = {"result": {"mount": {"move_type": "ScopeGoto"}}}
     ptr = Pointer(sc, sky, 30, 5)
 
-    started = time.time()
-    with pytest.raises(PointingError) as exc:
-        ptr._goto_wait(8.604, 60.43, 0.1)
-    elapsed = time.time() - started
+    with patch.object(sweep_mod, "time", clock):
+        with pytest.raises(PointingError) as exc:
+            ptr._goto_wait(8.604, 60.43, 0.1)
 
     assert (
-        elapsed < NO_PROGRESS_S + 15
-    ), f"took {elapsed:.0f}s to give up; extending on motion alone took 288"
+        clock.t < GOTO_TIMEOUT + NO_PROGRESS_S + 30
+    ), f"took {clock.t:.0f}s to give up; extending on motion alone took 288"
     assert "stopped improving" in str(
         exc.value
     ), "it must say the mount moved but would not converge, not that it never moved"
