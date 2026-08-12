@@ -139,9 +139,10 @@ and `mosaic.hugin_available()` report what you have.
 ## Quickstart: photograph to planning file
 
 Six steps. The numbers quoted are from a real seven-column run at the example
-site, to shape-check yours against. (The published report is a larger,
-16-fiducial fit of the same yard, so its rms differs — see
-[why the residuals aren't comparable](docs/field-notes.md#why-orient-stops-on-yaw-stability-and-not-on-the-residual).)
+site, to shape-check yours against. (The example report linked above is a
+different fit of the same yard — 8 of 9 columns, rms 0.31° — so its numbers
+differ:
+[residuals aren't comparable across fits](docs/field-notes.md#why-orient-stops-on-yaw-stability-and-not-on-the-residual).)
 
 **1. Photograph the horizon.** Individual overlapping frames, held roughly
 level, all the way round. Nineteen shots two seconds apart worked; seventeen to
