@@ -7407,9 +7407,45 @@ def test_re_measure_ignores_a_cached_verdict_on_request(tmp_path):
     fresh = [d for d in lines if d["az"] == 0 and d.get("alt") == 25.0]
     assert fresh, "the fresh measurement must be checkpointed to supersede it"
 
+    # This half runs UNPATCHED on purpose: a typo'd --re-measure must be
+    # rejected before anything touches the scope. When the parse sat next to
+    # the checkpoint load it ran after the daytime anti-Sun seed slew, so this
+    # passed at night (the slew is skipped) and failed in any daytime CI run —
+    # the assertion below is what makes the contract time-of-day independent.
     with pytest.raises(SeestarError, match="re-measure"):
         bad, cfg2, sc2 = _orient_harness(tmp_path, re_measure="north-ish")
         cli.cmd_orient(sc2, cfg2, bad)
+    with pytest.raises(SeestarError, match="re-measure"):
+        cli._parse_re_measure("1e999")  # round() raises OverflowError, not ValueError
+    # cmd_orient's finally issues stop_view on any non-dry run (a failure that
+    # leaves the instrument streaming is its own small fault); everything else
+    # is a cost.
+    touched = [name for name, *_ in sc2.method_calls if name != "stop_view"]
+    assert not touched, f"a typo'd --re-measure must cost no scope calls, got {touched}"
+
+    # A refusal that refuses nothing is a typo too: --re-measure 342 against a
+    # checkpoint whose poisoned column is 324 would quietly re-serve the very
+    # verdict the operator meant to reject. Also unpatched, also before any
+    # scope call.
+    sub = tmp_path / "nomatch"
+    sub.mkdir()
+    args3, cfg3, sc3 = _orient_harness(sub, re_measure="10")
+    (sub / "solved_fiducials.jsonl").write_text(
+        json.dumps({"az": 0, "verdict": "edge", "alt": 13.8, "ceiling": 60,
+                    "channel": "star4800", "profile": []}) + "\n"
+    )  # fmt: skip
+    with pytest.raises(SeestarError, match="matches no cached"):
+        cli.cmd_orient(sc3, cfg3, args3)
+    touched = [name for name, *_ in sc3.method_calls if name != "stop_view"]
+    assert not touched, f"a no-match --re-measure must cost no scope calls, got {touched}"
+
+    # No checkpoint file at all is the same typo louder (wrong --out path,
+    # usually), and it must not depend on the exists() branch being entered.
+    sub2 = tmp_path / "nofile"
+    sub2.mkdir()
+    args4, cfg4, sc4 = _orient_harness(sub2, re_measure="10")
+    with pytest.raises(SeestarError, match="matches no cached"):
+        cli.cmd_orient(sc4, cfg4, args4)
 
 
 def test_an_unreadable_scope_backs_off_and_then_stops_instead_of_churning(tmp_path):
