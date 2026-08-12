@@ -1206,18 +1206,21 @@ def _scope_measure(sc, cfg, args):
                         d["coarse_only"] = True
             cache[int(d["az"])] = d
 
-    # THE FLAG MUST MATCH SOMETHING. --re-measure 342,177 against a checkpoint
+    # THE FLAG MUST MATCH SOMETHING. --re-measure 342 against a checkpoint
     # whose poisoned column is az 324 parses fine, refuses nothing, and quietly
-    # re-serves the very verdict the operator meant to reject — discovered at
-    # dawn, exactly like the late parse above. A refusal that refused nothing
-    # is a typo, and it is caught here, before the scope is touched (E-17).
+    # re-serves the very verdict the operator meant to reject — a mistake that
+    # only surfaces when the bad fit does. A refusal that refused nothing is a
+    # typo, and it is caught here, before the scope is touched (E-17).
     missing = redo - refused
     if missing:
         raise SeestarError(
             f"--re-measure {','.join(str(a) for a in sorted(missing))} matches no cached "
-            f"verdict in {ckpt_path}; nothing would be re-measured. Cached azimuths: "
-            f"{','.join(str(a) for a in sorted(cache)) or 'none'}"
+            f"verdict in {ckpt_path}. Cached azimuths: "
+            f"{','.join(str(a) for a in sorted(set(cache) | refused)) or 'none'}"
         )
+    if cache:
+        print(f"resuming {len(cache)} columns from {os.path.basename(ckpt_path)}: "
+              f"{sorted(cache)}")  # fmt: skip
 
     if not sc.is_eq_mode() and not args.dry_run:
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
@@ -1288,10 +1291,6 @@ def _scope_measure(sc, cfg, args):
         except (SunGuard, PointingError, OSError) as e:
             print(f"could not seed the sky reference ({e}); columns will be inconclusive",
                   file=sys.stderr)  # fmt: skip
-
-        if cache:
-            print(f"resuming {len(cache)} columns from {os.path.basename(ckpt_path)}: "
-                  f"{sorted(cache)}")  # fmt: skip
 
     def checkpoint(rec):
         with open(ckpt_path, "a") as fh:

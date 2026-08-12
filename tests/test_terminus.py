@@ -7439,6 +7439,14 @@ def test_re_measure_ignores_a_cached_verdict_on_request(tmp_path):
     touched = [name for name, *_ in sc3.method_calls if name != "stop_view"]
     assert not touched, f"a no-match --re-measure must cost no scope calls, got {touched}"
 
+    # No checkpoint file at all is the same typo louder (wrong --out path,
+    # usually), and it must not depend on the exists() branch being entered.
+    sub2 = tmp_path / "nofile"
+    sub2.mkdir()
+    args4, cfg4, sc4 = _orient_harness(sub2, re_measure="10")
+    with pytest.raises(SeestarError, match="matches no cached"):
+        cli.cmd_orient(sc4, cfg4, args4)
+
 
 def test_an_unreadable_scope_backs_off_and_then_stops_instead_of_churning(tmp_path):
     """Thursday's churn: a dead control channel skipped az 320, 40, 61, 219 at
