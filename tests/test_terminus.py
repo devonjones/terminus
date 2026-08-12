@@ -7375,7 +7375,8 @@ def test_re_measure_ignores_a_cached_verdict_on_request(tmp_path):
     from terminus import cli, guide
     from terminus.client import SeestarError
 
-    args, cfg, sc = _orient_harness(tmp_path, re_measure="0")
+    # 360 wraps to 0: the parser's normalisation is load-bearing, not decor.
+    args, cfg, sc = _orient_harness(tmp_path, re_measure="360")
     ckpt = tmp_path / "solved_fiducials.jsonl"
     # az 0 is a guaranteed seed, so the planner always offers it.
     ckpt.write_text(
@@ -7646,6 +7647,115 @@ def test_the_reconnect_budget_is_per_incident_not_per_run(tmp_path):
         mode["dead"] = True
         measure(50)
         assert state["reconnects"] == 1, "the second incident starts a fresh budget"
+
+
+def test_the_unreadable_count_resets_on_success(tmp_path):
+    """Round 2 of the loop found this reset unpinned: without it, unreadable
+    blips separated by healthy columns accumulate toward the reconnect
+    threshold across the whole run instead of per incident.
+    """
+    import time as real_time
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.sweep import PointingUnreadable
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 80_000.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    args, cfg, sc = _orient_harness(tmp_path)
+    ptr = MagicMock()
+    ptr.dry = False
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    mode = {"dead": False}
+
+    def scan(ptr_, sc_, az, *a, **k):
+        if mode["dead"]:
+            raise PointingUnreadable("cannot read current pointing")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli, "time", FakeTime()),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scan),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(cli, "UNREADABLE_BEFORE_RECONNECT", 2),
+    ):
+        measure, _reach, _stop, state = cli._scope_measure(sc, cfg, args)
+        mode["dead"] = True
+        measure(10)  # one unreadable skip: below the threshold of 2
+        assert state["unreadable"] == 1 and state["reconnects"] == 0
+        mode["dead"] = False
+        assert measure(30) is not None
+        assert state["unreadable"] == 0, (
+            "a successful measurement must reset the unreadable count; without "
+            "it, blips separated by healthy columns accumulate across the run"
+        )
+        mode["dead"] = True
+        measure(50)
+        assert (
+            state["reconnects"] == 0
+        ), "the fresh blip must start counting from zero, not inherit the old one"
+
+
+def test_a_dead_channel_after_a_waypoint_is_unreadable_not_a_sun_refusal():
+    """The fourth raise site, pinned: the over-the-top route's post-waypoint
+    readback. Reverting it to plain SunGuard survives every other test, and a
+    dead channel discovered on exactly that route shape would dodge the
+    backoff — the churn this PR exists to end, one path over.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus.sweep import Pointer, PointingUnreadable, Sky, SunGuard
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    reads = {"n": 0}
+
+    def equ():
+        reads["n"] += 1
+        # Alive for the start-of-slew read; dead for the post-waypoint readback.
+        return (12.0, 20.0) if reads["n"] <= 1 else None
+
+    sc.equ_coord = MagicMock(side_effect=equ)
+    ptr = Pointer(sc, sky, 30, 5)
+
+    # The site lives in the LEGACY over-the-top fallback: plan_route must fail,
+    # the direct path must be Sun-blocked (first path_min_sep call), and the
+    # via candidate legs must clear (subsequent calls).
+    seps = {"n": 0}
+
+    def sep_seq(self, a, b):
+        seps["n"] += 1
+        return 1.0 if seps["n"] == 1 else 90.0
+
+    with (
+        patch.object(Pointer, "_goto_wait", lambda self, ra, dec, settle: None),
+        patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
+        patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
+        patch.object(Pointer, "plan_route", lambda self, a, b: None),
+        patch.object(Pointer, "path_min_sep", sep_seq),
+    ):
+        with pytest.raises(SunGuard, match="after the waypoint") as exc:
+            ptr.point_to(200.0, 30.0)
+    assert isinstance(exc.value, PointingUnreadable), (
+        "the dead channel must surface as the SPECIFIC class so the orient "
+        "loop's backoff can meter it - a bare SunGuard reads as Sun geometry"
+    )
 
 
 def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
