@@ -1067,6 +1067,45 @@ RECONNECT_CYCLES = 2
 INCONCLUSIVE_SUPPRESS_DEG = 10.0
 
 
+def _parse_re_measure(value):
+    """--re-measure's CSV of azimuths, normalised onto the checkpoint's [0,360) grid."""
+    try:
+        return {int(round(float(a))) % 360 for a in value.split(",") if a.strip()}
+    except ValueError as e:
+        raise SeestarError(f"--re-measure wants azimuths like 324,177: {e}") from e
+
+
+def _back_off_unreadable(state, sc, az, error):
+    """The unreadable-scope escalation: count, reconnect once per cycle, then stop.
+
+    Skips are seconds each, so a dead control channel spends the whole plan
+    proving the same dead socket unless something meters it (Thursday: az
+    320/40/61/219). Three consecutive unreadable skips buy one reconnect and a
+    30 s settle; a second full cycle means the scope needs hands, so the run
+    stops cleanly - every measured column is already in the checkpoint.
+    """
+    state["unreadable"] += 1
+    print(f"az {az:3d}: skipped ({error}) [unreadable "
+          f"{state['unreadable']}/{UNREADABLE_BEFORE_RECONNECT}]", file=sys.stderr)  # fmt: skip
+    if state["unreadable"] >= UNREADABLE_BEFORE_RECONNECT:
+        if state["reconnects"] >= RECONNECT_CYCLES:
+            raise SeestarError(
+                "the control channel stayed unreadable through two reconnect "
+                "cycles. The scope likely needs a power cycle; every measured "
+                "column is checkpointed - rerun the same command to resume."
+            ) from error
+        state["reconnects"] += 1
+        print(f"reconnecting to the scope and waiting 30 s "
+              f"(cycle {state['reconnects']}/{RECONNECT_CYCLES})", file=sys.stderr)  # fmt: skip
+        try:
+            sc.reconnect()
+        except (OSError, SeestarError) as e2:
+            print(f"reconnect failed ({str(e2)[:60]}); waiting anyway", file=sys.stderr)
+        time.sleep(30)
+        state["unreadable"] = 0
+    return None
+
+
 def _fail_column(checkpoint, dry_run, az, error, message):
     """Checkpoint a column as failed and say why. The shared tail of every
     give-this-column-up path — identical dict, identical shape, four sites."""
@@ -1116,7 +1155,7 @@ def _scope_measure(sc, cfg, args):
         # Azimuths that came back inconclusive TONIGHT. An inconclusive is a
         # verdict about the sky's condition, and the sky a few degrees over is
         # the same sky - the planner re-offering the neighbours spent ~2.5
-        # minutes of dusk per retry on Thursday (M-08, the second P2 bead).
+        # minutes of dusk per retry on 2026-08-07 (terminus-62).
         "dead_zones": [],
     }
 
@@ -1175,10 +1214,7 @@ def _scope_measure(sc, cfg, args):
     cache = {}
     redo = set()
     if getattr(args, "re_measure", None):
-        try:
-            redo = {int(round(float(a))) % 360 for a in args.re_measure.split(",") if a.strip()}
-        except ValueError as e:
-            raise SeestarError(f"--re-measure wants azimuths like 324,177: {e}") from e
+        redo = _parse_re_measure(args.re_measure)
     if os.path.exists(ckpt_path):
         for line in open(ckpt_path):
             try:
@@ -1246,22 +1282,34 @@ def _scope_measure(sc, cfg, args):
         return None  # open / inconclusive: measured, no constraint
 
     def measure(az):
+        # THE CACHE OUTRANKS THE DEAD ZONE. A cached verdict is evidence from
+        # conditions that supported measuring; a dead zone only says tonight's
+        # sky cannot answer HERE AND NOW. Checking the zone first silently
+        # discarded evidenced prior measurements that happened to sit near a
+        # later inconclusive (review round 1's P1).
+        if int(az) in cache:
+            d = cache[int(az)]
+            print(f"az {int(az):3d}: from checkpoint ({d['verdict']} {d.get('alt') or ''})")
+            return cached_result(d)
         # A LIVE inconclusive poisons its neighbourhood for the rest of the
         # run: the verdict is about the sky's condition, and the sky a few
         # degrees over is the same sky. Suppressing the region costs nothing
         # (no slew happens); re-offering it cost ~2.5 minutes of dusk per
         # retry on Thursday. Cached inconclusives from a PRIOR session do not
-        # create zones - they describe that night's sky, not tonight's.
+        # create zones - they describe that night's sky, not tonight's. Each
+        # suppressed skip is CHECKPOINTED as failed (D-12: a thing skipped
+        # must be recorded as skipped), which also means a later resume under
+        # fresh conditions re-attempts it.
         for dz in state["dead_zones"]:
             if abs(((float(az) - dz + 180.0) % 360.0) - 180.0) <= INCONCLUSIVE_SUPPRESS_DEG:
-                print(f"az {int(az):3d}: within {INCONCLUSIVE_SUPPRESS_DEG:g} deg of "
-                      f"inconclusive az {dz:g} (conditions, not geometry); skipping",
-                      file=sys.stderr)  # fmt: skip
-                return None
-        if int(az) in cache:
-            d = cache[int(az)]
-            print(f"az {int(az):3d}: from checkpoint ({d['verdict']} {d.get('alt') or ''})")
-            return cached_result(d)
+                return _fail_column(
+                    checkpoint,
+                    args.dry_run,
+                    int(az),
+                    f"within {INCONCLUSIVE_SUPPRESS_DEG:g} deg of inconclusive az {dz:g}",
+                    f"within {INCONCLUSIVE_SUPPRESS_DEG:g} deg of inconclusive az {dz:g} "
+                    "(conditions, not geometry); skipping",
+                )
         t0 = time.time()
         try:
             if night:
@@ -1407,35 +1455,7 @@ def _scope_measure(sc, cfg, args):
                             f"failed after view restart ({str(e2)[:80]})",
                         )
         except PointingUnreadable as e:
-            # The scope has stopped answering, which is not a property of this
-            # column: skipping candidate after candidate at seconds each spends
-            # the plan proving the same dead socket (Thursday, az 320/40/61/
-            # 219). Three in a row buys one reconnect-and-wait; a second full
-            # cycle means the scope needs hands (power cycle), so stop cleanly
-            # with the checkpoint intact rather than churn to dawn.
-            state["unreadable"] += 1
-            print(f"az {az:3d}: skipped ({e}) [unreadable "
-                  f"{state['unreadable']}/{UNREADABLE_BEFORE_RECONNECT}]",
-                  file=sys.stderr)  # fmt: skip
-            if state["unreadable"] >= UNREADABLE_BEFORE_RECONNECT:
-                if state["reconnects"] >= RECONNECT_CYCLES:
-                    raise SeestarError(
-                        "the control channel stayed unreadable through two reconnect "
-                        "cycles. The scope likely needs a power cycle; every measured "
-                        "column is checkpointed - rerun the same command to resume."
-                    ) from e
-                state["reconnects"] += 1
-                print(f"reconnecting to the scope and waiting 30 s "
-                      f"(cycle {state['reconnects']}/{RECONNECT_CYCLES})",
-                      file=sys.stderr)  # fmt: skip
-                try:
-                    sc.reconnect()
-                except (OSError, SeestarError) as e2:
-                    print(f"reconnect failed ({str(e2)[:60]}); waiting anyway",
-                          file=sys.stderr)  # fmt: skip
-                time.sleep(30)
-                state["unreadable"] = 0
-            return None
+            return _back_off_unreadable(state, sc, az, e)
         except SunGuard as e:
             print(f"az {az:3d}: skipped ({e})", file=sys.stderr)
             return None
@@ -1461,6 +1481,11 @@ def _scope_measure(sc, cfg, args):
             return None
         state["misses"] = 0
         state["unreadable"] = 0
+        # A successful measurement means the channel recovered, so the
+        # reconnect budget resets too: it meters an INCIDENT, not the run's
+        # lifetime. Without this, two fully recovered blips hours apart spent
+        # the budget and a third aborted a healthy run (round 1's P2).
+        state["reconnects"] = 0
         if status in ("inconclusive", "no_reference"):
             state["dead_zones"].append(float(az))
         verdict = ("edge" if status.startswith("edge")

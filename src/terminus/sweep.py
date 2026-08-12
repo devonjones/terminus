@@ -815,7 +815,9 @@ class Pointer:
                 # holds it drifts about a degree every four minutes.
                 landed = self.sc.equ_coord()
                 if landed is None:
-                    raise SunGuard("cannot read pointing after the waypoint; refusing to slew")
+                    raise PointingUnreadable(
+                        "cannot read pointing after the waypoint; refusing to slew"
+                    )
                 self._sun_check(*self.sky.radec_to_altaz(*landed))
                 target = self.sky.altaz_to_radec(az, alt)
                 sep = self.path_min_sep(landed, target)

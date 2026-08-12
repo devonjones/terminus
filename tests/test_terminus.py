@@ -7535,6 +7535,119 @@ def test_an_inconclusive_column_shadows_its_neighbourhood(tmp_path):
             )
 
 
+def test_the_cache_outranks_the_dead_zone_and_suppressed_skips_are_recorded(tmp_path):
+    """Round 1's two P1s on the dead-zone fix, pinned by driving measure() directly.
+
+    A cached verdict is evidence from conditions that supported measuring; a
+    dead zone only says tonight's sky cannot answer here and now — so the
+    cache is served even inside a zone. And every suppressed skip is
+    checkpointed as failed (D-12), which doubles as a re-attempt on the next
+    resume under fresh conditions.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+
+    args, cfg, sc = _orient_harness(tmp_path)
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    # az 85 was measured healthy on a prior night; az 90 will go inconclusive
+    # live, shadowing 80-100.
+    ckpt.write_text(
+        json.dumps({"az": 85, "verdict": "edge", "alt": 12.0, "ceiling": 60,
+                    "channel": "scenery", "sky_ref": 245.0, "profile": []}) + "\n"
+    )  # fmt: skip
+    ptr = MagicMock()
+    ptr.dry = False
+
+    def inconclusive_scan(*a, **k):
+        return (60.0, "inconclusive", "unknown", [])
+
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=inconclusive_scan),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "is_stowed", return_value=False),
+    ):
+        measure, _reach, _stop, state = cli._scope_measure(sc, cfg, args)
+        assert measure(90) is None, "the live column goes inconclusive"
+        assert state["dead_zones"] == [90.0]
+        got = measure(85)
+        assert got is not None and got[0] == {"alt": 12.0, "snr": None}, (
+            "the cached verdict must be SERVED inside the zone - it is evidence "
+            "from conditions that supported measuring"
+        )
+        assert measure(95) is None, "a live candidate inside the zone is suppressed"
+
+    lines = [json.loads(x) for x in ckpt.read_text().splitlines()]
+    suppressed = [d for d in lines if "inconclusive az 90" in d.get("error", "")]
+    assert (
+        suppressed and suppressed[0]["az"] == 95 and suppressed[0]["verdict"] == "failed"
+    ), "the suppressed skip must be checkpointed (D-12) so a later resume re-attempts it"
+
+
+def test_the_reconnect_budget_is_per_incident_not_per_run(tmp_path):
+    """Round 1's P2: two fully recovered blips hours apart must not spend the
+    budget so that a third, equally recoverable blip aborts a healthy run. Any
+    successful measurement resets the reconnect count along with the others.
+    """
+    import time as real_time
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.sweep import PointingUnreadable
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 70_000.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    args, cfg, sc = _orient_harness(tmp_path)
+    ptr = MagicMock()
+    ptr.dry = False
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    mode = {"dead": False}
+
+    def scan(ptr_, sc_, az, *a, **k):
+        if mode["dead"]:
+            raise PointingUnreadable("cannot read current pointing")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli, "time", FakeTime()),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scan),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(cli, "UNREADABLE_BEFORE_RECONNECT", 1),
+    ):
+        measure, _reach, _stop, state = cli._scope_measure(sc, cfg, args)
+        # Incident 1: one unreadable skip triggers a reconnect, then recovery.
+        mode["dead"] = True
+        measure(10)
+        assert state["reconnects"] == 1
+        mode["dead"] = False
+        assert measure(30) is not None, "the channel recovered and measured"
+        assert state["reconnects"] == 0, (
+            "a successful measurement must reset the reconnect budget - it "
+            "meters an incident, not the run's lifetime"
+        )
+        # Incident 2, identical: must be survivable again, not a third strike.
+        mode["dead"] = True
+        measure(50)
+        assert state["reconnects"] == 1, "the second incident starts a fresh budget"
+
+
 def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
     """Live 2026-08-07: the RTSP stream died at column ten and killed the orient.
 
