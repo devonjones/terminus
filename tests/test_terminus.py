@@ -7323,6 +7323,441 @@ def test_an_unverified_exposure_lock_blocks_the_next_column(tmp_path):
     assert len(scan_calls["locks_at_scan"]) >= 2, "the healed run must resume measuring"
 
 
+def _orient_harness(tmp_path, **overrides):
+    """The shared cmd_orient test rig: photo mask, args, cfg, mocked scope."""
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from terminus.export import write_mask
+
+    photo = tmp_path / "photo.yaml"
+    rows = {
+        a: (20.0 + 10.0 * math.sin(math.radians(2 * a)), "structure") for a in range(0, 360, 10)
+    }
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+    args = SimpleNamespace(
+        mask=str(photo), out=str(tmp_path / "solved.yaml"), replay=None, fiducials=None,
+        seed=3, max_columns=6, window=3, yaw_tol=1.0, uncertainty=None, min_headroom=None,
+        dry_run=False, frames=None, stop_above_sun_alt=None, re_measure=None,
+    )  # fmt: skip
+    for k, v in overrides.items():
+        setattr(args, k, v)
+    cfg = {
+        "site": {"lat": 39.79, "lon": -104.89, "elev_m": 1600},
+        "sweep": {"az_step": 10, "alt_min": 0, "alt_max": 60, "alt_tol": 1.5,
+                  "sun_cone_deg": 30, "slew_step_deg": 5, "clear_thresh": 0.6},
+    }  # fmt: skip
+    sc = MagicMock()
+    sc.is_eq_mode.return_value = True
+    return args, cfg, sc
+
+
+_CANNED_FIT = {
+    "yaw": 10.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0, "rms": 0.1,
+    "n": 4, "n_bound": 0, "residuals": {0.0: 0.1}, "fiducials": [],
+}  # fmt: skip
+
+
+def test_re_measure_ignores_a_cached_verdict_on_request(tmp_path):
+    """The operator can refuse a checkpoint column whose CONDITIONS they no
+    longer trust — Thursday's az 324/177, night verdicts taken while the
+    twilight arch lit the treeline. The verdict stays in the append-only file
+    (D-16); it just is not served, so the column is measured again tonight and
+    the fresh line supersedes on every later load. Hand-editing the jsonl was
+    the alternative, and a file nobody may edit by hand is a file someone will.
+    """
+    import json
+    from unittest.mock import patch
+
+    import pytest
+
+    from terminus import cli, guide
+    from terminus.client import SeestarError
+
+    # 360 wraps to 0: the parser's normalisation is load-bearing, not decor.
+    args, cfg, sc = _orient_harness(tmp_path, re_measure="360")
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    # az 0 is a guaranteed seed, so the planner always offers it.
+    ckpt.write_text(
+        json.dumps({"az": 0, "verdict": "edge", "alt": 13.8, "ceiling": 60,
+                    "channel": "star4800", "profile": []}) + "\n"
+    )  # fmt: skip
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    scanned = []
+
+    def scans(ptr, sc_, az, *a, **k):
+        scanned.append(int(az))
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scans),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(guide, "fit", return_value=dict(_CANNED_FIT)),
+    ):
+        cli.cmd_orient(sc, cfg, args)
+
+    assert 0 in scanned, "the refused column must be measured again, not served"
+    lines = [json.loads(x) for x in ckpt.read_text().splitlines()]
+    assert lines[0]["alt"] == 13.8, "the old line STAYS - the file is append-only"
+    fresh = [d for d in lines if d["az"] == 0 and d.get("alt") == 25.0]
+    assert fresh, "the fresh measurement must be checkpointed to supersede it"
+
+    with pytest.raises(SeestarError, match="re-measure"):
+        bad, cfg2, sc2 = _orient_harness(tmp_path, re_measure="north-ish")
+        cli.cmd_orient(sc2, cfg2, bad)
+
+
+def test_an_unreadable_scope_backs_off_and_then_stops_instead_of_churning(tmp_path):
+    """Thursday's churn: a dead control channel skipped az 320, 40, 61, 219 at
+    seconds each — SunGuard skips, invisible to the miss counter — and would
+    have spent every candidate to dawn. Three consecutive unreadable skips now
+    buy one reconnect-and-wait; a second full cycle stops the run cleanly with
+    the checkpoint intact and a message naming the power cycle.
+    """
+    import time as real_time
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus import cli
+    from terminus.client import SeestarError
+    from terminus.sweep import PointingUnreadable
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 50_000.0
+            self.slept = []
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.slept.append(dt)
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    args, cfg, sc = _orient_harness(tmp_path, seed=4, max_columns=12)
+    # Thursday's shape: healthy columns already in the checkpoint, so the
+    # planner has a fit and keeps offering candidates - which is exactly the
+    # regime where the churn burned the plan.
+    import json as _json
+
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    ckpt.write_text("".join(
+        _json.dumps({"az": a, "verdict": "edge", "alt": alt, "ceiling": 60,
+                     "channel": "scenery", "sky_ref": 245.0, "profile": []}) + "\n"
+        for a, alt in ((0, 20.0), (90, 26.0), (180, 20.0), (270, 14.0))
+    ))  # fmt: skip
+    clock = FakeTime()
+    ptr = MagicMock()
+    ptr.dry = False  # a bare MagicMock's .dry is truthy, and scan_horizon short-circuits on it
+    ptr.point_to = MagicMock(side_effect=PointingUnreadable("cannot read current pointing"))
+
+    from terminus import guide
+
+    with (
+        patch.object(cli, "time", clock),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        # Tightened thresholds keep the scenario inside the candidates the
+        # planner offers; the POLICY (skips buy a reconnect, cycles buy a
+        # clean stop) is what is under test, not the production numbers.
+        patch.object(cli, "UNREADABLE_BEFORE_RECONNECT", 2),
+        patch.object(cli, "RECONNECT_CYCLES", 1),
+        # A WOBBLING fit: identical yaws would read as instantly settled and
+        # the run would finish before ever slewing. The wobble keeps the
+        # planner hunting, which is Thursday's regime.
+        patch.object(
+            guide,
+            "fit",
+            side_effect=[dict(_CANNED_FIT, yaw=float(10 + 30 * (i % 4))) for i in range(40)],
+        ),
+    ):
+        with pytest.raises(SeestarError, match="power cycle"):
+            cli.cmd_orient(sc, cfg, args)
+
+    assert sc.reconnect.call_count == 1, (
+        f"the unreadable skips buy one reconnect cycle, then stop: "
+        f"{sc.reconnect.call_count} reconnects"
+    )
+    assert clock.slept.count(30) == 1, "the reconnect waits 30 s for the scope to settle"
+
+
+def test_an_inconclusive_column_shadows_its_neighbourhood(tmp_path):
+    """Thursday: az 328 inconclusive, then the planner offered 332, then 329 —
+    the same unmeasurable sky, ~2.5 minutes of dusk each. An inconclusive is an
+    environmental verdict, so tonight's dead zone reaches
+    INCONCLUSIVE_SUPPRESS_DEG around it: the invariant is that no two SCANNED
+    azimuths sit within the suppression radius of each other.
+    """
+    from unittest.mock import patch
+
+    from terminus import cli, guide
+    from terminus.export import MaskError
+
+    args, cfg, sc = _orient_harness(tmp_path, max_columns=8)
+    scanned = []
+
+    def all_inconclusive(ptr, sc_, az, *a, **k):
+        scanned.append(float(az))
+        return (60.0, "inconclusive", "unknown", [])
+
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=all_inconclusive),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer"),
+        patch.object(cli, "column_touches_sun", return_value=False),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(guide, "fit", return_value=dict(_CANNED_FIT)),
+    ):
+        try:
+            cli.cmd_orient(sc, cfg, args)
+        except MaskError:
+            pass  # nothing measurable is a legitimate outcome
+
+    assert len(scanned) >= 2, "the scenario must scan at least two regions"
+    for i, a in enumerate(scanned):
+        for b in scanned[i + 1 :]:
+            sep = abs(((a - b + 180.0) % 360.0) - 180.0)
+            assert sep > cli.INCONCLUSIVE_SUPPRESS_DEG, (
+                f"scanned {a:g} and {b:g} only {sep:.1f} deg apart - the planner "
+                "re-offered a region the conditions already refused"
+            )
+
+
+def test_the_cache_outranks_the_dead_zone_and_suppressed_skips_are_recorded(tmp_path):
+    """Round 1's two P1s on the dead-zone fix, pinned by driving measure() directly.
+
+    A cached verdict is evidence from conditions that supported measuring; a
+    dead zone only says tonight's sky cannot answer here and now — so the
+    cache is served even inside a zone. And every suppressed skip is
+    checkpointed as failed (D-12), which doubles as a re-attempt on the next
+    resume under fresh conditions.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+
+    args, cfg, sc = _orient_harness(tmp_path)
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    # az 85 was measured healthy on a prior night; az 90 will go inconclusive
+    # live, shadowing 80-100.
+    ckpt.write_text(
+        json.dumps({"az": 85, "verdict": "edge", "alt": 12.0, "ceiling": 60,
+                    "channel": "scenery", "sky_ref": 245.0, "profile": []}) + "\n"
+    )  # fmt: skip
+    ptr = MagicMock()
+    ptr.dry = False
+
+    def inconclusive_scan(*a, **k):
+        return (60.0, "inconclusive", "unknown", [])
+
+    with (
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=inconclusive_scan),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "is_stowed", return_value=False),
+    ):
+        measure, _reach, _stop, state = cli._scope_measure(sc, cfg, args)
+        assert measure(90) is None, "the live column goes inconclusive"
+        assert state["dead_zones"] == [90.0]
+        got = measure(85)
+        assert got is not None and got[0] == {"alt": 12.0, "snr": None}, (
+            "the cached verdict must be SERVED inside the zone - it is evidence "
+            "from conditions that supported measuring"
+        )
+        assert measure(95) is None, "a live candidate inside the zone is suppressed"
+
+    lines = [json.loads(x) for x in ckpt.read_text().splitlines()]
+    suppressed = [d for d in lines if "inconclusive az 90" in d.get("error", "")]
+    assert (
+        suppressed and suppressed[0]["az"] == 95 and suppressed[0]["verdict"] == "failed"
+    ), "the suppressed skip must be checkpointed (D-12) so a later resume re-attempts it"
+
+
+def test_the_reconnect_budget_is_per_incident_not_per_run(tmp_path):
+    """Round 1's P2: two fully recovered blips hours apart must not spend the
+    budget so that a third, equally recoverable blip aborts a healthy run. Any
+    successful measurement resets the reconnect count along with the others.
+    """
+    import time as real_time
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.sweep import PointingUnreadable
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 70_000.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    args, cfg, sc = _orient_harness(tmp_path)
+    ptr = MagicMock()
+    ptr.dry = False
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    mode = {"dead": False}
+
+    def scan(ptr_, sc_, az, *a, **k):
+        if mode["dead"]:
+            raise PointingUnreadable("cannot read current pointing")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli, "time", FakeTime()),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scan),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(cli, "UNREADABLE_BEFORE_RECONNECT", 1),
+    ):
+        measure, _reach, _stop, state = cli._scope_measure(sc, cfg, args)
+        # Incident 1: one unreadable skip triggers a reconnect, then recovery.
+        mode["dead"] = True
+        measure(10)
+        assert state["reconnects"] == 1
+        mode["dead"] = False
+        assert measure(30) is not None, "the channel recovered and measured"
+        assert state["reconnects"] == 0, (
+            "a successful measurement must reset the reconnect budget - it "
+            "meters an incident, not the run's lifetime"
+        )
+        # Incident 2, identical: must be survivable again, not a third strike.
+        mode["dead"] = True
+        measure(50)
+        assert state["reconnects"] == 1, "the second incident starts a fresh budget"
+
+
+def test_the_unreadable_count_resets_on_success(tmp_path):
+    """Round 2 of the loop found this reset unpinned: without it, unreadable
+    blips separated by healthy columns accumulate toward the reconnect
+    threshold across the whole run instead of per incident.
+    """
+    import time as real_time
+    from unittest.mock import MagicMock, patch
+
+    from terminus import cli
+    from terminus.sweep import PointingUnreadable
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 80_000.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+        def strftime(self, fmt):
+            return real_time.strftime(fmt)
+
+    args, cfg, sc = _orient_harness(tmp_path)
+    ptr = MagicMock()
+    ptr.dry = False
+    prof = [(float(a), 80.0 if a > 25 else 8.0) for a in range(60, -1, -5)]
+    mode = {"dead": False}
+
+    def scan(ptr_, sc_, az, *a, **k):
+        if mode["dead"]:
+            raise PointingUnreadable("cannot read current pointing")
+        return (25.0, "edge(rel 3.0)", "tree", prof)
+
+    with (
+        patch.object(cli, "time", FakeTime()),
+        patch.object(cli.Sky, "sun", lambda self: (297.0, -5.0)),  # terminus-63
+        patch.object(cli, "scan_horizon", side_effect=scan),
+        patch.object(cli, "sky_reference", return_value=80.0),
+        patch.object(cli, "Pointer", return_value=ptr),
+        patch.object(cli, "is_stowed", return_value=False),
+        patch.object(cli, "UNREADABLE_BEFORE_RECONNECT", 2),
+    ):
+        measure, _reach, _stop, state = cli._scope_measure(sc, cfg, args)
+        mode["dead"] = True
+        measure(10)  # one unreadable skip: below the threshold of 2
+        assert state["unreadable"] == 1 and state["reconnects"] == 0
+        mode["dead"] = False
+        assert measure(30) is not None
+        assert state["unreadable"] == 0, (
+            "a successful measurement must reset the unreadable count; without "
+            "it, blips separated by healthy columns accumulate across the run"
+        )
+        mode["dead"] = True
+        measure(50)
+        assert (
+            state["reconnects"] == 0
+        ), "the fresh blip must start counting from zero, not inherit the old one"
+
+
+def test_a_dead_channel_after_a_waypoint_is_unreadable_not_a_sun_refusal():
+    """The fourth raise site, pinned: the over-the-top route's post-waypoint
+    readback. Reverting it to plain SunGuard survives every other test, and a
+    dead channel discovered on exactly that route shape would dodge the
+    backoff — the churn this PR exists to end, one path over.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus.sweep import Pointer, PointingUnreadable, Sky, SunGuard
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    reads = {"n": 0}
+
+    def equ():
+        reads["n"] += 1
+        # Alive for the start-of-slew read; dead for the post-waypoint readback.
+        return (12.0, 20.0) if reads["n"] <= 1 else None
+
+    sc.equ_coord = MagicMock(side_effect=equ)
+    ptr = Pointer(sc, sky, 30, 5)
+
+    # The site lives in the LEGACY over-the-top fallback: plan_route must fail,
+    # the direct path must be Sun-blocked (first path_min_sep call), and the
+    # via candidate legs must clear (subsequent calls).
+    seps = {"n": 0}
+
+    def sep_seq(self, a, b):
+        seps["n"] += 1
+        return 1.0 if seps["n"] == 1 else 90.0
+
+    with (
+        patch.object(Pointer, "_goto_wait", lambda self, ra, dec, settle: None),
+        patch.object(Pointer, "_sun_check", lambda self, az, alt: None),
+        patch.object(Pointer, "current_azalt", lambda self: (100.0, 40.0)),
+        patch.object(Pointer, "plan_route", lambda self, a, b: None),
+        patch.object(Pointer, "path_min_sep", sep_seq),
+    ):
+        with pytest.raises(SunGuard, match="after the waypoint") as exc:
+            ptr.point_to(200.0, 30.0)
+    assert isinstance(exc.value, PointingUnreadable), (
+        "the dead channel must surface as the SPECIFIC class so the orient "
+        "loop's backoff can meter it - a bare SunGuard reads as Sun geometry"
+    )
+
+
 def test_a_dead_scenery_stream_costs_a_retry_not_the_run(tmp_path):
     """Live 2026-08-07: the RTSP stream died at column ten and killed the orient.
 

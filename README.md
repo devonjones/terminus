@@ -120,7 +120,10 @@ constraint, rather than a plausible number.
 line in `<out>_fiducials.jsonl`, conditions included. Kill the run and run it
 again: cached columns are served without re-observation, and saved night
 profiles are re-judged by the *current* detector, so a detector fix improves an
-old night for free. Heading into dawn, `--stop-above-sun-alt -18` stops cleanly
+old night for free. A cached verdict whose *conditions* you no longer trust —
+a column measured through cloud, glare, or a lingering twilight arch — can be
+refused with `--re-measure 324,177`: the old lines stay in the append-only
+checkpoint, the columns are measured again, and the fresh result supersedes. Heading into dawn, `--stop-above-sun-alt -18` stops cleanly
 before any column once the Sun passes astronomical twilight, checked inside the
 loop rather than at launch.
 
