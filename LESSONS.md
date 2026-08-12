@@ -132,6 +132,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `E-14` Grep is not proof
 - `E-15` Concurrent agents make shared-checkout operations unsafe
 - `E-16` When two instruments write one record, merge field by field
+- `E-17` Validate operator input before the instrument moves, and pin it clock-independently
 
 **Decisions**
 
@@ -1652,6 +1653,28 @@ bound from the photo and the scope's value is a real crossing.
 
 Unconditional preservation is the mirror bug, so each rule needs a mutation test in both
 directions.
+
+### E-17 — Validate operator input before the instrument moves, and pin it clock-independently
+
+Two halves, one incident (terminus-65). `--re-measure` was parsed where it was consumed, next to
+the checkpoint load — after the view start, the channel choice, and the daytime anti-Sun seed
+slew — so a typo'd azimuth list cost a real slew before it errored. And the test covering the typo
+runs deliberately unpatched, which made it pass at night (the seed slew is skipped below −12°) and
+fail in every daytime run: PR #31 merged green on night CI, and each daytime CI run afterward was
+red — caught by a docs-only PR whose diff could not have broken anything.
+
+Three rules emerged:
+
+1. **Everything pure runs before the first scope call.** Flag parsing, checkpoint loading,
+   validation — an operator typo must cost ten seconds at launch, never an observing window.
+2. **A refusal that refuses nothing is itself a typo.** `--re-measure 342` against a checkpoint
+   whose poisoned column is az 324 parses fine, matches nothing, and quietly re-serves the very
+   verdict the operator meant to reject — so a redo set that matches no cached verdict is a typed
+   error, not a no-op.
+3. **A test that pins a hardware-free contract must fail on the contract, not on the sky.** Assert
+   the scope mock saw no calls (minus the sanctioned `stop_view` cleanup), not merely that the
+   error appeared — because the code path that spends the telescope can be conditional on the Sun,
+   and then the test's verdict depends on when CI happens to run.
 
 ---
 
