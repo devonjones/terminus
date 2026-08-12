@@ -1071,7 +1071,7 @@ def _parse_re_measure(value):
     """--re-measure's CSV of azimuths, normalised onto the checkpoint's [0,360) grid."""
     try:
         return {int(round(float(a))) % 360 for a in value.split(",") if a.strip()}
-    except ValueError as e:
+    except (ValueError, OverflowError) as e:  # OverflowError: round(float("1e999"))
         raise SeestarError(f"--re-measure wants azimuths like 324,177: {e}") from e
 
 
@@ -1134,10 +1134,90 @@ def _scope_measure(sc, cfg, args):
     # load — after the view start and the anti-Sun seed slew — so a typo'd
     # azimuth list cost a real slew before it errored. Found the slow way: the
     # test covering the typo only passed at night, when the daytime seed slew
-    # is skipped (E-12: reject a hand-typed value before it costs scope time).
+    # is skipped (E-17: reject a hand-typed value before it costs scope time).
     redo = set()
     if getattr(args, "re_measure", None):
         redo = _parse_re_measure(args.re_measure)
+
+    # EVERY COLUMN IS CHECKPOINTED AS IT COMPLETES, and a prior run's columns
+    # are served from the checkpoint instead of re-observed (terminus-58). A
+    # guided run on 2026-08-06 measured two columns, was refused on the rest,
+    # ended without a fit, and threw both away — each ~2.5 minutes of clear
+    # sky, and the run consumed an observing window to produce nothing. The
+    # file is append-only, one line per ATTEMPT with its conditions, because
+    # the first prototype of this fix checkpointed only successes and its very
+    # first crash left nothing behind.
+    ckpt_path = (
+        os.path.splitext(getattr(args, "out", None) or getattr(args, "mask", "orient"))[0]
+        + "_fiducials.jsonl"
+    )
+    cache = {}
+    refused = set()
+    if os.path.exists(ckpt_path):
+        for line in open(ckpt_path):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if "az" not in d or d.get("verdict") in (None, "failed"):
+                continue
+            if int(d["az"]) in redo:
+                refused.add(int(d["az"]))
+                # OPERATOR OVERRIDE, stated on the record: the verdict stands
+                # in the file (append-only, D-16) but is not served, so the
+                # column is measured again under tonight's conditions and the
+                # new line supersedes on every later load.
+                print(f"az {d['az']:3d}: cached {d.get('verdict')} ignored on request "
+                      "(--re-measure); will measure again", file=sys.stderr)  # fmt: skip
+                continue
+            # NIGHT VERDICTS ARE RE-JUDGED FROM THEIR SAVED PROFILES: the
+            # verdict in the file is what an old detector thought, the profile
+            # is what the sky did, and re-judging turned two wrong verdicts
+            # into right ones the night this was built. Day profiles keep their
+            # stored verdict — their judge needs a sky reference that is not in
+            # the record.
+            prof = [(a, lum) for a, lum in (d.get("profile") or [])]
+            # A DAY VERDICT FROM A DEAD SKY IS DISCARDED, NOT SERVED. Three
+            # twilight columns (2026-08-07, ref 21.3) came back as confident
+            # low edges in a treeline the sweeps put above 60 deg; serving
+            # them from the checkpoint would feed the night resume the very
+            # numbers the floor exists to refuse (M-08, M-13). Dropped from
+            # the cache entirely so the current channel re-measures them.
+            if (
+                d.get("channel") != "star4800"
+                and d.get("verdict") in ("edge", "blocked")
+                and below_day_floor(d.get("sky_ref"))
+            ):
+                print(f"az {d['az']:3d}: checkpoint {d['verdict']} discarded - measured at "
+                      f"sky_ref {d['sky_ref']}, below the day floor {DAY_REF_FLOOR:g}; "
+                      "will re-measure", file=sys.stderr)  # fmt: skip
+                continue
+            if d.get("channel") == "star4800" and len(prof) >= 3:
+                idx, verdict = night_find_edge(prof)
+                if verdict != d["verdict"]:
+                    print(f"az {d['az']:3d}: checkpoint verdict {d['verdict']} -> {verdict} "
+                          "under the current detector", file=sys.stderr)  # fmt: skip
+                    d = dict(d, verdict=verdict)
+                    if verdict == "edge":
+                        # The bisection never ran: this is the coarse bracket's
+                        # midpoint, and the record says so rather than passing
+                        # it off as a refined value.
+                        d["alt"] = round((prof[idx][0] + prof[idx + 1][0]) / 2.0, 1)
+                        d["coarse_only"] = True
+            cache[int(d["az"])] = d
+
+    # THE FLAG MUST MATCH SOMETHING. --re-measure 342,177 against a checkpoint
+    # whose poisoned column is az 324 parses fine, refuses nothing, and quietly
+    # re-serves the very verdict the operator meant to reject — discovered at
+    # dawn, exactly like the late parse above. A refusal that refused nothing
+    # is a typo, and it is caught here, before the scope is touched (E-17).
+    missing = redo - refused
+    if missing:
+        raise SeestarError(
+            f"--re-measure {','.join(str(a) for a in sorted(missing))} matches no cached "
+            f"verdict in {ckpt_path}; nothing would be re-measured. Cached azimuths: "
+            f"{','.join(str(a) for a in sorted(cache)) or 'none'}"
+        )
 
     if not sc.is_eq_mode() and not args.dry_run:
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
@@ -1209,70 +1289,6 @@ def _scope_measure(sc, cfg, args):
             print(f"could not seed the sky reference ({e}); columns will be inconclusive",
                   file=sys.stderr)  # fmt: skip
 
-    # EVERY COLUMN IS CHECKPOINTED AS IT COMPLETES, and a prior run's columns
-    # are served from the checkpoint instead of re-observed (terminus-58). A
-    # guided run on 2026-08-06 measured two columns, was refused on the rest,
-    # ended without a fit, and threw both away — each ~2.5 minutes of clear
-    # sky, and the run consumed an observing window to produce nothing. The
-    # file is append-only, one line per ATTEMPT with its conditions, because
-    # the first prototype of this fix checkpointed only successes and its very
-    # first crash left nothing behind.
-    ckpt_path = (
-        os.path.splitext(getattr(args, "out", None) or getattr(args, "mask", "orient"))[0]
-        + "_fiducials.jsonl"
-    )
-    cache = {}
-    if os.path.exists(ckpt_path):
-        for line in open(ckpt_path):
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if "az" not in d or d.get("verdict") in (None, "failed"):
-                continue
-            if int(d["az"]) in redo:
-                # OPERATOR OVERRIDE, stated on the record: the verdict stands
-                # in the file (append-only, D-16) but is not served, so the
-                # column is measured again under tonight's conditions and the
-                # new line supersedes on every later load.
-                print(f"az {d['az']:3d}: cached {d.get('verdict')} ignored on request "
-                      "(--re-measure); will measure again", file=sys.stderr)  # fmt: skip
-                continue
-            # NIGHT VERDICTS ARE RE-JUDGED FROM THEIR SAVED PROFILES: the
-            # verdict in the file is what an old detector thought, the profile
-            # is what the sky did, and re-judging turned two wrong verdicts
-            # into right ones the night this was built. Day profiles keep their
-            # stored verdict — their judge needs a sky reference that is not in
-            # the record.
-            prof = [(a, lum) for a, lum in (d.get("profile") or [])]
-            # A DAY VERDICT FROM A DEAD SKY IS DISCARDED, NOT SERVED. Three
-            # twilight columns (2026-08-07, ref 21.3) came back as confident
-            # low edges in a treeline the sweeps put above 60 deg; serving
-            # them from the checkpoint would feed the night resume the very
-            # numbers the floor exists to refuse (M-08, M-13). Dropped from
-            # the cache entirely so the current channel re-measures them.
-            if (
-                d.get("channel") != "star4800"
-                and d.get("verdict") in ("edge", "blocked")
-                and below_day_floor(d.get("sky_ref"))
-            ):
-                print(f"az {d['az']:3d}: checkpoint {d['verdict']} discarded - measured at "
-                      f"sky_ref {d['sky_ref']}, below the day floor {DAY_REF_FLOOR:g}; "
-                      "will re-measure", file=sys.stderr)  # fmt: skip
-                continue
-            if d.get("channel") == "star4800" and len(prof) >= 3:
-                idx, verdict = night_find_edge(prof)
-                if verdict != d["verdict"]:
-                    print(f"az {d['az']:3d}: checkpoint verdict {d['verdict']} -> {verdict} "
-                          "under the current detector", file=sys.stderr)  # fmt: skip
-                    d = dict(d, verdict=verdict)
-                    if verdict == "edge":
-                        # The bisection never ran: this is the coarse bracket's
-                        # midpoint, and the record says so rather than passing
-                        # it off as a refined value.
-                        d["alt"] = round((prof[idx][0] + prof[idx + 1][0]) / 2.0, 1)
-                        d["coarse_only"] = True
-            cache[int(d["az"])] = d
         if cache:
             print(f"resuming {len(cache)} columns from {os.path.basename(ckpt_path)}: "
                   f"{sorted(cache)}")  # fmt: skip

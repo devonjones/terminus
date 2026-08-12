@@ -7415,10 +7415,29 @@ def test_re_measure_ignores_a_cached_verdict_on_request(tmp_path):
     with pytest.raises(SeestarError, match="re-measure"):
         bad, cfg2, sc2 = _orient_harness(tmp_path, re_measure="north-ish")
         cli.cmd_orient(sc2, cfg2, bad)
-    # cmd_orient's finally always issues stop_view (a failure that leaves the
-    # instrument streaming is its own small fault); everything else is a cost.
+    with pytest.raises(SeestarError, match="re-measure"):
+        cli._parse_re_measure("1e999")  # round() raises OverflowError, not ValueError
+    # cmd_orient's finally issues stop_view on any non-dry run (a failure that
+    # leaves the instrument streaming is its own small fault); everything else
+    # is a cost.
     touched = [name for name, *_ in sc2.method_calls if name != "stop_view"]
     assert not touched, f"a typo'd --re-measure must cost no scope calls, got {touched}"
+
+    # A refusal that refuses nothing is a typo too: --re-measure 342 against a
+    # checkpoint whose poisoned column is 324 would quietly re-serve the very
+    # verdict the operator meant to reject. Also unpatched, also before any
+    # scope call.
+    sub = tmp_path / "nomatch"
+    sub.mkdir()
+    args3, cfg3, sc3 = _orient_harness(sub, re_measure="10")
+    (sub / "solved_fiducials.jsonl").write_text(
+        json.dumps({"az": 0, "verdict": "edge", "alt": 13.8, "ceiling": 60,
+                    "channel": "star4800", "profile": []}) + "\n"
+    )  # fmt: skip
+    with pytest.raises(SeestarError, match="matches no cached"):
+        cli.cmd_orient(sc3, cfg3, args3)
+    touched = [name for name, *_ in sc3.method_calls if name != "stop_view"]
+    assert not touched, f"a no-match --re-measure must cost no scope calls, got {touched}"
 
 
 def test_an_unreadable_scope_backs_off_and_then_stops_instead_of_churning(tmp_path):
