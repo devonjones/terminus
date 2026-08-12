@@ -1129,6 +1129,16 @@ def _scope_measure(sc, cfg, args):
     injected rather than imported by `plan`, because feasibility is Sun geometry
     and changes with the clock — see `plan.partition`.
     """
+    # The operator's --re-measure is validated before ANYTHING touches the
+    # scope. It used to be parsed where it is consumed, next to the checkpoint
+    # load — after the view start and the anti-Sun seed slew — so a typo'd
+    # azimuth list cost a real slew before it errored. Found the slow way: the
+    # test covering the typo only passed at night, when the daytime seed slew
+    # is skipped (E-12: reject a hand-typed value before it costs scope time).
+    redo = set()
+    if getattr(args, "re_measure", None):
+        redo = _parse_re_measure(args.re_measure)
+
     if not sc.is_eq_mode() and not args.dry_run:
         raise SeestarError("not in EQ mode; terminus needs a polar-aligned EQ mount")
     if not args.dry_run and is_stowed(sc.equ_coord()):
@@ -1212,9 +1222,6 @@ def _scope_measure(sc, cfg, args):
         + "_fiducials.jsonl"
     )
     cache = {}
-    redo = set()
-    if getattr(args, "re_measure", None):
-        redo = _parse_re_measure(args.re_measure)
     if os.path.exists(ckpt_path):
         for line in open(ckpt_path):
             try:

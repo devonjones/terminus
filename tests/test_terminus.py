@@ -7407,9 +7407,18 @@ def test_re_measure_ignores_a_cached_verdict_on_request(tmp_path):
     fresh = [d for d in lines if d["az"] == 0 and d.get("alt") == 25.0]
     assert fresh, "the fresh measurement must be checkpointed to supersede it"
 
+    # This half runs UNPATCHED on purpose: a typo'd --re-measure must be
+    # rejected before anything touches the scope. When the parse sat next to
+    # the checkpoint load it ran after the daytime anti-Sun seed slew, so this
+    # passed at night (the slew is skipped) and failed in any daytime CI run —
+    # the assertion below is what makes the contract time-of-day independent.
     with pytest.raises(SeestarError, match="re-measure"):
         bad, cfg2, sc2 = _orient_harness(tmp_path, re_measure="north-ish")
         cli.cmd_orient(sc2, cfg2, bad)
+    # cmd_orient's finally always issues stop_view (a failure that leaves the
+    # instrument streaming is its own small fault); everything else is a cost.
+    touched = [name for name, *_ in sc2.method_calls if name != "stop_view"]
+    assert not touched, f"a typo'd --re-measure must cost no scope calls, got {touched}"
 
 
 def test_an_unreadable_scope_backs_off_and_then_stops_instead_of_churning(tmp_path):
