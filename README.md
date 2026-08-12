@@ -127,20 +127,21 @@ sudo apt install ffmpeg hugin-tools        # macOS: brew install ffmpeg hugin
 uv sync --extra segment    # pip users: pip install -e '.[segment]' --extra-index-url
                            #   https://download.pytorch.org/whl/cpu
 
-cp config.example.toml config.toml   # edit host + pem path. Scope commands
-                                     # only: mosaic/skymask/orient --fiducials/
-                                     # export/polar run without a config.toml
+cp config.example.toml config.toml   # edit scope host + pem path
 ```
 
-`terminus mosaic`, `skymask`, `export` and `polar` need no telescope, no network
-and no `config.toml`. Importing terminus never pulls in torch or transformers
-and never shells out to Hugin; `skymask.available()` and
-`mosaic.hugin_available()` report what you have.
+Only the commands that talk to the scope need `config.toml`: `terminus mosaic`,
+`skymask`, `export`, `polar`, and `orient` with `--fiducials` or `--replay` all
+run with no telescope, no network and no config. Importing terminus never pulls
+in torch or transformers and never shells out to Hugin; `skymask.available()`
+and `mosaic.hugin_available()` report what you have.
 
 ## Quickstart: photograph to planning file
 
-Six steps. The numbers quoted are from the published example run, to
-shape-check yours against.
+Six steps. The numbers quoted are from a real seven-column run at the example
+site, to shape-check yours against. (The published report is a larger,
+16-fiducial fit of the same yard, so its rms differs — see
+[why the residuals aren't comparable](docs/field-notes.md#why-orient-stops-on-yaw-stability-and-not-on-the-residual).)
 
 **1. Photograph the horizon.** Individual overlapping frames, held roughly
 level, all the way round. Nineteen shots two seconds apart worked; seventeen to
@@ -249,7 +250,7 @@ rather than dots, because the scope stopped at its tilt limit: the horizon there
 is *at least* that high, not exactly that high. Without a panorama the command
 still works and draws the measured horizon on a plain disc.
 
-What each step reports on the published data:
+What each step reported on that run:
 
 | Step | Expect |
 |---|---|
@@ -354,28 +355,26 @@ the mask is written once, at the end. (`orient` checkpoints per column;
 
 ## Practical cautions
 
-The measured horizon is only as good as the run that produced it. The short
-version — each links to the incident that earned it in
-[docs/field-notes.md](docs/field-notes.md):
+The measured horizon is only as good as the run that produced it. Beyond the
+two rules in Quickstart step 4 (plate solve first; stay on one side of the
+twilight boundary), each of these links to the incident that earned it:
 
-- **Plate solve first.** An alignment error biases every column identically
-  and the fit cannot see it.
-- **Don't let an `orient` run straddle dusk or dawn.** Use
-  `--stop-above-sun-alt -18` toward dawn.
 - **The Sun is checked for where it is now, not where it will be.** A column
   clear when chosen may not be by the time it is measured; at dusk this errs
-  safe, at dawn it does not.
+  safe, at dawn it does not
+  ([what still bites](docs/field-notes.md#what-still-bites)).
 - **The horizon is specific to where the tripod stood.** Re-measure if you
   move — above all if you move *nearer* an obstruction, which costs about
-  twice what moving away gains (2 m closer to a 2 m fence 5 m away: **+11.9°**;
-  2 m further: −5.9°).
+  twice what moving away gains: 2 m closer to a 2 m fence 5 m away is
+  **+11.9°**, 2 m further is −5.9°
+  ([the geometry](docs/field-notes.md#moving-the-tripod-closer-costs-more-than-further-gains)).
 
 ## As a library
 
 ```python
 from terminus import Horizon, Sky
 h = Horizon.from_mask("horizon_mask.yaml")
-sky = Sky(39.79, -104.89, 1600)
+sky = Sky(31.9583, -111.5967, 2096)   # lat, lon, elevation m (example: Kitt Peak)
 h.is_visible(ra_hours=20.2, dec_deg=38.4, sky=sky)   # NGC 6888 clear right now?
 h.altitude_at(120)                                    # horizon altitude at az 120
 
