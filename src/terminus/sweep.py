@@ -49,6 +49,21 @@ class SunGuard(Exception):
     pass
 
 
+class PointingUnreadable(SunGuard):
+    """The mount's position cannot be read, so no slew can be Sun-checked.
+
+    A SunGuard subclass because the refusal is the same safe behaviour — do not
+    move blind — but the CAUSE is a dead control channel, not Sun geometry.
+    Thursday's live run burned candidate after candidate on this at seconds
+    each: every loop treats SunGuard as an ordinary feasibility skip, which is
+    right for the Sun and wrong for a scope that has stopped answering. Being
+    a subclass keeps every existing handler safe while letting the orient loop
+    count these separately and back off (reconnect, wait, or stop cleanly).
+    """
+
+    pass
+
+
 class PointingError(Exception):
     """A slew did not arrive where it was told to go.
 
@@ -720,7 +735,7 @@ class Pointer:
             return az, alt
         cur = self.sc.equ_coord()
         if cur is None:
-            raise SunGuard("cannot read current pointing; refusing to slew")
+            raise PointingUnreadable("cannot read current pointing; refusing to slew")
         # If the tube is already inside the cone, LEAVE rather than refuse. The
         # old code raised here, which trapped it: every slew was refused,
         # including one straight away from the Sun.
@@ -730,7 +745,7 @@ class Pointer:
             self.escape()
             cur = self.sc.equ_coord()
             if cur is None:
-                raise SunGuard("lost the pointing during the escape; refusing to slew")
+                raise PointingUnreadable("lost the pointing during the escape; refusing to slew")
         self._sun_check(*self.sky.radec_to_altaz(*cur))
         az, alt = self.avoid_pole(az, alt)
         target = self.sky.altaz_to_radec(az, alt)
@@ -755,7 +770,7 @@ class Pointer:
                 # where it ACTUALLY is rather than from where it was asked to go.
                 here = self.sc.equ_coord()
                 if here is None:
-                    raise SunGuard("lost the pointing mid-route; refusing to continue")
+                    raise PointingUnreadable("lost the pointing mid-route; refusing to continue")
                 self._sun_check(*self.sky.radec_to_altaz(*here))
                 if self.route_min_sep(here, waypoints[i:]) < self.cone:
                     raise SunGuard(
