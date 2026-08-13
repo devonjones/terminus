@@ -258,10 +258,14 @@ that produced nothing, the conditions each was measured under (channel, Sun
 altitude, sky reference, clock, duration), the yaw across refits, and the scan
 frames themselves with the chosen edge outlined.
 
-That last part is the one that matters most. The measurement is a brightness
-step and a brightness step cannot say what made it — cloud, canopy and a lit
-wall all make honest ones. A storm bank here produced textbook edges at 57° over
-a 15° treeline, and nothing but the pictures settled it.
+That last part is the one that matters most, and the numbers are why. A storm
+bank sat *above* the treeline here at sunset, so the scan walked down and
+stopped at the cloud's lower edge: two columns read 57.5° and 53.8° where the
+photograph puts the treeline at 46°. Every diagnostic available at the time was
+healthy — those columns carry the two **highest** open-sky references of the
+whole run, because bright sky above bright cloud is still bright sky. The same
+direction read 46.2° on the night channel hours later. No statistic caught it;
+the frames catch it on sight, as a black bank at 50° under blue sky at 60°.
 
 ```bash
 terminus polar oriented.yaml                 # everything: site, clock, frames
@@ -283,7 +287,7 @@ What each step reported on that run:
 | `mosaic --segment` | `55% of pixels labelled` (the rest is sky nobody photographed) |
 | `skymask` | `360 columns, 0 clipped`, and a refusal to export: the mask is **unoriented** |
 | `orient` | `yaw settled within 1 deg over 3 refits`, seven columns |
-| `polar` | one self-contained HTML file, ~460 KB |
+| `polar` | one self-contained HTML file: ~460 KB with `--no-frames`, roughly double once the scan frames ride along |
 
 ### Without a telescope tonight
 

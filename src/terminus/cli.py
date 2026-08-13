@@ -594,7 +594,7 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
     # under, which is enough to admire a good run and useless for triaging
     # someone else's bad one. Both files are written by `orient` next to --out,
     # so finding them needs no new flag and their absence costs only detail.
-    attempts = _load_attempts(args.mask)
+    attempts, notes = _load_attempts(args.mask)
     frames_dir = None
     if not getattr(args, "no_frames", False):
         guess = os.path.splitext(args.mask)[0] + "_frames"
@@ -620,11 +620,18 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             meta=meta,
             size=args.size,
             floor=args.floor,
-            title=args.title or f"terminus horizon — {os.path.basename(args.mask)}",
+            # The auto-title is the MASK FILENAME, and filenames carry identity
+            # in practice — "ron-backyard", "live-2026-08-12-night". It reached
+            # <title> and <h1> ten lines above the page's own "no coordinates,
+            # dates or clock times" note. An explicit --title is the operator's
+            # own words and is left alone.
+            title=args.title
+            or ("terminus horizon" if args.privacy else f"terminus horizon — {os.path.basename(args.mask)}"),  # fmt: skip
             attempts=attempts,
             frames_dir=frames_dir,
             frame_px=args.frame_px,
             private=args.privacy,
+            notes=notes,
         ),  # fmt: skip
     )
     print(f"wrote {out} ({os.path.getsize(out) // 1024} KB, self-contained)")
@@ -640,22 +647,39 @@ def _load_attempts(mask_path):
     """
     ckpt = os.path.splitext(mask_path)[0] + "_fiducials.jsonl"
     if not os.path.exists(ckpt):
-        return []
-    attempts = []
+        return [], []
+    attempts, bad = [], 0
+    notes = []
     try:
-        with open(ckpt) as fh:
+        # errors="replace": a mangled byte in a hand-edited checkpoint would
+        # otherwise raise UnicodeDecodeError from the iteration itself, outside
+        # the per-line guard and outside OSError, and take the whole report
+        # down — the exact file this is most lenient about.
+        with open(ckpt, errors="replace") as fh:
             for line in fh:
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    bad += line.strip() != ""
                     continue
                 if isinstance(d, dict) and "az" in d:
                     # The profile is the raw brightness ladder — kilobytes per
                     # column, already summarised by the frames and the verdict.
                     attempts.append({k: v for k, v in d.items() if k != "profile"})
+                else:
+                    bad += 1
     except OSError as e:
+        # ON THE PAGE, not only on the terminal. A report with no attempt log
+        # is indistinguishable from a run that never checkpointed, and the
+        # reader of a mailed-in page never saw this stderr line.
+        notes.append(f"The attempt log {os.path.basename(ckpt)} could not be read ({e}), so this page shows none of it.")  # fmt: skip
         print(f"could not read {ckpt} ({e}); the report will have no attempt log", file=sys.stderr)
-    return attempts
+    if bad:
+        notes.append(
+            f"{bad} line(s) of {os.path.basename(ckpt)} were unreadable and are missing "
+            "from the attempt log below."
+        )
+    return attempts, notes
 
 
 def _mask_entries(path):
@@ -934,8 +958,13 @@ def _orient(sc, cfg, args):
             # (F-13), and a run someone mails in is unreadable without knowing
             # which code measured it.
             terminus_version=__version__,
-            measured=time.strftime("%Y-%m-%d %H:%M %Z"),
-            **_site_record(cfg),
+            # `oriented_at`, NOT `measured`. They are different events — the
+            # photographs were taken once and the scope solved them later — and
+            # `measured` is a key the merge path deliberately preserves, so
+            # writing the orient time into it destroys the mask's own record of
+            # when its horizon was observed.
+            oriented_at=time.strftime("%Y-%m-%d %H:%M %Z"),
+            **_site_record(cfg, meta),
             source_mask=os.path.abspath(args.mask),
         ),
     )
@@ -976,19 +1005,26 @@ def _fit_trail_record(steps):
     return trail
 
 
-def _site_record(cfg):
-    """The observing site, when the config names one.
+def _site_record(cfg, prior=None):
+    """The observing site, when the config names one and the mask does not.
 
     Recorded because sun altitude and twilight cannot be checked against a run
     without it, and a horizon is meaningless away from the spot it was measured
     from. `polar --privacy` is what keeps it off a page meant for strangers;
     withholding it from the FILE would only mean nobody could debug the run at
     all.
+
+    A POSITION ALREADY IN THE MASK WINS. `_check_mergeable` refuses to merge
+    runs from different positions by comparing exactly these keys, so
+    restamping them from whatever `config.toml` says today would quietly retune
+    that guard to agree with wherever the tripod is now — turning a refusal to
+    mix two sites into a silent merge.
     """
+    prior = prior or {}
     site = (cfg or {}).get("site") or {}
     out = {}
     for key in ("lat", "lon"):
-        if site.get(key) is not None:
+        if prior.get(key) is None and site.get(key) is not None:
             out[key] = round(float(site[key]), 4)
     return out
 

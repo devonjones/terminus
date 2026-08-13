@@ -8472,6 +8472,7 @@ def _diag_meta(**over):
         "yaw": 135.25,
         "pitch": 2.28,
         "tilt_mag": 2.25,
+        "tilt_dir": 180.0,
         "fit_rms": 6.23,
         "fit_columns": [0, 34, 90],
         "fit_settled": False,
@@ -8491,6 +8492,11 @@ _DIAG_ATTEMPTS = [
     {"az": 45, "t": "20:04:50", "verdict": "failed", "secs": 12},
     {"az": 19, "t": "19:48:13", "verdict": "inconclusive", "channel": "scenery",
      "sun_alt": 1.2, "sky_ref": 63.3, "secs": 173},
+    # A night row carrying a DAY reference: the run state keeps the last day
+    # value across the twilight boundary, and the night channel never writes
+    # one of its own.
+    {"az": 34, "t": "21:21:56", "verdict": "edge", "alt": 46.2, "channel": "star4800",
+     "sun_alt": -14.9, "sky_ref": 7.7, "secs": 485},
 ]  # fmt: skip
 
 
@@ -8522,19 +8528,27 @@ def test_the_report_carries_every_attempt_not_just_the_ones_that_worked():
     from terminus import polar
 
     html_out = polar.diagnostics(_diag_meta(), _DIAG_ATTEMPTS)
-    assert "Every attempt (3)" in html_out
+    assert "Every attempt (4)" in html_out
     assert "failed" in html_out and "inconclusive" in html_out
-    assert (
-        "attempts</b> 3 for 3 used"
-        in html_out.replace("<b>", "</b><b>").replace("</b></b>", "</b>")
-        or "3 for 3 used" in html_out
-    )
-    # The conditions, not just the verdicts: a plausible altitude measured
-    # against a collapsed sky reference is the storm-cloud failure, and the
-    # number is the only thing that shows it.
+    assert "4 for 3 used" in html_out, "the page must say attempts, not just fit columns"
+    # The conditions, not just the verdicts.
     assert "254.0" in html_out and "63.3" in html_out
-    assert "collapsed during the run" in html_out
-    assert "star4800" not in html_out and "scenery" in html_out
+    assert "star4800" in html_out and "scenery" in html_out
+
+    # A STALE DAY REFERENCE IS NOT THIS COLUMN'S CONDITIONS. The night channel
+    # has no open-sky reference; the value in a night record crossed the
+    # twilight boundary from the last day column, and printing it as that
+    # column's own reports a measurement nobody made (M-19).
+    assert "7.7" not in html_out, "a night row must not quote a stale day sky reference"
+    # ...and it must not skew the run-level range either: 7.7 is below every
+    # real day reference, so a leak moves the stated minimum.
+    assert "63.3 to 254.0" in html_out
+
+    # The falling reference is a WEAK tell and is stated as one: it did not
+    # catch the columns that actually went wrong on 2026-08-12, and a run
+    # spanning dusk drops for the honest reason.
+    assert "fell during the run" in html_out
+    assert "the Sun" in html_out, "the reference note must not blame cloud on its own"
 
 
 def test_privacy_redacts_the_site_and_the_clock_but_keeps_the_evidence():
@@ -8548,12 +8562,29 @@ def test_privacy_redacts_the_site_and_the_clock_but_keeps_the_evidence():
     from terminus import polar
 
     meta, attempts = _diag_meta(), _DIAG_ATTEMPTS
-    open_html = polar.diagnostics(meta, attempts, private=False)
-    shy = polar.diagnostics(meta, attempts, private=True)
+
+    # THE FINISHED PAGE, not just the section. The coordinates and the date are
+    # rendered by `page`'s footer, which `diagnostics` never touches, so a test
+    # that only exercised the section left the one place lat/lon actually
+    # reaches a shared page covered by nothing.
+    def render(private):
+        return polar.page(
+            [(0.0, 10.0, "tree"), (180.0, 20.0, "structure")],
+            polar.solution_from_meta(meta),
+            meta=meta,
+            attempts=attempts,
+            private=private,
+            size=64,
+            title="terminus horizon" if private else "terminus horizon — devon-backyard.yaml",
+        )
+
+    open_html, shy = render(False), render(True)
 
     for secret in ("39.7917", "-104.894", "2026-08-12 21:55", "19:52:38"):
         assert secret in open_html, f"the open report must carry {secret}"
         assert secret not in shy, f"--privacy must redact {secret}"
+    # The mask filename is identity too, and it reaches <title> and <h1>.
+    assert "devon-backyard" in open_html and "devon-backyard" not in shy
     # Everything a diagnosis needs survives redaction.
     for kept in ("57.5", "254.0", "63.3", "failed", "inconclusive", "scenery", "9.9.9"):
         assert kept in shy, f"--privacy must keep {kept}"
@@ -8617,8 +8648,8 @@ def test_the_night_scan_keeps_the_frame_it_measured(tmp_path):
     frames = tmp_path / "scan"
     scan_horizon_night(ptr, sc, 318.0, 0, 60, 15.0, 5.0, frames_dir=str(frames))
 
-    pngs = sorted(p.name for p in frames.glob("az318_alt*.png"))
-    assert pngs, "the night scan must save the frames it measured"
+    saved = sorted(p.name for p in frames.glob("az318_alt*.jpg"))
+    assert saved, "the night scan must save the frames it measured"
     assert (frames / "az318_night.jsonl").exists(), "the numeric ladder stays too"
 
     from PIL import Image
@@ -8626,11 +8657,167 @@ def test_the_night_scan_keeps_the_frame_it_measured(tmp_path):
     def shade(name):
         return float(np.asarray(Image.open(frames / name)).mean())
 
-    sky = [p for p in pngs if float(p.split("_alt")[1][:4]) > 30]
-    ground = [p for p in pngs if float(p.split("_alt")[1][:4]) <= 30]
+    sky = [p for p in saved if float(p.split("_alt")[1][:4]) > 30]
+    ground = [p for p in saved if float(p.split("_alt")[1][:4]) <= 30]
     assert sky and ground
     # COMMON SCALE, not a per-frame stretch: dark terrain must stay dark, or
     # every frame comes back as amplified noise that looks like open sky.
     assert shade(ground[0]) < 0.5 * shade(
         sky[0]
     ), "terrain frames must render darker than sky frames"
+
+
+def test_the_strip_outlines_the_edge_the_checkpoint_last_recorded(tmp_path):
+    """The one visual claim the page makes about the measurement.
+
+    An outline on the wrong frame is worse than none: the reader is asking
+    exactly "is that where the terrain starts", and the checkpoint's rule is
+    that a LATER line supersedes — `--re-measure` exists to force it. Keeping
+    the first attempt would outline the superseded answer on precisely the
+    columns somebody re-measured because they distrusted it.
+    """
+    import re
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import polar
+
+    frames = tmp_path / "scan"
+    frames.mkdir()
+    for alt in (60.0, 45.0, 30.0, 15.0):
+        shade = 200 if alt > 30 else 20
+        Image.fromarray(np.full((8, 4), shade, np.uint8)).save(
+            frames / f"az177_alt{alt:05.1f}_lum{shade:07.1f}.jpg"
+        )
+
+    superseded = {"az": 177, "verdict": "edge", "alt": 60.0, "channel": "star4800"}
+    fresh = {"az": 177, "verdict": "edge", "alt": 30.0, "channel": "scenery"}
+    out = polar._frame_strips([superseded, fresh], str(frames), px=8)
+
+    assert "az 177" in out and "edge at 30.0" in out, "the strip heads with the LAST edge"
+    assert out.count("<figure") == 4, "every sample in the ladder is shown"
+    # The outline brackets the bisected crossing, so it lands on the samples
+    # either side of 30 — and never on the superseded 60.
+    outlined = re.findall(r'<figure class="at">.*?alt="az 177 alt ([\d.]+)"', out)
+    assert outlined, "the frame at the recorded edge must be outlined"
+    assert all(abs(float(a) - 30.0) <= 2.6 for a in outlined), outlined
+    assert "60.0" not in outlined
+
+
+def test_the_report_reader_and_the_night_writer_agree_on_filenames(tmp_path):
+    """A cross-file contract with nothing coupling its two halves.
+
+    `_save_night_frame` writes the name and `polar.FRAME_RE` parses it, from
+    opposite sides of the codebase. A drift in either renders NO frames and
+    raises nothing — the page simply loses the evidence it exists to carry, and
+    says so nowhere.
+    """
+    import numpy as np
+
+    from terminus.polar import FRAME_RE
+    from terminus.sweep import _save_night_frame, save_scan_frame
+
+    _save_night_frame(str(tmp_path), 318, 45.0, 2608.0, np.full((8, 4), 2600.0), 2600.0)
+    save_scan_frame(np.full((8, 4, 3), 80.0), 41, 7.5, 17.3, str(tmp_path), sky_ref=200.0)
+
+    for f in sorted(p.name for p in tmp_path.iterdir()):
+        m = FRAME_RE.search(f)
+        assert m, f"polar cannot parse {f}"
+        assert int(m.group(1)) in (318, 41)
+        assert float(m.group(2)) in (45.0, 7.5)
+
+
+def test_the_attempt_log_survives_a_file_somebody_edited_by_hand(tmp_path):
+    """The checkpoint is the file most likely to arrive damaged.
+
+    It is append-only, hand-editable, and the thing a person truncates or
+    mangles before mailing it on. Losing a line is survivable; losing the
+    report is not — and a silently shortened log is the failure the settle
+    banner exists to prevent, so the shortfall is stated rather than absorbed.
+    """
+    from terminus import cli
+
+    mask = tmp_path / "solved.yaml"
+    mask.write_text("meta: {}\n")
+
+    # No checkpoint at all: no attempts, and nothing to complain about.
+    assert cli._load_attempts(str(mask)) == ([], [])
+
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    ckpt.write_bytes(
+        b'{"az": 41, "verdict": "edge", "alt": 57.5, "profile": [[60, 1], [55, 2]]}\n'
+        b"{this is not json}\n"
+        b"\n"  # blank lines are not damage
+        b'{"no_az": true}\n'
+        b'{"az": 99, "verdict": "edge"}\xff\n'  # a mangled byte kills ITS line...
+        b'{"az": 37, "verdict": "edge", "alt": 53.8}\n'  # ...and reading goes on
+    )
+    attempts, notes = cli._load_attempts(str(mask))
+
+    # 37 is the one that matters: decoding strictly would raise from the
+    # iteration itself, outside every guard, and take the whole report down at
+    # the mangled byte — losing this line and every line after it.
+    assert [a["az"] for a in attempts] == [41, 37], "reading must continue past a bad byte"
+    # The brightness ladder is kilobytes per column and already on the page as
+    # frames; carrying it into every report would bloat the thing enormously.
+    assert "profile" not in attempts[0]
+    assert notes and "3 line" in notes[0], f"the shortfall must be stated: {notes}"
+
+
+def test_the_night_median_is_taken_after_the_stream_is_drained():
+    """The split must not lose the drain, which is why the median is right.
+
+    Frames already in flight when the mount arrives were exposed at the PREVIOUS
+    pointing, so a median taken from them labels the old sky with the new
+    azimuth — a fabricated measurement that looks entirely ordinary.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+
+    from terminus.client import Seestar
+
+    sc = Seestar.__new__(Seestar)
+    sc.img = object()  # already open: no connect attempt
+    # Two stale frames from the previous pointing, then the one exposed here.
+    served = [np.full((2, 2), 900.0), np.full((2, 2), 900.0), np.full((2, 2), 42.0)]
+
+    with patch.object(Seestar, "_raw16_frame", side_effect=lambda: served.pop(0)):
+        # deadline = 0.0 + 2.0 + 0.5; the clock then reads 0.0, 1.0 (drain twice)
+        # and 3.0 (past the deadline, stop) before the counted frame is read.
+        with patch("terminus.client.time.time", side_effect=[0.0, 0.0, 1.0, 3.0]):
+            got = sc.capture_raw16_median(exposure_s=2.0)
+
+    assert got == 42.0, "the counted frame is the one read AFTER the drain, not the first"
+    assert served == [], "the drain must consume the stale frames"
+
+
+def test_the_published_example_page_names_no_site_and_no_date():
+    """The one page in this repo that strangers actually load.
+
+    `docs/example-horizon.html` is served from `main` at
+    devonjones.github.io/terminus and linked from the README's first screen. It
+    currently discloses nothing because it PREDATES the diagnostics fields —
+    not because anyone chose that — and `polar` now emits the site to ~11 m,
+    the local date and timezone, per-attempt clock times, and the mask filename
+    in the title. A regeneration without `--privacy` publishes all of it, and
+    nothing else in the repo would notice.
+    """
+    import os
+    import re
+
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs", "example-horizon.html")
+    if not os.path.exists(path):  # the example is optional; the guard is not
+        return
+    page = open(path).read()
+
+    footer = re.search(r"Measured with terminus from (.*?)\. Position-specific", page)
+    assert footer, "the published page must still carry its provenance footer"
+    assert re.search(r"from (\?,\?|an undisclosed site) on", footer.group(0)), (
+        f"the published example discloses a site or date: {footer.group(1)!r}. "
+        "Regenerate it with --privacy."
+    )
+    assert not re.search(
+        r"\b\d{2}:\d{2}:\d{2}\b", page
+    ), "the published example carries per-attempt clock times; regenerate with --privacy"

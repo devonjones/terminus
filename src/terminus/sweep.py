@@ -18,6 +18,7 @@ import datetime
 import json
 import math
 import os
+import sys
 import time
 import warnings
 
@@ -1069,10 +1070,22 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
         if ref["lum"] is None:
             ref["lum"] = lum
         if frames_dir:
-            os.makedirs(frames_dir, exist_ok=True)
-            with open(f"{frames_dir}/az{int(az):03d}_night.jsonl", "a") as fh:
-                fh.write(json.dumps({"alt": round(alt, 2), "median": round(lum, 1)}) + "\n")
-            _save_night_frame(frames_dir, az, alt, lum, frame, ref["lum"])
+            # THE RECORD MUST NEVER COST THE MEASUREMENT. A full disk, a
+            # read-only directory or an odd frame shape here would otherwise
+            # propagate out of `sample`: in `orient` it is caught far away and
+            # misdiagnosed as a dead imaging channel, which cycles the view and
+            # re-scans every remaining column; in `run_sweep` nothing catches it
+            # at all and the whole in-memory mask goes with it. The luminance is
+            # already in hand, so a failure here costs a picture and nothing
+            # else.
+            try:
+                os.makedirs(frames_dir, exist_ok=True)
+                with open(f"{frames_dir}/az{int(az):03d}_night.jsonl", "a") as fh:
+                    fh.write(json.dumps({"alt": round(alt, 2), "median": round(lum, 1)}) + "\n")
+                _save_night_frame(frames_dir, az, alt, lum, frame, ref["lum"])
+            except (OSError, ValueError, TypeError) as e:
+                print(f"az {int(az):3d} alt {alt:5.1f}: could not save the frame ({e}); "
+                      "the measurement stands", file=sys.stderr)  # fmt: skip
         return lum
 
     profile = []
@@ -1233,6 +1246,14 @@ def _save_night_frame(save_dir, az, alt, lum, frame, ref_lum):
     serves both. The MEDIAN in the name is the exact measured count; the
     picture is the texture behind it, and where the two disagree the number is
     the one that was measured.
+
+    HALF SIZE, AND JPEG, where the day path keeps full-resolution PNG. Not a
+    style choice: scaling read noise up onto several 8-bit levels produces an
+    image PNG cannot compress, measured at 0.76-1.80 MB per frame against the
+    day path's 141 KB, which is ~1.1 GB for a 72-column night sweep on a host
+    that may be a Raspberry Pi. The exact measurement is the median, recorded
+    losslessly in the filename and the jsonl beside it; this file only has to
+    show cloud from canopy from a lit wall, and it still does at half scale.
     """
     import os
 
@@ -1243,7 +1264,10 @@ def _save_night_frame(save_dir, az, alt, lum, frame, ref_lum):
     arr = np.clip(np.asarray(frame, dtype=float) / scale * 255.0, 0, 255).astype(np.uint8)
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = arr[..., 0]
-    Image.fromarray(arr).save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:07.1f}.png")
+    im = Image.fromarray(arr)
+    if min(im.size) > 1:
+        im = im.resize((max(1, im.width // 2), max(1, im.height // 2)), Image.BILINEAR)
+    im.save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:07.1f}.jpg", quality=85)
 
 
 def save_scan_frame(rgb, az, alt, lum, save_dir, sky_ref=None):

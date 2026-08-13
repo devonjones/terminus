@@ -8,6 +8,11 @@ config.toml
 /*.hrz
 /*.stellarium.txt
 *_frames/
+# the run's own record and the page that inlines all of it: coordinates, clock
+# times and hundreds of photographs of somebody's garden. *_frames/ was ignored
+# while the page embedding every one of those frames was not.
+/*_fiducials.jsonl
+/*_polar.html
 
 # python
 __pycache__/

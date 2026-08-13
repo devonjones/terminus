@@ -314,6 +314,16 @@ def _fmt(value, spec="", dash="&#8212;"):
         return html.escape(str(value))
 
 
+def _is_night(attempt):
+    """Was this attempt measured on the star-mode imaging channel?
+
+    The channel decides which fields of a record mean anything: a night row has
+    no open-sky reference and no obstruction type, and reading a day row's
+    fields off it silently reports the wrong sky.
+    """
+    return str(attempt.get("channel") or "").startswith("star")
+
+
 def _run_facts(meta, attempts, private):
     """Provenance and the run's shape, as a fact grid.
 
@@ -326,7 +336,13 @@ def _run_facts(meta, attempts, private):
         verdicts[a.get("verdict") or "?"] = verdicts.get(a.get("verdict") or "?", 0) + 1
     channels = sorted({a.get("channel") for a in attempts if a.get("channel")})
     suns = [float(a["sun_alt"]) for a in attempts if a.get("sun_alt") is not None]
-    refs = [float(a["sky_ref"]) for a in attempts if a.get("sky_ref") is not None]
+    # DAY ROWS ONLY. The night channel has no open-sky reference of its own, and
+    # the run state carries the last DAY value across the boundary unchanged —
+    # so a night row's `sky_ref` is a stale daylight number, and quoting it as
+    # that column's conditions invents a measurement nobody made (M-19).
+    refs = [
+        float(a["sky_ref"]) for a in attempts if a.get("sky_ref") is not None and not _is_night(a)
+    ]
 
     facts = [
         ("terminus", _fmt(meta.get("terminus_version"))),
@@ -354,11 +370,28 @@ def _run_facts(meta, attempts, private):
         # THE STORM-CLOUD TELL. On 2026-08-12 the open-sky reference fell
         # 254 -> 152 -> 63 as cloud rolled in, and the columns measured against
         # it read as confident edges at 57 deg in a 15 deg treeline. The
-        # altitudes look perfectly plausible on the disc; only the collapsing
+        # altitudes look perfectly plausible on the disc; only the falling
         # reference says the sky stopped being a sky.
-        facts.append(("sky reference", f"{min(refs):.1f} to {max(refs):.1f}"
-                                       + (" (collapsed during the run)"
-                                          if max(refs) - min(refs) > 60 else "")))  # fmt: skip
+        #
+        # A WEAK TELL, AND SAID WEAKLY. It did not catch the columns that
+        # actually went wrong that day — az 41 and 37 were measured at the two
+        # HIGHEST references of the run, because the cloud that fooled them sat
+        # above the treeline while the sky above it stayed bright. And a
+        # reference falls at dusk for the honest reason too, so a run
+        # straddling sunset would otherwise be accused of cloud every time. The
+        # Sun's own travel is in the record and separates those two; nothing
+        # here is stated as a cause.
+        note = ""
+        if max(refs) - min(refs) > 60:
+            fell = (max(suns) - min(suns)) if suns else None
+            note = (
+                f" (fell during the run, but so did the Sun, by {fell:.1f}&deg;"
+                " &mdash; expected at dusk)"
+                if fell is not None and fell > 5.0
+                else " (fell during the run with the Sun near steady, which twilight"
+                " does not explain)"
+            )
+        facts.append(("sky reference", f"{min(refs):.1f} to {max(refs):.1f}" + note))
     return (
         '<div class="facts">' + "".join(f"<div><b>{k}</b> {v}</div>" for k, v in facts) + "</div>"
     )
@@ -393,11 +426,13 @@ def _trail_table(meta):
 def _attempts_table(attempts, private):
     """Every attempt the run made, including the ones that produced nothing.
 
-    The fiducial table shows what the FIT used; this shows what the NIGHT did.
-    They differ by every failure — 2026-08-12 offered the fit 12 columns out of
-    39 attempts, and the 27 that produced nothing (inconclusive, unreachable,
-    dead channel) are the ones that say whether the mount, the sky or the
-    detector is at fault.
+    The fiducial table shows what the FIT used; this shows what the RUN did.
+    2026-08-12 made 39 attempts and gave the fit 12 columns. Nine produced no
+    value at all (6 inconclusive, 3 failed) and the rest are supersessions —
+    the same azimuth measured again on another night or after `--re-measure`.
+    Both kinds are evidence: the failures say whether the mount, the sky or the
+    detector is at fault, and the supersessions are where the same direction
+    was answered two different ways.
     """
     if not attempts:
         return ""
@@ -416,7 +451,9 @@ def _attempts_table(attempts, private):
             # two apart.
             _fmt(a.get("channel")),
             _fmt(a.get("sun_alt"), "+.1f"),
-            _fmt(a.get("sky_ref"), ".1f"),
+            # Night rows have no reference of their own; whatever sits in the
+            # field crossed the twilight boundary from the last day column.
+            _fmt(None if _is_night(a) else a.get("sky_ref"), ".1f"),
             _fmt(a.get("secs"), ".0f"),
         ]
         if not private:
@@ -433,18 +470,34 @@ def _attempts_table(attempts, private):
     )
 
 
-def _frame_strips(attempts, frames_dir, px=110, quality=72):
+def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
     """The scan ladder for each column, as embedded thumbnails.
 
     The measurement is a brightness step, and a brightness step has no idea
-    what made it. On 2026-08-12 a storm-cloud bank produced textbook steps at
-    57 deg over a 15 deg treeline: the numbers, the residuals and the disc all
-    looked survivable, and the ONLY thing that settled it was opening the
-    frames and seeing cloud. No summary statistic substitutes for that, and a
-    stranger cannot post their frames to us one at a time — so they ride along.
+    what made it.
+
+    2026-08-12, and the numbers exonerate the run completely. A storm bank sat
+    ABOVE the treeline at sunset, so the scan walked down and stopped at the
+    cloud's lower edge: az 41 read 57.5 deg and az 37 read 53.8 deg where the
+    photograph puts the treeline at 46 deg. Every diagnostic available at the
+    time was healthy — those two columns carry open-sky references of 254.0 and
+    236.7, the HIGHEST of the whole run — because a bright sky above bright
+    cloud is still a bright sky. Hours later, on the night channel, az 34 read
+    46.2 deg against the photograph's 46.0.
+
+    So no summary statistic catches this one; the reference that later collapsed
+    was at its peak while it happened. The frames catch it on sight — a black
+    bank at alt 50 under blue sky at alt 60 — and a stranger cannot post their
+    frames to us one at a time.
 
     The frame at the recorded edge is outlined, which is the whole question a
     reader is asking: is that where the terrain actually starts?
+
+    `budget_kb` caps the embedded bytes by dropping WHOLE COLUMNS, never a
+    ladder's middle: a partial ladder invites exactly the wrong reading, since
+    the question is where along the ladder the sky stops. Whatever is dropped
+    is named on the page (a cap nobody is told about reads as "this is all
+    there was"), and `--frame-px`/`--no-frames` are the knobs either way.
     """
     if not frames_dir or not os.path.isdir(frames_dir):
         return ""
@@ -462,13 +515,23 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72):
     if not by_az:
         return ""
 
+    # LAST wins, not first. The checkpoint is append-only and its own rule is
+    # that a later line supersedes (`--re-measure` exists to force exactly
+    # that), so keeping the first would head the strip with the superseded
+    # altitude and outline the wrong frame — on precisely the columns someone
+    # re-measured because they distrusted the old answer.
     edge_at = {}
     for a in attempts:
         if a.get("alt") is not None:
-            edge_at.setdefault(int(round(float(a["az"]))), float(a["alt"]))
+            edge_at[int(round(float(a["az"])))] = float(a["alt"])
 
     strips = []
+    shown = spent = 0
+    dropped = []
     for az in sorted(by_az):
+        if spent >= budget_kb * 1024:
+            dropped.append(az)
+            continue
         frames = sorted(by_az[az], key=lambda t: -t[0])
         edge = edge_at.get(az)
         films = []
@@ -476,11 +539,18 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72):
             try:
                 im = Image.open(path).convert("RGB")
             except OSError:
+                # Unreadable is not the same as absent, and the count below is
+                # of frames actually on the page — reporting the glob's total
+                # would claim evidence this page does not carry.
                 continue
             w, h = im.size
-            im = im.resize((px, max(1, round(h * px / w))), Image.LANCZOS)
+            # reducing_gap lets PIL pre-shrink by an integer factor before the
+            # good filter runs: same output, measured ~45% off the whole render
+            # (24.5 s for 412 frames), which matters on the Pi this can run on.
+            im = im.resize((px, max(1, round(h * px / w))), Image.LANCZOS, reducing_gap=2.0)
             buf = io.BytesIO()
             im.save(buf, "JPEG", quality=quality, optimize=True)
+            spent += buf.tell()
             uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
             # Bracket rather than match: the edge is bisected between samples,
             # so no frame sits exactly on it.
@@ -491,22 +561,34 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72):
                 f"<figcaption>{alt:.0f}&deg;<br>{lum:.0f}</figcaption></figure>"
             )
         if films:
+            shown += len(films)
             note = f" &mdash; edge at {edge:.1f}&deg;" if edge is not None else ""
             joined = "".join(films)
             strips.append(
                 f'<div class="strip"><h3>az {az:03d}{note}</h3>'
                 f'<div class="films">{joined}</div></div>'
             )
+    cut = (
+        f'<p class="note">Stopped at the {budget_kb / 1000:.0f} MB frame budget: '
+        f"az {', '.join(str(a) for a in dropped)} "
+        f"{'is' if len(dropped) == 1 else 'are'} not shown. Raise it with a smaller "
+        "--frame-px, or read those columns from the frames directory.</p>"
+        if dropped
+        else ""
+    )
     return (
         '<details class="cols" open><summary>Scan frames '
-        f"({sum(len(v) for v in by_az.values())} from {len(by_az)} columns, "
-        "brightest sample first; number under each is its luminance)</summary>"
+        f"({shown} from {len(by_az) - len(dropped)} columns, highest altitude "
+        "first; the number under each is its measured brightness. A column "
+        "measured more than once has every run's ladder here, so a repeated "
+        "altitude is a repeated visit, not a duplicate)</summary>"
+        + cut
         + "".join(strips)
         + "</details>"
     )
 
 
-def diagnostics(meta, attempts=(), frames_dir=None, frame_px=110, private=False):
+def diagnostics(meta, attempts=(), frames_dir=None, frame_px=110, private=False, notes=()):
     """Everything needed to debug a run someone else made, on the same page.
 
     The report was a result viewer: it showed what the fit concluded and
@@ -514,28 +596,40 @@ def diagnostics(meta, attempts=(), frames_dir=None, frame_px=110, private=False)
     a good run and useless for triaging a bad one, which is the case that
     actually needs another pair of eyes.
     """
+    strips = _frame_strips(attempts, frames_dir, frame_px) if frames_dir else ""
     parts = [
         _run_facts(meta, attempts, private),
         _trail_table(meta),
         _attempts_table(attempts, private),
-        _frame_strips(attempts, frames_dir, frame_px) if frames_dir else "",
+        strips,
     ]
     body = "".join(p for p in parts if p)
     if not body:
         return ""
-    note = (
-        "Redacted: no coordinates, dates or clock times."
-        if private
-        else "Includes the site, the clock and the frames: hand this to someone who can help."
-    )
+    # DESCRIBE THE PAGE IN HAND, not the feature. Promising "the site, the
+    # clock and the frames" on a page rendered --no-frames from a mask with no
+    # site is the same class of lie the settle banner exists to stop.
+    if private:
+        note = "Redacted: no coordinates, dates or clock times."
+    else:
+        has = ["the site"] if meta.get("lat") is not None else []
+        has += ["the clock"] if any(a.get("t") for a in attempts) else []
+        has += ["the frames"] if strips else []
+        note = (
+            "Includes " + ", ".join(has) + ": hand this to someone who can help."
+            if has
+            else "Everything this run recorded: hand it to someone who can help."
+        )
+    warn = "".join(f'<p class="banner warn">{html.escape(str(n))}</p>' for n in notes if n)
     return (
-        f'<section class="diag"><h2>Run diagnostics</h2><p class="note">{note}</p>{body}</section>'
+        f'<section class="diag"><h2>Run diagnostics</h2><p class="note">{note}</p>'
+        f"{warn}{body}</section>"
     )
 
 
 def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
          size=SIZE, floor=FLOOR_DEG, title="terminus horizon",
-         attempts=(), frames_dir=None, frame_px=110, private=False):  # fmt: skip
+         attempts=(), frames_dir=None, frame_px=110, private=False, notes=()):  # fmt: skip
     """One self-contained HTML page. No network, no assets, no build step.
 
     `rows` is the ORIENTED mask — already in true azimuth — so the ring is drawn
@@ -626,7 +720,7 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         pts_pressed="true" if markers else "false",
         columns=_columns_table(meta),
         banner=_banner(meta),
-        diagnostics=diagnostics(meta, attempts, frames_dir, frame_px, private),
+        diagnostics=diagnostics(meta, attempts, frames_dir, frame_px, private, notes),
         footer=footer,
         horizon=HORIZON_COLOUR,
         edge=EDGE_COLOUR,

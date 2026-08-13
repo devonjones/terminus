@@ -264,7 +264,16 @@ class Seestar:
         raise TimeoutError(f"no raw16 frame in {timeout}s")
 
     def capture_raw16_median(self, exposure_s=2.0):
-        """Median of one raw 16-bit frame EXPOSED at the current pointing.
+        """Median of `capture_raw16`, which is the night measurement itself.
+
+        MEDIAN, not mean: hot pixels and streetlights are bright outliers
+        sitting INSIDE terrain, and the mean follows them (M-12). Exposure,
+        draining and the reconnect all belong to `capture_raw16` below.
+        """
+        return float(np.median(self.capture_raw16(exposure_s)))
+
+    def capture_raw16(self, exposure_s=2.0):
+        """One raw 16-bit frame EXPOSED at the current pointing.
 
         The night capture path. The scenery RTSP stream is blind after dark —
         measured 2026-08-06: its ISP pins exposure at ~30 ms and gain at 112.5
@@ -273,28 +282,20 @@ class Seestar:
         arrive raw on the imaging channel instead. `start_view("star")` must be
         active.
 
-        MEDIAN, not mean: hot pixels and streetlights are bright outliers
-        sitting INSIDE terrain, and the mean follows them (M-12). Frames already
-        in flight when the mount arrives were exposed somewhere else, so the
-        stream is drained through one full exposure before the counted frame —
-        skipping that reads the previous pointing's sky at the new pointing's
-        label.
+        Frames already in flight when the mount arrives were exposed somewhere
+        else, so the stream is drained through one full exposure before the
+        counted frame — skipping that reads the previous pointing's sky at the
+        new pointing's label.
 
         One silent reconnect: the scope has been seen to reset this socket after
         a burst of failed gotos, and a dead socket must not poison every later
         column.
-        """
-        return float(np.median(self.capture_raw16(exposure_s)))
 
-    def capture_raw16(self, exposure_s=2.0):
-        """The frame itself, drained and reconnect-guarded as `capture_raw16_median`.
-
-        Split out so the night scan can keep the pixels it measured. A median is
-        one number and cannot say WHAT it was a median of: cloud, canopy and a
-        lit wall all produce honest brightness steps, and only the picture
-        separates them. The day path has saved its frames from the start; the
-        night path — where most columns are actually measured — kept a single
-        count per sample and discarded the evidence.
+        Returns the frame rather than only its median so the night scan can
+        keep the pixels it measured: a median cannot say WHAT it was a median
+        of, and cloud, canopy and a lit wall all make honest brightness steps.
+        The day path has saved its frames from the start; this one kept a
+        single count per sample and discarded the evidence.
         """
         if self.img is None:
             self._open_imaging()
