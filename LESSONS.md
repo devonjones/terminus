@@ -1694,10 +1694,10 @@ different way:
    edge; no statistic caught it." The frames show the recorded edge at the bank's TOP, and a
    statistic did catch it: the yaw spread was 17.06 deg against a 1 deg rule and the run never
    settled.
-3. Third telling: cloud dropped as the explanation entirely. A night column two degrees away, with
-   no cloud available, overshoots by the same 7.5 deg — and the residual is measured against a
-   photo column selected by an UNSETTLED yaw, so the comparison is not independent of the thing
-   being diagnosed.
+3. Third telling: cloud dropped as the explanation entirely. A night column two degrees away
+   overshoots by 9.26 deg, between the two daylight columns' 8.51 and 10.56 — and the residual is
+   measured against a photo column selected by an UNSETTLED yaw, so the comparison is not
+   independent of the thing being diagnosed.
 
 What made it durable was that each version was *plausible* and partially true. The mechanism was
 never checked end to end against the frames and the neighbouring columns; only the half that
@@ -1705,7 +1705,7 @@ supported the story was.
 
 **The rule: a comment asserting WHY something happened is a claim, and carries the same burden as
 a recorded value.** If the evidence supports the observation but not the cause, write the
-observation and stop. "Three columns read 7-11 deg high and the run did not settle" needed no
+observation and stop. "Three columns read 8.5-10.6 deg high and the run did not settle" needed no
 mechanism to justify embedding the frames — the argument was always that the numbers do not
 identify the fault, which is when a person looks at pictures. Reaching for a cause made the case
 weaker, not stronger, because it could be refuted while the real argument could not.
@@ -1721,10 +1721,17 @@ the edit too — and the change was reported as fixed in a review reply while ab
 The mutation harness then printed `SKIP: anchor not found` for that very guard, twice, and it was
 waved through both times as "checked separately".
 
-Two rules fall out. A test that passes after an edit proves nothing unless it FAILED before it: the
-mutation is the evidence, not the green run. And a skipped mutation is a failed mutation — the
+Three rules fall out. A test that passes after an edit proves nothing unless it FAILED before it:
+the mutation is the evidence, not the green run. A skipped mutation is a failed mutation — the
 anchor not matching means the code is not what you think it is, which is the same alarm as a
 surviving mutant and deserves the same stop.
+
+And **the mutation harness itself has to be checked against the same standard.** A mutant was
+reported killed on a `-k` expression matching no test at all: pytest exits 5 for "no tests
+collected", the harness read any non-zero exit as a kill, and a fix with zero coverage was
+counted as proven. The claim "every fix mutation-checked" was made on that evidence. A harness
+must fail loudly when its selector matches nothing, or it converts absent tests into passing
+ones — the same absent-versus-refuted confusion this project already refuses in its data (E-06).
 
 ---
 

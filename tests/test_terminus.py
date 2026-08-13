@@ -8694,7 +8694,15 @@ def test_the_strip_outlines_the_edge_the_checkpoint_last_recorded(tmp_path):
 
     frames = tmp_path / "scan"
     frames.mkdir()
-    for alt in (60.0, 45.0, 30.0, 15.0):
+    # A ladder that STRADDLES the edge rather than landing on it. The bisected
+    # crossing never coincides with a sample — the code says so — so a fixture
+    # with a frame at exactly the edge altitude pins only an exact match, and
+    # the ±2.6 bracket can then be widened or narrowed to almost anything
+    # without a test noticing.
+    # 38.0 sits in the band between the bracket (2.6) and the next sample up
+    # (15 away), so widening the bracket has something to wrongly catch. Without
+    # a sample there, 2.6 and 14.0 outline exactly the same two frames.
+    for alt in (60.0, 45.0, 38.0, 32.0, 28.0, 15.0):
         shade = 200 if alt > 30 else 20
         Image.fromarray(np.full((8, 4), shade, np.uint8)).save(
             frames / f"az177_alt{alt:05.1f}_lum{shade:07.1f}.jpg"
@@ -8705,13 +8713,16 @@ def test_the_strip_outlines_the_edge_the_checkpoint_last_recorded(tmp_path):
     out = polar._frame_strips([superseded, fresh], str(frames), px=8)
 
     assert "az 177" in out and "edge at 30.0" in out, "the strip heads with the LAST edge"
-    assert out.count("<figure") == 4, "every sample in the ladder is shown"
-    # The outline brackets the bisected crossing, so it lands on the samples
-    # either side of 30 — and never on the superseded 60.
-    outlined = re.findall(r'<figure class="at">.*?alt="az 177 alt ([\d.]+)"', out)
-    assert outlined, "the frame at the recorded edge must be outlined"
-    assert all(abs(float(a) - 30.0) <= 2.6 for a in outlined), outlined
-    assert "60.0" not in outlined
+    assert out.count("<figure") == 6, "every sample in the ladder is shown"
+    # Highest first, so a reader walks down the ladder the way the scan did.
+    order = [float(a) for a in re.findall(r'alt="az 177 alt ([\d.]+)"', out)]
+    assert order == sorted(order, reverse=True), order
+    # The outline brackets the crossing: BOTH samples straddling 30 and nothing
+    # else, which pins the width in both directions.
+    outlined = [
+        float(a) for a in re.findall(r'<figure class="at">.*?alt="az 177 alt ([\d.]+)"', out)
+    ]
+    assert sorted(outlined) == [28.0, 32.0], outlined
 
 
 def test_the_report_reader_and_the_night_writer_agree_on_filenames(tmp_path):
@@ -8876,7 +8887,11 @@ def test_the_frame_budget_bounds_the_page_and_names_what_it_dropped(tmp_path):
     embedded = sum(len(u) for u in re.findall(r'src="(data:image/jpeg[^"]+)"', out))
 
     assert embedded <= 6 * 1024 * 1.6, "the budget must bound the bytes that land on the page"
-    assert "not shown" in out, "a cap must name what it dropped"
+    # NAMED, not merely mentioned: with the azimuth list deleted the sentence
+    # still reads "az  are not shown" and a substring check still passes.
+    cut = re.search(r"Stopped at the .*?not shown", out)
+    assert cut, "a cap must say it stopped"
+    assert re.search(r"az \d+", cut.group(0)), f"a cap must NAME what it dropped: {cut.group(0)}"
     # WHOLE COLUMNS ONLY: a half ladder invites exactly the wrong reading,
     # because the question is where along it the sky stops.
     for az in range(0, 60, 10):
@@ -8968,3 +8983,112 @@ def test_a_hand_edited_field_cannot_take_the_whole_report_down():
     assert "Every attempt (2)" in out, "both rows are still listed"
     assert "north-ish" in out, "and the damaged value is shown as it was written"
     assert "254.0" in out, "the good row's conditions still render"
+
+
+def test_a_hand_edited_azimuth_cannot_take_the_frame_strips_down(tmp_path):
+    """The third coercion site, which the facts grid and the sort key do not reach.
+
+    `_frame_strips` builds its edge lookup from the same hand-editable records,
+    and a damaged `az` there raised out of the strips rather than the grid — a
+    separate path to the same crash, and one the other tests leave untouched.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus import polar
+
+    frames = tmp_path / "scan"
+    frames.mkdir()
+    Image.fromarray(np.full((8, 4), 120, np.uint8)).save(frames / "az041_alt050.0_lum00100.0.jpg")
+
+    out = polar._frame_strips(
+        [{"az": "north-ish", "alt": 50.0}, {"az": 41, "alt": 50.0}], str(frames), px=8
+    )
+    assert "az 041" in out and "edge at 50.0" in out
+
+
+def _oriented_mask(path, **meta_over):
+    """A minimal solved mask on disk, for the CLI-level polar tests."""
+    import yaml
+
+    meta = {
+        "yaw": 135.25, "pitch": 2.28, "tilt_mag": 2.25, "tilt_dir": 180.0,
+        "fit_rms": 6.23, "fit_settled": False, "fit_columns": [0, 180],
+        "oriented": True, "lat": 39.7917, "lon": -104.894,
+        "measured": "2026-08-12 21:55 MDT", "az_step": 180.0,
+    }  # fmt: skip
+    meta.update(meta_over)
+    path.write_text(
+        yaml.safe_dump({"meta": meta, "horizon": {0: {"alt": 10.0, "type": "tree"},
+                                                  180: {"alt": 20.0, "type": "structure"}}})
+    )  # fmt: skip
+    return path
+
+
+def test_polar_privacy_redacts_the_title_through_the_command(tmp_path):
+    """The redaction lives in `cmd_polar`, and nothing exercised `cmd_polar`.
+
+    `polar.page` never redacts a title — it renders what it is handed — so a
+    test that passes its own `title=` and then asserts on it is checking its
+    own argument. The auto-title is built from the mask FILENAME, filenames
+    carry identity, and the whole command had no test at all: reverting the
+    redaction left the suite green while `--privacy` published
+    "terminus horizon — ron-backyard.yaml" in the page's own <title>.
+    """
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "ron-backyard.yaml")
+
+    main(["polar", str(mask), "--no-frames", "--out", str(tmp_path / "open.html")])
+    assert "ron-backyard" in (tmp_path / "open.html").read_text()
+
+    main(["polar", str(mask), "--no-frames", "--privacy", "--out", str(tmp_path / "shy.html")])
+    shy = (tmp_path / "shy.html").read_text()
+    assert "ron-backyard" not in shy, "--privacy must not publish the mask filename"
+    assert "39.7917" not in shy and "2026-08-12" not in shy
+
+    # An explicit --title is the operator's own words and is left alone.
+    main(["polar", str(mask), "--no-frames", "--privacy", "--title", "Site B",
+          "--out", str(tmp_path / "named.html")])  # fmt: skip
+    assert "Site B" in (tmp_path / "named.html").read_text()
+
+
+def test_orient_does_not_restamp_a_site_or_a_date_the_mask_already_carries(tmp_path):
+    """`_check_mergeable` compares exactly these keys to refuse a tripod move.
+
+    Restamping them from today's config would retune that guard to agree with
+    wherever the scope is now, turning a refusal to mix two sites into a silent
+    merge — and `measured` is the mask's own record of when its horizon was
+    observed, which is not when the scope solved it.
+    """
+    from terminus import cli
+
+    prior = {"lat": 10.0, "lon": 20.0, "measured": "2026-01-01 00:00 UTC"}
+    cfg = {"site": {"lat": 39.7917, "lon": -104.894}}
+
+    assert cli._site_record(cfg, prior) == {}, "a position in the mask wins"
+    assert cli._site_record(cfg, {}) == {"lat": 39.7917, "lon": -104.894}
+    assert cli._site_record({}, {}) == {}, "no site anywhere is not an error"
+    # The orient time has its own key, so `measured` survives untouched.
+    assert "measured" not in cli._site_record(cfg, prior)
+
+
+def test_the_diagnostics_note_describes_the_page_in_hand():
+    """ "Includes the site, the clock and the frames" on a page carrying none.
+
+    The same class of lie the settle banner exists to stop: a claim about the
+    artifact that the artifact does not support. Rendered `--no-frames` from a
+    mask with no site, the promise was made anyway.
+    """
+    from terminus import polar
+
+    full = polar.diagnostics(_diag_meta(), _DIAG_ATTEMPTS)
+    assert "the site" in full and "the clock" in full
+
+    bare = polar.diagnostics(
+        _diag_meta(lat=None, lon=None), [{"az": 41, "verdict": "edge", "alt": 57.5}]
+    )
+    assert "the site" not in bare, "a siteless mask must not be said to include a site"
+    assert "the clock" not in bare, "attempts with no timestamps carry no clock"
+    assert "the frames" not in bare, "no frames were embedded"
+    assert "Everything this run recorded" in bare

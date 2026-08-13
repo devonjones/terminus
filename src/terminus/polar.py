@@ -505,12 +505,14 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
     what made it. Cloud, canopy and a lit wall all make honest ones.
 
     2026-08-12 is why this is here rather than in a backlog. Three NE columns
-    came back 7-11 deg above what the photograph puts there, a fourth beside
-    them landed within 0.2, and the run never settled. Reading the numbers alone, three different stories fit — cloud at
-    sunset, a detector fault, or a yaw error moving which photo column the
-    residual is even measured against — and the record cannot separate them:
-    az 41 (day, visible cloud in its frames) overshot 10.9, while az 39 (night,
-    the same treeline, no cloud available) overshot 7.5 on its own.
+    came back 8.5 to 10.6 deg above what the photograph puts there, a fourth
+    beside them landed within 0.02, and the run never settled. Reading the
+    numbers alone, three stories fit — cloud at sunset, a detector fault, or a
+    yaw error moving which photo column the residual is measured against — and
+    the record separates none of them. The two day columns are 8.51 (az 37,
+    cloud visible in its frames) and 10.56 (az 41); the night column between
+    them, az 39, is 9.26, and the night path kept no frames to say what it
+    saw.
 
     So the honest conclusion from the numbers is that they do not identify the
     fault, which is exactly when a person wants to look. The frames are what

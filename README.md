@@ -259,13 +259,13 @@ altitude, sky reference, clock, duration), the yaw across refits, and the scan
 frames themselves with the chosen edge outlined.
 
 That last part is the one that matters most, and a real run is why. Three
-neighbouring columns here came back 7–11° above what the photograph puts there
-while a fourth beside them landed within 0.2°, and the run never settled. From the numbers alone at least three stories fit —
-cloud at sunset, a detector fault, or a yaw error changing which photo column
-the residual is even measured against — and the record does not separate them:
-one of those columns was measured in daylight with cloud visible in its frames,
-another at night with no cloud available, and they overshoot by the same
-amount.
+neighbouring columns here came back 8.5–10.6° above what the photograph puts
+there while a fourth beside them landed within 0.02°, and the run never
+settled. From the numbers alone at least three stories fit — cloud at sunset, a
+detector fault, or a yaw error changing which photo column the residual is
+measured against — and the record separates none of them. Two of those columns
+were measured in daylight with cloud visible in their frames, at 8.51° and
+10.56°; the third was measured at night and sits between them at 9.26°.
 
 That is precisely when a person wants to look at the pictures, and the pictures
 are the one thing a stranger cannot mail you a few at a time.
