@@ -258,9 +258,9 @@ that produced nothing, the conditions each was measured under (channel, Sun
 altitude, sky reference, clock, duration), the yaw across refits, and the scan
 frames themselves with the chosen edge outlined.
 
-That last part is the one that matters most, and a real run is why. Four
-adjacent columns here came back 7–11° above what the photograph puts there, and
-the run never settled. From the numbers alone at least three stories fit —
+That last part is the one that matters most, and a real run is why. Three
+neighbouring columns here came back 7–11° above what the photograph puts there
+while a fourth beside them landed within 0.2°, and the run never settled. From the numbers alone at least three stories fit —
 cloud at sunset, a detector fault, or a yaw error changing which photo column
 the residual is even measured against — and the record does not separate them:
 one of those columns was measured in daylight with cloud visible in its frames,

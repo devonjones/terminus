@@ -8823,13 +8823,22 @@ def test_the_published_example_page_names_no_site_and_no_date():
 
     footer = re.search(r"Measured with terminus from (.*?)\. Position-specific", page)
     assert footer, "the published page must still carry its provenance footer"
-    assert re.search(r"from (\?,\?|an undisclosed site) on", footer.group(0)), (
-        f"the published example discloses a site or date: {footer.group(1)!r}. "
+    # BOTH HALVES OF THE FOOTER. Checking only the site let
+    # "from ?,? on 2026-08-12 21:55 MDT" through, and that page is reachable
+    # without anything unusual: `_site_record` writes lat/lon only when
+    # config.toml names a [site], while the date is written every time.
+    assert re.fullmatch(
+        r"Measured with terminus from (\?,\?|an undisclosed site) "
+        r"on (an unrecorded date|an undisclosed date)\. Position-specific",
+        footer.group(0),
+    ), (
+        f"the published example discloses a site or a date: {footer.group(1)!r}. "
         "Regenerate it with --privacy."
     )
+    # Attempt rows carry HH:MM:SS; the footer date is HH:MM. Catch either.
     assert not re.search(
-        r"\b\d{2}:\d{2}:\d{2}\b", page
-    ), "the published example carries per-attempt clock times; regenerate with --privacy"
+        r"\b\d{1,2}:\d{2}(:\d{2})?\b", page
+    ), "the published example carries clock times; regenerate with --privacy"
 
 
 def test_the_frame_budget_bounds_the_page_and_names_what_it_dropped(tmp_path):
@@ -8879,6 +8888,10 @@ def test_the_frame_budget_bounds_the_page_and_names_what_it_dropped(tmp_path):
     whole = polar._frame_strips([], str(frames), px=40, budget_kb=10_000)
     assert "not shown" not in whole, "this budget must not bite"
     assert "az 005" not in whole, "an undecodable column renders nothing"
+    # ...and its absence is STATED. Counting only rendered frames stopped the
+    # summary overclaiming; saying nothing at all would make a corrupt column
+    # look like one the run never visited.
+    assert "could not be decoded" in whole and "az 5" in whole, whole[:400]
     figures, columns = whole.count("<figure"), whole.count('<div class="strip">')
     assert columns == 6, f"6 decodable columns, got {columns}"
     assert f"({figures} from {columns} columns" in whole
@@ -8931,3 +8944,27 @@ def test_the_rendered_notes_carry_no_filename_and_no_path(tmp_path):
     assert "ron-backyard" not in blob, f"the note names the mask: {blob!r}"
     assert str(tmp_path) not in blob, f"the note carries an absolute path: {blob!r}"
     assert "directory" in blob.lower(), "and it must still say what went wrong"
+
+
+def test_a_hand_edited_field_cannot_take_the_whole_report_down():
+    """`_load_attempts` survives a damaged checkpoint; the page must too.
+
+    That leniency is pointless if the statistics then reach for `float()` and
+    raise on the way past. `_fmt` treats an unparseable field as absent and
+    renders it as a dash — but the facts grid, the table's sort key and the
+    edge lookup all coerce first, so a hand-typed `sky_ref: ""` killed a report
+    whose own table would have shown that row fine.
+    """
+    from terminus import polar
+
+    junk = [
+        {"az": 41, "verdict": "edge", "alt": 57.5, "channel": "scenery",
+         "sun_alt": 0.4, "sky_ref": 254.0, "t": "19:52:38"},
+        {"az": "north-ish", "verdict": "edge", "alt": "", "channel": "scenery",
+         "sun_alt": "n/a", "sky_ref": "", "t": "20:00:00"},
+    ]  # fmt: skip
+
+    out = polar.diagnostics(_diag_meta(), junk)
+    assert "Every attempt (2)" in out, "both rows are still listed"
+    assert "north-ish" in out, "and the damaged value is shown as it was written"
+    assert "254.0" in out, "the good row's conditions still render"

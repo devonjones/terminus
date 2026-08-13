@@ -1705,7 +1705,7 @@ supported the story was.
 
 **The rule: a comment asserting WHY something happened is a claim, and carries the same burden as
 a recorded value.** If the evidence supports the observation but not the cause, write the
-observation and stop. "Four columns read 7-11 deg high and the run did not settle" needed no
+observation and stop. "Three columns read 7-11 deg high and the run did not settle" needed no
 mechanism to justify embedding the frames — the argument was always that the numbers do not
 identify the fault, which is when a person looks at pictures. Reaching for a cause made the case
 weaker, not stronger, because it could be refuted while the real argument could not.
@@ -1713,6 +1713,18 @@ weaker, not stronger, because it could be refuted while the real argument could 
 Corollary for reviewers: check an anecdote's mechanism against the raw artifacts, not against its
 own summary. Every refutation here came from opening the frames or joining the checkpoint to the
 photo mask — never from reading the paragraph more carefully.
+
+**The same defect applies to claims about your own diff, and it bit in the same PR.** A test
+hardening was written by a script whose anchor did not match; the script raised, the surrounding
+commands ran on regardless, the test suite went green — because that test had been passing BEFORE
+the edit too — and the change was reported as fixed in a review reply while absent from the tree.
+The mutation harness then printed `SKIP: anchor not found` for that very guard, twice, and it was
+waved through both times as "checked separately".
+
+Two rules fall out. A test that passes after an edit proves nothing unless it FAILED before it: the
+mutation is the evidence, not the green run. And a skipped mutation is a failed mutation — the
+anchor not matching means the code is not what you think it is, which is the same alarm as a
+surviving mutant and deserves the same stop.
 
 ---
 

@@ -324,6 +324,22 @@ def _is_night(attempt):
     return str(attempt.get("channel") or "").startswith("star")
 
 
+def _num(value):
+    """A record field as a float, or None when it is not one.
+
+    `_fmt` already treats an unparseable field as absent, but the statistics
+    and the sort keys reach for `float()` directly and run FIRST — so a
+    hand-edited `sky_ref: ""` or `sun_alt: "n/a"` raised out of the facts grid
+    and took down a report that would have rendered those same fields fine.
+    `_load_attempts` is deliberate about surviving a damaged checkpoint; this
+    is the other half of that promise.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _run_facts(meta, attempts, private):
     """Provenance and the run's shape, as a fact grid.
 
@@ -335,7 +351,7 @@ def _run_facts(meta, attempts, private):
     for a in attempts:
         verdicts[a.get("verdict") or "?"] = verdicts.get(a.get("verdict") or "?", 0) + 1
     channels = sorted({a.get("channel") for a in attempts if a.get("channel")})
-    suns = [float(a["sun_alt"]) for a in attempts if a.get("sun_alt") is not None]
+    suns = [v for v in (_num(a.get("sun_alt")) for a in attempts) if v is not None]
     # DAY ROWS ONLY. The night channel has no open-sky reference of its own, and
     # the run state carries the last DAY value across the boundary unchanged —
     # so a night row's `sky_ref` is a stale daylight number, and quoting it as
@@ -348,9 +364,9 @@ def _run_facts(meta, attempts, private):
     # same spread as a darkening one. The checkpoint is append-only, so list
     # order is time order.
     day = [
-        (float(a["sky_ref"]), a.get("sun_alt"))
+        (_num(a.get("sky_ref")), _num(a.get("sun_alt")))
         for a in attempts
-        if a.get("sky_ref") is not None and not _is_night(a)
+        if _num(a.get("sky_ref")) is not None and not _is_night(a)
     ]
     refs = [r for r, _ in day]
 
@@ -393,9 +409,7 @@ def _run_facts(meta, attempts, private):
             # descent against it and call every mixed session "expected".
             sun_first, sun_last = day[0][1], day[-1][1]
             sun_moved = (
-                float(sun_last) - float(sun_first)
-                if sun_first is not None and sun_last is not None
-                else None
+                sun_last - sun_first if sun_first is not None and sun_last is not None else None
             )
             together = sun_moved is not None and abs(sun_moved) > 5.0 and (sun_moved < 0) == (moved < 0)  # fmt: skip
             note = (
@@ -454,7 +468,7 @@ def _attempts_table(attempts, private):
     if not private:
         head.insert(1, "at")
     rows = []
-    for a in sorted(attempts, key=lambda d: (str(d.get("t") or ""), float(d.get("az", 0)))):
+    for a in sorted(attempts, key=lambda d: (str(d.get("t") or ""), _num(d.get("az")) or 0.0)):
         cells = [
             _fmt(a.get("az"), ".0f"),
             _fmt(a.get("verdict"), dash="?"),
@@ -490,9 +504,9 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
     The measurement is a brightness step, and a brightness step has no idea
     what made it. Cloud, canopy and a lit wall all make honest ones.
 
-    2026-08-12 is why this is here rather than in a backlog. Four NE columns
-    came back 7-11 deg above what the photograph puts there, and the run never
-    settled. Reading the numbers alone, three different stories fit — cloud at
+    2026-08-12 is why this is here rather than in a backlog. Three NE columns
+    came back 7-11 deg above what the photograph puts there, a fourth beside
+    them landed within 0.2, and the run never settled. Reading the numbers alone, three different stories fit — cloud at
     sunset, a detector fault, or a yaw error moving which photo column the
     residual is even measured against — and the record cannot separate them:
     az 41 (day, visible cloud in its frames) overshot 10.9, while az 39 (night,
@@ -534,12 +548,14 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
     # re-measured because they distrusted the old answer.
     edge_at = {}
     for a in attempts:
-        if a.get("alt") is not None:
-            edge_at[int(round(float(a["az"])))] = float(a["alt"])
+        az_n, alt_n = _num(a.get("az")), _num(a.get("alt"))
+        if az_n is not None and alt_n is not None:
+            edge_at[int(round(az_n))] = alt_n
 
     strips = []
     shown = spent = 0
     dropped = []
+    unreadable = set()
     for az in sorted(by_az):
         if spent >= budget_kb * 1024:
             dropped.append(az)
@@ -551,9 +567,12 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
             try:
                 im = Image.open(path).convert("RGB")
             except OSError:
-                # Unreadable is not the same as absent, and the count below is
-                # of frames actually on the page — reporting the glob's total
-                # would claim evidence this page does not carry.
+                # Unreadable is not absent, and it is not "never scanned"
+                # either. Counting only rendered frames stopped the summary
+                # OVERCLAIMING; saying nothing at all makes a corrupt column
+                # indistinguishable from one the run never visited. Same ledger
+                # `_load_attempts` keeps: reject it, count it, state it.
+                unreadable.add(az)
                 continue
             w, h = im.size
             # reducing_gap lets PIL pre-shrink by an integer factor before the
@@ -586,6 +605,15 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
                 f'<div class="strip"><h3>az {az:03d}{note}</h3>'
                 f'<div class="films">{joined}</div></div>'
             )
+    lost = sorted(unreadable - {a for a in unreadable if any(f"az {a:03d}" in x for x in strips)})
+    bad = (
+        f'<p class="note">az {", ".join(str(a) for a in lost)}: '
+        f"{'a frame is' if len(lost) == 1 else 'frames are'} on disk but could not be "
+        "decoded, so nothing is shown for "
+        f"{'it' if len(lost) == 1 else 'them'}.</p>"
+        if lost
+        else ""
+    )
     cut = (
         f'<p class="note">Stopped at the {budget_kb / 1024:.0f} MB frame budget: '
         f"az {', '.join(str(a) for a in dropped)} "
@@ -602,6 +630,7 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
         "measured more than once has every run's ladder here, so a repeated "
         "altitude is a repeated visit, not a duplicate)</summary>"
         + cut
+        + bad
         + "".join(strips)
         + "</details>"
     )
