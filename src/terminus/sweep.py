@@ -1054,13 +1054,25 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
     if ptr.dry:
         return alt_min, "open_to_min", "open", []
 
+    # The column's own open-sky reference: the ladder starts at alt_max, the
+    # most sky it will ever see, and every later frame is scaled against it —
+    # the same common-scale rule `_save_frame` uses by day, and for the same
+    # reason. A per-frame stretch would renormalise dark terrain into amplified
+    # noise that looks like sky, destroying the one comparison the pictures
+    # exist to support.
+    ref = {"lum": None}
+
     def sample(alt):
         ptr.point_to(az, alt)
-        lum = sc.capture_raw16_median()
+        frame = sc.capture_raw16()
+        lum = float(np.median(frame))
+        if ref["lum"] is None:
+            ref["lum"] = lum
         if frames_dir:
             os.makedirs(frames_dir, exist_ok=True)
             with open(f"{frames_dir}/az{int(az):03d}_night.jsonl", "a") as fh:
                 fh.write(json.dumps({"alt": round(alt, 2), "median": round(lum, 1)}) + "\n")
+            _save_night_frame(frames_dir, az, alt, lum, frame, ref["lum"])
         return lum
 
     profile = []
@@ -1205,6 +1217,33 @@ def edge_is_ambiguous(profile, score_tol=0.05, alt_gap=5.0):
         if s >= (1.0 - score_tol) * best_s and abs(alt - best_alt) >= alt_gap:
             return True, (best_alt, alt, s / best_s if best_s else 0.0)
     return False, None
+
+
+def _save_night_frame(save_dir, az, alt, lum, frame, ref_lum):
+    """One night sample as a viewable 8-bit PNG, on the column's own scale.
+
+    Raw16 night counts run in the low thousands out of 65535, so a straight
+    downshift renders every frame black and a per-frame stretch renders every
+    frame identical — the first hides the terrain, the second manufactures it.
+    Scaling against the column's open-sky sample keeps the ladder comparable
+    frame to frame, which is the property that lets a person see whether the
+    step the detector found is a roofline or a cloud.
+
+    The filename carries the same fields the day path writes, so one reader
+    serves both. The MEDIAN in the name is the exact measured count; the
+    picture is the texture behind it, and where the two disagree the number is
+    the one that was measured.
+    """
+    import os
+
+    from PIL import Image
+
+    os.makedirs(save_dir, exist_ok=True)
+    scale = max(1.3 * (ref_lum or lum or 1.0), 1e-6)
+    arr = np.clip(np.asarray(frame, dtype=float) / scale * 255.0, 0, 255).astype(np.uint8)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    Image.fromarray(arr).save(f"{save_dir}/az{int(az):03d}_alt{alt:05.1f}_lum{lum:07.1f}.png")
 
 
 def save_scan_frame(rgb, az, alt, lum, save_dir, sky_ref=None):

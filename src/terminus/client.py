@@ -284,19 +284,31 @@ class Seestar:
         a burst of failed gotos, and a dead socket must not poison every later
         column.
         """
+        return float(np.median(self.capture_raw16(exposure_s)))
+
+    def capture_raw16(self, exposure_s=2.0):
+        """The frame itself, drained and reconnect-guarded as `capture_raw16_median`.
+
+        Split out so the night scan can keep the pixels it measured. A median is
+        one number and cannot say WHAT it was a median of: cloud, canopy and a
+        lit wall all produce honest brightness steps, and only the picture
+        separates them. The day path has saved its frames from the start; the
+        night path — where most columns are actually measured — kept a single
+        count per sample and discarded the evidence.
+        """
         if self.img is None:
             self._open_imaging()
         try:
             deadline = time.time() + exposure_s + 0.5
             while time.time() < deadline:
                 self._raw16_frame()
-            return float(np.median(self._raw16_frame()))
+            return self._raw16_frame()
         except (ConnectionError, OSError, TimeoutError):
             self._open_imaging()
             deadline = time.time() + exposure_s + 0.5
             while time.time() < deadline:
                 self._raw16_frame()
-            return float(np.median(self._raw16_frame()))
+            return self._raw16_frame()
 
     def capture_rgb(self, warmup=1.0, retries=2):
         """One RGB frame (float32 HxWx3) from the scenery RTSP stream via ffmpeg.

@@ -25,9 +25,12 @@ answered while the yellow line is drawn on top of it.
 """
 
 import base64
+import glob
 import html
 import io
 import math
+import os
+import re
 
 import numpy as np
 
@@ -159,10 +162,33 @@ PAGE = """<!doctype html>
   .cols td {{ padding:3px 14px 3px 0; border-bottom:1px solid var(--rule);
              vertical-align:top; }}
   .cols tr.unused td {{ color:var(--dim); }}
+  .banner {{ margin:0 0 16px; padding:11px 14px; border-radius:5px; font-size:14px;
+            border:1px solid; }}
+  .banner.warn {{ border-color:#7a4b12; background:#241a0d; color:#f0c07a; }}
+  .banner.ok {{ border-color:#2a4a2c; background:#111c12; color:#9fd0a2; }}
+  .banner code {{ font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }}
+  .diag {{ margin-top:26px; padding-top:16px; border-top:1px solid var(--rule); }}
+  .diag h2 {{ font-size:15px; margin:0 0 4px; font-weight:650; }}
+  .diag p.note {{ color:var(--dim); font-size:13px; margin:0 0 14px; }}
+  .facts {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:4px 22px;
+           font:13px/1.7 ui-monospace,Menlo,Consolas,monospace; color:var(--dim);
+           margin:0 0 18px; }}
+  .facts b {{ color:var(--ink); font-weight:600; }}
+  .strip {{ margin:0 0 18px; }}
+  .strip h3 {{ font:600 13px ui-monospace,Menlo,Consolas,monospace; color:var(--ink);
+              margin:0 0 6px; }}
+  .strip .films {{ display:flex; gap:5px; overflow-x:auto; padding-bottom:6px; }}
+  .strip figure {{ margin:0; flex:0 0 auto; }}
+  .strip img {{ display:block; border-radius:3px; border:1px solid var(--rule); }}
+  .strip figure.at img {{ border-color:{edge}; border-width:2px; }}
+  .strip figcaption {{ font:11px/1.4 ui-monospace,Menlo,monospace; color:var(--dim);
+                      text-align:center; margin-top:3px; }}
+  .strip figure.at figcaption {{ color:{edge}; }}
 </style>
 <div class="wrap">
 <h1>{title}</h1>
 <p class="sub">{subtitle}</p>
+{banner}
 <div class="stage" id="stage">
   <img class="base" src="{base}" alt="{alt_text}">
   <img class="ov off" data-layer="gap" src="{gap}" alt="">
@@ -186,6 +212,7 @@ PAGE = """<!doctype html>
   <span><i style="background:{bound}"></i>at the scope's tilt ceiling: horizon is <em>at least</em> this high</span>
 </p>
 {columns}
+{diagnostics}
 <footer>{footer}</footer>
 </div>
 <script>
@@ -247,8 +274,268 @@ def _columns_table(meta):
     )
 
 
+def _banner(meta):
+    """The settle verdict, stated where nobody can miss it.
+
+    A run that stopped with the yaw still moving rendered EXACTLY like a
+    converged one — same disc, same subtitle, same table — because the verdict
+    lived in a stderr line the reader never sees and a YAML key nobody opens.
+    The 2026-08-12 night run stopped at spread 3.75 deg against a 1 deg rule
+    and its page was indistinguishable from a good one.
+    """
+    settled = meta.get("fit_settled")
+    if settled is None:
+        return ""
+    if settled:
+        return '<p class="banner ok">The yaw settled: this fit met its stability rule.</p>'
+    return (
+        '<p class="banner warn"><strong>This run did not settle.</strong> The yaw was still '
+        "moving when the run stopped, so the orientation below is provisional and the mask "
+        "is marked UNORIENTED. Measure more columns (<code>--max-columns</code>), or look "
+        "for a column the fit cannot reconcile among the residuals.</p>"
+    )
+
+
+FRAME_RE = re.compile(r"az(\d+)_alt(-?\d+(?:\.\d+)?)_lum(-?\d+(?:\.\d+)?)\.(?:png|jpg)$")
+
+
+def _fmt(value, spec="", dash="&#8212;"):
+    """Format a value, or an em dash when it is absent.
+
+    Absent and zero are different claims and a bare f-string cannot tell them
+    apart (M-19): `sky_ref: None` means nobody measured a reference, not that
+    the sky was black.
+    """
+    if value is None or value == "":
+        return dash
+    try:
+        return format(float(value), spec) if spec else html.escape(str(value))
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def _run_facts(meta, attempts, private):
+    """Provenance and the run's shape, as a fact grid.
+
+    What a stranger's report has to answer before anything else can be judged:
+    which code measured it, under what sky, on which channel, and how many
+    attempts it took to get the columns the fit ended up using.
+    """
+    verdicts = {}
+    for a in attempts:
+        verdicts[a.get("verdict") or "?"] = verdicts.get(a.get("verdict") or "?", 0) + 1
+    channels = sorted({a.get("channel") for a in attempts if a.get("channel")})
+    suns = [float(a["sun_alt"]) for a in attempts if a.get("sun_alt") is not None]
+    refs = [float(a["sky_ref"]) for a in attempts if a.get("sky_ref") is not None]
+
+    facts = [
+        ("terminus", _fmt(meta.get("terminus_version"))),
+        ("detector backend", _fmt(meta.get("backend"))),
+        ("fit", f"yaw {_fmt(meta.get('yaw'), '.2f')}&deg; "
+                f"pitch {_fmt(meta.get('pitch'), '.2f')}&deg; "
+                f"tilt {_fmt(meta.get('tilt_mag'), '.2f')}&deg;"),  # fmt: skip
+        ("rms / columns", f"{_fmt(meta.get('fit_rms'), '.2f')}&deg; over "
+                          f"{len(meta.get('fit_columns') or [])}"),  # fmt: skip
+        ("settled", "no" if meta.get("fit_settled") is False else
+                    ("yes" if meta.get("fit_settled") else "&#8212;")),  # fmt: skip
+    ]
+    if not private:
+        facts.append(("measured", _fmt(meta.get("measured"), dash="an unrecorded date")))
+        facts.append(("site", f"{_fmt(meta.get('lat'), '.4f', '?')}, "
+                              f"{_fmt(meta.get('lon'), '.4f', '?')}"))  # fmt: skip
+    if attempts:
+        facts.append(("attempts", f"{len(attempts)} for "
+                                  f"{len(meta.get('fit_columns') or [])} used"))  # fmt: skip
+        facts.append(("verdicts", ", ".join(f"{k} {v}" for k, v in sorted(verdicts.items()))))
+        facts.append(("channels", ", ".join(html.escape(str(c)) for c in channels) or "&#8212;"))
+    if suns:
+        facts.append(("sun altitude", f"{min(suns):+.1f}&deg; to {max(suns):+.1f}&deg;"))
+    if refs:
+        # THE STORM-CLOUD TELL. On 2026-08-12 the open-sky reference fell
+        # 254 -> 152 -> 63 as cloud rolled in, and the columns measured against
+        # it read as confident edges at 57 deg in a 15 deg treeline. The
+        # altitudes look perfectly plausible on the disc; only the collapsing
+        # reference says the sky stopped being a sky.
+        facts.append(("sky reference", f"{min(refs):.1f} to {max(refs):.1f}"
+                                       + (" (collapsed during the run)"
+                                          if max(refs) - min(refs) > 60 else "")))  # fmt: skip
+    return (
+        '<div class="facts">' + "".join(f"<div><b>{k}</b> {v}</div>" for k, v in facts) + "</div>"
+    )
+
+
+def _trail_table(meta):
+    """The yaw across refits: converging and thrashing look nothing alike.
+
+    A single final yaw cannot distinguish a fit that walked steadily in from
+    one that is still bouncing, and the stopping rule is defined on exactly
+    this sequence — so the evidence for the rule's verdict belongs on the page
+    next to it.
+    """
+    trail = meta.get("fit_trail") or []
+    if not trail:
+        return ""
+    rows = "".join(
+        f"<tr><td>{_fmt(s.get('az'), '.0f')}</td><td>{_fmt(s.get('yaw'), '.2f')}</td>"
+        f"<td>{_fmt(s.get('rms'), '.2f')}</td><td>{_fmt(s.get('n'))}</td>"
+        f"<td>{_fmt(s.get('spread'), '.2f')}</td></tr>"
+        for s in trail
+    )
+    return (
+        '<details class="cols" open><summary>Yaw across refits '
+        f"({len(trail)} fits)</summary><table>"
+        "<tr><th>after az</th><th>yaw</th><th>rms</th><th>n</th><th>spread</th></tr>"
+        + rows
+        + "</table></details>"
+    )
+
+
+def _attempts_table(attempts, private):
+    """Every attempt the run made, including the ones that produced nothing.
+
+    The fiducial table shows what the FIT used; this shows what the NIGHT did.
+    They differ by every failure — 2026-08-12 offered the fit 12 columns out of
+    39 attempts, and the 27 that produced nothing (inconclusive, unreachable,
+    dead channel) are the ones that say whether the mount, the sky or the
+    detector is at fault.
+    """
+    if not attempts:
+        return ""
+    head = ["az", "verdict", "alt", "channel", "sun", "sky ref", "secs"]
+    if not private:
+        head.insert(1, "at")
+    rows = []
+    for a in sorted(attempts, key=lambda d: (str(d.get("t") or ""), float(d.get("az", 0)))):
+        cells = [
+            _fmt(a.get("az"), ".0f"),
+            _fmt(a.get("verdict"), dash="?"),
+            _fmt(a.get("alt"), ".1f"),
+            # NOT html.escape of a default entity: escaping "&#8212;" yields the
+            # literal "&amp;#8212;" on the page. The dash is markup the caller
+            # supplies, the value is data that gets escaped — `_fmt` keeps the
+            # two apart.
+            _fmt(a.get("channel")),
+            _fmt(a.get("sun_alt"), "+.1f"),
+            _fmt(a.get("sky_ref"), ".1f"),
+            _fmt(a.get("secs"), ".0f"),
+        ]
+        if not private:
+            cells.insert(1, _fmt(a.get("t")))
+        dim = "" if a.get("verdict") in ("edge", "blocked") else ' class="unused"'
+        rows.append(f"<tr{dim}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    return (
+        f'<details class="cols" open><summary>Every attempt ({len(attempts)})</summary><table>'
+        "<tr>"
+        + "".join(f"<th>{h}</th>" for h in head)
+        + "</tr>"
+        + "".join(rows)
+        + "</table></details>"
+    )
+
+
+def _frame_strips(attempts, frames_dir, px=110, quality=72):
+    """The scan ladder for each column, as embedded thumbnails.
+
+    The measurement is a brightness step, and a brightness step has no idea
+    what made it. On 2026-08-12 a storm-cloud bank produced textbook steps at
+    57 deg over a 15 deg treeline: the numbers, the residuals and the disc all
+    looked survivable, and the ONLY thing that settled it was opening the
+    frames and seeing cloud. No summary statistic substitutes for that, and a
+    stranger cannot post their frames to us one at a time — so they ride along.
+
+    The frame at the recorded edge is outlined, which is the whole question a
+    reader is asking: is that where the terrain actually starts?
+    """
+    if not frames_dir or not os.path.isdir(frames_dir):
+        return ""
+    from PIL import Image
+
+    by_az = {}
+    for path in glob.glob(os.path.join(frames_dir, "*.png")) + glob.glob(
+        os.path.join(frames_dir, "*.jpg")
+    ):
+        m = FRAME_RE.search(os.path.basename(path))
+        if m:
+            by_az.setdefault(int(m.group(1)), []).append(
+                (float(m.group(2)), float(m.group(3)), path)
+            )
+    if not by_az:
+        return ""
+
+    edge_at = {}
+    for a in attempts:
+        if a.get("alt") is not None:
+            edge_at.setdefault(int(round(float(a["az"]))), float(a["alt"]))
+
+    strips = []
+    for az in sorted(by_az):
+        frames = sorted(by_az[az], key=lambda t: -t[0])
+        edge = edge_at.get(az)
+        films = []
+        for alt, lum, path in frames:
+            try:
+                im = Image.open(path).convert("RGB")
+            except OSError:
+                continue
+            w, h = im.size
+            im = im.resize((px, max(1, round(h * px / w))), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=quality, optimize=True)
+            uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+            # Bracket rather than match: the edge is bisected between samples,
+            # so no frame sits exactly on it.
+            at = ' class="at"' if edge is not None and abs(alt - edge) <= 2.6 else ""
+            films.append(
+                f'<figure{at}><img src="{uri}" width="{px}" '
+                f'alt="az {az} alt {alt:.1f}" loading="lazy">'
+                f"<figcaption>{alt:.0f}&deg;<br>{lum:.0f}</figcaption></figure>"
+            )
+        if films:
+            note = f" &mdash; edge at {edge:.1f}&deg;" if edge is not None else ""
+            joined = "".join(films)
+            strips.append(
+                f'<div class="strip"><h3>az {az:03d}{note}</h3>'
+                f'<div class="films">{joined}</div></div>'
+            )
+    return (
+        '<details class="cols" open><summary>Scan frames '
+        f"({sum(len(v) for v in by_az.values())} from {len(by_az)} columns, "
+        "brightest sample first; number under each is its luminance)</summary>"
+        + "".join(strips)
+        + "</details>"
+    )
+
+
+def diagnostics(meta, attempts=(), frames_dir=None, frame_px=110, private=False):
+    """Everything needed to debug a run someone else made, on the same page.
+
+    The report was a result viewer: it showed what the fit concluded and
+    nothing about the conditions it concluded under. That is enough to admire
+    a good run and useless for triaging a bad one, which is the case that
+    actually needs another pair of eyes.
+    """
+    parts = [
+        _run_facts(meta, attempts, private),
+        _trail_table(meta),
+        _attempts_table(attempts, private),
+        _frame_strips(attempts, frames_dir, frame_px) if frames_dir else "",
+    ]
+    body = "".join(p for p in parts if p)
+    if not body:
+        return ""
+    note = (
+        "Redacted: no coordinates, dates or clock times."
+        if private
+        else "Includes the site, the clock and the frames: hand this to someone who can help."
+    )
+    return (
+        f'<section class="diag"><h2>Run diagnostics</h2><p class="note">{note}</p>{body}</section>'
+    )
+
+
 def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
-         size=SIZE, floor=FLOOR_DEG, title="terminus horizon"):  # fmt: skip
+         size=SIZE, floor=FLOOR_DEG, title="terminus horizon",
+         attempts=(), frames_dir=None, frame_px=110, private=False):  # fmt: skip
     """One self-contained HTML page. No network, no assets, no build step.
 
     `rows` is the ORIENTED mask — already in true azimuth — so the ring is drawn
@@ -316,9 +603,10 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
     bits.append(f"rim at {floor:+.0f}")
     subtitle = "  ".join(bits) + " degrees"
 
+    where = "an undisclosed site" if private else f"{meta.get('lat', '?')},{meta.get('lon', '?')}"
+    when = "an undisclosed date" if private else meta.get("measured", "an unrecorded date")
     footer = html.escape(
-        f"Measured with terminus from {meta.get('lat', '?')},{meta.get('lon', '?')} "
-        f"on {meta.get('measured', 'an unrecorded date')}. Position-specific: a near "
+        f"Measured with terminus from {where} on {when}. Position-specific: a near "
         "obstruction shifts by degrees for a few metres of observer displacement. "
         f"{gap_pct}% of the disc has no photograph behind it."
     )
@@ -337,6 +625,8 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         markers="".join(markers),
         pts_pressed="true" if markers else "false",
         columns=_columns_table(meta),
+        banner=_banner(meta),
+        diagnostics=diagnostics(meta, attempts, frames_dir, frame_px, private),
         footer=footer,
         horizon=HORIZON_COLOUR,
         edge=EDGE_COLOUR,

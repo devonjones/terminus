@@ -251,6 +251,30 @@ rather than dots, because the scope stopped at its tilt limit: the horizon there
 is *at least* that high, not exactly that high. Without a panorama the command
 still works and draws the measured horizon on a plain disc.
 
+**The page is also the bug report.** If the run went wrong, `polar` picks up the
+checkpoint and the scan frames lying beside the mask and puts the whole run on
+the page: whether the yaw actually settled, every attempt including the ones
+that produced nothing, the conditions each was measured under (channel, Sun
+altitude, sky reference, clock, duration), the yaw across refits, and the scan
+frames themselves with the chosen edge outlined.
+
+That last part is the one that matters most. The measurement is a brightness
+step and a brightness step cannot say what made it — cloud, canopy and a lit
+wall all make honest ones. A storm bank here produced textbook edges at 57° over
+a 15° treeline, and nothing but the pictures settled it.
+
+```bash
+terminus polar oriented.yaml                 # everything: site, clock, frames
+terminus polar oriented.yaml --privacy       # no site, no dates, no clock times
+terminus polar oriented.yaml --no-frames     # smaller page, no visual evidence
+```
+
+`--privacy` redacts *who and where*, never *what happened*: altitudes, verdicts,
+sky references, Sun altitudes and the frames all still ride along, because a
+report nobody can debug is not worth sending. It does not anonymise the
+photographs — the panorama is a picture of your horizon and that is the point of
+the page.
+
 What each step reported on that run:
 
 | Step | Expect |

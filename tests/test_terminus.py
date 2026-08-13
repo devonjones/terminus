@@ -6691,8 +6691,11 @@ def test_a_night_scan_skips_the_pole_band_sample_and_keeps_the_column():
         return az, alt
 
     ptr.point_to = point_to
-    sc.capture_raw16_median = lambda **k: float(
-        levels[min(levels, key=lambda a: abs(a - at["alt"]))]
+    # The night scan keeps the pixels now, so the fake hands back a frame and
+    # lets the real median run over it — mocking the median instead would skip
+    # the code under test.
+    sc.capture_raw16 = lambda **k: np.full(
+        (4, 4), float(levels[min(levels, key=lambda a: abs(a - at["alt"]))])
     )
 
     alt, status, typ, profile = scan_horizon_night(ptr, sc, 0.0, 0, 60, 5.0, 1.5)
@@ -8461,3 +8464,173 @@ def test_a_mount_that_never_moves_is_reported_differently():
 
     with pytest.raises(PointingError, match="never moved toward it at all"):
         ptr._goto_wait(8.604, 60.43, 0.1)
+
+
+def _diag_meta(**over):
+    """A solved-mask meta with the fields the diagnostics section reads."""
+    meta = {
+        "yaw": 135.25,
+        "pitch": 2.28,
+        "tilt_mag": 2.25,
+        "fit_rms": 6.23,
+        "fit_columns": [0, 34, 90],
+        "fit_settled": False,
+        "terminus_version": "9.9.9",
+        "measured": "2026-08-12 21:55 MDT",
+        "lat": 39.7917,
+        "lon": -104.894,
+        "fit_trail": [{"az": 34, "yaw": 135.69, "rms": 1.68, "n": 8, "spread": 12.5}],
+    }
+    meta.update(over)
+    return meta
+
+
+_DIAG_ATTEMPTS = [
+    {"az": 41, "t": "19:52:38", "verdict": "edge", "alt": 57.5, "channel": "scenery",
+     "sun_alt": 0.4, "sky_ref": 254.0, "secs": 263},
+    {"az": 45, "t": "20:04:50", "verdict": "failed", "secs": 12},
+    {"az": 19, "t": "19:48:13", "verdict": "inconclusive", "channel": "scenery",
+     "sun_alt": 1.2, "sky_ref": 63.3, "secs": 173},
+]  # fmt: skip
+
+
+def test_a_run_that_did_not_settle_says_so_on_the_page():
+    """The verdict a reader needs first, and the one the page never carried.
+
+    An unsettled fit rendered EXACTLY like a converged one — same disc, same
+    subtitle, same table — with the difference living in a stderr line nobody
+    keeps and a YAML key nobody opens. The 2026-08-12 night run stopped at
+    spread 3.75 deg against a 1 deg rule and looked fine (terminus-68).
+    """
+    from terminus import polar
+
+    unsettled = polar._banner(_diag_meta())
+    settled = polar._banner(_diag_meta(fit_settled=True))
+    assert "did not settle" in unsettled and "warn" in unsettled
+    assert "did not settle" not in settled and "settled" in settled
+    # A mask from before the flag existed must not be given a verdict either way.
+    assert polar._banner({"yaw": 1.0}) == ""
+
+
+def test_the_report_carries_every_attempt_not_just_the_ones_that_worked():
+    """The fiducial table shows what the FIT used; this shows what the NIGHT did.
+
+    They differ by every failure, and the failures are what say whether the
+    mount, the sky or the detector is at fault: 2026-08-12 gave the fit 12
+    columns out of 39 attempts.
+    """
+    from terminus import polar
+
+    html_out = polar.diagnostics(_diag_meta(), _DIAG_ATTEMPTS)
+    assert "Every attempt (3)" in html_out
+    assert "failed" in html_out and "inconclusive" in html_out
+    assert (
+        "attempts</b> 3 for 3 used"
+        in html_out.replace("<b>", "</b><b>").replace("</b></b>", "</b>")
+        or "3 for 3 used" in html_out
+    )
+    # The conditions, not just the verdicts: a plausible altitude measured
+    # against a collapsed sky reference is the storm-cloud failure, and the
+    # number is the only thing that shows it.
+    assert "254.0" in html_out and "63.3" in html_out
+    assert "collapsed during the run" in html_out
+    assert "star4800" not in html_out and "scenery" in html_out
+
+
+def test_privacy_redacts_the_site_and_the_clock_but_keeps_the_evidence():
+    """--privacy is for sharing, so it hides identity, not diagnosis.
+
+    Devon: "if someone wants my help, they are probably gonna need to suck it
+    up" — so the default is full disclosure, and even the redacted form keeps
+    every number a diagnosis runs on. A report nobody can debug is not worth
+    writing.
+    """
+    from terminus import polar
+
+    meta, attempts = _diag_meta(), _DIAG_ATTEMPTS
+    open_html = polar.diagnostics(meta, attempts, private=False)
+    shy = polar.diagnostics(meta, attempts, private=True)
+
+    for secret in ("39.7917", "-104.894", "2026-08-12 21:55", "19:52:38"):
+        assert secret in open_html, f"the open report must carry {secret}"
+        assert secret not in shy, f"--privacy must redact {secret}"
+    # Everything a diagnosis needs survives redaction.
+    for kept in ("57.5", "254.0", "63.3", "failed", "inconclusive", "scenery", "9.9.9"):
+        assert kept in shy, f"--privacy must keep {kept}"
+
+
+def test_the_yaw_trail_is_recorded_so_thrashing_can_be_told_from_converging():
+    """One final yaw cannot distinguish a fit that walked in from one bouncing.
+
+    The stopping rule is defined on this very sequence, so the evidence for its
+    verdict belongs beside the verdict.
+    """
+    from terminus import cli, polar
+
+    class _Step:
+        def __init__(self, az, solution, spread):
+            self.az, self.solution, self.spread = az, solution, spread
+
+    sol = {"yaw": 135.69, "rms": 1.68, "n": 8}
+    trail = cli._fit_trail_record(
+        [
+            _Step(34, sol, 12.5),
+            _Step(90, sol, None),  # spread is absent until enough refits exist
+            _Step(None, None, None),  # the "did not settle" sentinel carries no fit
+        ]
+    )
+    assert len(trail) == 2, "only steps that produced a fit belong in the trail"
+    assert trail[0]["spread"] == 12.5
+    # OMITTED, not None: the meta is serialised via repr, where None round-trips
+    # through YAML as the string 'None'.
+    assert "spread" not in trail[1]
+    assert "Yaw across refits" in polar._trail_table({"fit_trail": trail})
+
+
+def test_the_night_scan_keeps_the_frame_it_measured(tmp_path):
+    """A median cannot say what it was a median of.
+
+    Cloud, canopy and a lit wall all make honest brightness steps; on
+    2026-08-12 a storm bank produced textbook edges at 57 deg over a 15 deg
+    treeline and only the pictures settled it. The night path — where most
+    columns are measured — kept one count per sample and threw the pixels away.
+    """
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from terminus.sweep import scan_horizon_night
+
+    sc, ptr = MagicMock(), MagicMock()
+    ptr.dry = False
+    ptr.point_to.return_value = (0.0, 0.0)
+    at = {"alt": 60.0}
+
+    def point_to(az, alt, **k):
+        at["alt"] = alt
+        return az, alt
+
+    ptr.point_to = point_to
+    # Sky above 30, terrain below: a real step for the detector to find.
+    sc.capture_raw16 = lambda **k: np.full((4, 4), 3000.0 if at["alt"] > 30 else 400.0)
+
+    frames = tmp_path / "scan"
+    scan_horizon_night(ptr, sc, 318.0, 0, 60, 15.0, 5.0, frames_dir=str(frames))
+
+    pngs = sorted(p.name for p in frames.glob("az318_alt*.png"))
+    assert pngs, "the night scan must save the frames it measured"
+    assert (frames / "az318_night.jsonl").exists(), "the numeric ladder stays too"
+
+    from PIL import Image
+
+    def shade(name):
+        return float(np.asarray(Image.open(frames / name)).mean())
+
+    sky = [p for p in pngs if float(p.split("_alt")[1][:4]) > 30]
+    ground = [p for p in pngs if float(p.split("_alt")[1][:4]) <= 30]
+    assert sky and ground
+    # COMMON SCALE, not a per-frame stretch: dark terrain must stay dark, or
+    # every frame comes back as amplified noise that looks like open sky.
+    assert shade(ground[0]) < 0.5 * shade(
+        sky[0]
+    ), "terrain frames must render darker than sky frames"
