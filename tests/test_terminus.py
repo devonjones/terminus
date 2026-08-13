@@ -8487,14 +8487,17 @@ def _diag_meta(**over):
 
 
 _DIAG_ATTEMPTS = [
+    # IN TIME ORDER, as an append-only checkpoint is: the reference and the Sun
+    # are read off the same rows in sequence, so the order is load-bearing.
     {"az": 41, "t": "19:52:38", "verdict": "edge", "alt": 57.5, "channel": "scenery",
      "sun_alt": 0.4, "sky_ref": 254.0, "secs": 263},
     {"az": 45, "t": "20:04:50", "verdict": "failed", "secs": 12},
-    {"az": 19, "t": "19:48:13", "verdict": "inconclusive", "channel": "scenery",
-     "sun_alt": 1.2, "sky_ref": 63.3, "secs": 173},
+    {"az": 19, "t": "20:48:13", "verdict": "inconclusive", "channel": "scenery",
+     "sun_alt": -8.0, "sky_ref": 63.3, "secs": 173},
     # A night row carrying a DAY reference: the run state keeps the last day
     # value across the twilight boundary, and the night channel never writes
-    # one of its own.
+    # one of its own. 7.7 is below every real day reference here, so a leak
+    # moves the stated figures.
     {"az": 34, "t": "21:21:56", "verdict": "edge", "alt": 46.2, "channel": "star4800",
      "sun_alt": -14.9, "sky_ref": 7.7, "secs": 485},
 ]  # fmt: skip
@@ -8540,15 +8543,21 @@ def test_the_report_carries_every_attempt_not_just_the_ones_that_worked():
     # twilight boundary from the last day column, and printing it as that
     # column's own reports a measurement nobody made (M-19).
     assert "7.7" not in html_out, "a night row must not quote a stale day sky reference"
-    # ...and it must not skew the run-level range either: 7.7 is below every
-    # real day reference, so a leak moves the stated minimum.
-    assert "63.3 to 254.0" in html_out
+    # ...and it must not skew the run figures either.
+    assert "254.0 to 63.3 over the day columns" in html_out
 
-    # The falling reference is a WEAK tell and is stated as one: it did not
-    # catch the columns that actually went wrong on 2026-08-12, and a run
-    # spanning dusk drops for the honest reason.
-    assert "fell during the run" in html_out
-    assert "the Sun" in html_out, "the reference note must not blame cloud on its own"
+    # DIRECTION IS MEASURED, NOT ASSUMED. min-to-max carries none, and sky_ref
+    # is a sawtooth — a brightening run has the same spread as a darkening one.
+    assert "fell while the Sun fell 8.4" in html_out, html_out[html_out.find("sky reference") :][
+        :200
+    ]
+    # And the Sun is read off the SAME day rows: scoring the night row's -14.9
+    # against a day-only reference span would call any mixed session expected.
+    assert "twilight does this" in html_out
+
+    rose = [dict(a, sky_ref=(300.0 if a["az"] == 19 else 60.0)) for a in _DIAG_ATTEMPTS[:3]]
+    assert "60.0 to 300.0" in polar.diagnostics(_diag_meta(), rose)
+    assert "rose without the Sun accounting for it" in polar.diagnostics(_diag_meta(), rose)
 
 
 def test_privacy_redacts_the_site_and_the_clock_but_keeps_the_evidence():
@@ -8821,3 +8830,104 @@ def test_the_published_example_page_names_no_site_and_no_date():
     assert not re.search(
         r"\b\d{2}:\d{2}:\d{2}\b", page
     ), "the published example carries per-attempt clock times; regenerate with --privacy"
+
+
+def test_the_frame_budget_bounds_the_page_and_names_what_it_dropped(tmp_path):
+    """A cap nobody is told about reads as "this is all there was".
+
+    And the cap has to bound the thing it claims to: the budget is spent in
+    base64, which is 4/3 of the JPEG it encodes, so charging the JPEG's own
+    bytes let a page announcing 6 MB ship 9.8 MB at a large --frame-px — the
+    "page someone tries to mail" the cap exists for.
+    """
+    import re
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import polar
+
+    frames = tmp_path / "scan"
+    frames.mkdir()
+    rng = np.random.default_rng(3)
+    for az in range(0, 60, 10):
+        for alt in (60.0, 40.0, 20.0):
+            # Noise, so the JPEG cannot compress to nothing and the budget bites.
+            Image.fromarray(rng.integers(0, 255, (60, 40, 3), dtype=np.uint8)).save(
+                frames / f"az{az:03d}_alt{alt:05.1f}_lum{100.0:07.1f}.jpg"
+            )
+
+    # A column whose only frame cannot be decoded, placed EARLY so the budget
+    # reaches it: it must not be counted as a rendered column, which the glob
+    # total would do. (Sorted last it lands in the dropped set instead, and
+    # both counts agree by accident.)
+    (frames / "az005_alt030.0_lum00100.0.jpg").write_bytes(b"not an image")
+
+    out = polar._frame_strips([], str(frames), px=40, budget_kb=6)
+    embedded = sum(len(u) for u in re.findall(r'src="(data:image/jpeg[^"]+)"', out))
+
+    assert embedded <= 6 * 1024 * 1.6, "the budget must bound the bytes that land on the page"
+    assert "not shown" in out, "a cap must name what it dropped"
+    # WHOLE COLUMNS ONLY: a half ladder invites exactly the wrong reading,
+    # because the question is where along it the sky stops.
+    for az in range(0, 60, 10):
+        shown = out.count(f'alt="az {az} ')
+        assert shown in (0, 3), f"az {az} rendered {shown} of 3 frames"
+    # THE COUNT IS OF WHAT THE PAGE CARRIES, not of what the glob found. Needs
+    # a budget generous enough to REACH the undecodable column: bitten first,
+    # it lands in the dropped set instead and the two counts agree by accident.
+    whole = polar._frame_strips([], str(frames), px=40, budget_kb=10_000)
+    assert "not shown" not in whole, "this budget must not bite"
+    assert "az 005" not in whole, "an undecodable column renders nothing"
+    figures, columns = whole.count("<figure"), whole.count('<div class="strip">')
+    assert columns == 6, f"6 decodable columns, got {columns}"
+    assert f"({figures} from {columns} columns" in whole
+
+
+def test_a_damaged_channel_field_is_rejected_rather_than_read_as_daylight(tmp_path):
+    """Lenient decoding must not turn damage into a measurement.
+
+    Reading with errors="replace" stops a stray byte killing the whole report,
+    but inside a STRING value the replacement character parses cleanly — and
+    the string that matters is `channel`. One bad byte in "star4800" makes a
+    night row read as a day row, and the stale daylight sky reference it
+    carries flows straight back into the table and the run figures: exactly the
+    leak `_is_night` exists to stop, reintroduced by a single byte, with
+    nothing on the page saying a byte was replaced.
+    """
+    from terminus import cli
+
+    mask = tmp_path / "solved.yaml"
+    mask.write_text("meta: {}\n")
+    (tmp_path / "solved_fiducials.jsonl").write_bytes(
+        b'{"az": 34, "verdict": "edge", "alt": 46.2, "channel": "st\xffr4800", "sky_ref": 7.7}\n'
+        b'{"az": 41, "verdict": "edge", "alt": 57.5, "channel": "scenery", "sky_ref": 254.0}\n'
+    )
+    attempts, notes = cli._load_attempts(str(mask))
+
+    assert [a["az"] for a in attempts] == [41], "a damaged channel must not be served as a day row"
+    assert notes and "1 line" in notes[0], "and the loss must be stated, not absorbed"
+
+
+def test_the_rendered_notes_carry_no_filename_and_no_path(tmp_path):
+    """`--privacy` strips the mask name from the title; the notes handed it back.
+
+    These render on the page, and the page is what gets mailed to a stranger. A
+    mask name carries identity ("ron-backyard"), and an OSError stringifies
+    with the absolute path `open` was given — username and directory layout
+    included. Both notes fire on exactly the mailed-in-report path.
+    """
+    from terminus import cli
+
+    mask = tmp_path / "ron-backyard-2026-08-12.yaml"
+    mask.write_text("meta: {}\n")
+    # A directory where the checkpoint should be: open() raises IsADirectoryError.
+    (tmp_path / "ron-backyard-2026-08-12_fiducials.jsonl").mkdir()
+
+    attempts, notes = cli._load_attempts(str(mask))
+    assert attempts == [] and notes, "an unreadable log must still be reported"
+
+    blob = " ".join(notes)
+    assert "ron-backyard" not in blob, f"the note names the mask: {blob!r}"
+    assert str(tmp_path) not in blob, f"the note carries an absolute path: {blob!r}"
+    assert "directory" in blob.lower(), "and it must still say what went wrong"

@@ -258,14 +258,17 @@ that produced nothing, the conditions each was measured under (channel, Sun
 altitude, sky reference, clock, duration), the yaw across refits, and the scan
 frames themselves with the chosen edge outlined.
 
-That last part is the one that matters most, and the numbers are why. A storm
-bank sat *above* the treeline here at sunset, so the scan walked down and
-stopped at the cloud's lower edge: two columns read 57.5° and 53.8° where the
-photograph puts the treeline at 46°. Every diagnostic available at the time was
-healthy — those columns carry the two **highest** open-sky references of the
-whole run, because bright sky above bright cloud is still bright sky. The same
-direction read 46.2° on the night channel hours later. No statistic caught it;
-the frames catch it on sight, as a black bank at 50° under blue sky at 60°.
+That last part is the one that matters most, and a real run is why. Four
+adjacent columns here came back 7–11° above what the photograph puts there, and
+the run never settled. From the numbers alone at least three stories fit —
+cloud at sunset, a detector fault, or a yaw error changing which photo column
+the residual is even measured against — and the record does not separate them:
+one of those columns was measured in daylight with cloud visible in its frames,
+another at night with no cloud available, and they overshoot by the same
+amount.
+
+That is precisely when a person wants to look at the pictures, and the pictures
+are the one thing a stranger cannot mail you a few at a time.
 
 ```bash
 terminus polar oriented.yaml                 # everything: site, clock, frames

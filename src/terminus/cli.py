@@ -657,6 +657,16 @@ def _load_attempts(mask_path):
         # down — the exact file this is most lenient about.
         with open(ckpt, errors="replace") as fh:
             for line in fh:
+                # A REPLACED BYTE MUST NOT BECOME A MEASUREMENT. Inside a
+                # number the damage yields invalid JSON and is rejected below,
+                # but inside a string value U+FFFD parses cleanly — and the
+                # string that matters is `channel`: one bad byte in "star4800"
+                # makes a night row read as a day row, and its stale daylight
+                # sky reference flows back into the table and the run range,
+                # reintroducing exactly the leak `_is_night` exists to stop.
+                if "�" in line:
+                    bad += 1
+                    continue
                 try:
                     d = json.loads(line)
                 except ValueError:
@@ -672,12 +682,21 @@ def _load_attempts(mask_path):
         # ON THE PAGE, not only on the terminal. A report with no attempt log
         # is indistinguishable from a run that never checkpointed, and the
         # reader of a mailed-in page never saw this stderr line.
-        notes.append(f"The attempt log {os.path.basename(ckpt)} could not be read ({e}), so this page shows none of it.")  # fmt: skip
+        # NO FILENAME, AND NO str(e), IN A NOTE THAT RENDERS. The page is the
+        # thing that gets mailed to a stranger: a mask name carries identity
+        # ("ron-backyard"), and an OSError stringifies with the absolute path
+        # `open` was handed — username and directory layout included.
+        # `--privacy` had just stripped that same filename out of the title,
+        # and this path handed it straight back. The terminal line below keeps
+        # the full detail, where only the operator sees it.
+        notes.append(
+            f"The attempt log beside this mask could not be read ({e.strerror}), "
+            "so this page shows none of it."
+        )
         print(f"could not read {ckpt} ({e}); the report will have no attempt log", file=sys.stderr)
     if bad:
         notes.append(
-            f"{bad} line(s) of {os.path.basename(ckpt)} were unreadable and are missing "
-            "from the attempt log below."
+            f"{bad} line(s) of the attempt log were unreadable and are missing from it below."
         )
     return attempts, notes
 
@@ -981,9 +1000,11 @@ def _orient(sc, cfg, args):
 def _fit_trail_record(steps):
     """The refit sequence, one row per fit, rounded for a person to read.
 
-    Steps with no solution (the sentinel the loop appends when it gives up, and
-    columns that failed before a refit) carry no fit to record and are left
-    out — the attempt log is where a failure belongs, not the trail of fits.
+    Steps with no solution are left out: the sentinel the loop appends when it
+    gives up, and the opening columns measured BEFORE four of them made a fit
+    possible at all. The latter did not fail — they are in the attempt log with
+    their values — they simply predate the first fit, and this is a trail of
+    fits.
     """
     trail = []
     for s in steps:

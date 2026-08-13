@@ -1057,7 +1057,7 @@ def scan_horizon_night(ptr, sc, az, alt_min, alt_max, coarse_step, tol, frames_d
 
     # The column's own open-sky reference: the ladder starts at alt_max, the
     # most sky it will ever see, and every later frame is scaled against it —
-    # the same common-scale rule `_save_frame` uses by day, and for the same
+    # the same common-scale rule `save_scan_frame` uses by day, and for the same
     # reason. A per-frame stretch would renormalise dark terrain into amplified
     # noise that looks like sky, destroying the one comparison the pictures
     # exist to support.

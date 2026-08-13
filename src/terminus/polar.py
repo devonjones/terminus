@@ -340,9 +340,19 @@ def _run_facts(meta, attempts, private):
     # the run state carries the last DAY value across the boundary unchanged —
     # so a night row's `sky_ref` is a stale daylight number, and quoting it as
     # that column's conditions invents a measurement nobody made (M-19).
-    refs = [
-        float(a["sky_ref"]) for a in attempts if a.get("sky_ref") is not None and not _is_night(a)
+    # PAIRED AND IN ORDER. The reference and the Sun have to be read off the
+    # SAME rows in the SAME sequence to say anything about how one moved with
+    # the other; a min and a max carry no direction at all, and `sky_ref` is a
+    # sawtooth by construction — the run ratchets it up over bright columns and
+    # the staleness refresh lets it drop — so a brightening run has exactly the
+    # same spread as a darkening one. The checkpoint is append-only, so list
+    # order is time order.
+    day = [
+        (float(a["sky_ref"]), a.get("sun_alt"))
+        for a in attempts
+        if a.get("sky_ref") is not None and not _is_night(a)
     ]
+    refs = [r for r, _ in day]
 
     facts = [
         ("terminus", _fmt(meta.get("terminus_version"))),
@@ -367,31 +377,34 @@ def _run_facts(meta, attempts, private):
     if suns:
         facts.append(("sun altitude", f"{min(suns):+.1f}&deg; to {max(suns):+.1f}&deg;"))
     if refs:
-        # THE STORM-CLOUD TELL. On 2026-08-12 the open-sky reference fell
-        # 254 -> 152 -> 63 as cloud rolled in, and the columns measured against
-        # it read as confident edges at 57 deg in a 15 deg treeline. The
-        # altitudes look perfectly plausible on the disc; only the falling
-        # reference says the sky stopped being a sky.
-        #
-        # A WEAK TELL, AND SAID WEAKLY. It did not catch the columns that
-        # actually went wrong that day — az 41 and 37 were measured at the two
-        # HIGHEST references of the run, because the cloud that fooled them sat
-        # above the treeline while the sky above it stayed bright. And a
-        # reference falls at dusk for the honest reason too, so a run
-        # straddling sunset would otherwise be accused of cloud every time. The
-        # Sun's own travel is in the record and separates those two; nothing
-        # here is stated as a cause.
+        # REPORTED, NOT DIAGNOSED. A large move in the open-sky reference is
+        # worth a reader's attention — the day floor already refuses verdicts
+        # taken below it — but it is not evidence of any particular cause, and
+        # this line has been rewritten twice for claiming one it could not
+        # support. The Sun's own travel over the same rows is the only
+        # discrimination offered, because that much IS in the record; anything
+        # further belongs to whoever looks at the frames.
         note = ""
-        if max(refs) - min(refs) > 60:
-            fell = (max(suns) - min(suns)) if suns else None
-            note = (
-                f" (fell during the run, but so did the Sun, by {fell:.1f}&deg;"
-                " &mdash; expected at dusk)"
-                if fell is not None and fell > 5.0
-                else " (fell during the run with the Sun near steady, which twilight"
-                " does not explain)"
+        moved = refs[-1] - refs[0]
+        if abs(moved) > 60:
+            went = "fell" if moved < 0 else "rose"
+            # The Sun over the SAME rows, or nothing. A day-only reference span
+            # judged against every attempt's Sun would score the night half's
+            # descent against it and call every mixed session "expected".
+            sun_first, sun_last = day[0][1], day[-1][1]
+            sun_moved = (
+                float(sun_last) - float(sun_first)
+                if sun_first is not None and sun_last is not None
+                else None
             )
-        facts.append(("sky reference", f"{min(refs):.1f} to {max(refs):.1f}" + note))
+            together = sun_moved is not None and abs(sun_moved) > 5.0 and (sun_moved < 0) == (moved < 0)  # fmt: skip
+            note = (
+                f" ({went} while the Sun {'fell' if sun_moved < 0 else 'rose'} "
+                f"{abs(sun_moved):.1f}&deg; with it &mdash; twilight does this)"
+                if together
+                else f" ({went} without the Sun accounting for it)"
+            )
+        facts.append(("sky reference", f"{refs[0]:.1f} to {refs[-1]:.1f} over the day columns" + note))  # fmt: skip
     return (
         '<div class="facts">' + "".join(f"<div><b>{k}</b> {v}</div>" for k, v in facts) + "</div>"
     )
@@ -428,11 +441,12 @@ def _attempts_table(attempts, private):
 
     The fiducial table shows what the FIT used; this shows what the RUN did.
     2026-08-12 made 39 attempts and gave the fit 12 columns. Nine produced no
-    value at all (6 inconclusive, 3 failed) and the rest are supersessions —
-    the same azimuth measured again on another night or after `--re-measure`.
-    Both kinds are evidence: the failures say whether the mount, the sky or the
-    detector is at fault, and the supersessions are where the same direction
-    was answered two different ways.
+    value at all (6 inconclusive, 3 failed); six are the same azimuth measured
+    again on a later night or after `--re-measure`; the rest produced a value
+    the fit never used. All three kinds are evidence — the failures say whether
+    the mount, the sky or the detector is at fault, the repeats are where one
+    direction was answered two different ways, and a measured column the fit
+    ignored is a question in itself.
     """
     if not attempts:
         return ""
@@ -474,21 +488,19 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
     """The scan ladder for each column, as embedded thumbnails.
 
     The measurement is a brightness step, and a brightness step has no idea
-    what made it.
+    what made it. Cloud, canopy and a lit wall all make honest ones.
 
-    2026-08-12, and the numbers exonerate the run completely. A storm bank sat
-    ABOVE the treeline at sunset, so the scan walked down and stopped at the
-    cloud's lower edge: az 41 read 57.5 deg and az 37 read 53.8 deg where the
-    photograph puts the treeline at 46 deg. Every diagnostic available at the
-    time was healthy — those two columns carry open-sky references of 254.0 and
-    236.7, the HIGHEST of the whole run — because a bright sky above bright
-    cloud is still a bright sky. Hours later, on the night channel, az 34 read
-    46.2 deg against the photograph's 46.0.
+    2026-08-12 is why this is here rather than in a backlog. Four NE columns
+    came back 7-11 deg above what the photograph puts there, and the run never
+    settled. Reading the numbers alone, three different stories fit — cloud at
+    sunset, a detector fault, or a yaw error moving which photo column the
+    residual is even measured against — and the record cannot separate them:
+    az 41 (day, visible cloud in its frames) overshot 10.9, while az 39 (night,
+    the same treeline, no cloud available) overshot 7.5 on its own.
 
-    So no summary statistic catches this one; the reference that later collapsed
-    was at its peak while it happened. The frames catch it on sight — a black
-    bank at alt 50 under blue sky at alt 60 — and a stranger cannot post their
-    frames to us one at a time.
+    So the honest conclusion from the numbers is that they do not identify the
+    fault, which is exactly when a person wants to look. The frames are what
+    they look at, and a stranger cannot post them to us one at a time.
 
     The frame at the recorded edge is outlined, which is the whole question a
     reader is asking: is that where the terrain actually starts?
@@ -545,13 +557,19 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
                 continue
             w, h = im.size
             # reducing_gap lets PIL pre-shrink by an integer factor before the
-            # good filter runs: same output, measured ~45% off the whole render
-            # (24.5 s for 412 frames), which matters on the Pi this can run on.
+            # good filter runs: measured 37% off a 412-frame render (23.6 s to
+            # 14.7 s), for +0.3% bytes and a max channel difference of 2/255.
+            # It is an approximation, not the same pixels — which is a fair
+            # trade for a thumbnail and would not be for a measurement.
             im = im.resize((px, max(1, round(h * px / w))), Image.LANCZOS, reducing_gap=2.0)
             buf = io.BytesIO()
             im.save(buf, "JPEG", quality=quality, optimize=True)
-            spent += buf.tell()
             uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+            # THE BUDGET COUNTS WHAT LANDS ON THE PAGE. Charging the JPEG's own
+            # bytes undercounts by the base64 4/3, so a page announcing a 6 MB
+            # ceiling shipped 8.2 MB — and at --frame-px 800, 9.8 MB, which is
+            # precisely the "page someone tries to mail" this cap exists for.
+            spent += len(uri)
             # Bracket rather than match: the edge is bisected between samples,
             # so no frame sits exactly on it.
             at = ' class="at"' if edge is not None and abs(alt - edge) <= 2.6 else ""
@@ -569,16 +587,17 @@ def _frame_strips(attempts, frames_dir, px=110, quality=72, budget_kb=6000):
                 f'<div class="films">{joined}</div></div>'
             )
     cut = (
-        f'<p class="note">Stopped at the {budget_kb / 1000:.0f} MB frame budget: '
+        f'<p class="note">Stopped at the {budget_kb / 1024:.0f} MB frame budget: '
         f"az {', '.join(str(a) for a in dropped)} "
-        f"{'is' if len(dropped) == 1 else 'are'} not shown. Raise it with a smaller "
-        "--frame-px, or read those columns from the frames directory.</p>"
+        f"{'is' if len(dropped) == 1 else 'are'} not shown. A smaller --frame-px "
+        "fits more columns under it; the full ladders are in the frames "
+        "directory beside the mask.</p>"
         if dropped
         else ""
     )
     return (
         '<details class="cols" open><summary>Scan frames '
-        f"({shown} from {len(by_az) - len(dropped)} columns, highest altitude "
+        f"({shown} from {len(strips)} columns, highest altitude "
         "first; the number under each is its measured brightness. A column "
         "measured more than once has every run's ladder here, so a repeated "
         "altitude is a repeated visit, not a duplicate)</summary>"
