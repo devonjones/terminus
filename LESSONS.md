@@ -133,6 +133,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `E-15` Concurrent agents make shared-checkout operations unsafe
 - `E-16` When two instruments write one record, merge field by field
 - `E-17` Validate operator input before the instrument moves, and pin it clock-independently
+- `E-18` Prose asserts causes the data cannot support, and reviewers catch it late
 
 **Decisions**
 
@@ -1675,6 +1676,62 @@ Three rules emerged:
    the scope mock saw no calls (minus the sanctioned `stop_view` cleanup), not merely that the
    error appeared — because the code path that spends the telescope can be conditional on the Sun,
    and then the test's verdict depends on when CI happens to run.
+
+### E-18 — Prose asserts causes the data cannot support, and reviewers catch it late
+
+The code in this project is disciplined about never recording an unevidenced value (M-19, E-06).
+The COMMENTS were not, and the same defect in prose survived three rounds of review before it was
+removed rather than re-fixed.
+
+An incident narrative about a bad run was written into a docstring, the README, a PR description
+and a memory note. Each round of review checked it against the record and found it wrong in a
+different way:
+
+1. First telling: "cloud produced 57 deg edges over a 15 deg treeline, and the collapsing sky
+   reference is the tell." The treeline is 46 deg, and those columns were measured at the two
+   HIGHEST references of the run — the collapse came later, against columns that read normally.
+2. Second telling, corrected: "the bank sat above the treeline so the scan stopped at its lower
+   edge; no statistic caught it." The frames show the recorded edge at the bank's TOP, and a
+   statistic did catch it: the yaw spread was 17.06 deg against a 1 deg rule and the run never
+   settled.
+3. Third telling: cloud dropped as the explanation entirely. A night column two degrees away
+   overshoots by 9.26 deg, between the two daylight columns' 8.51 and 10.56 — and the residual is
+   measured against a photo column selected by an UNSETTLED yaw, so the comparison is not
+   independent of the thing being diagnosed.
+
+What made it durable was that each version was *plausible* and partially true. The mechanism was
+never checked end to end against the frames and the neighbouring columns; only the half that
+supported the story was.
+
+**The rule: a comment asserting WHY something happened is a claim, and carries the same burden as
+a recorded value.** If the evidence supports the observation but not the cause, write the
+observation and stop. "Three columns read 8.5-10.6 deg high and the run did not settle" needed no
+mechanism to justify embedding the frames — the argument was always that the numbers do not
+identify the fault, which is when a person looks at pictures. Reaching for a cause made the case
+weaker, not stronger, because it could be refuted while the real argument could not.
+
+Corollary for reviewers: check an anecdote's mechanism against the raw artifacts, not against its
+own summary. Every refutation here came from opening the frames or joining the checkpoint to the
+photo mask — never from reading the paragraph more carefully.
+
+**The same defect applies to claims about your own diff, and it bit in the same PR.** A test
+hardening was written by a script whose anchor did not match; the script raised, the surrounding
+commands ran on regardless, the test suite went green — because that test had been passing BEFORE
+the edit too — and the change was reported as fixed in a review reply while absent from the tree.
+The mutation harness then printed `SKIP: anchor not found` for that very guard, twice, and it was
+waved through both times as "checked separately".
+
+Three rules fall out. A test that passes after an edit proves nothing unless it FAILED before it:
+the mutation is the evidence, not the green run. A skipped mutation is a failed mutation — the
+anchor not matching means the code is not what you think it is, which is the same alarm as a
+surviving mutant and deserves the same stop.
+
+And **the mutation harness itself has to be checked against the same standard.** A mutant was
+reported killed on a `-k` expression matching no test at all: pytest exits 5 for "no tests
+collected", the harness read any non-zero exit as a kill, and a fix with zero coverage was
+counted as proven. The claim "every fix mutation-checked" was made on that evidence. A harness
+must fail loudly when its selector matches nothing, or it converts absent tests into passing
+ones — the same absent-versus-refuted confusion this project already refuses in its data (E-06).
 
 ---
 

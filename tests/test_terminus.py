@@ -6691,8 +6691,11 @@ def test_a_night_scan_skips_the_pole_band_sample_and_keeps_the_column():
         return az, alt
 
     ptr.point_to = point_to
-    sc.capture_raw16_median = lambda **k: float(
-        levels[min(levels, key=lambda a: abs(a - at["alt"]))]
+    # The night scan keeps the pixels now, so the fake hands back a frame and
+    # lets the real median run over it — mocking the median instead would skip
+    # the code under test.
+    sc.capture_raw16 = lambda **k: np.full(
+        (4, 4), float(levels[min(levels, key=lambda a: abs(a - at["alt"]))])
     )
 
     alt, status, typ, profile = scan_horizon_night(ptr, sc, 0.0, 0, 60, 5.0, 1.5)
@@ -7951,6 +7954,19 @@ def test_orient_keeps_what_it_measured(tmp_path):
     measure = guide.replay(data)
     assert measure(int(next(iter(data)))) is not None
 
+    # THE SOLVE TIME GETS ITS OWN KEY. `measured` is the mask's record of when
+    # its horizon was OBSERVED — the photographs were taken once and the scope
+    # solved them later — and the merge path preserves it deliberately, so
+    # stamping the orient time into it destroys the only record of the former.
+    import yaml
+
+    meta = yaml.safe_load(out.read_text())["meta"]
+    assert meta.get("oriented_at"), "the orient run records when it solved"
+    assert (
+        meta.get("measured") != meta["oriented_at"]
+    ), "the solve time must not overwrite the mask's own observation date"
+    assert meta["lat"] == 39.79, "and the mask's own position is not restamped"
+
 
 def test_a_tube_inside_the_cone_can_still_be_moved_out():
     """Devon asked whether the mount could get trapped inside its own banned wedge.
@@ -8461,3 +8477,726 @@ def test_a_mount_that_never_moves_is_reported_differently():
 
     with pytest.raises(PointingError, match="never moved toward it at all"):
         ptr._goto_wait(8.604, 60.43, 0.1)
+
+
+def _diag_meta(**over):
+    """A solved-mask meta with the fields the diagnostics section reads."""
+    meta = {
+        "yaw": 135.25,
+        "pitch": 2.28,
+        "tilt_mag": 2.25,
+        "tilt_dir": 180.0,
+        "fit_rms": 6.23,
+        "fit_columns": [0, 34, 90],
+        "fit_settled": False,
+        "terminus_version": "9.9.9",
+        "measured": "2026-08-12 21:55 MDT",
+        "lat": 39.7917,
+        "lon": -104.894,
+        "fit_trail": [{"az": 34, "yaw": 135.69, "rms": 1.68, "n": 8, "spread": 12.5}],
+    }
+    meta.update(over)
+    return meta
+
+
+_DIAG_ATTEMPTS = [
+    # IN TIME ORDER, as an append-only checkpoint is: the reference and the Sun
+    # are read off the same rows in sequence, so the order is load-bearing.
+    {"az": 41, "t": "19:52:38", "verdict": "edge", "alt": 57.5, "channel": "scenery",
+     "sun_alt": 0.4, "sky_ref": 254.0, "secs": 263},
+    {"az": 45, "t": "20:04:50", "verdict": "failed", "secs": 12},
+    {"az": 19, "t": "20:48:13", "verdict": "inconclusive", "channel": "scenery",
+     "sun_alt": -8.0, "sky_ref": 63.3, "secs": 173},
+    # A night row carrying a DAY reference: the run state keeps the last day
+    # value across the twilight boundary, and the night channel never writes
+    # one of its own. 7.7 is below every real day reference here, so a leak
+    # moves the stated figures.
+    {"az": 34, "t": "21:21:56", "verdict": "edge", "alt": 46.2, "channel": "star4800",
+     "sun_alt": -14.9, "sky_ref": 7.7, "secs": 485},
+]  # fmt: skip
+
+
+def test_a_run_that_did_not_settle_says_so_on_the_page():
+    """The verdict a reader needs first, and the one the page never carried.
+
+    An unsettled fit rendered EXACTLY like a converged one — same disc, same
+    subtitle, same table — with the difference living in a stderr line nobody
+    keeps and a YAML key nobody opens. The 2026-08-12 night run stopped at
+    spread 3.75 deg against a 1 deg rule and looked fine (terminus-68).
+    """
+    from terminus import polar
+
+    unsettled = polar._banner(_diag_meta())
+    settled = polar._banner(_diag_meta(fit_settled=True))
+    assert "did not settle" in unsettled and "warn" in unsettled
+    assert "did not settle" not in settled and "settled" in settled
+    # A mask from before the flag existed must not be given a verdict either way.
+    assert polar._banner({"yaw": 1.0}) == ""
+
+
+def test_the_report_carries_every_attempt_not_just_the_ones_that_worked():
+    """The fiducial table shows what the FIT used; this shows what the NIGHT did.
+
+    They differ by every failure, and the failures are what say whether the
+    mount, the sky or the detector is at fault: 2026-08-12 gave the fit 12
+    columns out of 39 attempts.
+    """
+    from terminus import polar
+
+    html_out = polar.diagnostics(_diag_meta(), _DIAG_ATTEMPTS)
+    assert "Every attempt (4)" in html_out
+    assert "failed" in html_out and "inconclusive" in html_out
+    assert "4 for 3 used" in html_out, "the page must say attempts, not just fit columns"
+    # The conditions, not just the verdicts.
+    assert "254.0" in html_out and "63.3" in html_out
+    assert "star4800" in html_out and "scenery" in html_out
+
+    # A STALE DAY REFERENCE IS NOT THIS COLUMN'S CONDITIONS. The night channel
+    # has no open-sky reference; the value in a night record crossed the
+    # twilight boundary from the last day column, and printing it as that
+    # column's own reports a measurement nobody made (M-19).
+    assert "7.7" not in html_out, "a night row must not quote a stale day sky reference"
+    # ...and it must not skew the run figures either.
+    assert "254.0 to 63.3 over the day columns" in html_out
+
+    # DIRECTION IS MEASURED, NOT ASSUMED. min-to-max carries none, and sky_ref
+    # is a sawtooth — a brightening run has the same spread as a darkening one.
+    assert "fell while the Sun fell 8.4" in html_out, html_out[html_out.find("sky reference") :][
+        :200
+    ]
+    # And the Sun is read off the SAME day rows: scoring the night row's -14.9
+    # against a day-only reference span would call any mixed session expected.
+    assert "twilight does this" in html_out
+
+    rose = [dict(a, sky_ref=(300.0 if a["az"] == 19 else 60.0)) for a in _DIAG_ATTEMPTS[:3]]
+    assert "60.0 to 300.0" in polar.diagnostics(_diag_meta(), rose)
+    assert "rose without the Sun accounting for it" in polar.diagnostics(_diag_meta(), rose)
+
+
+def test_privacy_redacts_the_site_and_the_clock_but_keeps_the_evidence():
+    """--privacy is for sharing, so it hides identity, not diagnosis.
+
+    Devon: "if someone wants my help, they are probably gonna need to suck it
+    up" — so the default is full disclosure, and even the redacted form keeps
+    every number a diagnosis runs on. A report nobody can debug is not worth
+    writing.
+    """
+    from terminus import polar
+
+    meta, attempts = _diag_meta(), _DIAG_ATTEMPTS
+
+    # THE FINISHED PAGE, not just the section. The coordinates and the date are
+    # rendered by `page`'s footer, which `diagnostics` never touches, so a test
+    # that only exercised the section left the one place lat/lon actually
+    # reaches a shared page covered by nothing.
+    def render(private):
+        return polar.page(
+            [(0.0, 10.0, "tree"), (180.0, 20.0, "structure")],
+            polar.solution_from_meta(meta),
+            meta=meta,
+            attempts=attempts,
+            private=private,
+            size=64,
+            title="terminus horizon" if private else "terminus horizon — devon-backyard.yaml",
+        )
+
+    open_html, shy = render(False), render(True)
+
+    for secret in ("39.7917", "-104.894", "2026-08-12 21:55", "19:52:38"):
+        assert secret in open_html, f"the open report must carry {secret}"
+        assert secret not in shy, f"--privacy must redact {secret}"
+    # The mask filename is identity too, and it reaches <title> and <h1>.
+    assert "devon-backyard" in open_html and "devon-backyard" not in shy
+    # Everything a diagnosis needs survives redaction.
+    for kept in ("57.5", "254.0", "63.3", "failed", "inconclusive", "scenery", "9.9.9"):
+        assert kept in shy, f"--privacy must keep {kept}"
+
+
+def test_the_yaw_trail_is_recorded_so_thrashing_can_be_told_from_converging():
+    """One final yaw cannot distinguish a fit that walked in from one bouncing.
+
+    The stopping rule is defined on this very sequence, so the evidence for its
+    verdict belongs beside the verdict.
+    """
+    from terminus import cli, polar
+
+    class _Step:
+        def __init__(self, az, solution, spread):
+            self.az, self.solution, self.spread = az, solution, spread
+
+    sol = {"yaw": 135.69, "rms": 1.68, "n": 8}
+    trail = cli._fit_trail_record(
+        [
+            _Step(34, sol, 12.5),
+            _Step(90, sol, None),  # spread is absent until enough refits exist
+            _Step(None, None, None),  # the "did not settle" sentinel carries no fit
+        ]
+    )
+    assert len(trail) == 2, "only steps that produced a fit belong in the trail"
+    assert trail[0]["spread"] == 12.5
+    # OMITTED, not None: the meta is serialised via repr, where None round-trips
+    # through YAML as the string 'None'.
+    assert "spread" not in trail[1]
+    assert "Yaw across refits" in polar._trail_table({"fit_trail": trail})
+
+
+def test_the_night_scan_keeps_the_frame_it_measured(tmp_path):
+    """A median cannot say what it was a median of.
+
+    Cloud, canopy and a lit wall all make honest brightness steps; on
+    2026-08-12 a storm bank produced textbook edges at 57 deg over a 15 deg
+    treeline and only the pictures settled it. The night path — where most
+    columns are measured — kept one count per sample and threw the pixels away.
+    """
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from terminus.sweep import scan_horizon_night
+
+    sc, ptr = MagicMock(), MagicMock()
+    ptr.dry = False
+    ptr.point_to.return_value = (0.0, 0.0)
+    at = {"alt": 60.0}
+
+    def point_to(az, alt, **k):
+        at["alt"] = alt
+        return az, alt
+
+    ptr.point_to = point_to
+    # Sky above 30, terrain below: a real step for the detector to find.
+    sc.capture_raw16 = lambda **k: np.full((4, 4), 3000.0 if at["alt"] > 30 else 400.0)
+
+    frames = tmp_path / "scan"
+    scan_horizon_night(ptr, sc, 318.0, 0, 60, 15.0, 5.0, frames_dir=str(frames))
+
+    saved = sorted(p.name for p in frames.glob("az318_alt*.jpg"))
+    assert saved, "the night scan must save the frames it measured"
+    assert (frames / "az318_night.jsonl").exists(), "the numeric ladder stays too"
+
+    from PIL import Image
+
+    def shade(name):
+        return float(np.asarray(Image.open(frames / name)).mean())
+
+    sky = [p for p in saved if float(p.split("_alt")[1][:4]) > 30]
+    ground = [p for p in saved if float(p.split("_alt")[1][:4]) <= 30]
+    assert sky and ground
+    # COMMON SCALE, not a per-frame stretch: dark terrain must stay dark, or
+    # every frame comes back as amplified noise that looks like open sky.
+    assert shade(ground[0]) < 0.5 * shade(
+        sky[0]
+    ), "terrain frames must render darker than sky frames"
+
+
+def test_the_strip_outlines_the_edge_the_checkpoint_last_recorded(tmp_path):
+    """The one visual claim the page makes about the measurement.
+
+    An outline on the wrong frame is worse than none: the reader is asking
+    exactly "is that where the terrain starts", and the checkpoint's rule is
+    that a LATER line supersedes — `--re-measure` exists to force it. Keeping
+    the first attempt would outline the superseded answer on precisely the
+    columns somebody re-measured because they distrusted it.
+    """
+    import re
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import polar
+
+    frames = tmp_path / "scan"
+    frames.mkdir()
+    # A ladder that STRADDLES the edge rather than landing on it. The bisected
+    # crossing never coincides with a sample — the code says so — so a fixture
+    # with a frame at exactly the edge altitude pins only an exact match, and
+    # the ±2.6 bracket can then be widened or narrowed to almost anything
+    # without a test noticing.
+    # The ladder brackets the crossing at 2 deg (28, 32) and misses it at 3 and
+    # 4 (33, 34), so the tolerance is pinned into [2.0, 3.0) from both sides. A
+    # near-miss sample further out only bounds it from above: at 38 every value
+    # in (2.6, 8) survived, at 34 everything in (2.6, 4).
+    for alt in (60.0, 45.0, 34.0, 33.0, 32.0, 28.0, 15.0):
+        shade = 200 if alt > 30 else 20
+        Image.fromarray(np.full((8, 4), shade, np.uint8)).save(
+            frames / f"az177_alt{alt:05.1f}_lum{shade:07.1f}.jpg"
+        )
+
+    superseded = {"az": 177, "verdict": "edge", "alt": 60.0, "channel": "star4800"}
+    fresh = {"az": 177, "verdict": "edge", "alt": 30.0, "channel": "scenery"}
+    out = polar._frame_strips([superseded, fresh], str(frames), px=8)
+
+    assert "az 177" in out and "edge at 30.0" in out, "the strip heads with the LAST edge"
+    assert out.count("<figure") == 7, "every sample in the ladder is shown"
+    # Highest first, so a reader walks down the ladder the way the scan did.
+    order = [float(a) for a in re.findall(r'alt="az 177 alt ([\d.]+)"', out)]
+    assert order == sorted(order, reverse=True), order
+    # The outline brackets the crossing: BOTH samples straddling 30 and nothing
+    # else, which pins the width in both directions.
+    outlined = [
+        float(a) for a in re.findall(r'<figure class="at">.*?alt="az 177 alt ([\d.]+)"', out)
+    ]
+    assert sorted(outlined) == [28.0, 32.0], outlined
+
+
+def test_the_report_reader_and_the_night_writer_agree_on_filenames(tmp_path):
+    """A cross-file contract with nothing coupling its two halves.
+
+    `_save_night_frame` writes the name and `polar.FRAME_RE` parses it, from
+    opposite sides of the codebase. A drift in either renders NO frames and
+    raises nothing — the page simply loses the evidence it exists to carry, and
+    says so nowhere.
+    """
+    import numpy as np
+
+    from terminus.polar import FRAME_RE
+    from terminus.sweep import _save_night_frame, save_scan_frame
+
+    _save_night_frame(str(tmp_path), 318, 45.0, 2608.0, np.full((8, 4), 2600.0), 2600.0)
+    save_scan_frame(np.full((8, 4, 3), 80.0), 41, 7.5, 17.3, str(tmp_path), sky_ref=200.0)
+
+    for f in sorted(p.name for p in tmp_path.iterdir()):
+        m = FRAME_RE.search(f)
+        assert m, f"polar cannot parse {f}"
+        assert int(m.group(1)) in (318, 41)
+        assert float(m.group(2)) in (45.0, 7.5)
+
+
+def test_the_attempt_log_survives_a_file_somebody_edited_by_hand(tmp_path):
+    """The checkpoint is the file most likely to arrive damaged.
+
+    It is append-only, hand-editable, and the thing a person truncates or
+    mangles before mailing it on. Losing a line is survivable; losing the
+    report is not — and a silently shortened log is the failure the settle
+    banner exists to prevent, so the shortfall is stated rather than absorbed.
+    """
+    from terminus import cli
+
+    mask = tmp_path / "solved.yaml"
+    mask.write_text("meta: {}\n")
+
+    # No checkpoint at all: no attempts, and nothing to complain about.
+    assert cli._load_attempts(str(mask)) == ([], [])
+
+    ckpt = tmp_path / "solved_fiducials.jsonl"
+    ckpt.write_bytes(
+        b'{"az": 41, "verdict": "edge", "alt": 57.5, "profile": [[60, 1], [55, 2]]}\n'
+        b"{this is not json}\n"
+        b"\n"  # blank lines are not damage
+        b'{"no_az": true}\n'
+        b'{"az": 99, "verdict": "edge"}\xff\n'  # a mangled byte kills ITS line...
+        b'{"az": 37, "verdict": "edge", "alt": 53.8}\n'  # ...and reading goes on
+    )
+    attempts, notes = cli._load_attempts(str(mask))
+
+    # 37 is the one that matters: decoding strictly would raise from the
+    # iteration itself, outside every guard, and take the whole report down at
+    # the mangled byte — losing this line and every line after it.
+    assert [a["az"] for a in attempts] == [41, 37], "reading must continue past a bad byte"
+    # The brightness ladder is kilobytes per column and already on the page as
+    # frames; carrying it into every report would bloat the thing enormously.
+    assert "profile" not in attempts[0]
+    assert notes and "3 line" in notes[0], f"the shortfall must be stated: {notes}"
+
+
+def test_the_night_median_is_taken_after_the_stream_is_drained():
+    """The split must not lose the drain, which is why the median is right.
+
+    Frames already in flight when the mount arrives were exposed at the PREVIOUS
+    pointing, so a median taken from them labels the old sky with the new
+    azimuth — a fabricated measurement that looks entirely ordinary.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+
+    from terminus.client import Seestar
+
+    sc = Seestar.__new__(Seestar)
+    sc.img = object()  # already open: no connect attempt
+    # Two stale frames from the previous pointing, then the one exposed here.
+    served = [np.full((2, 2), 900.0), np.full((2, 2), 900.0), np.full((2, 2), 42.0)]
+
+    with patch.object(Seestar, "_raw16_frame", side_effect=lambda: served.pop(0)):
+        # deadline = 0.0 + 2.0 + 0.5; the clock then reads 0.0, 1.0 (drain twice)
+        # and 3.0 (past the deadline, stop) before the counted frame is read.
+        with patch("terminus.client.time.time", side_effect=[0.0, 0.0, 1.0, 3.0]):
+            got = sc.capture_raw16_median(exposure_s=2.0)
+
+    assert got == 42.0, "the counted frame is the one read AFTER the drain, not the first"
+    assert served == [], "the drain must consume the stale frames"
+
+
+def test_the_published_example_page_names_no_site_and_no_date():
+    """The one page in this repo that strangers actually load.
+
+    `docs/example-horizon.html` is served from `main` at
+    devonjones.github.io/terminus and linked from the README's first screen. It
+    currently discloses nothing because it PREDATES the diagnostics fields —
+    not because anyone chose that — and `polar` now emits the site to ~11 m,
+    the local date and timezone, per-attempt clock times, and the mask filename
+    in the title. A regeneration without `--privacy` publishes all of it, and
+    nothing else in the repo would notice.
+    """
+    import os
+    import re
+
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs", "example-horizon.html")
+    if not os.path.exists(path):  # the example is optional; the guard is not
+        return
+    page = open(path).read()
+
+    footer = re.search(r"Measured with terminus from (.*?)\. Position-specific", page)
+    assert footer, "the published page must still carry its provenance footer"
+    # BOTH HALVES OF THE FOOTER. Checking only the site let
+    # "from ?,? on 2026-08-12 21:55 MDT" through, and that page is reachable
+    # without anything unusual: `_site_record` writes lat/lon only when
+    # config.toml names a [site], while the date is written every time.
+    assert re.fullmatch(
+        r"Measured with terminus from (\?,\?|an undisclosed site) "
+        r"on (an unrecorded date|an undisclosed date)\. Position-specific",
+        footer.group(0),
+    ), (
+        f"the published example discloses a site or a date: {footer.group(1)!r}. "
+        "Regenerate it with --privacy."
+    )
+    # Attempt rows carry HH:MM:SS; the footer date is HH:MM. Catch either.
+    assert not re.search(
+        r"\b\d{1,2}:\d{2}(:\d{2})?\b", page
+    ), "the published example carries clock times; regenerate with --privacy"
+
+
+def test_the_frame_budget_bounds_the_page_and_names_what_it_dropped(tmp_path):
+    """A cap nobody is told about reads as "this is all there was".
+
+    And the cap has to bound the thing it claims to: the budget is spent in
+    base64, which is 4/3 of the JPEG it encodes, so charging the JPEG's own
+    bytes let a page announcing 6 MB ship 9.8 MB at a large --frame-px — the
+    "page someone tries to mail" the cap exists for.
+    """
+    import re
+
+    import numpy as np
+    from PIL import Image
+
+    from terminus import polar
+
+    frames = tmp_path / "scan"
+    frames.mkdir()
+    rng = np.random.default_rng(3)
+    for az in range(0, 60, 10):
+        for alt in (60.0, 40.0, 20.0):
+            # Noise, so the JPEG cannot compress to nothing and the budget bites.
+            Image.fromarray(rng.integers(0, 255, (60, 40, 3), dtype=np.uint8)).save(
+                frames / f"az{az:03d}_alt{alt:05.1f}_lum{100.0:07.1f}.jpg"
+            )
+
+    # A column whose only frame cannot be decoded, placed EARLY so the budget
+    # reaches it: it must not be counted as a rendered column, which the glob
+    # total would do. (Sorted last it lands in the dropped set instead, and
+    # both counts agree by accident.)
+    (frames / "az005_alt030.0_lum00100.0.jpg").write_bytes(b"not an image")
+
+    out = polar._frame_strips([], str(frames), px=40, budget_kb=6)
+    embedded = sum(len(u) for u in re.findall(r'src="(data:image/jpeg[^"]+)"', out))
+
+    assert embedded <= 6 * 1024 * 1.6, "the budget must bound the bytes that land on the page"
+    # NAMED, not merely mentioned: with the azimuth list deleted the sentence
+    # still reads "az  are not shown" and a substring check still passes.
+    cut = re.search(r"Stopped at the .*?not shown", out)
+    assert cut, "a cap must say it stopped"
+    assert re.search(r"az \d+", cut.group(0)), f"a cap must NAME what it dropped: {cut.group(0)}"
+    # WHOLE COLUMNS ONLY: a half ladder invites exactly the wrong reading,
+    # because the question is where along it the sky stops.
+    for az in range(0, 60, 10):
+        shown = out.count(f'alt="az {az} ')
+        assert shown in (0, 3), f"az {az} rendered {shown} of 3 frames"
+    # THE COUNT IS OF WHAT THE PAGE CARRIES, not of what the glob found. Needs
+    # a budget generous enough to REACH the undecodable column: bitten first,
+    # it lands in the dropped set instead and the two counts agree by accident.
+    whole = polar._frame_strips([], str(frames), px=40, budget_kb=10_000)
+    assert "not shown" not in whole, "this budget must not bite"
+    assert "az 005" not in whole, "an undecodable column renders nothing"
+    # ...and its absence is STATED. Counting only rendered frames stopped the
+    # summary overclaiming; saying nothing at all would make a corrupt column
+    # look like one the run never visited.
+    assert "could not be decoded" in whole and "az 5" in whole, whole[:400]
+    figures, columns = whole.count("<figure"), whole.count('<div class="strip">')
+    assert columns == 6, f"6 decodable columns, got {columns}"
+    assert f"({figures} from {columns} columns" in whole
+
+
+def test_a_damaged_channel_field_is_rejected_rather_than_read_as_daylight(tmp_path):
+    """Lenient decoding must not turn damage into a measurement.
+
+    Reading with errors="replace" stops a stray byte killing the whole report,
+    but inside a STRING value the replacement character parses cleanly — and
+    the string that matters is `channel`. One bad byte in "star4800" makes a
+    night row read as a day row, and the stale daylight sky reference it
+    carries flows straight back into the table and the run figures: exactly the
+    leak `_is_night` exists to stop, reintroduced by a single byte, with
+    nothing on the page saying a byte was replaced.
+    """
+    from terminus import cli
+
+    mask = tmp_path / "solved.yaml"
+    mask.write_text("meta: {}\n")
+    (tmp_path / "solved_fiducials.jsonl").write_bytes(
+        b'{"az": 34, "verdict": "edge", "alt": 46.2, "channel": "st\xffr4800", "sky_ref": 7.7}\n'
+        b'{"az": 41, "verdict": "edge", "alt": 57.5, "channel": "scenery", "sky_ref": 254.0}\n'
+    )
+    attempts, notes = cli._load_attempts(str(mask))
+
+    assert [a["az"] for a in attempts] == [41], "a damaged channel must not be served as a day row"
+    assert notes and "1 line" in notes[0], "and the loss must be stated, not absorbed"
+
+
+def test_the_rendered_notes_carry_no_filename_and_no_path(tmp_path):
+    """`--privacy` strips the mask name from the title; the notes handed it back.
+
+    These render on the page, and the page is what gets mailed to a stranger. A
+    mask name carries identity ("ron-backyard"), and an OSError stringifies
+    with the absolute path `open` was given — username and directory layout
+    included. Both notes fire on exactly the mailed-in-report path.
+    """
+    from terminus import cli
+
+    mask = tmp_path / "ron-backyard-2026-08-12.yaml"
+    mask.write_text("meta: {}\n")
+    # A directory where the checkpoint should be: open() raises IsADirectoryError.
+    (tmp_path / "ron-backyard-2026-08-12_fiducials.jsonl").mkdir()
+
+    attempts, notes = cli._load_attempts(str(mask))
+    assert attempts == [] and notes, "an unreadable log must still be reported"
+
+    blob = " ".join(notes)
+    assert "ron-backyard" not in blob, f"the note names the mask: {blob!r}"
+    assert str(tmp_path) not in blob, f"the note carries an absolute path: {blob!r}"
+    assert "directory" in blob.lower(), "and it must still say what went wrong"
+
+
+def test_a_hand_edited_field_cannot_take_the_whole_report_down():
+    """`_load_attempts` survives a damaged checkpoint; the page must too.
+
+    That leniency is pointless if the statistics then reach for `float()` and
+    raise on the way past. `_fmt` treats an unparseable field as absent and
+    renders it as a dash — but the facts grid, the table's sort key and the
+    edge lookup all coerce first, so a hand-typed `sky_ref: ""` killed a report
+    whose own table would have shown that row fine.
+    """
+    from terminus import polar
+
+    junk = [
+        {"az": 41, "verdict": "edge", "alt": 57.5, "channel": "scenery",
+         "sun_alt": 0.4, "sky_ref": 254.0, "t": "19:52:38"},
+        {"az": "north-ish", "verdict": "edge", "alt": "", "channel": "scenery",
+         "sun_alt": "n/a", "sky_ref": "", "t": "20:00:00"},
+    ]  # fmt: skip
+
+    out = polar.diagnostics(_diag_meta(), junk)
+    assert "Every attempt (2)" in out, "both rows are still listed"
+    assert "north-ish" in out, "and the damaged value is shown as it was written"
+    assert "254.0" in out, "the good row's conditions still render"
+
+
+def test_a_hand_edited_azimuth_cannot_take_the_frame_strips_down(tmp_path):
+    """The third coercion site, which the facts grid and the sort key do not reach.
+
+    `_frame_strips` builds its edge lookup from the same hand-editable records,
+    and a damaged `az` there raised out of the strips rather than the grid — a
+    separate path to the same crash, and one the other tests leave untouched.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus import polar
+
+    frames = tmp_path / "scan"
+    frames.mkdir()
+    Image.fromarray(np.full((8, 4), 120, np.uint8)).save(frames / "az041_alt050.0_lum00100.0.jpg")
+
+    out = polar._frame_strips(
+        [{"az": "north-ish", "alt": 50.0}, {"az": 41, "alt": 50.0}], str(frames), px=8
+    )
+    assert "az 041" in out and "edge at 50.0" in out
+
+
+def _oriented_mask(path, **meta_over):
+    """A minimal solved mask on disk, for the CLI-level polar tests."""
+    import yaml
+
+    meta = {
+        "yaw": 135.25, "pitch": 2.28, "tilt_mag": 2.25, "tilt_dir": 180.0,
+        "fit_rms": 6.23, "fit_settled": False, "fit_columns": [0, 180],
+        "oriented": True, "lat": 39.7917, "lon": -104.894,
+        "measured": "2026-08-12 21:55 MDT", "az_step": 180.0,
+    }  # fmt: skip
+    meta.update(meta_over)
+    path.write_text(
+        yaml.safe_dump({"meta": meta, "horizon": {0: {"alt": 10.0, "type": "tree"},
+                                                  180: {"alt": 20.0, "type": "structure"}}})
+    )  # fmt: skip
+    return path
+
+
+def test_polar_privacy_redacts_the_title_through_the_command(tmp_path):
+    """The redaction lives in `cmd_polar`, and nothing exercised `cmd_polar`.
+
+    `polar.page` never redacts a title — it renders what it is handed — so a
+    test that passes its own `title=` and then asserts on it is checking its
+    own argument. The auto-title is built from the mask FILENAME, filenames
+    carry identity, and the whole command had no test at all: reverting the
+    redaction left the suite green while `--privacy` published
+    "terminus horizon — ron-backyard.yaml" in the page's own <title>.
+    """
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "ron-backyard.yaml")
+
+    main(["polar", str(mask), "--no-frames", "--out", str(tmp_path / "open.html")])
+    assert "ron-backyard" in (tmp_path / "open.html").read_text()
+
+    main(["polar", str(mask), "--no-frames", "--privacy", "--out", str(tmp_path / "shy.html")])
+    shy = (tmp_path / "shy.html").read_text()
+    assert "ron-backyard" not in shy, "--privacy must not publish the mask filename"
+    assert "39.7917" not in shy and "2026-08-12" not in shy
+
+    # An explicit --title is the operator's own words and is left alone.
+    main(["polar", str(mask), "--no-frames", "--privacy", "--title", "Site B",
+          "--out", str(tmp_path / "named.html")])  # fmt: skip
+    assert "Site B" in (tmp_path / "named.html").read_text()
+
+
+def test_orient_does_not_restamp_a_site_or_a_date_the_mask_already_carries(tmp_path):
+    """`_check_mergeable` compares exactly these keys to refuse a tripod move.
+
+    Restamping them from today's config would retune that guard to agree with
+    wherever the scope is now, turning a refusal to mix two sites into a silent
+    merge — and `measured` is the mask's own record of when its horizon was
+    observed, which is not when the scope solved it.
+    """
+    from terminus import cli
+
+    prior = {"lat": 10.0, "lon": 20.0, "measured": "2026-01-01 00:00 UTC"}
+    cfg = {"site": {"lat": 39.7917, "lon": -104.894}}
+
+    assert cli._site_record(cfg, prior) == {}, "a position in the mask wins"
+    assert cli._site_record(cfg, {}) == {"lat": 39.7917, "lon": -104.894}
+    assert cli._site_record({}, {}) == {}, "no site anywhere is not an error"
+    # The orient time has its own key, so `measured` survives untouched.
+    assert "measured" not in cli._site_record(cfg, prior)
+
+
+def test_the_diagnostics_note_describes_the_page_in_hand():
+    """ "Includes the site, the clock and the frames" on a page carrying none.
+
+    The same class of lie the settle banner exists to stop: a claim about the
+    artifact that the artifact does not support. Rendered `--no-frames` from a
+    mask with no site, the promise was made anyway.
+    """
+    from terminus import polar
+
+    full = polar.diagnostics(_diag_meta(), _DIAG_ATTEMPTS)
+    assert "the site" in full and "the clock" in full
+
+    bare = polar.diagnostics(
+        _diag_meta(lat=None, lon=None), [{"az": 41, "verdict": "edge", "alt": 57.5}]
+    )
+    assert "the site" not in bare, "a siteless mask must not be said to include a site"
+    assert "the clock" not in bare, "attempts with no timestamps carry no clock"
+    assert "the frames" not in bare, "no frames were embedded"
+    assert "Everything this run recorded" in bare
+
+
+def test_an_oriented_mask_draws_its_own_columns_without_a_second_file(tmp_path):
+    """The disc is where a wrong yaw stops being a number, so it needs the dots.
+
+    Drawing the telescope's columns required `--fiducials` pointing at a
+    SEPARATE sweep mask, so an oriented mask rendering its own solution came
+    out with an empty marker layer — a "Telescope columns" toggle that did
+    nothing, above a table announcing twelve of them. The record has been in
+    the meta since terminus-53.
+    """
+    from terminus.cli import main
+
+    mask = _oriented_mask(
+        tmp_path / "solved.yaml",
+        fit_fiducials=[
+            {"az": 90.0, "alt": 6.2, "bound": False, "used": True, "residual": 0.1},
+            {"az": 0.0, "alt": 60.0, "bound": True, "used": True, "residual": 0.0},
+            # Measured, offered, and NOT used: it belongs in the table with its
+            # reason, not on the disc in the vocabulary of a solved column.
+            {"az": 45.0, "alt": 30.0, "bound": False, "used": False,
+             "reason": "excluded: dawn-contaminated"},
+        ],  # fmt: skip
+    )
+    out = tmp_path / "p.html"
+    main(["polar", str(mask), "--no-frames", "--out", str(out)])
+    page = out.read_text()
+
+    assert page.count('class="edg"') == 1, "the measured edge is drawn as a dot"
+    assert page.count('class="bnd"') == 1, "the ceiling column is drawn as a chevron"
+    assert 'data-t="pts" aria-pressed="true"' in page, "and the layer starts visible"
+    # The unused column is on the page, but in the table with its reason.
+    assert "dawn-contaminated" in page
+    assert page.count('class="edg"') + page.count('class="bnd"') == 2, "not the unused one"
+
+
+def test_polar_finds_the_frames_directory_beside_the_mask(tmp_path):
+    """The discovery step nothing exercised, one level above the name contract.
+
+    Every other polar test passes `--no-frames`, so the code that FINDS the
+    frames had no coverage at all: renaming the suffix or dropping the `scan/`
+    preference embedded nothing and raised nothing. That is silent evidence
+    loss — the page simply arrives without the pictures it exists to carry, and
+    says so nowhere.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "solved.yaml")
+    scan = tmp_path / "solved_frames" / "scan"
+    scan.mkdir(parents=True)
+    # A decoy one level up: `scan/` is preferred, and taking the parent instead
+    # would embed the wrong pictures rather than none.
+    Image.fromarray(np.full((8, 4), 90, np.uint8)).save(
+        tmp_path / "solved_frames" / "az000_alt010.0_lum00090.0.jpg"
+    )
+    Image.fromarray(np.full((8, 4), 200, np.uint8)).save(scan / "az180_alt020.0_lum00200.0.jpg")
+
+    out = tmp_path / "p.html"
+    main(["polar", str(mask), "--out", str(out)])
+    page = out.read_text()
+
+    assert "Scan frames" in page, "the frames beside the mask must be found"
+    assert 'alt="az 180 alt 20.0"' in page, "and it must prefer the scan/ subdirectory"
+    assert 'alt="az 0 alt 10.0"' not in page
+
+
+def test_a_blank_reading_is_absent_not_zero():
+    """M-19 in the report layer: absent and zero are different claims.
+
+    Both `_fmt` and `_num` cite it, and neither was tested. Coercing a blank
+    `sky_ref` to 0.0 does not merely mislabel a cell — it manufactures a
+    narrative, turning a run with one unrecorded reference into
+    "254.0 to 0.0 ... fell without the Sun accounting for it".
+    """
+    from terminus import polar
+
+    assert polar._num("") is None and polar._num(None) is None
+    assert polar._num("n/a") is None
+    assert polar._num(0) == 0.0, "a real zero is a real measurement"
+    assert polar._fmt(None, ".1f") == "&#8212;"
+    assert polar._fmt(0.0, ".1f") == "0.0", "and must not be dashed away"
+
+    blank = [
+        {"az": 41, "verdict": "edge", "alt": 57.5, "channel": "scenery",
+         "sun_alt": 0.4, "sky_ref": 254.0},
+        {"az": 37, "verdict": "edge", "alt": 53.8, "channel": "scenery",
+         "sun_alt": -0.5, "sky_ref": ""},
+    ]  # fmt: skip
+    out = polar.diagnostics(_diag_meta(), blank)
+    assert "254.0 to 254.0" in out, "the one real reading stands alone"
+    assert "fell" not in out and "rose" not in out, "a blank must not invent a collapse"

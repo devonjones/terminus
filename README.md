@@ -251,6 +251,37 @@ rather than dots, because the scope stopped at its tilt limit: the horizon there
 is *at least* that high, not exactly that high. Without a panorama the command
 still works and draws the measured horizon on a plain disc.
 
+**The page is also the bug report.** If the run went wrong, `polar` picks up the
+checkpoint and the scan frames lying beside the mask and puts the whole run on
+the page: whether the yaw actually settled, every attempt including the ones
+that produced nothing, the conditions each was measured under (channel, Sun
+altitude, sky reference, clock, duration), the yaw across refits, and the scan
+frames themselves with the chosen edge outlined.
+
+That last part is the one that matters most, and a real run is why. Three
+neighbouring columns here came back 8.5–10.6° above what the photograph puts
+there while a fourth beside them landed within 0.02°, and the run never
+settled. From the numbers alone at least three stories fit — cloud at sunset, a
+detector fault, or a yaw error changing which photo column the residual is
+measured against — and the record separates none of them. Two of those columns
+were measured in daylight with cloud visible in their frames, at 8.51° and
+10.56°; the third was measured at night and sits between them at 9.26°.
+
+That is precisely when a person wants to look at the pictures, and the pictures
+are the one thing a stranger cannot mail you a few at a time.
+
+```bash
+terminus polar oriented.yaml                 # everything: site, clock, frames
+terminus polar oriented.yaml --privacy       # no site, no dates, no clock times
+terminus polar oriented.yaml --no-frames     # smaller page, no visual evidence
+```
+
+`--privacy` redacts *who and where*, never *what happened*: altitudes, verdicts,
+sky references, Sun altitudes and the frames all still ride along, because a
+report nobody can debug is not worth sending. It does not anonymise the
+photographs — the panorama is a picture of your horizon and that is the point of
+the page.
+
 What each step reported on that run:
 
 | Step | Expect |
@@ -259,7 +290,7 @@ What each step reported on that run:
 | `mosaic --segment` | `55% of pixels labelled` (the rest is sky nobody photographed) |
 | `skymask` | `360 columns, 0 clipped`, and a refusal to export: the mask is **unoriented** |
 | `orient` | `yaw settled within 1 deg over 3 refits`, seven columns |
-| `polar` | one self-contained HTML file, ~460 KB |
+| `polar` | one self-contained HTML file: ~460 KB with `--no-frames`, roughly double once the scan frames ride along |
 
 ### Without a telescope tonight
 

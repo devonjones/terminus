@@ -1,3 +1,18 @@
+<!--
+  PUBLISHED PAGE - served at devonjones.github.io/terminus/example-horizon.html
+  and linked from the README.
+
+  REGENERATE WITH --privacy, ALWAYS:
+
+      terminus polar <mask> --privacy --out docs/example-horizon.html
+
+  Without the flag `polar` now embeds the observing site to 4 decimal places
+  (~11 m), the local date and timezone, per-attempt clock times, and the mask
+  filename in the title. This file predates those fields, so it reads
+  "from ?,? on an unrecorded date" by accident rather than by intent - and a
+  plain regeneration would publish the lot. tests/test_terminus.py has a guard
+  that fails if that ever lands.
+-->
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

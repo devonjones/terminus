@@ -19,6 +19,7 @@ import sys
 import time
 
 from . import polar
+from .__init__ import __version__
 from .client import Seestar, SeestarError
 from .config import ConfigError, load_config
 from .export import (
@@ -587,6 +588,44 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             raise MaskError(f"{args.fiducials}: {e}") from e
         n_bound = sum(1 for f in fiducials if f.bound)
         print(f"{len(fiducials)} fiducials from {args.fiducials} ({n_bound} at the ceiling)")
+    elif meta.get("fit_fiducials"):
+        # THE FIT'S OWN COLUMNS, from the mask it solved. Drawing them needed
+        # `--fiducials` pointing at a SEPARATE sweep mask, so an oriented mask
+        # rendered its own solution with an empty marker layer: a "Telescope
+        # columns" button that toggled nothing, over a table announcing twelve
+        # of them. The record has been in the meta since terminus-53 and the
+        # disc is where a wrong yaw stops being a number.
+        #
+        # ONLY THE COLUMNS THE FIT USED. An excluded or unused column drawn in
+        # the same vocabulary reads as part of the solution, which is the
+        # collapse this project refuses everywhere else; the table carries
+        # those with their reasons.
+        fiducials = [
+            orient_mod.Fiducial(az=f["az"], alt=f["alt"], bound=f.get("bound", False))
+            for f in meta["fit_fiducials"]
+            if f.get("used") and f.get("alt") is not None
+        ]
+        offered = len(meta["fit_fiducials"])
+        extra = f", {offered - len(fiducials)} offered but not used" if offered > len(fiducials) else ""  # fmt: skip
+        print(f"{len(fiducials)} columns from the fit's own record{extra}")
+
+    # THE RUN'S OWN RECORD, if it is lying beside the mask. The page used to
+    # show what the fit concluded and nothing about the conditions it concluded
+    # under, which is enough to admire a good run and useless for triaging
+    # someone else's bad one. Both files are written by `orient` next to --out,
+    # so finding them needs no new flag and their absence costs only detail.
+    attempts, notes = _load_attempts(args.mask)
+    frames_dir = None
+    if not getattr(args, "no_frames", False):
+        guess = os.path.splitext(args.mask)[0] + "_frames"
+        for cand in (os.path.join(guess, "scan"), guess):
+            if os.path.isdir(cand):
+                frames_dir = cand
+                break
+    if attempts:
+        print(f"{len(attempts)} attempts from the checkpoint will ride along")
+    if frames_dir:
+        print(f"embedding scan frames from {frames_dir}")
 
     out = args.out or os.path.splitext(args.mask)[0] + "_polar.html"
     _write_or_explain(
@@ -601,10 +640,85 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             meta=meta,
             size=args.size,
             floor=args.floor,
-            title=args.title or f"terminus horizon — {os.path.basename(args.mask)}",
+            # The auto-title is the MASK FILENAME, and filenames carry identity
+            # in practice — "ron-backyard", "live-2026-08-12-night". It reached
+            # <title> and <h1> ten lines above the page's own "no coordinates,
+            # dates or clock times" note. An explicit --title is the operator's
+            # own words and is left alone.
+            title=args.title
+            or ("terminus horizon" if args.privacy else f"terminus horizon — {os.path.basename(args.mask)}"),  # fmt: skip
+            attempts=attempts,
+            frames_dir=frames_dir,
+            frame_px=args.frame_px,
+            private=args.privacy,
+            notes=notes,
         ),  # fmt: skip
     )
     print(f"wrote {out} ({os.path.getsize(out) // 1024} KB, self-contained)")
+
+
+def _load_attempts(mask_path):
+    """The append-only attempt log `orient` wrote beside this mask, if any.
+
+    Read leniently and never fatally: a report that refuses to render because
+    one checkpoint line is malformed is worse than one that renders without it,
+    and this file is the thing a person is most likely to have hand-edited or
+    truncated before sending it on.
+    """
+    ckpt = os.path.splitext(mask_path)[0] + "_fiducials.jsonl"
+    if not os.path.exists(ckpt):
+        return [], []
+    attempts, bad = [], 0
+    notes = []
+    try:
+        # errors="replace": a mangled byte in a hand-edited checkpoint would
+        # otherwise raise UnicodeDecodeError from the iteration itself, outside
+        # the per-line guard and outside OSError, and take the whole report
+        # down — the exact file this is most lenient about.
+        with open(ckpt, errors="replace") as fh:
+            for line in fh:
+                # A REPLACED BYTE MUST NOT BECOME A MEASUREMENT. Inside a
+                # number the damage yields invalid JSON and is rejected below,
+                # but inside a string value U+FFFD parses cleanly — and the
+                # string that matters is `channel`: one bad byte in "star4800"
+                # makes a night row read as a day row, and its stale daylight
+                # sky reference flows back into the table and the run range,
+                # reintroducing exactly the leak `_is_night` exists to stop.
+                if "�" in line:
+                    bad += 1
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    bad += line.strip() != ""
+                    continue
+                if isinstance(d, dict) and "az" in d:
+                    # The profile is the raw brightness ladder — kilobytes per
+                    # column, already summarised by the frames and the verdict.
+                    attempts.append({k: v for k, v in d.items() if k != "profile"})
+                else:
+                    bad += 1
+    except OSError as e:
+        # ON THE PAGE, not only on the terminal. A report with no attempt log
+        # is indistinguishable from a run that never checkpointed, and the
+        # reader of a mailed-in page never saw this stderr line.
+        # NO FILENAME, AND NO str(e), IN A NOTE THAT RENDERS. The page is the
+        # thing that gets mailed to a stranger: a mask name carries identity
+        # ("ron-backyard"), and an OSError stringifies with the absolute path
+        # `open` was handed — username and directory layout included.
+        # `--privacy` had just stripped that same filename out of the title,
+        # and this path handed it straight back. The terminal line below keeps
+        # the full detail, where only the operator sees it.
+        notes.append(
+            f"The attempt log beside this mask could not be read ({e.strerror}), "
+            "so this page shows none of it."
+        )
+        print(f"could not read {ckpt} ({e}); the report will have no attempt log", file=sys.stderr)
+    if bad:
+        notes.append(
+            f"{bad} line(s) of the attempt log were unreadable and are missing from it below."
+        )
+    return attempts, notes
 
 
 def _mask_entries(path):
@@ -873,6 +987,23 @@ def _orient(sc, cfg, args):
             # published run used 16 of 30 and nothing on disk says which, so its
             # 0.69 deg is unreachable and incomparable (terminus-53, F-25).
             fit_fiducials=_fit_fiducials_record(solution, excluded_by_mask),
+            # THE EVIDENCE FOR THE STOPPING RULE'S VERDICT, beside the verdict.
+            # `fit_settled` is one bit; the sequence it was computed from is
+            # what distinguishes a fit that walked steadily in from one still
+            # bouncing between two answers, and only the sequence can say which
+            # column knocked it off.
+            fit_trail=_fit_trail_record(steps),
+            # A calibration is only valid for the detector version that made it
+            # (F-13), and a run someone mails in is unreadable without knowing
+            # which code measured it.
+            terminus_version=__version__,
+            # `oriented_at`, NOT `measured`. They are different events — the
+            # photographs were taken once and the scope solved them later — and
+            # `measured` is a key the merge path deliberately preserves, so
+            # writing the orient time into it destroys the mask's own record of
+            # when its horizon was observed.
+            oriented_at=time.strftime("%Y-%m-%d %H:%M %Z"),
+            **_site_record(cfg, meta),
             source_mask=os.path.abspath(args.mask),
         ),
     )
@@ -884,6 +1015,59 @@ def _orient(sc, cfg, args):
             else "(marked UNORIENTED: the yaw was still moving when the run stopped)"
         )
     )
+
+
+def _fit_trail_record(steps):
+    """The refit sequence, one row per fit, rounded for a person to read.
+
+    Steps with no solution are left out: the sentinel the loop appends when it
+    gives up, and the opening columns measured BEFORE four of them made a fit
+    possible at all. The latter did not fail — they are in the attempt log with
+    their values — they simply predate the first fit, and this is a trail of
+    fits.
+    """
+    trail = []
+    for s in steps:
+        sol = getattr(s, "solution", None)
+        if not sol:
+            continue
+        row = {
+            "az": s.az,
+            "yaw": round(sol["yaw"], 2),
+            "rms": round(sol["rms"], 2),
+            "n": sol["n"],
+        }
+        # Omitted rather than None: repr-YAML turns None into the string
+        # 'None', and spread is legitimately absent until there have been
+        # enough refits to judge stability over.
+        if getattr(s, "spread", None) is not None:
+            row["spread"] = round(s.spread, 2)
+        trail.append(row)
+    return trail
+
+
+def _site_record(cfg, prior=None):
+    """The observing site, when the config names one and the mask does not.
+
+    Recorded because sun altitude and twilight cannot be checked against a run
+    without it, and a horizon is meaningless away from the spot it was measured
+    from. `polar --privacy` is what keeps it off a page meant for strangers;
+    withholding it from the FILE would only mean nobody could debug the run at
+    all.
+
+    A POSITION ALREADY IN THE MASK WINS. `_check_mergeable` refuses to merge
+    runs from different positions by comparing exactly these keys, so
+    restamping them from whatever `config.toml` says today would quietly retune
+    that guard to agree with wherever the tripod is now — turning a refusal to
+    mix two sites into a silent merge.
+    """
+    prior = prior or {}
+    site = (cfg or {}).get("site") or {}
+    out = {}
+    for key in ("lat", "lon"):
+        if prior.get(key) is None and site.get(key) is not None:
+            out[key] = round(float(site[key]), 4)
+    return out
 
 
 def _fit_fiducials_record(solution, excluded_by_mask):
@@ -2037,6 +2221,27 @@ def main(argv=None):
     )
     po.add_argument("--size", type=int, default=polar.SIZE, help="pixels across the disc")
     po.add_argument("--title", default=None)
+    po.add_argument(
+        "--privacy",
+        action="store_true",
+        help="redact the site, the date and clock times from the page. Everything a "
+        "diagnosis needs (altitudes, verdicts, sky references, sun altitudes, the "
+        "frames) still rides along, because a redacted report nobody can debug is "
+        "not worth writing",
+    )
+    po.add_argument(
+        "--no-frames",
+        action="store_true",
+        help="leave the scan frames out. They are the only evidence of WHAT the "
+        "brightness step actually was — cloud, canopy or roofline — so drop them "
+        "only for size",
+    )
+    po.add_argument(
+        "--frame-px",
+        type=int,
+        default=110,
+        help="width of each embedded scan frame (default %(default)s)",
+    )
     po.add_argument(
         "--allow-unoriented",
         action="store_true",
