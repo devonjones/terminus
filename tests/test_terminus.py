@@ -7954,6 +7954,19 @@ def test_orient_keeps_what_it_measured(tmp_path):
     measure = guide.replay(data)
     assert measure(int(next(iter(data)))) is not None
 
+    # THE SOLVE TIME GETS ITS OWN KEY. `measured` is the mask's record of when
+    # its horizon was OBSERVED — the photographs were taken once and the scope
+    # solved them later — and the merge path preserves it deliberately, so
+    # stamping the orient time into it destroys the only record of the former.
+    import yaml
+
+    meta = yaml.safe_load(out.read_text())["meta"]
+    assert meta.get("oriented_at"), "the orient run records when it solved"
+    assert (
+        meta.get("measured") != meta["oriented_at"]
+    ), "the solve time must not overwrite the mask's own observation date"
+    assert meta["lat"] == 39.79, "and the mask's own position is not restamped"
+
 
 def test_a_tube_inside_the_cone_can_still_be_moved_out():
     """Devon asked whether the mount could get trapped inside its own banned wedge.
@@ -8699,10 +8712,11 @@ def test_the_strip_outlines_the_edge_the_checkpoint_last_recorded(tmp_path):
     # with a frame at exactly the edge altitude pins only an exact match, and
     # the ±2.6 bracket can then be widened or narrowed to almost anything
     # without a test noticing.
-    # 38.0 sits in the band between the bracket (2.6) and the next sample up
-    # (15 away), so widening the bracket has something to wrongly catch. Without
-    # a sample there, 2.6 and 14.0 outline exactly the same two frames.
-    for alt in (60.0, 45.0, 38.0, 32.0, 28.0, 15.0):
+    # The ladder brackets the crossing at 2 deg (28, 32) and misses it at 3 and
+    # 4 (33, 34), so the tolerance is pinned into [2.0, 3.0) from both sides. A
+    # near-miss sample further out only bounds it from above: at 38 every value
+    # in (2.6, 8) survived, at 34 everything in (2.6, 4).
+    for alt in (60.0, 45.0, 34.0, 33.0, 32.0, 28.0, 15.0):
         shade = 200 if alt > 30 else 20
         Image.fromarray(np.full((8, 4), shade, np.uint8)).save(
             frames / f"az177_alt{alt:05.1f}_lum{shade:07.1f}.jpg"
@@ -8713,7 +8727,7 @@ def test_the_strip_outlines_the_edge_the_checkpoint_last_recorded(tmp_path):
     out = polar._frame_strips([superseded, fresh], str(frames), px=8)
 
     assert "az 177" in out and "edge at 30.0" in out, "the strip heads with the LAST edge"
-    assert out.count("<figure") == 6, "every sample in the ladder is shown"
+    assert out.count("<figure") == 7, "every sample in the ladder is shown"
     # Highest first, so a reader walks down the ladder the way the scan did.
     order = [float(a) for a in re.findall(r'alt="az 177 alt ([\d.]+)"', out)]
     assert order == sorted(order, reverse=True), order
@@ -9126,3 +9140,63 @@ def test_an_oriented_mask_draws_its_own_columns_without_a_second_file(tmp_path):
     # The unused column is on the page, but in the table with its reason.
     assert "dawn-contaminated" in page
     assert page.count('class="edg"') + page.count('class="bnd"') == 2, "not the unused one"
+
+
+def test_polar_finds_the_frames_directory_beside_the_mask(tmp_path):
+    """The discovery step nothing exercised, one level above the name contract.
+
+    Every other polar test passes `--no-frames`, so the code that FINDS the
+    frames had no coverage at all: renaming the suffix or dropping the `scan/`
+    preference embedded nothing and raised nothing. That is silent evidence
+    loss — the page simply arrives without the pictures it exists to carry, and
+    says so nowhere.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "solved.yaml")
+    scan = tmp_path / "solved_frames" / "scan"
+    scan.mkdir(parents=True)
+    # A decoy one level up: `scan/` is preferred, and taking the parent instead
+    # would embed the wrong pictures rather than none.
+    Image.fromarray(np.full((8, 4), 90, np.uint8)).save(
+        tmp_path / "solved_frames" / "az000_alt010.0_lum00090.0.jpg"
+    )
+    Image.fromarray(np.full((8, 4), 200, np.uint8)).save(scan / "az180_alt020.0_lum00200.0.jpg")
+
+    out = tmp_path / "p.html"
+    main(["polar", str(mask), "--out", str(out)])
+    page = out.read_text()
+
+    assert "Scan frames" in page, "the frames beside the mask must be found"
+    assert 'alt="az 180 alt 20.0"' in page, "and it must prefer the scan/ subdirectory"
+    assert 'alt="az 0 alt 10.0"' not in page
+
+
+def test_a_blank_reading_is_absent_not_zero():
+    """M-19 in the report layer: absent and zero are different claims.
+
+    Both `_fmt` and `_num` cite it, and neither was tested. Coercing a blank
+    `sky_ref` to 0.0 does not merely mislabel a cell — it manufactures a
+    narrative, turning a run with one unrecorded reference into
+    "254.0 to 0.0 ... fell without the Sun accounting for it".
+    """
+    from terminus import polar
+
+    assert polar._num("") is None and polar._num(None) is None
+    assert polar._num("n/a") is None
+    assert polar._num(0) == 0.0, "a real zero is a real measurement"
+    assert polar._fmt(None, ".1f") == "&#8212;"
+    assert polar._fmt(0.0, ".1f") == "0.0", "and must not be dashed away"
+
+    blank = [
+        {"az": 41, "verdict": "edge", "alt": 57.5, "channel": "scenery",
+         "sun_alt": 0.4, "sky_ref": 254.0},
+        {"az": 37, "verdict": "edge", "alt": 53.8, "channel": "scenery",
+         "sun_alt": -0.5, "sky_ref": ""},
+    ]  # fmt: skip
+    out = polar.diagnostics(_diag_meta(), blank)
+    assert "254.0 to 254.0" in out, "the one real reading stands alone"
+    assert "fell" not in out and "rose" not in out, "a blank must not invent a collapse"
