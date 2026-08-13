@@ -9092,3 +9092,37 @@ def test_the_diagnostics_note_describes_the_page_in_hand():
     assert "the clock" not in bare, "attempts with no timestamps carry no clock"
     assert "the frames" not in bare, "no frames were embedded"
     assert "Everything this run recorded" in bare
+
+
+def test_an_oriented_mask_draws_its_own_columns_without_a_second_file(tmp_path):
+    """The disc is where a wrong yaw stops being a number, so it needs the dots.
+
+    Drawing the telescope's columns required `--fiducials` pointing at a
+    SEPARATE sweep mask, so an oriented mask rendering its own solution came
+    out with an empty marker layer — a "Telescope columns" toggle that did
+    nothing, above a table announcing twelve of them. The record has been in
+    the meta since terminus-53.
+    """
+    from terminus.cli import main
+
+    mask = _oriented_mask(
+        tmp_path / "solved.yaml",
+        fit_fiducials=[
+            {"az": 90.0, "alt": 6.2, "bound": False, "used": True, "residual": 0.1},
+            {"az": 0.0, "alt": 60.0, "bound": True, "used": True, "residual": 0.0},
+            # Measured, offered, and NOT used: it belongs in the table with its
+            # reason, not on the disc in the vocabulary of a solved column.
+            {"az": 45.0, "alt": 30.0, "bound": False, "used": False,
+             "reason": "excluded: dawn-contaminated"},
+        ],  # fmt: skip
+    )
+    out = tmp_path / "p.html"
+    main(["polar", str(mask), "--no-frames", "--out", str(out)])
+    page = out.read_text()
+
+    assert page.count('class="edg"') == 1, "the measured edge is drawn as a dot"
+    assert page.count('class="bnd"') == 1, "the ceiling column is drawn as a chevron"
+    assert 'data-t="pts" aria-pressed="true"' in page, "and the layer starts visible"
+    # The unused column is on the page, but in the table with its reason.
+    assert "dawn-contaminated" in page
+    assert page.count('class="edg"') + page.count('class="bnd"') == 2, "not the unused one"

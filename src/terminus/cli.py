@@ -588,6 +588,26 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             raise MaskError(f"{args.fiducials}: {e}") from e
         n_bound = sum(1 for f in fiducials if f.bound)
         print(f"{len(fiducials)} fiducials from {args.fiducials} ({n_bound} at the ceiling)")
+    elif meta.get("fit_fiducials"):
+        # THE FIT'S OWN COLUMNS, from the mask it solved. Drawing them needed
+        # `--fiducials` pointing at a SEPARATE sweep mask, so an oriented mask
+        # rendered its own solution with an empty marker layer: a "Telescope
+        # columns" button that toggled nothing, over a table announcing twelve
+        # of them. The record has been in the meta since terminus-53 and the
+        # disc is where a wrong yaw stops being a number.
+        #
+        # ONLY THE COLUMNS THE FIT USED. An excluded or unused column drawn in
+        # the same vocabulary reads as part of the solution, which is the
+        # collapse this project refuses everywhere else; the table carries
+        # those with their reasons.
+        fiducials = [
+            orient_mod.Fiducial(az=f["az"], alt=f["alt"], bound=f.get("bound", False))
+            for f in meta["fit_fiducials"]
+            if f.get("used") and f.get("alt") is not None
+        ]
+        offered = len(meta["fit_fiducials"])
+        extra = f", {offered - len(fiducials)} offered but not used" if offered > len(fiducials) else ""  # fmt: skip
+        print(f"{len(fiducials)} columns from the fit's own record{extra}")
 
     # THE RUN'S OWN RECORD, if it is lying beside the mask. The page used to
     # show what the fit concluded and nothing about the conditions it concluded
