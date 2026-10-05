@@ -1,0 +1,33 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+body {
+  margin: 0;
+}
+nav {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  border-bottom: 1px solid #8884;
+}
+nav button {
+  padding: 0.4rem 0.9rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+nav button[aria-selected="true"] {
+  border-color: currentColor;
+  font-weight: 600;
+}
+section,
+footer {
+  padding: 1rem;
+}
+footer {
+  opacity: 0.8;
+}

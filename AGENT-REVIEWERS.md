@@ -10,7 +10,7 @@
     "homelab-values-reviewer",
     "logging-reviewer"
   ],
-  "notes": "terminus is a small pure-Python library + CLI that drives a Seestar S50 over TCP and produces horizon files. No threads, no database, no long-lived resources. The pack below replaces the disabled defaults with reviewers tuned to what this project can actually get wrong: pointing the telescope somewhere dangerous, coordinate/azimuth-convention bugs, leaking the interop key, breaking the exported file formats other tools depend on, accepting a failure as a measurement while still surviving the night, and letting the prose drift away from the code."
+  "notes": "terminus is a Python library + CLI that drives a Seestar S50 and produces horizon files, plus an Electron desktop app (app/, TypeScript) over a Python sidecar (src/terminus/server/): a local HTTP API on 127.0.0.1 that will move a telescope. It has long-lived resources (the scope socket, the sidecar process, the RTSP view, per-frame temp files) and, in the app, threads and child processes. The pack below replaces the disabled defaults with reviewers tuned to what this project can actually get wrong: pointing the telescope somewhere dangerous, coordinate/azimuth-convention bugs, leaking the interop key, breaking the exported file formats other tools depend on, accepting a failure as a measurement while still surviving the night, and letting the prose drift away from the code."
 }
 ```
 
@@ -42,6 +42,14 @@ the project's highest-stakes surface.
 - Starts a view or issues a command with a known mount-nudge side effect
   (`start_view`) inside a Sun-sensitive sequence without accounting for it.
 
+**App (terminus-71):** the same rules cover the Alpaca driver, every sidecar
+route that moves the scope, and the dev channel (`--dev`, `/dev/*`).
+
+- FLAG (P1) a Sun guard that lives only in the UI (TypeScript, `app/**`). The
+  guard lives in the engine, so every route and the dev channel hit it.
+- FLAG (P1) an in-sun / in-shade switch that does not default to SUN, or that any
+  API route (dev or not) can set. Only the human sets it, through the UI.
+
 **Do NOT flag:** read-only calls (`equ_coord`, `mount_state`, `location`), or
 `--dry-run` paths that issue no motion.
 
@@ -69,6 +77,11 @@ or a `Horizon` interpolation that mishandles the 0/360 wrap.
 interpolation without a value-pinning test, or hard-coded site constants that
 should come from config/`Sky`.
 
+**App:** the same ground truth applies to JS projection and rotation code in
+`app/src/**`. On the polar disc, north is up and east is right, as in `polar.py`.
+FLAG (P1) a mirrored or rotated disc. FLAG (P2) JS that re-implements engine
+math without reading the shared golden fixture the Python test also reads.
+
 **Do NOT flag** the documented EQ-mode fact that `scope_get_horiz_coord` is
 untrusted, or screen-space image conventions in exporters (handle per format).
 
@@ -86,6 +99,10 @@ The Seestar interop key is an RSA **private key**. It must never enter the repo.
   containing a real key.
 - Weakens the README's interoperability framing (§1201(f), key extracted by the
   owner, never shipped) or bundles the key with the package.
+
+**Also FLAG (P1)** code-signing certificates, Apple Developer ID / notarization
+credentials, or auto-update signing keys committed, embedded, or echoed into CI
+logs. They belong in CI secrets only.
 
 **Do NOT flag** loading the key from a user-configured path at runtime (the
 intended design), or documentation *describing* how a user extracts their own.
@@ -169,6 +186,10 @@ a measurement. Every one of these happened:
   `skipped`, or discarding a partial sweep on abort.
 - Collapses a non-result into a value, in particular conflating "blocked above
   the ceiling" with "open to the search floor".
+
+**The Alpaca driver (app stage 4) is in scope.** Alpaca calls also report
+success while doing nothing, so read back `Slewing`, `AtPark` and the position
+before recording anything.
 
 **FLAG (P2) when a PR:**
 
@@ -376,7 +397,12 @@ capture, and six **Hugin** binaries (`pto_gen`, `cpfind`, `cpclean`,
 an unhelpful error here costs an observing session that cannot be repeated on
 demand.
 
-**FLAG (P1):** `shell=True` with any non-literal argument.
+**The Electron main process spawning the sidecar (`app/main/sidecar.ts`) is in
+scope.** The same rules apply: a startup timeout, stderr captured (to
+`sidecar.log`), and spawn errors, early exits and timeouts reported as distinct
+messages.
+
+**FLAG (P1):** `shell=True` (or `spawn(..., {shell: true})`) with any non-literal argument.
 
 **FLAG (P2) when a `subprocess` call:**
 
@@ -424,6 +450,10 @@ running sweep with Ctrl-C is a normal operator action and must work.
 
 **FLAG (P3):** a raise inside an `except` that omits `from e`, discarding the
 original traceback.
+
+**JavaScript/TypeScript (`app/**`):** FLAG (P2) an unhandled promise rejection
+(a floating promise with no `.catch`/`await`), or a `catch` in an IPC handler or
+click handler that swallows the error without showing or logging it.
 
 **Do NOT flag** the deliberate swallows listed under
 `strategic-fragility-reviewer`; they are argued there and are correct.
@@ -477,15 +507,146 @@ telescope path can't run in CI.
 - Adds a new exporter or classifier mode without a test pinning its output.
 - Changes `Horizon` interpolation/visibility logic without a value test.
 
+**App (terminus-71 TESTING rules): every stage ships its tests in the same PR.**
+FLAG (P2) when a PR:
+
+- adds a sidecar route (`src/terminus/server/`) without a pytest that calls it
+  in-process, including its refusal paths (no token, wrong Host, an Origin);
+- changes `app/main/**` lifecycle (spawn, health, stop, crash) without a vitest
+  that mocks `child_process`;
+- adds a front-end component or display math in `app/src/**` without a vitest
+  (Testing Library for components, value-pinned for math);
+- adds a user-visible flow without extending the Playwright-Electron e2e
+  (`app/e2e/`); scope flows run against the OmniSim Alpaca simulator, never hardware.
+
 **Do NOT flag** missing tests for code that requires a live Seestar (`client`
 socket I/O, `Pointer` motion, `run_sweep`), pure formatting, or docs.
 
 ---
 
+## electron-security-reviewer
+
+Review `app/main/**` and `app/preload/**`. The renderer will display files from
+a site folder and talk to an engine that moves a telescope; a renderer that can
+reach Node or arbitrary IPC is a remote-code path into both.
+
+**FLAG (P1) when a PR:**
+
+- Turns `nodeIntegration` on, or `contextIsolation` or `sandbox` off, for any
+  window or webContents.
+- Exposes `ipcRenderer`, a generic `invoke(channel, ...)`, or any pass-through
+  through `contextBridge`, instead of named, narrow functions.
+- Loads remote content (any `http(s)://` URL) into a window.
+- Leaves navigation unlocked: no `will-navigate` prevention, or a
+  `setWindowOpenHandler` that allows.
+- Calls `shell.openExternal` on a URL that is not validated against an allowlist.
+- Makes the CDP `--remote-debugging-port` reachable outside `--dev`: in a packaged
+  build, or bound to anything but 127.0.0.1.
+
+**FLAG (P2):** an `ipcMain.handle` that does not validate its arguments and
+`event.senderFrame`; a page without a Content-Security-Policy; `webSecurity: false`.
+
+**Do NOT flag** the remote-debugging port in `--dev`. It exists so an agent can
+drive the window (terminus-71.9). It is gated on `!app.isPackaged`.
+
+---
+
+## local-api-reviewer
+
+Review `src/terminus/server/**` and `app/main/**`. **The telescope is behind a
+localhost port.** Any web page in the user's browser can fire requests at
+127.0.0.1, and DNS rebinding lets it read the answers.
+
+**FLAG (P1) when a PR:**
+
+- Adds a route that changes state (slew, unpark, capture, focuser, settings)
+  reachable without the per-launch secret token.
+- Removes or weakens the `Host` check (127.0.0.1/localhost on the bound port) or
+  the refusal of requests that carry an `Origin`.
+- Binds anything but 127.0.0.1.
+- Adds CORS headers, above all `Access-Control-Allow-Origin: *`.
+- Makes a `/dev/*` route reachable without `--dev`.
+
+**FLAG (P2):** a request body that is not validated (type, size, allowed
+values) before use; an error response or log line that leaks a filesystem path
+or the token.
+
+---
+
+## sidecar-lifecycle-reviewer
+
+Review `app/main/**` and `src/terminus/server/**`. The Seestar tolerates **one**
+control connection, and an orphaned sidecar can hold it and leave the scope
+unparked.
+
+**FLAG (P1) when a PR:**
+
+- Opens a path where the window dies and the sidecar survives holding the scope,
+  or where the sidecar exits **without** parking. The design is that stdin EOF
+  means shutdown and the park runs in `finally`; a kill on Windows skips
+  handlers, so it is only the last resort.
+- Makes two sidecars possible: removes the single-instance lock, or starts a
+  second sidecar without stopping the first.
+
+**FLAG (P2):** no health/version handshake between UI and sidecar (a stale
+sidecar after an update); sidecar stderr not captured to a log; no startup
+timeout with a plain-language error; a fixed port instead of an OS-assigned free one.
+
+---
+
+## api-contract-reviewer
+
+Review the sidecar routes (`src/terminus/server/**`), their TypeScript side
+(`app/src/api/**`, `app/main/**`), and any shared schema or fixture.
+
+**FLAG (P2) when a PR:**
+
+- Changes a route or payload on one side only.
+- Hand-writes TS types for a payload instead of generating them from the
+  sidecar's schema. Stage 0's `app/src/api/types.ts` is hand-written, and
+  generation is tracked (see the beads); do not re-flag it until then.
+- Makes a breaking change without a version bump. The UI refuses a sidecar of a
+  different version, so the versions in `app/package.json`, `pyproject.toml` and
+  `src/terminus/__init__.py` move together.
+- Re-implements engine math in JS without a shared golden fixture read by both
+  the vitest and pytest suites (epic TESTING).
+
+---
+
+## ui-reviewer
+
+Review `app/src/**`.
+
+**FLAG (P2) when a PR:**
+
+- Adds a chart palette that has not been run through the dataviz
+  `validate_palette` script, in both light AND dark.
+- Encodes identity by colour alone (no label, shape or pattern).
+- Leaves a core action with no keyboard path.
+- Changes the UI and the PR description has no screenshot taken through dev
+  mode (`app/scripts/dev-snap.mjs`). We look at images before shipping them.
+
+**Do NOT flag** styling taste.
+
+---
+
+## release-reviewer
+
+Review electron-builder config, `.github/workflows/**`, and packaging scripts.
+
+**FLAG (P1):** signing certificates, Apple credentials or update keys committed,
+or echoed in CI logs; an auto-update feed that is not HTTPS or not
+signature-verified.
+
+**FLAG (P2):** bundled GPL binaries (Hugin, enblend) without the source or a
+written offer; segmentation model weights bundled without a licence check; an
+installer job missing from the win/mac/linux matrix; asar integrity off.
+
 # Guidelines
 
-terminus: a small pure-Python library + CLI that measures the local horizon with
-a Seestar S50 and exports it for N.I.N.A., Stellarium, and planners.
+terminus: a Python library + CLI that measures the local horizon with a Seestar
+S50 and exports it for N.I.N.A., Stellarium, and planners, and an Electron
+desktop app over a Python sidecar.
 
 ## How the pack runs
 
@@ -497,17 +658,23 @@ and exit conditions.
 
 | Reviewer | Files in scope |
 |----------|----------------|
-| `sun-safety-reviewer` | `src/terminus/client.py`, `sweep.py`, `cli.py` |
-| `coordinate-correctness-reviewer` | `src/terminus/sweep.py`, `horizon.py`, `orient.py`, `plan.py` |
-| `secrets-reviewer` | whole repo, `.gitignore`, `pyproject.toml`, `README.md` |
+| `sun-safety-reviewer` | `src/terminus/client.py`, `sweep.py`, `cli.py`, `server/**`, the Alpaca driver, `app/**` |
+| `coordinate-correctness-reviewer` | `src/terminus/sweep.py`, `horizon.py`, `orient.py`, `plan.py`, `app/src/**` |
+| `secrets-reviewer` | whole repo, `.gitignore`, `pyproject.toml`, `README.md`, `.github/workflows/**` |
 | `export-format-reviewer` | `src/terminus/export.py` |
-| `strategic-fragility-reviewer` | `src/**/*.py` |
+| `strategic-fragility-reviewer` | `src/**/*.py` (incl. the Alpaca driver) |
 | `complexity-reviewer` | `src/**/*.py` (never `tests/`) |
 | `clarity-reviewer` | `README.md`, docstrings/comments, `--help` text, the PR description |
-| `external-process-reviewer` | `src/terminus/mosaic.py`, `client.py` |
-| `error-handling-reviewer` | `src/**/*.py` |
+| `external-process-reviewer` | `src/terminus/mosaic.py`, `client.py`, `app/main/**` |
+| `error-handling-reviewer` | `src/**/*.py`, `app/**/*.ts` |
 | `resource-leak-reviewer` | `src/**/*.py` |
-| `test-coverage-reviewer` | `src/**/*.py`, `tests/**/*.py` |
+| `test-coverage-reviewer` | `src/**/*.py`, `tests/**/*.py`, `app/**/*.ts` |
+| `electron-security-reviewer` | `app/main/**`, `app/preload/**`, `app/src/index.html` |
+| `local-api-reviewer` | `src/terminus/server/**`, `app/main/**` |
+| `sidecar-lifecycle-reviewer` | `app/main/**`, `src/terminus/server/**` |
+| `api-contract-reviewer` | `src/terminus/server/**`, `app/src/api/**`, `app/main/**` |
+| `ui-reviewer` | `app/src/**` |
+| `release-reviewer` | electron-builder config, `.github/workflows/**`, packaging scripts |
 
 Skip reviewers whose scope doesn't match the diff. A reviewer's silence means
 nothing in its scope changed, not endorsement.
@@ -520,8 +687,18 @@ nothing in its scope changed, not endorsement.
 - `uv run black --check src tests` — formatting (line length 100)
 - `uv run pytest -q` — hardware-free unit tests
 
-Reviewers do not re-litigate formatting (black owns it) or lint that ruff already
-enforces.
+The `app` job, in `app/`:
+
+- `npm run lint` — eslint (typescript-eslint recommended)
+- `npm run typecheck` — `tsc --noEmit`, strict
+- `npm run format:check` — prettier (print width 100)
+- `npm test` — vitest (main-process lifecycle with `child_process` mocked, front end in jsdom)
+- `npm run e2e` — Playwright-Electron smoke against the real sidecar, under xvfb
+
+The win/mac/linux packaging matrix lands with packaging (terminus-71.6).
+
+Reviewers do not re-litigate formatting (black, prettier own it), lint that ruff
+or eslint already enforces, or type errors tsc catches.
 
 ## Severity convention
 
