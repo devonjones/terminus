@@ -60,10 +60,17 @@ def photo_sample(rows, pockets=None):
         return float(np.interp(float(a) % 360.0, az, alt, period=360.0))
 
     # {native az: [(alt_hi, alt_lo), ...]}: sky seen below the line. Carried on
-    # the sampler so `orient.predict` can compare a telescope edge measured
-    # inside a pocket against the pocket's floor without every caller between
-    # here and there growing a parameter.
-    sample.pockets = pockets or {}
+    # the sampler so `orient.predict` can compare a telescope edge measured at
+    # a pocket's floor against that floor without every caller between here and
+    # there growing a parameter. Looked up at the NEAREST mask column, so a
+    # mask with columns every 5 or 10 degrees still matches.
+    pk = {float(k) % 360.0: v for k, v in (pockets or {}).items()}
+
+    def pockets_near(phi):
+        col = az[int(np.argmin(np.abs((az - float(phi) + 180.0) % 360.0 - 180.0)))]
+        return pk.get(float(col), ())
+
+    sample.pockets_near = pockets_near if pk else None
     return sample
 
 

@@ -69,9 +69,8 @@ import yaml
 #   pockets      [[alt_hi, alt_lo], ...] sky seen BELOW the horizon (canopy gaps,
 #                under overhangs). Blocked for planning; a telescope edge inside
 #                one is measuring the pocket's floor, not missing the horizon.
-#   planning     the line a planner should respect: `alt` raised by how far the
-#                boundary was seen to move between frames (wind), never lower.
-#   fuzz         planning - alt, degrees: that movement, measured per column.
+#   planning     the line a planner should respect; never below `alt`.
+#   fuzz         planning - alt, degrees.
 COLUMN_FIELDS = (
     "clipped", "gap_fraction", "uncertainty", "type_source", "bound", "pockets", "planning", "fuzz",
 )  # fmt: skip
@@ -174,6 +173,24 @@ def load_mask(path):
     return meta, sorted((az, c["alt"], c.get("type", "")) for az, c in cols.items())
 
 
+def parse_pockets(raw):
+    """[(alt_hi, alt_lo), ...] from a mask's `pockets`, refusing a malformed one.
+
+    The mask is hand-editable, so a pair typed upside down or half-typed must
+    fail here with its column named, not later as a backwards interval.
+    """
+    out = []
+    for p in raw or ():
+        try:
+            hi, lo = (float(v) for v in p)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"pockets must be [[alt_hi, alt_lo], ...], got {p!r}") from e
+        if hi < lo:
+            raise ValueError(f"pocket {p!r} has alt_hi below alt_lo")
+        out.append((hi, lo))
+    return out
+
+
 def load_columns(path):
     """(meta, {az: {alt, type, clipped?, gap_fraction?, uncertainty?}}).
 
@@ -202,7 +219,10 @@ def load_columns(path):
                     elif key == "type_source":
                         col[key] = str(raw)
                     elif key == "pockets":
-                        col[key] = [(float(hi), float(lo)) for hi, lo in raw]
+                        try:
+                            col[key] = parse_pockets(raw)
+                        except ValueError as e:
+                            raise MaskError(f"{path}: column {az}: {e}") from e
                     else:
                         col[key] = float(raw)
         else:  # bare "az: alt"

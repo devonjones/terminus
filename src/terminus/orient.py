@@ -382,7 +382,7 @@ def predict(fids, sample, yaw, tilt_mag, tilt_dir):
     Split out from `residuals` because pitch enters as a pure offset, so the fit
     can sweep it without redoing the rotation — which is the expensive part.
     """
-    pockets = getattr(sample, "pockets", None) or {}
+    pockets_near = getattr(sample, "pockets_near", None)
     out = np.empty(len(fids))
     for i, f in enumerate(fids):
         phi, raw = native_column(sample, f.az, yaw, tilt_mag, tilt_dir)
@@ -390,35 +390,42 @@ def predict(fids, sample, yaw, tilt_mag, tilt_dir):
             out[i] = np.nan
             continue
         out[i] = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)[1]
-        if pockets and not f.bound:
-            out[i] = _pocket_floor(pockets, phi, yaw, tilt_mag, tilt_dir, f.alt, out[i])
+        if pockets_near and not f.bound:
+            out[i] = _pocket_floor(pockets_near, f, yaw, tilt_mag, tilt_dir, out[i])
     return out
 
 
 POCKET_TOL_DEG = 2.0  # covers pitch, which is applied after `predict`
 
 
-def _pocket_floor(pockets, phi, yaw, tilt_mag, tilt_dir, measured, line):
+def _pocket_floor(pockets_near, f, yaw, tilt_mag, tilt_dir, line):
     """The pocket floor a telescope edge is measuring, or the line if none.
 
     A scope walking down a column steps over a thin band of canopy and stops at
-    the bottom of the sky it can see, so an edge inside a pocket is a real
-    measurement of that pocket's FLOOR, not a miss of the horizon line. Only a
-    measurement that falls within a pocket's span (plus POCKET_TOL_DEG) is
-    matched to it; anywhere else the line stands. Planning never uses this:
-    pockets are blocked sky.
+    the bottom of the sky it can see, so an edge at a pocket's FLOOR is a real
+    measurement of that floor, not a miss of the horizon line. Only an edge
+    within POCKET_TOL_DEG of a floor matches it; one partway up a pocket agrees
+    with neither boundary and stays scored against the line. Each floor is
+    placed with its own `native_column`, because tilt shifts azimuth by an
+    amount that depends on altitude. Planning never uses this: pockets are
+    blocked sky.
     """
-    best, best_d = line, abs(line - measured)
-    for k in (round(phi) - 1, round(phi), round(phi) + 1):
-        for hi, lo in pockets.get(k % 360, ()):
-            top = _rotate_scalar(phi + yaw, hi, tilt_mag, tilt_dir)[1]
-            floor = _rotate_scalar(phi + yaw, lo, tilt_mag, tilt_dir)[1]
-            if (
-                floor - POCKET_TOL_DEG <= measured <= top + POCKET_TOL_DEG
-                and abs(floor - measured) < best_d
-            ):
-                best, best_d = floor, abs(floor - measured)
+    best, best_d = line, abs(line - f.alt)
+    phi, _ = native_column(lambda a: f.alt, f.az, yaw, tilt_mag, tilt_dir)
+    for _hi, lo in pockets_near(phi):
+        phi_lo, _ = native_column(lambda a, lo=lo: lo, f.az, yaw, tilt_mag, tilt_dir)
+        floor = _rotate_scalar(phi_lo + yaw, lo, tilt_mag, tilt_dir)[1]
+        d = abs(floor - f.alt)
+        if d <= POCKET_TOL_DEG and d < best_d:
+            best, best_d = floor, d
     return best
+
+
+def pocket_matched(fids, sample, yaw, tilt_mag, tilt_dir):
+    """Azimuths of the fiducials `predict` scored against a pocket floor."""
+    with_pk = predict(fids, sample, yaw, tilt_mag, tilt_dir)
+    bare = predict(fids, lambda a: sample(a), yaw, tilt_mag, tilt_dir)
+    return [f.az for f, a, b in zip(fids, with_pk, bare, strict=True) if a != b]
 
 
 def score(fids, photo, pitch):

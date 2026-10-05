@@ -114,32 +114,32 @@ def sky_layers(classes, coverage, solution, planning, size=SIZE, floor=FLOOR_DEG
     azimuth cannot draw. So the sky region is projected pixel by pixel through
     `disc_index` (the photograph's own mapping) and its boundary is drawn.
 
-    Sky: labelled sky, covered, and contiguous with the zenith (the disc centre;
-    a heater lid is not sky). No altitude clamp: true 0 deg is only known after
+    Sky: labelled sky, covered, and contiguous with the open sky
+    (`skymask.connected_sky`, on the panorama itself, where the azimuth wraps; a
+    heater lid is not sky). No altitude clamp: true 0 deg is only known after
     matching, so clipping at it would bake the fit's own error into the map.
-    sky). Pockets: that sky where it lies below the planning line, which is
-    the one horizon a scheduler may use and stays one value per azimuth.
+    Pockets: that sky where it lies below the planning line, which is the one
+    horizon a scheduler may use and stays one value per azimuth.
     """
     from scipy import ndimage
 
-    from .skymask import SKY_CLASS_ADE20K
+    from .skymask import SKY_CLASS_ADE20K, connected_sky
 
     cls, cov = np.asarray(classes), np.asarray(coverage)
+    if cls.shape != cov.shape:
+        raise ValueError(
+            f"class map {cls.shape} and coverage {cov.shape} differ: not the same mosaic run"
+        )
+    seen = (cov > 0) & (cls >= 0)
+    open_sky = connected_sky(cls == SKY_CLASS_ADE20K, seen)
     sy, sx, inside, taz, talt = disc_index(cls.shape, solution, size, floor)
-    c = cls[sy, sx]
-    valid = inside & (cov[sy, sx] > 0) & (c >= 0)
-    sky = valid & (c == SKY_CLASS_ADE20K)
-    # Contiguous with the open sky: seed from the zenith (the disc centre).
-    centre = size // 2
-    seed = np.zeros_like(sky)
-    seed[centre - 3 : centre + 4, centre - 3 : centre + 4] = True
-    passable = sky | ~valid  # unphotographed is unknown, not a wall
-    labels, _ = ndimage.label(passable & inside)
-    open_ = set(np.unique(labels[seed & passable]).tolist()) - {0}
-    sky &= np.isin(labels, list(open_))
+    valid = inside & seen[sy, sx]
+    sky = valid & open_sky[sy, sx]
+    if not sky.any():
+        raise ValueError("no sky in the class map connects to the open sky")
     # The horizon is where sky meets REAL terrain, not where it meets a pixel
     # nobody photographed: an uncovered spot at the zenith is not an obstruction.
-    terrain = valid & ~(c == SKY_CLASS_ADE20K)
+    terrain = valid & (cls[sy, sx] != SKY_CLASS_ADE20K)
     edge = sky & ndimage.binary_dilation(terrain, iterations=1)
     edge = ndimage.binary_dilation(edge, iterations=1)
     outline = np.zeros((size, size, 4), np.uint8)
@@ -787,9 +787,6 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         x, y = disc_xy(az, alt, size, floor)
         pts.append(f"{x:.1f},{y:.1f}")
 
-    # SKY POCKETS, as (az_hi, alt_hi, az_lo, alt_lo) in TRUE coordinates: the
-    # caller rotates both ends with the same solution as the photo and the line,
-    # so every layer on the disc moves together.
     # PLANNING HORIZON, (az, alt) in true coordinates from the same mask as the
     # line: what a scheduler should respect, never below the actual line.
     plan_pts = " ".join(
@@ -806,10 +803,12 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
             for a, al in sorted((float(a), float(al)) for a, al, *_ in rows)
         )
         pocket_band = f'<path class="pkb" d="M{act_pts} Z M{plan_pts} Z"/>'
+    # SKY POCKETS, (az, alt_hi, alt_lo) in TRUE coordinates, read off the same
+    # oriented mask as the line, so they need no rotation here.
     pocket_lines = []
-    for az1, alt1, az2, alt2 in pockets:
-        x1, y1 = disc_xy(float(az1), float(alt1), size, floor)
-        x2, y2 = disc_xy(float(az2), float(alt2), size, floor)
+    for az, hi, lo in pockets:
+        x1, y1 = disc_xy(float(az), float(hi), size, floor)
+        x2, y2 = disc_xy(float(az), float(lo), size, floor)
         pocket_lines.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
 
     # Hover text per column: which azimuth it is, what the scope measured, and
@@ -844,7 +843,7 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         else:
             # A column re-measured with autofocus and fine steps is a different
             # grade of evidence from a coarse sweep column, so it looks different.
-            cls = "edg rev" if int(round(float(f.az))) in remeasured else "edg"
+            cls = "edg rev" if int(round(float(f.az))) % 360 in remeasured else "edg"
             markers.append(
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="9" class="{cls}"><title>{_tip(f)}</title></circle>'
             )

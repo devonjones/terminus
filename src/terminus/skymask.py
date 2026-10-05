@@ -320,12 +320,14 @@ VEG_CLASSES_ADE20K = (4, 9, 17, 66)  # tree, grass, plant, flower
 def connected_sky(sky, valid=None):
     """Keep only sky that connects to the open sky: sky must be CONTIGUOUS.
 
-    Seeds are each column's topmost labelled pixel when it is sky. Anything
-    sky-coloured that cannot reach those through other sky (4-connected, with
-    azimuth wrapping at 0/360) is not sky: a reflection on a heater lid, a
-    window, a blue tarp. Only ever turns sky into terrain, so the horizon it
-    feeds can only rise, which is the safe direction for a map that exists to
-    say where the telescope must not look.
+    Seeds are each column's topmost labelled pixel when it is sky, the passable
+    pixels of the top row, and the largest sky region. Anything sky-coloured that cannot reach
+    those through other sky (4-connected, with azimuth wrapping at 0/360) is not
+    sky: a reflection on a heater lid, a window, a blue tarp. Only ever turns
+    sky into terrain, so the horizon it feeds can only rise, which is the safe
+    direction for a map that exists to say where the telescope must not look.
+    Because unphotographed pixels are passable, a coverage hole can bridge a
+    reflection to the open sky and keep it.
     """
     from scipy import ndimage
 
@@ -337,25 +339,32 @@ def connected_sky(sky, valid=None):
     # ground (M-19); treating it as a barrier cut columns off below a thin
     # uncovered strip under the zenith and drew spikes to the centre.
     passable = sky | ~valid
-    labels, _ = ndimage.label(passable)
+    labels, n = ndimage.label(passable)
+    # The panorama wraps: a region touching the right edge continues on the left.
+    root = list(range(n + 1))
+
+    def find(x):
+        while root[x] != x:
+            x = root[x]
+        return x
+
+    for a, b in zip(labels[:, 0], labels[:, -1], strict=True):
+        if a and b:
+            root[find(int(a))] = find(int(b))
+    roots = np.array([find(i) for i in range(n + 1)])
     first = np.argmax(valid, axis=0)
     cols = np.flatnonzero(valid.any(axis=0) & sky[first, np.arange(w)])
-    open_ = set(labels[first[cols], cols].tolist()) | set(labels[0][passable[0]].tolist())
-    open_ -= {0}
-    # The panorama wraps: a region touching the right edge continues on the left.
-    pairs = {
-        (int(a), int(b))
-        for a, b in zip(labels[:, 0], labels[:, -1], strict=True)
-        if a and b and a != b
-    }  # fmt: skip
-    changed = True
-    while changed:
-        changed = False
-        for a, b in pairs:
-            if (a in open_) != (b in open_):
-                open_ |= {a, b}
-                changed = True
-    return np.isin(labels, list(open_)) & sky
+    open_ = set(roots[labels[first[cols], cols]].tolist())
+    open_ |= set(roots[labels[0][passable[0]]].tolist())
+    # THE LARGEST SKY REGION IS OPEN SKY even when nothing reaches the top: a
+    # canopy over the zenith leaves no seed, and a reflection is never the
+    # biggest patch of blue in the panorama.
+    per_root = np.bincount(roots[labels[sky]], minlength=n + 1)
+    per_root[0] = 0
+    if per_root.any():
+        open_.add(int(np.argmax(per_root)))
+    open_.discard(0)
+    return np.isin(roots[labels], list(open_)) & sky
 
 
 def pocket_intervals(sky, top, valid=None, min_deg=0.5):

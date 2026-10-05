@@ -29,6 +29,7 @@ from .export import (
     export_all,
     is_oriented,
     load_columns,
+    parse_pockets,
     write_mask,
 )
 from .mosaic import MIN_CONTROL_POINTS, MosaicError
@@ -527,6 +528,27 @@ def cmd_sweep(sc, cfg, args):
         raise SystemExit(3)
 
 
+_ROTATION_KEYS = ("yaw", "pitch", "tilt_mag", "tilt_dir")
+
+
+def _polar_solution(meta, path):
+    """The rotation to draw a mask with: its own, or the identity if it has none.
+
+    An unsettled fit is marked unoriented but still carries its provisional
+    rotation, and drawing it is the whole point of looking. A mask straight from
+    skymask has no rotation and is drawn in panorama azimuth, which
+    --allow-unoriented already warned about. A PARTIAL rotation is corrupt, not
+    absent: drawing it at yaw 0 would put the photo and the line in different
+    frames without a word.
+    """
+    missing = [k for k in _ROTATION_KEYS if meta.get(k) is None]
+    if not missing:
+        return polar.solution_from_meta(meta)
+    if len(missing) == len(_ROTATION_KEYS):
+        return {k: 0.0 for k in _ROTATION_KEYS}
+    raise MaskError(f"{path}: partial rotation in meta (missing {', '.join(missing)})")
+
+
 def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
     """Write the fisheye page. Reads the mask; touches no hardware.
 
@@ -551,14 +573,7 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             "Run `terminus orient` first, or pass --allow-unoriented to draw it anyway "
             "(the compass labels will be wrong)."
         )
-    # An unsettled fit is marked unoriented but still carries its provisional
-    # rotation, and drawing it is the whole point of looking. Only a mask with
-    # no rotation at all (straight from skymask) falls back to the identity:
-    # panorama azimuth as drawn, which --allow-unoriented already warned about.
-    if all(meta.get(k) is not None for k in ("yaw", "pitch", "tilt_mag", "tilt_dir")):
-        solution = polar.solution_from_meta(meta)
-    else:
-        solution = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    solution = _polar_solution(meta, args.mask)
 
     image = coverage = None
     source = args.image or meta.get("source")
@@ -624,18 +639,21 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
     # because they were read off the same reprojected class map as the line.
     # Rotating the photo's native pockets here instead leaned them sideways by
     # an altitude-dependent amount under tilt and drew some in open sky.
-    pockets = [
-        (float(az), float(hi), float(az), float(lo))
-        for az, entry in _mask_entries(args.mask).items()
-        if isinstance(entry, dict)
-        for hi, lo in (entry.get("pockets") or [])
-    ]
+    entries = {az: e for az, e in _mask_entries(args.mask).items() if isinstance(e, dict)}
+    try:
+        pockets = [
+            (float(az), hi, lo)
+            for az, entry in entries.items()
+            for hi, lo in parse_pockets(entry.get("pockets"))
+        ]
+    except ValueError as e:
+        raise MaskError(f"{args.mask}: {e}") from e
     if pockets:
         print(f"{len(pockets)} sky-pocket segments from the mask")
     planning = [
         (float(az), float(entry["planning"]))
-        for az, entry in _mask_entries(args.mask).items()
-        if isinstance(entry, dict) and entry.get("planning") is not None
+        for az, entry in entries.items()
+        if entry.get("planning") is not None
     ]
 
     sky_outline = sky_pockets = None
@@ -644,9 +662,12 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             raise MaskError(
                 "--classes needs the panorama's coverage (--coverage or beside --image)"
             )
-        sky_outline, sky_pockets = polar.sky_layers(
-            np.load(args.classes), coverage, solution, planning or None, args.size, args.floor
-        )
+        try:
+            sky_outline, sky_pockets = polar.sky_layers(
+                np.load(args.classes), coverage, solution, planning or None, args.size, args.floor
+            )
+        except ValueError as e:
+            raise MaskError(f"{args.classes}: {e}") from e
         print(f"horizon drawn as the outline of the contiguous sky from {args.classes}")
 
     # THE RUN'S OWN RECORD, if it is lying beside the mask. The page used to
@@ -969,14 +990,22 @@ def _orient(sc, cfg, args):
             "one that says it is not oriented."
         )
     settled = not any(s.note == "did not settle" for s in steps)
-    from .orient import yaw_uncertainty
+    from .orient import pocket_matched, yaw_uncertainty
 
     # How well the yaw is actually pinned, with pitch and tilt free to absorb it.
     # Reporting the value alone is what let two runs look like they disagreed by
     # 30 degrees when both were really saying "somewhere around here, give or
     # take fifteen".
     fids = [s.fiducial for s in steps if s.fiducial is not None]
-    half = yaw_uncertainty(fids, guide.photo_sample(rows, pockets), solution, step=2.0)
+    sample = guide.photo_sample(rows, pockets)
+    half = yaw_uncertainty(fids, sample, solution, step=2.0)
+    matched = pocket_matched(
+        fids, sample, solution["yaw"], solution["tilt_mag"], solution["tilt_dir"]
+    )
+    if matched:
+        print(
+            f"scored against a sky-pocket floor, not the line: az {', '.join(f'{a:g}' for a in matched)}"
+        )
     spread = f"+/- {half:.0f} deg" if half else "NOT BOUNDED within 60 deg"
     print(
         f"\nyaw {solution['yaw']:.2f} ({spread})  pitch {solution['pitch']:.2f}  "
@@ -2021,6 +2050,10 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     # SKY MUST BE CONTIGUOUS. A blue patch with no path to the open sky (the
     # patio heater's lid reflecting it, a window) is not a view of the sky.
     kept = skymask.connected_sky(sky, valid)
+    if sky.any() and not kept.any():
+        raise MaskError(
+            "no sky in this panorama connects to the open sky; check the image and --coverage"
+        )
     if (sky & ~kept).any():
         print(
             f"{int((sky & ~kept).sum())} sky pixels not connected to the open sky: read as terrain"
