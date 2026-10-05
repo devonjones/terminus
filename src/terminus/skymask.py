@@ -46,6 +46,7 @@ fraction above the horizon line" is the phrasing both fields read without
 objection.
 """
 
+import sys
 import warnings
 
 import numpy as np
@@ -335,17 +336,18 @@ def _wrap_roots(labels, n):
 def connected_sky(sky, valid=None):
     """Keep only sky that connects to the open sky: sky must be CONTIGUOUS.
 
-    Seeds are the passable pixels of the top row (labelled sky, or unphotographed
-    above the first labelled pixel). Anything sky-coloured that cannot reach
-    them through other sky (4-connected, with azimuth wrapping at 0/360) is not
-    sky: a reflection on a heater lid, a window, a blue tarp. With seeds it only
-    ever turns sky into terrain, so the horizon can only rise. Because
-    unphotographed pixels are passable, a coverage hole can bridge a reflection
-    to the open sky and keep it.
+    Seeds are the top row's passable pixels (labelled sky, or unphotographed),
+    counted only where their region holds real sky. Anything sky-coloured that
+    cannot reach a seed through other sky (4-connected, with azimuth wrapping at
+    0/360) is not sky: a reflection on a heater lid, a window, a blue tarp.
+    Because unphotographed pixels are passable, a coverage hole can bridge a
+    reflection to the open sky and keep it.
 
-    A canopy over the zenith leaves no seed at all; then the largest sky region
-    is taken as the open sky, with a warning, since that guess is the one case
-    where a reflection could be kept.
+    A canopy over the zenith can leave no seed, or only a speck of sky at the
+    top. So the largest sky region also counts as open sky whenever it outweighs
+    all the seeded sky together; a reflection is never the biggest patch of blue
+    in a panorama. That rescue is reported on stderr, not through `warnings`,
+    because importing terminus silences warnings (sweep.py).
     """
     from scipy import ndimage
 
@@ -359,16 +361,16 @@ def connected_sky(sky, valid=None):
     passable = sky | ~valid
     labels, n = ndimage.label(passable)
     roots = _wrap_roots(labels, n)[labels]
+    sizes = np.bincount(roots[sky], minlength=n + 1)
     open_ = set(roots[0][passable[0]].tolist())
-    if not open_ and sky.any():
-        sizes = np.bincount(roots[sky], minlength=n + 1)
-        big = int(np.argmax(sizes))
-        warnings.warn(
-            f"no sky reaches the top of the panorama: kept the largest sky region "
+    big = int(np.argmax(sizes))
+    if sizes[big] and big not in open_ and sizes[big] > sum(sizes[r] for r in open_):
+        print(
+            f"no open sky reaches the top of the panorama: kept the largest sky region "
             f"({sizes[big]} px, {100 * sizes[big] / sky.sum():.0f}% of the sky)",
-            stacklevel=2,
+            file=sys.stderr,
         )
-        open_ = {big}
+        open_.add(big)
     return np.isin(roots, list(open_)) & sky
 
 

@@ -9511,31 +9511,44 @@ def test_the_guided_loop_hands_its_pockets_to_the_sampler(monkeypatch):
     assert seen["pockets"] == {90: [(20.0, 15.0)]}
 
 
-def test_connected_sky_seeds_win_over_size_and_uncovered_is_never_sky():
-    """With a real seed, a large disconnected blob is still a reflection; the
-    largest-region rescue is only for a covered zenith, and counts SKY pixels,
-    not unphotographed ones. Unphotographed pixels never come back as sky."""
-    import warnings
-
+def test_connected_sky_seeds_win_over_size_and_uncovered_is_never_sky(capsys):
+    """Seeded open sky beats a smaller disconnected blob. A speck of seeded sky,
+    or a seed in unphotographed pixels with no sky, does not: the largest sky
+    region outweighs it and is kept, and the run says so on stderr (warnings
+    are silenced package-wide). Unphotographed pixels never come back as sky."""
     import numpy as np
 
     from terminus.skymask import connected_sky
 
     sky = np.zeros((40, 60), bool)
-    sky[0, 5] = True  # a sliver of real sky at the top
-    sky[20:30, 10:40] = True  # a big blue blob, cut off from it
-    assert not connected_sky(sky)[20:30, 10:40].any(), "a seed exists: the blob is not sky"
+    sky[0:10] = True  # the open sky, reaching the top
+    sky[20:30, 10:40] = True  # a smaller blue blob, cut off from it
+    kept = connected_sky(sky)
+    assert kept[0:10].all() and not kept[20:30, 10:40].any()
+    assert "largest sky region" not in capsys.readouterr().err
+
+    sky = np.zeros((40, 60), bool)
+    sky[0, 5] = True  # a speck at the top: canopy over the zenith
+    sky[20:30, 10:40] = True  # the real sky, under the canopy
+    kept = connected_sky(sky)
+    assert kept[20:30, 10:40].all(), "a speck must not outweigh the sky"
+    assert "largest sky region" in capsys.readouterr().err
+
+    valid = np.ones((40, 60), bool)
+    valid[0:2] = False  # unphotographed strip at the top, touching no sky
+    sky = np.zeros((40, 60), bool)
+    sky[5:15] = True  # all the sky, under a canopy band in rows 2-4
+    kept = connected_sky(sky, valid)
+    assert kept[5:15].all(), "a seed with no sky in its region is not open sky"
+    assert not kept[~valid].any()
 
     valid = np.ones((40, 60), bool)
     valid[5:15, 40:60] = False  # a big unphotographed hole, bigger than any sky
     sky = np.zeros((40, 60), bool)
     sky[20:30, 0:20] = True  # largest sky region
     sky[32:35, 30:35] = True  # small reflection
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        kept = connected_sky(sky, valid)
+    kept = connected_sky(sky, valid)
     assert kept[20:30, 0:20].all() and not kept[32:35, 30:35].any()
-    assert any("largest sky region" in str(x.message) for x in w), "the rescue must say so"
     assert not kept[~valid].any(), "unphotographed is passable, never returned as sky"
 
     top_hole = np.ones((40, 60), bool)
@@ -9544,6 +9557,19 @@ def test_connected_sky_seeds_win_over_size_and_uncovered_is_never_sky():
     sky[3:20] = True
     kept = connected_sky(sky, top_hole)
     assert kept[3:20].all() and not kept[0:3].any()
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:5] = True
+    sky[20:25, 0:3] = True  # touches the LEFT edge only: not wrapped into anything
+    sky[20:25, 57:60] = True  # touches the right edge: wraps to the left patch
+    kept = connected_sky(sky)
+    assert not kept[20:25].any(), "two edge patches joined by the wrap are still one blob"
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:10, 0:30] = True  # open sky touching only the LEFT edge
+    sky[20:25, 50:60] = True  # a reflection touching only the RIGHT edge
+    kept = connected_sky(sky)
+    assert kept[0:10, 0:30].all() and not kept[20:25].any(), "edges merge only sky to sky"
 
 
 def test_sky_layers_ignores_coverage_holes_and_refuses_a_skyless_map():
@@ -9571,7 +9597,15 @@ def test_pocket_lookup_does_not_reach_across_a_gap_in_the_mask():
     rows = [(float(a), 35.0, "tree") for a in range(360) if not 1 <= a <= 30]
     sample = photo_sample(rows, {0: [(30.0, 10.0)]})
     assert sample.pockets_near(0.4) == [(30.0, 10.0)]
+    assert sample.pockets_near(0.7) == (), "beyond half the 1-degree spacing"
     assert sample.pockets_near(10.0) == ()
+    # Mixed spacing: 5 degrees to 175, then every 20. Column 200's reach is 10.
+    mixed = [(float(a), 35.0, "tree") for a in list(range(0, 180, 5)) + list(range(180, 360, 20))]
+    coarse = photo_sample(mixed, {200: [(30.0, 10.0)]})
+    assert coarse.pockets_near(208.0) == [(30.0, 10.0)]
+    assert coarse.pockets_near(211.0) == ()
+    single = photo_sample([(90.0, 35.0, "tree")], {90: [(30.0, 10.0)]})
+    assert single.pockets_near(250.0) == [(30.0, 10.0)], "one column covers the circle"
 
 
 def test_pocket_matched_ignores_unreadable_columns():
@@ -9646,7 +9680,7 @@ def test_polar_refuses_bad_inputs_through_the_command(tmp_path, capsys):
     with pytest.raises(SystemExit):
         main(["polar", str(good), "--no-frames", "--classes", str(tmp_path / "c.npy"),
               "--out", str(tmp_path / "b.html")])  # fmt: skip
-    assert "coverage" in capsys.readouterr().err
+    assert "--classes needs" in capsys.readouterr().err
     from PIL import Image
 
     Image.new("RGB", (360, 180), (120, 150, 200)).save(tmp_path / "pano.png")

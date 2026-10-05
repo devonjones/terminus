@@ -65,14 +65,16 @@ def photo_sample(rows, pockets=None):
     # there growing a parameter. Looked up at the NEAREST mask column, so a
     # mask with columns every 5 or 10 degrees still matches.
     pk = {float(k) % 360.0: v for k, v in (pockets or {}).items()}
-    # Half the usual column spacing: a column further away than that is a gap
-    # (an excluded or dropped azimuth), not this column's neighbour.
-    reach = float(np.median(np.diff(np.append(az, az[0] + 360.0)))) / 2.0 if len(az) > 1 else 180.0
+    # Half the nearest column's SMALLER gap to a neighbour: further away than
+    # that is a gap in the mask (an excluded or dropped azimuth), not this
+    # column. Local, so a mask with coarse and fine stretches works in both.
+    gaps = np.diff(np.append(az, az[0] + 360.0))
+    reach = np.minimum(gaps, np.roll(gaps, 1)) / 2.0
 
     def pockets_near(phi):
         d = np.abs((az - float(phi) + 180.0) % 360.0 - 180.0)
         i = int(np.argmin(d))
-        return pk.get(float(az[i]), ()) if d[i] <= reach else ()
+        return pk.get(float(az[i]), ()) if d[i] <= reach[i] else ()
 
     sample.pockets_near = pockets_near if pk else None
     return sample

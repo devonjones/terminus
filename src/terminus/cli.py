@@ -640,13 +640,12 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
     # Rotating the photo's native pockets here instead leaned them sideways by
     # an altitude-dependent amount under tilt and drew some in open sky.
     entries = {az: e for az, e in _mask_entries(args.mask).items() if isinstance(e, dict)}
-    pockets = []
-    for az, entry in entries.items():
-        try:
-            pairs = parse_pockets(entry.get("pockets"))
-        except ValueError as e:
-            raise MaskError(f"{args.mask}: column {az}: {e}") from e
-        pockets += [(float(az), hi, lo) for hi, lo in pairs]
+    # load_mask above has already refused a malformed pocket, naming its column.
+    pockets = [
+        (float(az), hi, lo)
+        for az, entry in entries.items()
+        for hi, lo in parse_pockets(entry.get("pockets"))
+    ]
     if pockets:
         print(f"{len(pockets)} sky-pocket segments from the mask")
     planning = [
