@@ -158,6 +158,11 @@ describe("request", () => {
     expect(init.body).toBe('{"tab":"fit"}');
   });
 
+  it("rejects a success response whose body is not JSON", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => JSON.parse("<html>") });
+    await expect(request(sc, "/state")).rejects.toThrow(SyntaxError);
+  });
+
   it("keeps the HTTP status when an error body is not JSON", async () => {
     fetchMock.mockResolvedValue({ ok: false, status: 502, json: async () => JSON.parse("<html>") });
     await expect(request(sc, "/state")).rejects.toThrow("engine /state: 502");
