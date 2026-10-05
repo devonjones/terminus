@@ -317,6 +317,85 @@ def upper_envelope(rows, half_deg, px_per_deg):
 VEG_CLASSES_ADE20K = (4, 9, 17, 66)  # tree, grass, plant, flower
 
 
+def connected_sky(sky, valid=None):
+    """Keep only sky that connects to the open sky: sky must be CONTIGUOUS.
+
+    Seeds are each column's topmost labelled pixel when it is sky. Anything
+    sky-coloured that cannot reach those through other sky (4-connected, with
+    azimuth wrapping at 0/360) is not sky: a reflection on a heater lid, a
+    window, a blue tarp. Only ever turns sky into terrain, so the horizon it
+    feeds can only rise, which is the safe direction for a map that exists to
+    say where the telescope must not look.
+    """
+    from scipy import ndimage
+
+    h, w = sky.shape
+    if valid is None:
+        valid = np.ones((h, w), bool)
+    sky = sky & valid
+    # UNPHOTOGRAPHED IS PASSABLE, NOT A WALL. A coverage hole is unknown, not
+    # ground (M-19); treating it as a barrier cut columns off below a thin
+    # uncovered strip under the zenith and drew spikes to the centre.
+    passable = sky | ~valid
+    labels, _ = ndimage.label(passable)
+    first = np.argmax(valid, axis=0)
+    cols = np.flatnonzero(valid.any(axis=0) & sky[first, np.arange(w)])
+    open_ = set(labels[first[cols], cols].tolist()) | set(labels[0][passable[0]].tolist())
+    open_ -= {0}
+    # The panorama wraps: a region touching the right edge continues on the left.
+    pairs = {
+        (int(a), int(b))
+        for a, b in zip(labels[:, 0], labels[:, -1], strict=True)
+        if a and b and a != b
+    }  # fmt: skip
+    changed = True
+    while changed:
+        changed = False
+        for a, b in pairs:
+            if (a in open_) != (b in open_):
+                open_ |= {a, b}
+                changed = True
+    return np.isin(labels, list(open_)) & sky
+
+
+def pocket_intervals(sky, top, valid=None, min_deg=0.5):
+    """Per column: the runs of SKY below that column's horizon (`top` row).
+
+    A pocket is sky seen through a canopy gap or under an overhang. For planning
+    it is blocked like any terrain, but a telescope edge measured inside one is
+    EXPLAINED, not a misfit: the scope saw real sky there, just not open sky.
+    Recording where the pockets are is what lets the fit tell the two apart.
+
+    Returns one list per column of (alt_hi, alt_lo) in degrees, for sky runs at
+    least `min_deg` tall; shorter runs are leaf speckle.
+    """
+    h, w = sky.shape
+    if valid is None:
+        valid = np.ones((h, w), bool)
+    deg_per_row = 180.0 / h
+    min_rows = max(1, int(round(min_deg / deg_per_row)))
+    out = []
+    for x in range(w):
+        if not np.isfinite(top[x]):
+            out.append([])
+            continue
+        t = int(top[x])
+        col = sky[t:, x] & valid[t:, x]
+        edges = np.diff(np.concatenate([[0], col.astype(np.int8), [0]]))
+        starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+        out.append(
+            [
+                (
+                    round(float(90.0 - (t + s) * deg_per_row), 2),
+                    round(float(90.0 - (t + e) * deg_per_row), 2),
+                )
+                for s, e in zip(starts, ends, strict=True)
+                if e - s >= min_rows
+            ]
+        )
+    return out
+
+
 def horizon_band(sky, valid=None, run=6):
     """Per column: where obstruction starts, where it ends, and how solid it is.
 

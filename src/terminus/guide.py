@@ -33,7 +33,7 @@ from .orient import PARAMS, Fiducial, effective_constraints, fit, native_column
 from .orient import rotate as _rotate
 
 
-def photo_sample(rows):
+def photo_sample(rows, pockets=None):
     """`sample(az)` over a photo mask's columns, interpolated across the wrap.
 
     `orient.native_column` calls this at arbitrary azimuths while solving a fixed
@@ -59,6 +59,11 @@ def photo_sample(rows):
     def sample(a):
         return float(np.interp(float(a) % 360.0, az, alt, period=360.0))
 
+    # {native az: [(alt_hi, alt_lo), ...]}: sky seen below the line. Carried on
+    # the sampler so `orient.predict` can compare a telescope edge measured
+    # inside a pocket against the pocket's floor without every caller between
+    # here and there growing a parameter.
+    sample.pockets = pockets or {}
     return sample
 
 
@@ -134,6 +139,7 @@ def run(
     log=print,
     min_headroom=None,
     fit_kw=None,
+    pockets=None,
 ):
     """Measure columns until the solved yaw stops moving. Returns (solution, steps).
 
@@ -167,8 +173,11 @@ def run(
     the accurate one and costs tens of seconds per refit — cheap next to the
     minutes a column takes to measure, and far too slow for a test suite, which
     is the only reason this is reachable.
+
+    `pockets` ({native az: [(alt_hi, alt_lo), ...]}) lets an edge measured inside
+    a sky pocket be scored against the pocket floor (see `orient._pocket_floor`).
     """
-    sample = photo_sample(rows)
+    sample = photo_sample(rows, pockets)
     # THE GRADIENT MUST BE READ IN THE PHOTO'S OWN FRAME. The mask is in the
     # panorama's azimuth and the scope points in true azimuth, so the slope that
     # decides whether a column carries yaw information sits at `az - yaw`, not at

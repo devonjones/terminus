@@ -197,6 +197,29 @@ def test_horizon_rows_flags_clipped_columns():
     assert clipped[0] and not clipped[1]
 
 
+def test_pocket_intervals_finds_sky_below_the_horizon():
+    """Sky under an overhang is a pocket; a one-row gap and a solid wall are not."""
+    import numpy as np
+
+    from terminus.skymask import pocket_intervals
+
+    h = 180  # one row per degree: row r is altitude 90 - r
+    sky = np.ones((h, 3), bool)
+    sky[30:, :] = False  # every column: horizon at row 30 (alt 60)
+    sky[50:60, 0] = True  # column 0: a 10-degree window onto the sky below it
+    sky[45, 1] = True  # column 1: a single-row speck of leaf gap
+    top = np.array([30.0, 30.0, 30.0])
+    out = pocket_intervals(sky, top, min_deg=0.5)
+    assert out[0] == [(40.0, 30.0)]  # rows 50..60 -> alt 40 down to 30
+    assert out[1] == [(45.0, 44.0)]  # one row is a full degree at this scale, so it counts
+    assert out[2] == []  # solid wall below the horizon
+    # at the real panorama scale (8 rows per degree) one row is 1/8 deg: speckle
+    fine = np.ones((1440, 1), bool)
+    fine[240:, 0] = False
+    fine[400, 0] = True
+    assert pocket_intervals(fine, np.array([240.0]), min_deg=0.5) == [[]]
+
+
 def test_upper_envelope_fills_narrow_gaps():
     """A gap narrower than mask resolution is not usable sky."""
     import numpy as np
@@ -9200,3 +9223,60 @@ def test_a_blank_reading_is_absent_not_zero():
     out = polar.diagnostics(_diag_meta(), blank)
     assert "254.0 to 254.0" in out, "the one real reading stands alone"
     assert "fell" not in out and "rose" not in out, "a blank must not invent a collapse"
+
+
+def test_pockets_survive_a_mask_round_trip(tmp_path):
+    """write_mask once dropped any field not in its list, so pockets vanished silently."""
+    import numpy as np
+
+    from terminus.export import load_columns, write_mask
+
+    p = tmp_path / "m.yaml"
+    write_mask(
+        str(p),
+        {10: {"alt": 30.0, "type": "tree", "pockets": [(np.float64(22.5), np.float64(19.0))]}},
+        [],
+        {"oriented": False},
+    )
+    assert "np.float64" not in p.read_text()
+    _, cols = load_columns(str(p))
+    assert cols[10]["pockets"] == [(22.5, 19.0)]
+
+
+def test_connected_sky_drops_isolated_blue():
+    """Sky must reach the open sky: a heater lid reflecting blue is not sky."""
+    import numpy as np
+
+    from terminus.skymask import connected_sky
+
+    sky = np.ones((8, 6), bool)
+    sky[3, :] = False  # a wall across the frame...
+    sky[3, 0] = True  # ...with a gap at the left edge
+    sky[5:, :] = False
+    sky[6, 3] = True  # a blue blob inside the terrain: the heater lid
+    kept = connected_sky(sky)
+    assert kept[4, 5]  # reached through the gap
+    assert not kept[6, 3]  # isolated, so not sky
+    assert not (kept & ~sky).any()  # never invents sky
+
+    # The panorama wraps: the right-hand pixel's only sky neighbour is across
+    # the 0/360 seam, so without the wrap it would be wrongly dropped.
+    wrap = np.array([[True, False, False, False], [True, False, False, True]])
+    assert connected_sky(wrap)[1, 3]
+
+
+def test_connected_sky_passes_through_unphotographed_strips():
+    """A strip nobody photographed is unknown, not a wall: sky below it still counts."""
+    import numpy as np
+
+    from terminus.skymask import connected_sky
+
+    sky = np.ones((10, 5), bool)
+    valid = np.ones((10, 5), bool)
+    valid[3, :] = False  # an uncovered ring under the zenith, all the way round
+    sky[7:, :] = False  # real terrain
+    sky[8, 2] = True  # and a reflection inside it
+    valid[8, 2] = True
+    kept = connected_sky(sky, valid)
+    assert kept[5, :].all()  # sky below the strip is still open sky
+    assert not kept[8, 2]  # the reflection is still not

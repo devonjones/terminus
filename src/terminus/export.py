@@ -66,7 +66,15 @@ import yaml
 #                segmentation) or "scope" (colour, daylight only). Per column,
 #                because a merged mask holds both and they are not equally able
 #                to tell a tree from a wall.
-COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty", "type_source", "bound")
+#   pockets      [[alt_hi, alt_lo], ...] sky seen BELOW the horizon (canopy gaps,
+#                under overhangs). Blocked for planning; a telescope edge inside
+#                one is measuring the pocket's floor, not missing the horizon.
+#   planning     the line a planner should respect: `alt` raised by how far the
+#                boundary was seen to move between frames (wind), never lower.
+#   fuzz         planning - alt, degrees: that movement, measured per column.
+COLUMN_FIELDS = (
+    "clipped", "gap_fraction", "uncertainty", "type_source", "bound", "pockets", "planning", "fuzz",
+)  # fmt: skip
 # Old spellings still accepted when reading, never written.
 _RENAMED = {"gap_fraction": "porosity"}
 
@@ -143,6 +151,10 @@ def write_mask(path, mask, skipped, meta):
         for key in COLUMN_FIELDS:
             if col.get(key) is not None:
                 v = col[key]
+                if key == "pockets":
+                    # Plain floats: a numpy scalar would print as np.float64(...)
+                    # and the file would no longer be YAML anyone can read.
+                    v = [[round(float(hi), 2), round(float(lo), 2)] for hi, lo in v]
                 parts.append(f"{key}: {v!r}" if isinstance(v, bool) else f"{key}: {v}")
         lines.append(f"  {az}: {{{', '.join(parts)}}}")
     if skipped:
@@ -189,6 +201,8 @@ def load_columns(path):
                         col[key] = bool(raw)
                     elif key == "type_source":
                         col[key] = str(raw)
+                    elif key == "pockets":
+                        col[key] = [(float(hi), float(lo)) for hi, lo in raw]
                     else:
                         col[key] = float(raw)
         else:  # bare "az: alt"

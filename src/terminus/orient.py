@@ -382,14 +382,43 @@ def predict(fids, sample, yaw, tilt_mag, tilt_dir):
     Split out from `residuals` because pitch enters as a pure offset, so the fit
     can sweep it without redoing the rotation — which is the expensive part.
     """
+    pockets = getattr(sample, "pockets", None) or {}
     out = np.empty(len(fids))
     for i, f in enumerate(fids):
         phi, raw = native_column(sample, f.az, yaw, tilt_mag, tilt_dir)
         if raw is None or not math.isfinite(raw):
             out[i] = np.nan
-        else:
-            out[i] = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)[1]
+            continue
+        out[i] = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)[1]
+        if pockets and not f.bound:
+            out[i] = _pocket_floor(pockets, phi, yaw, tilt_mag, tilt_dir, f.alt, out[i])
     return out
+
+
+POCKET_TOL_DEG = 2.0  # covers pitch, which is applied after `predict`
+
+
+def _pocket_floor(pockets, phi, yaw, tilt_mag, tilt_dir, measured, line):
+    """The pocket floor a telescope edge is measuring, or the line if none.
+
+    A scope walking down a column steps over a thin band of canopy and stops at
+    the bottom of the sky it can see, so an edge inside a pocket is a real
+    measurement of that pocket's FLOOR, not a miss of the horizon line. Only a
+    measurement that falls within a pocket's span (plus POCKET_TOL_DEG) is
+    matched to it; anywhere else the line stands. Planning never uses this:
+    pockets are blocked sky.
+    """
+    best, best_d = line, abs(line - measured)
+    for k in (round(phi) - 1, round(phi), round(phi) + 1):
+        for hi, lo in pockets.get(k % 360, ()):
+            top = _rotate_scalar(phi + yaw, hi, tilt_mag, tilt_dir)[1]
+            floor = _rotate_scalar(phi + yaw, lo, tilt_mag, tilt_dir)[1]
+            if (
+                floor - POCKET_TOL_DEG <= measured <= top + POCKET_TOL_DEG
+                and abs(floor - measured) < best_d
+            ):
+                best, best_d = floor, abs(floor - measured)
+    return best
 
 
 def score(fids, photo, pitch):

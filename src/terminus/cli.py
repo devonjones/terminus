@@ -551,7 +551,14 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             "Run `terminus orient` first, or pass --allow-unoriented to draw it anyway "
             "(the compass labels will be wrong)."
         )
-    solution = polar.solution_from_meta(meta)
+    # An unsettled fit is marked unoriented but still carries its provisional
+    # rotation, and drawing it is the whole point of looking. Only a mask with
+    # no rotation at all (straight from skymask) falls back to the identity:
+    # panorama azimuth as drawn, which --allow-unoriented already warned about.
+    if all(meta.get(k) is not None for k in ("yaw", "pitch", "tilt_mag", "tilt_dir")):
+        solution = polar.solution_from_meta(meta)
+    else:
+        solution = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
 
     image = coverage = None
     source = args.image or meta.get("source")
@@ -574,6 +581,7 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
         print(f"panorama {source} not found; drawing the horizon without it", file=sys.stderr)
 
     fiducials = ()
+    remeasured = set()
     if args.fiducials:
         fid_meta, _ = load_mask(args.fiducials)
         doc = _mask_entries(args.fiducials)
@@ -583,6 +591,9 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             ceiling = float(search[1]) if len(search) > 1 else None
         try:
             fiducials = orient_mod.from_mask(doc, ceiling=ceiling)
+            remeasured = {
+                int(az) for az, e in doc.items() if isinstance(e, dict) and e.get("remeasured")
+            }
         except ValueError as e:
             # A malformed hand-edited `exclude` gets the clean sentence (E-12).
             raise MaskError(f"{args.fiducials}: {e}") from e
@@ -608,6 +619,35 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
         offered = len(meta["fit_fiducials"])
         extra = f", {offered - len(fiducials)} offered but not used" if offered > len(fiducials) else ""  # fmt: skip
         print(f"{len(fiducials)} columns from the fit's own record{extra}")
+
+    # SKY POCKETS FROM THE ORIENTED MASK ITSELF, already in true coordinates
+    # because they were read off the same reprojected class map as the line.
+    # Rotating the photo's native pockets here instead leaned them sideways by
+    # an altitude-dependent amount under tilt and drew some in open sky.
+    pockets = [
+        (float(az), float(hi), float(az), float(lo))
+        for az, entry in _mask_entries(args.mask).items()
+        if isinstance(entry, dict)
+        for hi, lo in (entry.get("pockets") or [])
+    ]
+    if pockets:
+        print(f"{len(pockets)} sky-pocket segments from the mask")
+    planning = [
+        (float(az), float(entry["planning"]))
+        for az, entry in _mask_entries(args.mask).items()
+        if isinstance(entry, dict) and entry.get("planning") is not None
+    ]
+
+    sky_outline = sky_pockets = None
+    if getattr(args, "classes", None):
+        if coverage is None:
+            raise MaskError(
+                "--classes needs the panorama's coverage (--coverage or beside --image)"
+            )
+        sky_outline, sky_pockets = polar.sky_layers(
+            np.load(args.classes), coverage, solution, planning or None, args.size, args.floor
+        )
+        print(f"horizon drawn as the outline of the contiguous sky from {args.classes}")
 
     # THE RUN'S OWN RECORD, if it is lying beside the mask. The page used to
     # show what the fit concluded and nothing about the conditions it concluded
@@ -652,6 +692,11 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
             frame_px=args.frame_px,
             private=args.privacy,
             notes=notes,
+            pockets=pockets,
+            planning=planning,
+            sky_outline=sky_outline,
+            sky_pockets=sky_pockets,
+            remeasured=remeasured,
         ),  # fmt: skip
     )
     print(f"wrote {out} ({os.path.getsize(out) // 1024} KB, self-contained)")
@@ -879,11 +924,16 @@ def _orient(sc, cfg, args):
     real run. Without it the scope measures, Sun-guarded like every other slew.
     """
     from . import guide
-    from .export import load_mask, write_mask
+    from .export import load_columns, load_mask, write_mask
 
     meta, rows = load_mask(args.mask)
     if not rows:
         raise MaskError(f"{args.mask} has no columns to orient")
+    # Sky pockets the photo saw below its line: an edge measured inside one is
+    # scored against the pocket floor rather than counted as a miss.
+    pockets = {az: c["pockets"] for az, c in load_columns(args.mask)[1].items() if c.get("pockets")}
+    if pockets:
+        print(f"{len(pockets)} photo columns carry sky pockets")
 
     fiducials = getattr(args, "fiducials", None)
     excluded_by_mask = {}
@@ -910,6 +960,7 @@ def _orient(sc, cfg, args):
         reachable=reachable,
         should_stop=should_stop,
         min_headroom=args.min_headroom,
+        pockets=pockets,
     )
     if solution is None:
         raise MaskError(
@@ -925,7 +976,7 @@ def _orient(sc, cfg, args):
     # 30 degrees when both were really saying "somewhere around here, give or
     # take fifteen".
     fids = [s.fiducial for s in steps if s.fiducial is not None]
-    half = yaw_uncertainty(fids, guide.photo_sample(rows), solution, step=2.0)
+    half = yaw_uncertainty(fids, guide.photo_sample(rows, pockets), solution, step=2.0)
     spread = f"+/- {half:.0f} deg" if half else "NOT BOUNDED within 60 deg"
     print(
         f"\nyaw {solution['yaw']:.2f} ({spread})  pitch {solution['pitch']:.2f}  "
@@ -1966,6 +2017,15 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     # `backend` is now what RAN, not what was asked for. Everything below keys
     # off it — the printed line, the segmentation-only type pass, and the mask
     # meta — so a silent fallback cannot be recorded as a segment run.
+    #
+    # SKY MUST BE CONTIGUOUS. A blue patch with no path to the open sky (the
+    # patio heater's lid reflecting it, a window) is not a view of the sky.
+    kept = skymask.connected_sky(sky, valid)
+    if (sky & ~kept).any():
+        print(
+            f"{int((sky & ~kept).sum())} sky pixels not connected to the open sky: read as terrain"
+        )
+    sky = kept
     band = skymask.horizon_band(sky, valid=valid, run=args.run)
     px_per_deg = w / 360.0
     # IMAGE PROCESSING EMITS THE FAITHFUL SKYLINE (terminus-55). The envelope
@@ -1990,6 +2050,7 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
             skymask.segment_classes(image), band["top"], valid=valid
         )
     unc = skymask.type_uncertainty(classes, band["gap_fraction"])
+    pockets = skymask.pocket_intervals(sky, band["top"], valid=valid)
 
     step = max(1, int(round(args.az_step * px_per_deg)))
     mask, clipped_n = {}, 0
@@ -2012,6 +2073,10 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
             "gap_fraction": round(float(band["gap_fraction"][x]), 3),
             "uncertainty": round(float(unc[x]), 2),
         }
+        if pockets[x]:
+            # Sky below the horizon: blocked for planning, but a telescope edge
+            # measured inside one was looking through it, not missing the line.
+            mask[az]["pockets"] = [list(p) for p in pockets[x]]
     if not mask:
         raise SeestarError("no column yielded a horizon; check the image and --coverage")
 
@@ -2202,6 +2267,13 @@ def main(argv=None):
         help="equirectangular panorama to reproject (default: the mask's own meta.source)",
     )
     po.add_argument("--coverage", default=None, help="the mosaic's .coverage.npy")
+    po.add_argument(
+        "--classes",
+        default=None,
+        help="the mosaic's class map (.classes.npy, same run as --coverage): draws the\n"
+        "        horizon as the real outline of the contiguous sky, and the pockets under the\n"
+        "        planning line, through the same per-pixel mapping as the photograph",
+    )
     po.add_argument(
         "--fiducials",
         default=None,
