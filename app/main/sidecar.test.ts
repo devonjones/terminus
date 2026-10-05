@@ -75,10 +75,12 @@ describe("startSidecar", () => {
     await expect(p).rejects.toThrow("could not run py: spawn py ENOENT");
   });
 
-  it("says when the engine exits before starting", async () => {
+  it("says when the engine exits before starting, and drops its startup timer", async () => {
+    vi.useFakeTimers();
     const p = startSidecar(opts);
     proc.exit(1);
     await expect(p).rejects.toThrow("the engine exited (code 1) before starting");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("times out a stuck engine and kills it", async () => {
@@ -117,6 +119,7 @@ describe("startSidecar", () => {
 
 describe("stopSidecar", () => {
   it("closes stdin and waits for the sidecar to park and exit", async () => {
+    vi.useFakeTimers();
     let ended = false;
     proc.stdin.on("finish", () => {
       ended = true;
@@ -125,6 +128,7 @@ describe("stopSidecar", () => {
     await stopSidecar(proc as never);
     expect(ended).toBe(true);
     expect(proc.kill).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0); // the grace timer does not outlive the exit
   });
 
   it("kills a sidecar that ignores stdin closing", async () => {

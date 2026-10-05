@@ -56,9 +56,11 @@ describe("mount", () => {
 
   it("shows a refused tab change instead of dropping it", async () => {
     const root = document.createElement("div");
+    document.body.appendChild(root);
     await mount(root, fakeApi({ setTab: async () => Promise.reject(new Error("engine down")) }));
     getByRole(root, "tab", { name: "Panorama" }).click();
     expect((await findByText(root, "engine down")).getAttribute("role")).toBe("alert");
     expect(getByRole(root, "tab", { selected: true }).textContent).toBe("Connect");
+    expect(document.activeElement).toBe(getByRole(root, "tab", { selected: true }));
   });
 });

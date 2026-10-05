@@ -20,7 +20,8 @@ export interface StartOptions {
 }
 
 // The sidecar's first stdout line is {"port", "token"}. Each failure gets its own
-// message: not installed (spawn error), refused to start (exit), stuck (timeout).
+// message: not installed (spawn error), refused to start (exit), stuck (timeout),
+// or printed something else (bad line).
 function hello(proc: ChildProcess, command: string, timeoutMs: number) {
   return new Promise<{ port: number; token: string }>((resolve, reject) => {
     const fail = (msg: string) => (clearTimeout(timer), reject(new Error(msg)));
@@ -59,9 +60,11 @@ export async function request<T = unknown>(
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(10_000),
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`engine ${path}: ${res.status} ${json.error ?? ""}`.trim());
-  return json;
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(`engine ${path}: ${res.status} ${err?.error ?? ""}`.trim());
+  }
+  return res.json();
 }
 
 export async function startSidecar(o: StartOptions): Promise<Sidecar> {

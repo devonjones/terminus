@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -92,6 +92,36 @@ describe("IPC", () => {
     await boot();
     expect(() => h.handlers.get("state:tab")!(ourPage, tab)).toThrow("short string");
     expect(h.request).not.toHaveBeenCalled();
+  });
+});
+
+describe("dev mode gating", () => {
+  const argv = process.argv;
+  afterEach(() => {
+    process.argv = argv;
+    h.app.isPackaged = false;
+    h.app.commandLine.hasSwitch.mockReturnValue(false);
+  });
+
+  it("opens the DevTools port only with --dev in an unpackaged build", async () => {
+    process.argv = [...argv, "--dev"];
+    await boot();
+    expect(h.app.commandLine.appendSwitch).toHaveBeenCalledWith("remote-debugging-port", "0");
+  });
+
+  it("ignores --dev in a packaged build", async () => {
+    process.argv = [...argv, "--dev"];
+    h.app.isPackaged = true;
+    await boot();
+    expect(h.app.commandLine.appendSwitch).not.toHaveBeenCalled();
+    expect(h.app.exit).not.toHaveBeenCalled();
+  });
+
+  it("refuses to run a packaged build launched with a DevTools port", async () => {
+    h.app.isPackaged = true;
+    h.app.commandLine.hasSwitch.mockReturnValue(true);
+    await boot();
+    expect(h.app.exit).toHaveBeenCalledWith(1);
   });
 });
 

@@ -7,8 +7,8 @@ Binds 127.0.0.1 on a free port and prints one JSON line to stdout,
 Bearer <token>``, a ``Host`` of 127.0.0.1/localhost on that port, and no
 ``Origin`` header. The only legitimate callers are the Electron main process and
 a developer's curl, neither of which sends ``Origin``; browsers send it on
-cross-origin POSTs. The token stops a page that omits it, and the ``Host`` check
-stops DNS rebinding. That matters because this port will eventually move a telescope.
+cross-origin POSTs. A page cannot know the token, and the ``Host`` check stops
+DNS rebinding. That matters because this port will eventually move a telescope.
 
 The sidecar exits when its stdin closes, and parks the scope on the way out. The
 parent holds the other end of the pipe, so if the Electron main process dies the

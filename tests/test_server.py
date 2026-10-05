@@ -14,6 +14,7 @@ import types
 import pytest
 
 import terminus
+import terminus.server as server_module
 from terminus.server import TABS, Sidecar
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -160,6 +161,16 @@ def test_an_idle_connection_does_not_block_shutdown(serve):
         assert not done.is_alive()
 
 
+def test_unusable_stdin_shuts_down_instead_of_running_forever(serve, monkeypatch, caplog):
+    s = serve()
+    monkeypatch.setattr(sys, "stdin", None)  # e.g. launched with no stdin at all
+    t = threading.Thread(target=server_module._stop_on_eof, args=(s,), daemon=True)
+    t.start()
+    t.join(timeout=3)
+    assert not t.is_alive()  # shutdown() returned, so serve_forever stopped
+    assert "cannot read stdin, shutting down" in caplog.text
+
+
 def _sidecar_process():
     p = subprocess.Popen(
         [sys.executable, "-m", "terminus.server", "--dev"],
@@ -171,6 +182,7 @@ def _sidecar_process():
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
     )
     watchdog = threading.Timer(30, p.kill)  # readline() has no timeout of its own
+    watchdog.daemon = True  # never hold up pytest's exit
     watchdog.start()
     hello = json.loads(p.stdout.readline() or "null")
     assert hello, "sidecar printed no startup line"
