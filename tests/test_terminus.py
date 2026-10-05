@@ -9361,13 +9361,13 @@ def test_polar_draws_a_full_rotation_or_none_and_refuses_a_partial_one():
         _polar_solution({k: v for k, v in full.items() if k != "tilt_dir"}, "m.yaml")
 
 
-def test_a_malformed_pocket_is_refused_with_its_column():
+def test_a_malformed_pocket_is_refused_with_its_column(tmp_path):
     import pytest
 
     from terminus.export import MaskError, load_columns
 
-    for bad in ("[[10, 20]]", "[5]"):
-        p = __import__("pathlib").Path(__import__("tempfile").mkdtemp()) / "m.yaml"
+    for i, bad in enumerate(("[[10, 20]]", "[5]", "5", "[[.nan, 1]]", "[[.inf, 0]]")):
+        p = tmp_path / f"m{i}.yaml"
         p.write_text(f"horizon:\n  12: {{alt: 30.0, type: tree, pockets: {bad}}}\n")
         with pytest.raises(MaskError, match="column 12"):
             load_columns(str(p))
@@ -9412,7 +9412,7 @@ def test_sky_layers_draws_an_outline_under_a_covered_zenith_and_drops_reflection
 
     plain, _ = polar.sky_layers(*_sky_classes(), sol, None, size=200)
     lid = _sky_classes()[0]
-    lid[120:124, 100:104] = SKY_CLASS_ADE20K
+    lid[80:84, 100:104] = SKY_CLASS_ADE20K  # alt 6-10: on the disc, under the line
     with_lid, _ = polar.sky_layers(lid, cov, sol, None, size=200)
     assert np.array_equal(plain, with_lid), "a disconnected patch adds no outline"
 
@@ -9434,7 +9434,9 @@ def test_sky_layers_refuses_mismatched_runs_and_puts_pockets_under_the_planning_
 
 def test_skymask_feeds_connected_sky_and_writes_pockets(tmp_path, monkeypatch, capsys):
     """The wiring, not the helpers: what connected_sky keeps is what the mask is
-    built from, and pocket_intervals' result lands in the file."""
+    built from, pocket_intervals' result lands in the file, and a panorama with
+    no sky at all is refused rather than written as a wall."""
+    import numpy as np
     import pytest
 
     from terminus import skymask
@@ -9442,18 +9444,31 @@ def test_skymask_feeds_connected_sky_and_writes_pockets(tmp_path, monkeypatch, c
     from terminus.export import load_columns
 
     pano = tmp_path / "pano.png"
-    _synthetic_panorama(str(pano), blocked=(100, 140))
+    _synthetic_panorama(str(pano))
+    args = ["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"]
+    main(args)
+    _, plain = load_columns(str(tmp_path / "pano_mask.yaml"))
+
+    real = skymask.connected_sky
+
+    def east_only(sky, valid=None):
+        return real(sky, valid) & (np.arange(sky.shape[1]) >= sky.shape[1] // 2)
+
+    monkeypatch.setattr(skymask, "connected_sky", east_only)
     monkeypatch.setattr(
         skymask, "pocket_intervals", lambda sky, top, valid=None: [[(20.0, 15.0)]] * sky.shape[1]
     )
-    main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"])
+    main(args)
     _, cols = load_columns(str(tmp_path / "pano_mask.yaml"))
     assert all(c.get("pockets") == [(20.0, 15.0)] for c in cols.values())
+    assert all(cols[a]["alt"] > plain[a]["alt"] for a in cols if a < 180), "kept sky ignored"
+    assert all(cols[a]["alt"] == plain[a]["alt"] for a in cols if a >= 180)
 
-    monkeypatch.setattr(skymask, "connected_sky", lambda sky, valid: sky & False)
+    wall = tmp_path / "wall.png"
+    _synthetic_panorama(str(wall), blocked=(0, 720))
     with pytest.raises(SystemExit):
-        main(["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"])
-    assert "connects to the open sky" in capsys.readouterr().err
+        main(["skymask", str(wall), "--backend", "heuristic", "--az-step", "30"])
+    assert "no labelled sky" in capsys.readouterr().err
 
 
 def test_the_page_draws_planning_pockets_and_remeasured_columns():
@@ -9494,3 +9509,149 @@ def test_the_guided_loop_hands_its_pockets_to_the_sampler(monkeypatch):
             _synthetic_horizon(), None, pockets={90: [(20.0, 15.0)]}, log=lambda *a, **k: None
         )
     assert seen["pockets"] == {90: [(20.0, 15.0)]}
+
+
+def test_connected_sky_seeds_win_over_size_and_uncovered_is_never_sky():
+    """With a real seed, a large disconnected blob is still a reflection; the
+    largest-region rescue is only for a covered zenith, and counts SKY pixels,
+    not unphotographed ones. Unphotographed pixels never come back as sky."""
+    import warnings
+
+    import numpy as np
+
+    from terminus.skymask import connected_sky
+
+    sky = np.zeros((40, 60), bool)
+    sky[0, 5] = True  # a sliver of real sky at the top
+    sky[20:30, 10:40] = True  # a big blue blob, cut off from it
+    assert not connected_sky(sky)[20:30, 10:40].any(), "a seed exists: the blob is not sky"
+
+    valid = np.ones((40, 60), bool)
+    valid[5:15, 40:60] = False  # a big unphotographed hole, bigger than any sky
+    sky = np.zeros((40, 60), bool)
+    sky[20:30, 0:20] = True  # largest sky region
+    sky[32:35, 30:35] = True  # small reflection
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        kept = connected_sky(sky, valid)
+    assert kept[20:30, 0:20].all() and not kept[32:35, 30:35].any()
+    assert any("largest sky region" in str(x.message) for x in w), "the rescue must say so"
+    assert not kept[~valid].any(), "unphotographed is passable, never returned as sky"
+
+    top_hole = np.ones((40, 60), bool)
+    top_hole[0:3] = False  # an unphotographed strip IN the open sky's own region
+    sky = np.zeros((40, 60), bool)
+    sky[3:20] = True
+    kept = connected_sky(sky, top_hole)
+    assert kept[3:20].all() and not kept[0:3].any()
+
+
+def test_sky_layers_ignores_coverage_holes_and_refuses_a_skyless_map():
+    import numpy as np
+    import pytest
+
+    from terminus import polar
+
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    cls, cov = _sky_classes()
+    full, _ = polar.sky_layers(cls, cov, sol, None, size=200)
+    holed = cov.copy()
+    holed[10:20, 100:140] = 0  # nobody photographed this patch of open sky
+    with_hole, _ = polar.sky_layers(cls, holed, sol, None, size=200)
+    assert (with_hole[..., 3] > 0).sum() <= (full[..., 3] > 0).sum(), "a hole is not terrain"
+    with pytest.raises(ValueError, match="no sky"):
+        polar.sky_layers(np.full_like(cls, 4), cov, sol, None, size=200)
+
+
+def test_pocket_lookup_does_not_reach_across_a_gap_in_the_mask():
+    """Columns 1-30 excluded: a fiducial at native 10 has no neighbour within
+    half a column, so column 0's pocket must not be borrowed for it."""
+    from terminus.guide import photo_sample
+
+    rows = [(float(a), 35.0, "tree") for a in range(360) if not 1 <= a <= 30]
+    sample = photo_sample(rows, {0: [(30.0, 10.0)]})
+    assert sample.pockets_near(0.4) == [(30.0, 10.0)]
+    assert sample.pockets_near(10.0) == ()
+
+
+def test_pocket_matched_ignores_unreadable_columns():
+    from terminus.orient import Fiducial, pocket_matched
+
+    def blind(a):
+        return float("nan")
+
+    assert pocket_matched([Fiducial(90, 10.0)], blind, 0.0, 0.0, 0.0) == []
+
+
+def test_orient_hands_its_pockets_to_the_loop_and_reports_matches(tmp_path, monkeypatch, capsys):
+    """`_orient` must carry the mask's pockets into the loop and into the sampler
+    it scores with, and name the columns scored against a pocket floor."""
+    from terminus import guide
+    from terminus.cli import main
+    from terminus.export import write_mask
+    from terminus.orient import Fiducial
+
+    photo = tmp_path / "photo.yaml"
+    rows = {a: {"alt": 35.0, "type": "tree"} for a in range(0, 360, 5)}
+    rows[90]["pockets"] = [(30.0, 10.0)]
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+    prof = tmp_path / "p.json"
+    prof.write_text('{"90": [[60, 80.0]]}')
+    seen = {}
+    sol = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "tilt_mag": 0.0,
+        "tilt_dir": 0.0,
+        "rms": 0.1,
+        "residuals": {90.0: 0.2, 180.0: 0.0},
+        "n": 2,
+        "n_bound": 0,
+    }
+
+    def fake_run(rows_, measure, **kw):
+        seen["pockets"] = kw.get("pockets")
+        steps = [guide.Step(90.0, fiducial=Fiducial(90.0, 10.2), solution=sol),
+                 guide.Step(180.0, fiducial=Fiducial(180.0, 35.0), solution=sol)]  # fmt: skip
+        return sol, steps
+
+    monkeypatch.setattr(guide, "run", fake_run)
+    try:
+        main(["orient", str(photo), "--replay", str(prof), "--out", str(tmp_path / "o.yaml")])
+    except SystemExit:
+        pass  # whatever the record-writing says about a two-column fit, the print is the point
+    assert seen["pockets"] == {90: [(30.0, 10.0)]}
+    assert "scored against a sky-pocket floor, not the line: az 90" in capsys.readouterr().out
+
+
+def test_polar_refuses_bad_inputs_through_the_command(tmp_path, capsys):
+    import numpy as np
+    import pytest
+    import yaml
+
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "m.yaml")
+    doc = yaml.safe_load(mask.read_text())
+    doc["horizon"][0]["pockets"] = [[10, 20]]
+    mask.write_text(yaml.safe_dump(doc))
+    with pytest.raises(SystemExit):
+        main(["polar", str(mask), "--no-frames", "--out", str(tmp_path / "a.html")])
+    assert "column 0" in capsys.readouterr().err
+
+    good = _oriented_mask(tmp_path / "g.yaml")
+    cls, cov = _sky_classes()
+    np.save(tmp_path / "c.npy", cls)
+    np.save(tmp_path / "cov.npy", cov[::2, ::2])
+    with pytest.raises(SystemExit):
+        main(["polar", str(good), "--no-frames", "--classes", str(tmp_path / "c.npy"),
+              "--out", str(tmp_path / "b.html")])  # fmt: skip
+    assert "coverage" in capsys.readouterr().err
+    from PIL import Image
+
+    Image.new("RGB", (360, 180), (120, 150, 200)).save(tmp_path / "pano.png")
+    with pytest.raises(SystemExit):
+        main(["polar", str(good), "--no-frames", "--classes", str(tmp_path / "c.npy"),
+              "--image", str(tmp_path / "pano.png"), "--coverage", str(tmp_path / "cov.npy"),
+              "--out", str(tmp_path / "c.html")])  # fmt: skip
+    assert "same mosaic run" in capsys.readouterr().err

@@ -640,14 +640,13 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
     # Rotating the photo's native pockets here instead leaned them sideways by
     # an altitude-dependent amount under tilt and drew some in open sky.
     entries = {az: e for az, e in _mask_entries(args.mask).items() if isinstance(e, dict)}
-    try:
-        pockets = [
-            (float(az), hi, lo)
-            for az, entry in entries.items()
-            for hi, lo in parse_pockets(entry.get("pockets"))
-        ]
-    except ValueError as e:
-        raise MaskError(f"{args.mask}: {e}") from e
+    pockets = []
+    for az, entry in entries.items():
+        try:
+            pairs = parse_pockets(entry.get("pockets"))
+        except ValueError as e:
+            raise MaskError(f"{args.mask}: column {az}: {e}") from e
+        pockets += [(float(az), hi, lo) for hi, lo in pairs]
     if pockets:
         print(f"{len(pockets)} sky-pocket segments from the mask")
     planning = [
@@ -2049,11 +2048,9 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     #
     # SKY MUST BE CONTIGUOUS. A blue patch with no path to the open sky (the
     # patio heater's lid reflecting it, a window) is not a view of the sky.
+    if not (sky if valid is None else sky & valid).any():
+        raise MaskError("no labelled sky inside coverage; check the image and --coverage")
     kept = skymask.connected_sky(sky, valid)
-    if sky.any() and not kept.any():
-        raise MaskError(
-            "no sky in this panorama connects to the open sky; check the image and --coverage"
-        )
     if (sky & ~kept).any():
         print(
             f"{int((sky & ~kept).sum())} sky pixels not connected to the open sky: read as terrain"

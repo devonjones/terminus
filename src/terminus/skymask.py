@@ -317,17 +317,35 @@ def upper_envelope(rows, half_deg, px_per_deg):
 VEG_CLASSES_ADE20K = (4, 9, 17, 66)  # tree, grass, plant, flower
 
 
+def _wrap_roots(labels, n):
+    """Root of every label, with regions touching both panorama edges merged."""
+    root = list(range(n + 1))
+
+    def find(x):
+        while root[x] != x:
+            x = root[x]
+        return x
+
+    for a, b in zip(labels[:, 0], labels[:, -1], strict=True):
+        if a and b:
+            root[find(int(a))] = find(int(b))
+    return np.array([find(i) for i in range(n + 1)])
+
+
 def connected_sky(sky, valid=None):
     """Keep only sky that connects to the open sky: sky must be CONTIGUOUS.
 
-    Seeds are each column's topmost labelled pixel when it is sky, the passable
-    pixels of the top row, and the largest sky region. Anything sky-coloured that cannot reach
-    those through other sky (4-connected, with azimuth wrapping at 0/360) is not
-    sky: a reflection on a heater lid, a window, a blue tarp. Only ever turns
-    sky into terrain, so the horizon it feeds can only rise, which is the safe
-    direction for a map that exists to say where the telescope must not look.
-    Because unphotographed pixels are passable, a coverage hole can bridge a
-    reflection to the open sky and keep it.
+    Seeds are the passable pixels of the top row (labelled sky, or unphotographed
+    above the first labelled pixel). Anything sky-coloured that cannot reach
+    them through other sky (4-connected, with azimuth wrapping at 0/360) is not
+    sky: a reflection on a heater lid, a window, a blue tarp. With seeds it only
+    ever turns sky into terrain, so the horizon can only rise. Because
+    unphotographed pixels are passable, a coverage hole can bridge a reflection
+    to the open sky and keep it.
+
+    A canopy over the zenith leaves no seed at all; then the largest sky region
+    is taken as the open sky, with a warning, since that guess is the one case
+    where a reflection could be kept.
     """
     from scipy import ndimage
 
@@ -340,31 +358,18 @@ def connected_sky(sky, valid=None):
     # uncovered strip under the zenith and drew spikes to the centre.
     passable = sky | ~valid
     labels, n = ndimage.label(passable)
-    # The panorama wraps: a region touching the right edge continues on the left.
-    root = list(range(n + 1))
-
-    def find(x):
-        while root[x] != x:
-            x = root[x]
-        return x
-
-    for a, b in zip(labels[:, 0], labels[:, -1], strict=True):
-        if a and b:
-            root[find(int(a))] = find(int(b))
-    roots = np.array([find(i) for i in range(n + 1)])
-    first = np.argmax(valid, axis=0)
-    cols = np.flatnonzero(valid.any(axis=0) & sky[first, np.arange(w)])
-    open_ = set(roots[labels[first[cols], cols]].tolist())
-    open_ |= set(roots[labels[0][passable[0]]].tolist())
-    # THE LARGEST SKY REGION IS OPEN SKY even when nothing reaches the top: a
-    # canopy over the zenith leaves no seed, and a reflection is never the
-    # biggest patch of blue in the panorama.
-    per_root = np.bincount(roots[labels[sky]], minlength=n + 1)
-    per_root[0] = 0
-    if per_root.any():
-        open_.add(int(np.argmax(per_root)))
-    open_.discard(0)
-    return np.isin(roots[labels], list(open_)) & sky
+    roots = _wrap_roots(labels, n)[labels]
+    open_ = set(roots[0][passable[0]].tolist())
+    if not open_ and sky.any():
+        sizes = np.bincount(roots[sky], minlength=n + 1)
+        big = int(np.argmax(sizes))
+        warnings.warn(
+            f"no sky reaches the top of the panorama: kept the largest sky region "
+            f"({sizes[big]} px, {100 * sizes[big] / sky.sum():.0f}% of the sky)",
+            stacklevel=2,
+        )
+        open_ = {big}
+    return np.isin(roots, list(open_)) & sky
 
 
 def pocket_intervals(sky, top, valid=None, min_deg=0.5):

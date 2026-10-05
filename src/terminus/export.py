@@ -176,15 +176,21 @@ def load_mask(path):
 def parse_pockets(raw):
     """[(alt_hi, alt_lo), ...] from a mask's `pockets`, refusing a malformed one.
 
-    The mask is hand-editable, so a pair typed upside down or half-typed must
-    fail here with its column named, not later as a backwards interval.
+    The mask is hand-editable, so a pair typed upside down, half-typed or not a
+    number must fail here, not later as a backwards interval.
     """
+    try:
+        pairs = list(raw or ())
+    except TypeError as e:
+        raise ValueError(f"pockets must be a list of [alt_hi, alt_lo] pairs, got {raw!r}") from e
     out = []
-    for p in raw or ():
+    for p in pairs:
         try:
             hi, lo = (float(v) for v in p)
         except (TypeError, ValueError) as e:
             raise ValueError(f"pockets must be [[alt_hi, alt_lo], ...], got {p!r}") from e
+        if not (math.isfinite(hi) and math.isfinite(lo)):
+            raise ValueError(f"pocket {p!r} is not finite")
         if hi < lo:
             raise ValueError(f"pocket {p!r} has alt_hi below alt_lo")
         out.append((hi, lo))
