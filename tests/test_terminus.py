@@ -9655,3 +9655,52 @@ def test_polar_refuses_bad_inputs_through_the_command(tmp_path, capsys):
               "--image", str(tmp_path / "pano.png"), "--coverage", str(tmp_path / "cov.npy"),
               "--out", str(tmp_path / "c.html")])  # fmt: skip
     assert "same mosaic run" in capsys.readouterr().err
+
+
+def test_the_closest_pocket_floor_wins_and_lookup_wraps_at_north():
+    """Two floors within tolerance: the nearer one is what the edge measured.
+    And the nearest column to native 359.7 is column 0, across the wrap."""
+    from terminus.guide import photo_sample
+    from terminus.orient import Fiducial, predict
+
+    rows = [(float(a), 35.0, "tree") for a in range(360)]
+    sample = photo_sample(rows, {180: [(30.0, 11.5), (11.0, 10.0)], 0: [(25.0, 20.0)]})
+    assert predict([Fiducial(180, 11.2)], sample, 0.0, 0.0, 0.0)[0] == 11.5
+    assert sample.pockets_near(359.7) == [(25.0, 20.0)]
+
+
+def test_pocket_lines_run_from_the_pocket_top_to_its_floor(tmp_path):
+    """Through the command: a pocket's segment is drawn from alt_hi down to
+    alt_lo at its own azimuth, and a bare `az: alt` column does not break it."""
+    import re
+
+    import yaml
+
+    from terminus import polar
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "m.yaml", yaw=0.0, pitch=0.0, tilt_mag=0.0, tilt_dir=0.0)
+    doc = yaml.safe_load(mask.read_text())
+    doc["horizon"][0]["pockets"] = [[18.0, 12.0]]
+    doc["horizon"][90] = 15.0
+    mask.write_text(yaml.safe_dump(doc))
+    out = tmp_path / "p.html"
+    main(["polar", str(mask), "--no-frames", "--out", str(out)])
+    lines = re.findall(
+        r'<line x1="([-\d.]+)" y1="([-\d.]+)" x2="([-\d.]+)" y2="([-\d.]+)"/>', out.read_text()
+    )
+    want = [f"{v:.1f}" for v in (*polar.disc_xy(0.0, 18.0), *polar.disc_xy(0.0, 12.0))]
+    assert want in [list(m) for m in lines], (want, lines)
+
+
+def test_planning_pockets_are_interpolated_across_north():
+    """A planning line known only at 350 and 10 still covers azimuth 0."""
+    from terminus import polar
+
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    cls, cov = _sky_classes()
+    # 60 at 350 and 20 at 10: across north the line is 40 at az 0. Clamped to
+    # the nearest end instead it would read 20, under the sky band (> 30).
+    _, pk = polar.sky_layers(cls, cov, sol, [(350.0, 60.0), (10.0, 20.0), (180.0, 0.0)], size=200)
+    x, y = (int(round(v)) for v in polar.disc_xy(0.0, 35.0, 200))
+    assert pk[y, x, 3] > 0, "the pocket under the planning line at north is missing"
