@@ -9470,3 +9470,27 @@ def test_the_page_draws_planning_pockets_and_remeasured_columns():
     assert 'class="pl"' in page and 'class="pkb"' in page
     assert page.count("<line x1") >= 1
     assert 'class="edg rev"' in page
+
+
+def test_the_guided_loop_hands_its_pockets_to_the_sampler(monkeypatch):
+    """`run` must build its sampler WITH the pockets, or orient never scores a
+    pocket floor however well the helpers below it are tested."""
+    import pytest
+
+    from terminus import guide
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    def spy(rows, pockets=None):
+        seen["pockets"] = pockets
+        raise _Stop
+
+    monkeypatch.setattr(guide, "photo_sample", spy)
+    with pytest.raises(_Stop):
+        guide.run(
+            _synthetic_horizon(), None, pockets={90: [(20.0, 15.0)]}, log=lambda *a, **k: None
+        )
+    assert seen["pockets"] == {90: [(20.0, 15.0)]}
