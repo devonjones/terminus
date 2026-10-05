@@ -15,15 +15,15 @@ function el<K extends keyof HTMLElementTagNameMap>(
 // Render the tab bar, the (empty for now) active tab and a status line.
 export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> {
   let error = "";
-  const render = (s: AppState) => {
+  const render = (s: AppState, keepFocus = false) => {
     const tabs = s.tabs.map((t) => {
       const b = el("button", { textContent: title(t) });
       b.setAttribute("role", "tab");
       b.setAttribute("aria-selected", String(t === s.tab));
       b.addEventListener("click", () => {
         api.setTab(t).then(
-          (next) => ((error = ""), render(next)),
-          (e: Error) => ((error = e.message), render(s)),
+          (next) => ((error = ""), render(next, true)),
+          (e: Error) => ((error = e.message), render(s, true)),
         );
       });
       return b;
@@ -44,6 +44,8 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       parts.push(alert);
     }
     root.replaceChildren(...parts);
+    // Re-rendering replaced the button that had focus; give it to the selected tab.
+    if (keepFocus) root.querySelector<HTMLElement>('[aria-selected="true"]')?.focus();
   };
   render(await api.getState());
 }

@@ -13,11 +13,12 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 cd /mnt/c # cmd.exe refuses a \\wsl$ working directory
-win() { cmd.exe /d /c "$@" 2>&1 | stdbuf -oL tr -d '\r'; }
+# Run a command in a Windows directory. Interop maps the working directory, so no
+# path has to survive cmd.exe's quoting (which mangles quotes passed from WSL).
+win() { (cd "$1" && cmd.exe /d /c "$2" 2>&1 | stdbuf -oL tr -d '\r'); }
 local_w=$(cmd.exe /d /c 'echo %LOCALAPPDATA%' | tr -d '\r')
 roaming_w=$(cmd.exe /d /c 'echo %APPDATA%' | tr -d '\r')
 dst=$(wslpath -u "$local_w")/terminus/src
-dst_w=$(wslpath -w "$dst")
 dev=$(wslpath -u "$roaming_w")/terminus/dev
 
 case "${1:-}" in
@@ -30,26 +31,26 @@ run)
     --exclude test-results --exclude playwright-report \
     "$repo/" "$dst/"
   if [ ! -x "$dst/.venv/Scripts/python.exe" ] || ! cmp -s "$dst/pyproject.toml" "$dst/.venv/pyproject.stamp"; then
-    win "cd /d $dst_w && python -m venv .venv && .venv\\Scripts\\python -m pip install -q -e ."
+    win "$dst" "python -m venv .venv && .venv\\Scripts\\python -m pip install -q -e ."
     cp "$dst/pyproject.toml" "$dst/.venv/pyproject.stamp"
   fi
   if ! cmp -s "$dst/app/package-lock.json" "$dst/app/node_modules/.lock.stamp"; then
-    win "cd /d $dst_w\\app && npm ci"
+    win "$dst/app" "npm ci"
     cp "$dst/app/package-lock.json" "$dst/app/node_modules/.lock.stamp"
   fi
-  win "cd /d $dst_w\\app && npm run dev"
+  win "$dst/app" "npm run dev"
   ;;
 snap)
   shift
   # Playwright resolves from the Windows copy's node_modules.
-  win "cd /d $dst_w\\app && node scripts\\dev-snap.mjs $*"
+  win "$dst/app" "node scripts\\dev-snap.mjs $*"
   echo "screenshot: $dev/screenshot.png"
   ;;
 state)
   s=$dev/session.json
   token=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$s")
   url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sidecar"])' "$s")
-  curl.exe -sS --max-time 10 -H "Authorization: Bearer $token" "$url/dev/state"
+  curl.exe -fsS --max-time 10 -H "Authorization: Bearer $token" "$url/dev/state"
   echo
   ;;
 *)

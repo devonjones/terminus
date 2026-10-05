@@ -43,6 +43,17 @@ describe("mount", () => {
     expect(getByRole(root, "tab", { selected: true }).textContent).toBe("Horizon");
   });
 
+  it("keeps keyboard focus on the tab bar after a tab change", async () => {
+    const root = document.body.appendChild(document.createElement("div"));
+    await mount(root, fakeApi());
+    const tab = getByRole(root, "tab", { name: "Horizon" });
+    tab.focus();
+    tab.click();
+    await waitFor(() => expect(root.querySelector("h1")!.textContent).toBe("Horizon"));
+    expect(document.activeElement).toBe(getByRole(root, "tab", { selected: true }));
+    root.remove();
+  });
+
   it("shows a refused tab change instead of dropping it", async () => {
     const root = document.createElement("div");
     await mount(root, fakeApi({ setTab: async () => Promise.reject(new Error("engine down")) }));

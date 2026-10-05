@@ -20,14 +20,14 @@ mode an agent can drive. There are no real tabs yet.
 The main process spawns `python -m terminus.server`, using the repo's
 `.venv` (override with `TERMINUS_PYTHON`). The sidecar binds 127.0.0.1 on a
 free port and prints `{"port", "token"}` on stdout. Main then checks `/health`
-and refuses a sidecar whose version differs from `package.json`. Bump both
-together with `pyproject.toml` and `src/terminus/__init__.py` (a pytest checks
-it). The renderer never sees the token: it calls two named IPC functions and
+and refuses a sidecar whose version differs from `package.json`, so bump
+`app/package.json` together with `pyproject.toml` and `src/terminus/__init__.py`
+(a pytest checks it). The renderer never sees the token: it calls two named IPC functions and
 main forwards them.
 
 Quitting closes the sidecar's stdin, and the sidecar parks the scope and
-exits. A crashed main process closes the pipe too, so the window dying still
-parks. The sidecar's stderr goes to `<logs>/sidecar.log`, which is
+exits. If the main process crashes, the OS closes the pipe, so the sidecar
+still parks. A kill (the fallback after 5 s) skips the park on Windows. The sidecar's stderr goes to `<logs>/sidecar.log`, which is
 `%APPDATA%\terminus\logs` on Windows and `~/.config/terminus/logs` on Linux.
 
 ## Develop

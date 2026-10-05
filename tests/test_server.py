@@ -4,9 +4,11 @@ import http.client
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -65,11 +67,16 @@ def test_app_and_sidecar_versions_match():
         ({}, False, 401),
         ({"Authorization": "Bearer wrong"}, False, 401),
         ({"Host": "evil.example:80"}, True, 403),  # DNS rebinding
+        ({"Host": "127.0.0.1"}, True, 403),
+        ({"Host": "127.0.0.1:1"}, True, 403),
         ({"Origin": "http://evil.example"}, True, 403),  # a page in the user's browser
         ({"Origin": "null"}, True, 403),
     ],
 )
-@pytest.mark.parametrize("method,path", [("GET", "/state"), ("POST", "/state/tab")])
+@pytest.mark.parametrize(
+    "method,path",
+    [("GET", "/health"), ("GET", "/state"), ("GET", "/dev/state"), ("POST", "/state/tab")],
+)
 def test_refuses_without_token_host_or_with_origin(serve, method, path, headers, token, code):
     s = serve()
     status, _ = call(s, method, path, {"tab": "fit"}, headers=headers, token=token)
@@ -143,7 +150,17 @@ def test_errors_do_not_echo_the_token(serve):
     assert s.token not in json.dumps(body)
 
 
-def test_process_prints_port_and_token_and_parks_when_stdin_closes():
+def test_an_idle_connection_does_not_block_shutdown(serve):
+    s = serve()
+    with socket.create_connection(("127.0.0.1", s.port)):  # connects, sends nothing
+        time.sleep(0.2)
+        done = threading.Thread(target=s.shutdown)
+        done.start()
+        done.join(timeout=3)
+        assert not done.is_alive()
+
+
+def _sidecar_process():
     p = subprocess.Popen(
         [sys.executable, "-m", "terminus.server", "--dev"],
         stdin=subprocess.PIPE,
@@ -153,13 +170,27 @@ def test_process_prints_port_and_token_and_parks_when_stdin_closes():
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
     )
+    watchdog = threading.Timer(30, p.kill)  # readline() has no timeout of its own
+    watchdog.start()
+    hello = json.loads(p.stdout.readline() or "null")
+    assert hello, "sidecar printed no startup line"
+    return p, types.SimpleNamespace(**hello), watchdog  # namespace: just enough for call()
+
+
+@pytest.mark.parametrize("stop", ["stdin", "sigterm"])
+def test_process_prints_port_and_token_and_parks_on_exit(stop):
+    if stop == "sigterm" and sys.platform == "win32":
+        pytest.skip("Windows has no SIGTERM handler path; stdin is how it stops")
+    p, s, watchdog = _sidecar_process()
     with p:
         try:
-            hello = json.loads(p.stdout.readline())
-            s = types.SimpleNamespace(**hello)  # just enough for call()
             assert call(s, "GET", "/health")[0] == 200
-            p.stdin.close()
+            if stop == "stdin":
+                p.stdin.close()
+            else:
+                p.terminate()
             assert p.wait(timeout=20) == 0
         finally:
+            watchdog.cancel()
             p.kill()
         assert "park: no scope linked" in p.stderr.read()

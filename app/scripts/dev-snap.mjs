@@ -11,12 +11,13 @@ import os from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
-const userData =
-  {
-    win32: () => path.join(process.env.APPDATA ?? "", "terminus"),
-    darwin: () => path.join(os.homedir(), "Library", "Application Support", "terminus"),
-  }[process.platform] ??
-  (() => path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"), "terminus"));
+// Electron's app.getPath("userData") for an app named "terminus".
+function userData() {
+  if (process.platform === "win32") return path.join(process.env.APPDATA ?? "", "terminus");
+  if (process.platform === "darwin")
+    return path.join(os.homedir(), "Library", "Application Support", "terminus");
+  return path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"), "terminus");
+}
 const devDir = path.join(userData(), "dev");
 
 const { values } = parseArgs({ options: { click: { type: "string" }, out: { type: "string" } } });

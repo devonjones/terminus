@@ -3,7 +3,8 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
-vi.mock("node:fs", () => ({ createWriteStream: () => new PassThrough() }));
+const logStream = new PassThrough();
+vi.mock("node:fs", () => ({ createWriteStream: () => logStream }));
 
 import { spawn } from "node:child_process";
 import { request, startSidecar, stopSidecar } from "./sidecar";
@@ -89,11 +90,28 @@ describe("startSidecar", () => {
     expect(proc.kill).toHaveBeenCalled();
   });
 
-  it("rejects a startup line that is not JSON", async () => {
+  it.each(["Traceback (most recent call last):", "{}", '{"port": "1", "token": "t"}', "null"])(
+    "rejects and kills on a startup line of %s",
+    async (line) => {
+      const p = startSidecar(opts);
+      proc.stdout.write(line + "\n");
+      await expect(p).rejects.toThrow(`startup line was not {port, token}: ${line}`);
+      expect(proc.kill).toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("survives errors on the log file and the sidecar's stdin", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    health();
     const p = startSidecar(opts);
-    proc.stdout.write("Traceback (most recent call last):\n");
-    await expect(p).rejects.toThrow("startup line was not JSON");
-    expect(proc.kill).toHaveBeenCalled();
+    proc.stdout.write('{"port": 1, "token": "t"}\n');
+    await p;
+    // With no listener these would be uncaught exceptions in the main process.
+    logStream.emit("error", new Error("EACCES"));
+    proc.stdin.emit("error", new Error("EPIPE"));
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("EACCES"));
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("EPIPE"));
   });
 });
 
@@ -134,6 +152,11 @@ describe("request", () => {
     const [, init] = fetchMock.mock.calls[0];
     expect(init.method).toBe("POST");
     expect(init.body).toBe('{"tab":"fit"}');
+  });
+
+  it("keeps the HTTP status when an error body is not JSON", async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 502, json: async () => JSON.parse("<html>") });
+    await expect(request(sc, "/state")).rejects.toThrow("engine /state: 502");
   });
 
   it("turns an error response into an error carrying the sidecar's message", async () => {

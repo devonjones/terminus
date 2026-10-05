@@ -6,14 +6,14 @@ Binds 127.0.0.1 on a free port and prints one JSON line to stdout,
 ``{"port": N, "token": "..."}``. Every request must carry ``Authorization:
 Bearer <token>``, a ``Host`` of 127.0.0.1/localhost on that port, and no
 ``Origin`` header. The only legitimate callers are the Electron main process and
-a developer's curl, neither of which sends ``Origin``. A web page in the user's
-browser always does, and DNS rebinding cannot forge ``Host``. That matters because
-this port will eventually move a telescope.
+a developer's curl, neither of which sends ``Origin``; browsers send it on
+cross-origin POSTs. The token stops a page that omits it, and the ``Host`` check
+stops DNS rebinding. That matters because this port will eventually move a telescope.
 
 The sidecar exits when its stdin closes, and parks the scope on the way out. The
-parent holds the other end of the pipe, so a crash of the window still parks. On
-Windows a kill is TerminateProcess and runs no handler, so stdin is the shutdown
-path that works on every OS.
+parent holds the other end of the pipe, so if the Electron main process dies the
+sidecar still parks. On Windows a kill is TerminateProcess and runs no handler,
+so stdin is the shutdown path that works on every OS.
 
 Routes:
   GET  /health      {"ok": true, "version": ...}, the UI/sidecar version handshake
@@ -31,7 +31,7 @@ import secrets
 import signal
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .. import __version__
 
@@ -62,7 +62,13 @@ class _RecentLog(logging.Handler):
         self.lines.append(self.format(record))
 
 
-class Sidecar(HTTPServer):
+class Sidecar(ThreadingHTTPServer):
+    # Threads, so an idle or slow connection cannot hold up shutdown (and the
+    # park behind it); daemon threads, so shutdown does not wait for them.
+    daemon_threads = True
+    # SO_REUSEADDR on Windows lets another process bind the same port.
+    allow_reuse_address = False
+
     def __init__(self, dev=False, token=None, scope=None):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.dev = dev
@@ -92,6 +98,7 @@ class Sidecar(HTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server: Sidecar
+    timeout = 10  # seconds a connection may sit idle
 
     def log_message(self, fmt, *args):
         log.info("%s %s", self.address_string(), fmt % args)
@@ -149,9 +156,14 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _stop_on_eof(server):
-    sys.stdin.read()
-    log.info("stdin closed, shutting down")
-    server.shutdown()
+    try:
+        sys.stdin.read()
+        log.info("stdin closed, shutting down")
+    except Exception:
+        # No usable stdin means no way to be told to stop: stop now, not never.
+        log.exception("cannot read stdin, shutting down")
+    finally:
+        server.shutdown()
 
 
 def main(argv=None):

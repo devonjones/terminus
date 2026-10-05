@@ -23,26 +23,27 @@ export interface StartOptions {
 // message: not installed (spawn error), refused to start (exit), stuck (timeout).
 function hello(proc: ChildProcess, command: string, timeoutMs: number) {
   return new Promise<{ port: number; token: string }>((resolve, reject) => {
+    const fail = (msg: string) => (clearTimeout(timer), reject(new Error(msg)));
     const timer = setTimeout(
-      () => reject(new Error(`the engine did not start within ${timeoutMs / 1000} s`)),
+      fail,
       timeoutMs,
+      `the engine did not start within ${timeoutMs / 1000} s`,
     );
-    const done = () => clearTimeout(timer);
-    proc.once(
-      "error",
-      (e) => (done(), reject(new Error(`could not run ${command}: ${e.message}`))),
-    );
-    proc.once(
-      "exit",
-      (code) => (done(), reject(new Error(`the engine exited (code ${code}) before starting`))),
+    proc.once("error", (e) => fail(`could not run ${command}: ${e.message}`));
+    proc.once("exit", (code, signal) =>
+      fail(`the engine exited (${signal ?? `code ${code}`}) before starting`),
     );
     createInterface({ input: proc.stdout! }).once("line", (line) => {
-      done();
+      clearTimeout(timer);
+      let hi: { port?: unknown; token?: unknown } | null = null;
       try {
-        resolve(JSON.parse(line));
+        hi = JSON.parse(line);
       } catch {
-        reject(new Error("the engine's startup line was not JSON"));
+        // reported below with the line itself
       }
+      if (typeof hi?.port === "number" && typeof hi.token === "string")
+        resolve({ port: hi.port, token: hi.token });
+      else fail(`the engine's startup line was not {port, token}: ${line.slice(0, 200)}`);
     });
   });
 }
@@ -58,14 +59,18 @@ export async function request<T = unknown>(
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(10_000),
   });
-  const json = await res.json();
+  const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`engine ${path}: ${res.status} ${json.error ?? ""}`.trim());
   return json;
 }
 
 export async function startSidecar(o: StartOptions): Promise<Sidecar> {
   const proc = spawn(o.command, o.args, { cwd: o.cwd, stdio: "pipe", windowsHide: true });
-  proc.stderr!.pipe(createWriteStream(o.logPath, { flags: "a" }));
+  const log = createWriteStream(o.logPath, { flags: "a" });
+  log.on("error", (e) => console.error(`terminus: cannot write ${o.logPath}: ${e.message}`));
+  proc.stderr!.pipe(log);
+  // EPIPE if the sidecar is already gone when we close stdin; its exit says why.
+  proc.stdin!.on("error", (e) => console.error(`terminus: engine stdin: ${e.message}`));
   try {
     const { port, token } = await hello(proc, o.command, o.timeoutMs ?? 30_000);
     const url = `http://127.0.0.1:${port}`;
@@ -85,8 +90,11 @@ export async function stopSidecar(proc: ChildProcess, graceMs = 5_000): Promise<
   if (proc.exitCode !== null || proc.signalCode !== null) return;
   const exited = new Promise((r) => proc.once("exit", r));
   proc.stdin!.end();
-  const timer = new Promise((r) => setTimeout(r, graceMs, "timeout"));
-  if ((await Promise.race([exited, timer])) === "timeout") {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise((r) => (timer = setTimeout(r, graceMs, "timeout")));
+  const winner = await Promise.race([exited, timeout]);
+  clearTimeout(timer);
+  if (winner === "timeout") {
     console.error(
       `terminus: engine did not exit within ${graceMs} ms of stdin closing; killing it`,
     );

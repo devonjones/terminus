@@ -17,6 +17,7 @@ const indexHtml = path.join(__dirname, "index.html");
 const indexUrl = pathToFileURL(indexHtml).href;
 let sidecar: Sidecar | undefined;
 let quitting = false;
+const logPath = () => path.join(app.getPath("logs"), "sidecar.log");
 
 function fromOurPage(e: IpcMainInvokeEvent) {
   if (e.senderFrame?.url !== indexUrl) throw new Error("IPC from an unexpected frame");
@@ -54,31 +55,19 @@ async function boot() {
   const repo = path.resolve(__dirname, "..", "..");
   const venvPython = process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python";
   const python = process.env.TERMINUS_PYTHON ?? path.join(repo, venvPython);
-  const logDir = app.getPath("logs");
-  mkdirSync(logDir, { recursive: true });
-  const logPath = path.join(logDir, "sidecar.log");
-  try {
-    sidecar = await startSidecar({
-      command: python,
-      args: ["-m", "terminus.server", ...(dev ? ["--dev"] : [])],
-      cwd: repo,
-      logPath,
-      expectedVersion: app.getVersion(),
-    });
-  } catch (e) {
-    dialog.showErrorBox(
-      "terminus could not start its engine",
-      `${(e as Error).message}\n\nLog: ${logPath}`,
-    );
-    app.quit();
-    return;
-  }
-  const sc = sidecar;
-  sc.proc.on("exit", (code) => {
+  mkdirSync(path.dirname(logPath()), { recursive: true });
+  const sc = (sidecar = await startSidecar({
+    command: python,
+    args: ["-m", "terminus.server", ...(dev ? ["--dev"] : [])],
+    cwd: repo,
+    logPath: logPath(),
+    expectedVersion: app.getVersion(),
+  }));
+  sc.proc.on("exit", (code, signal) => {
     if (quitting) return;
     dialog.showErrorBox(
       "terminus engine stopped",
-      `It exited with code ${code}.\n\nLog: ${logPath}`,
+      `It exited (${signal ?? `code ${code}`}).\n\nLog: ${logPath()}`,
     );
     app.quit();
   });
@@ -107,15 +96,21 @@ if (!app.requestSingleInstanceLock()) {
     if (win?.isMinimized()) win.restore();
     win?.focus();
   });
-  app.whenReady().then(() => {
-    session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
-    return boot();
-  });
+  app
+    .whenReady()
+    .then(() => {
+      session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
+      return boot();
+    })
+    .catch((e: Error) => {
+      dialog.showErrorBox("terminus could not start", `${e.message}\n\nLog: ${logPath()}`);
+      app.quit();
+    });
 }
 
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", () => (quitting = true));
-// Hold the quit until the sidecar has parked and exited.
+// Hold the quit until the sidecar has exited (parked, unless it had to be killed).
 app.on("will-quit", (e) => {
   const proc = sidecar?.proc;
   if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
