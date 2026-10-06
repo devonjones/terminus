@@ -431,3 +431,14 @@ table.sites button {
   background: none;
   color: inherit;
 }
+
+/* The picture of a build, the match graph and the curation panorama always fit
+   the window below the bar, tabs and heading: they shrink rather than run off
+   the bottom, so the whole canvas is always in view. */
+.live,
+.stage {
+  width: min(100%, calc((100vh - 240px) * 2));
+}
+svg.graph {
+  width: min(100%, calc((100vh - 240px) * 1000 / 560));
+}
