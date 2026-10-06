@@ -9257,6 +9257,7 @@ def test_run_sweep_skips_a_column_inside_the_sun_cone():
     scanned, pointed = [], []
 
     def fake_scan(ptr, sc_, az, *a, **k):
+        ptr.point_to(az, 0.0)  # the real scan climbs the column from the bottom
         scanned.append(az)
         return 20.0, "edge", "tree", []
 
