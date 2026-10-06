@@ -33,7 +33,7 @@ from .orient import PARAMS, Fiducial, effective_constraints, fit, native_column
 from .orient import rotate as _rotate
 
 
-def photo_sample(rows):
+def photo_sample(rows, pockets=None):
     """`sample(az)` over a photo mask's columns, interpolated across the wrap.
 
     `orient.native_column` calls this at arbitrary azimuths while solving a fixed
@@ -49,6 +49,11 @@ def photo_sample(rows):
     stretch is not what the yaw is solved against. It becomes wrong only if a
     fiducial lands inside the gap, which is the caller's business to avoid; the
     same bridging is what `Horizon` has always done.
+
+    `pockets` is `{native az: [(alt_hi, alt_lo), ...]}`, the sky seen below the
+    line. When given, the sampler carries `sample.pockets_near(az)`, which
+    `orient.predict` reads to score an edge at a pocket's floor; otherwise that
+    attribute is None.
     """
     pts = sorted((float(az), float(alt)) for az, alt, *_ in rows)
     if not pts:
@@ -59,6 +64,24 @@ def photo_sample(rows):
     def sample(a):
         return float(np.interp(float(a) % 360.0, az, alt, period=360.0))
 
+    # {native az: [(alt_hi, alt_lo), ...]}: sky seen below the line. Carried on
+    # the sampler so `orient.predict` can compare a telescope edge measured at
+    # a pocket's floor against that floor without every caller between here and
+    # there growing a parameter. Looked up at the NEAREST mask column, so a
+    # mask with columns every 5 or 10 degrees still matches.
+    pk = {float(k) % 360.0: v for k, v in (pockets or {}).items()}
+    # Half the nearest column's SMALLER gap to a neighbour: further away than
+    # that is a gap in the mask (an excluded or dropped azimuth), not this
+    # column. Local, so a mask with coarse and fine stretches works in both.
+    gaps = np.diff(np.append(az, az[0] + 360.0))
+    reach = np.minimum(gaps, np.roll(gaps, 1)) / 2.0
+
+    def pockets_near(phi):
+        d = np.abs((az - float(phi) + 180.0) % 360.0 - 180.0)
+        i = int(np.argmin(d))
+        return pk.get(float(az[i]), ()) if d[i] <= reach[i] else ()
+
+    sample.pockets_near = pockets_near if pk else None
     return sample
 
 
@@ -134,6 +157,7 @@ def run(
     log=print,
     min_headroom=None,
     fit_kw=None,
+    pockets=None,
 ):
     """Measure columns until the solved yaw stops moving. Returns (solution, steps).
 
@@ -167,8 +191,11 @@ def run(
     the accurate one and costs tens of seconds per refit — cheap next to the
     minutes a column takes to measure, and far too slow for a test suite, which
     is the only reason this is reachable.
+
+    `pockets` ({native az: [(alt_hi, alt_lo), ...]}) lets an edge measured inside
+    a sky pocket be scored against the pocket floor (see `orient._pocket_floor`).
     """
-    sample = photo_sample(rows)
+    sample = photo_sample(rows, pockets)
     # THE GRADIENT MUST BE READ IN THE PHOTO'S OWN FRAME. The mask is in the
     # panorama's azimuth and the scope points in true azimuth, so the slope that
     # decides whether a column carries yaw information sits at `az - yaw`, not at

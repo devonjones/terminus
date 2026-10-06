@@ -66,7 +66,14 @@ import yaml
 #                segmentation) or "scope" (colour, daylight only). Per column,
 #                because a merged mask holds both and they are not equally able
 #                to tell a tree from a wall.
-COLUMN_FIELDS = ("clipped", "gap_fraction", "uncertainty", "type_source", "bound")
+#   pockets      [[alt_hi, alt_lo], ...] sky seen BELOW the horizon (canopy gaps,
+#                under overhangs). Blocked for planning; a telescope edge inside
+#                one is measuring the pocket's floor, not missing the horizon.
+#   planning     the line a planner should respect; never below `alt`.
+#   fuzz         planning - alt, degrees.
+COLUMN_FIELDS = (
+    "clipped", "gap_fraction", "uncertainty", "type_source", "bound", "pockets", "planning", "fuzz",
+)  # fmt: skip
 # Old spellings still accepted when reading, never written.
 _RENAMED = {"gap_fraction": "porosity"}
 
@@ -143,6 +150,10 @@ def write_mask(path, mask, skipped, meta):
         for key in COLUMN_FIELDS:
             if col.get(key) is not None:
                 v = col[key]
+                if key == "pockets":
+                    # Plain floats: a numpy scalar would print as np.float64(...)
+                    # and the file would no longer be YAML anyone can read.
+                    v = [[round(float(hi), 2), round(float(lo), 2)] for hi, lo in v]
                 parts.append(f"{key}: {v!r}" if isinstance(v, bool) else f"{key}: {v}")
         lines.append(f"  {az}: {{{', '.join(parts)}}}")
     if skipped:
@@ -160,6 +171,30 @@ def load_mask(path):
     """
     meta, cols = load_columns(path)
     return meta, sorted((az, c["alt"], c.get("type", "")) for az, c in cols.items())
+
+
+def parse_pockets(raw):
+    """[(alt_hi, alt_lo), ...] from a mask's `pockets`, refusing a malformed one.
+
+    The mask is hand-editable, so a pair typed upside down, half-typed or not a
+    number must fail here, not later as a backwards interval.
+    """
+    try:
+        pairs = list(raw or ())
+    except TypeError as e:
+        raise ValueError(f"pockets must be a list of [alt_hi, alt_lo] pairs, got {raw!r}") from e
+    out = []
+    for p in pairs:
+        try:
+            hi, lo = (float(v) for v in p)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"pockets must be [[alt_hi, alt_lo], ...], got {p!r}") from e
+        if not (math.isfinite(hi) and math.isfinite(lo)):
+            raise ValueError(f"pocket {p!r} is not finite")
+        if hi < lo:
+            raise ValueError(f"pocket {p!r} has alt_hi below alt_lo")
+        out.append((hi, lo))
+    return out
 
 
 def load_columns(path):
@@ -189,6 +224,11 @@ def load_columns(path):
                         col[key] = bool(raw)
                     elif key == "type_source":
                         col[key] = str(raw)
+                    elif key == "pockets":
+                        try:
+                            col[key] = parse_pockets(raw)
+                        except ValueError as e:
+                            raise MaskError(f"{path}: column {az}: {e}") from e
                     else:
                         col[key] = float(raw)
         else:  # bare "az: alt"

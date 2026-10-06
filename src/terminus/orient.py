@@ -376,20 +376,58 @@ def native_column(sample, target_az, yaw, tilt_mag, tilt_dir, tol=1e-3, iters=8)
     return best[1], best[2]
 
 
-def predict(fids, sample, yaw, tilt_mag, tilt_dir):
+def predict(fids, sample, yaw, tilt_mag, tilt_dir, use_pockets=True):
     """Photo altitude at each fiducial's azimuth, before pitch. NaN where unread.
 
     Split out from `residuals` because pitch enters as a pure offset, so the fit
     can sweep it without redoing the rotation — which is the expensive part.
     """
+    pockets_near = getattr(sample, "pockets_near", None) if use_pockets else None
     out = np.empty(len(fids))
     for i, f in enumerate(fids):
         phi, raw = native_column(sample, f.az, yaw, tilt_mag, tilt_dir)
         if raw is None or not math.isfinite(raw):
             out[i] = np.nan
-        else:
-            out[i] = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)[1]
+            continue
+        out[i] = _rotate_scalar(phi + yaw, raw, tilt_mag, tilt_dir)[1]
+        if pockets_near and not f.bound:
+            out[i] = _pocket_floor(pockets_near, f, yaw, tilt_mag, tilt_dir, out[i])
     return out
+
+
+POCKET_TOL_DEG = 2.0  # covers pitch, which is applied after `predict`
+
+
+def _pocket_floor(pockets_near, f, yaw, tilt_mag, tilt_dir, line):
+    """The pocket floor a telescope edge is measuring, or the line if none.
+
+    A scope walking down a column steps over a thin band of canopy and stops at
+    the bottom of the sky it can see, so an edge at a pocket's FLOOR is a real
+    measurement of that floor, not a miss of the horizon line. Only an edge
+    within POCKET_TOL_DEG of a floor matches it; one partway up a pocket agrees
+    with neither boundary and stays scored against the line. Each floor is
+    placed with its own `native_column`, because tilt shifts azimuth by an
+    amount that depends on altitude. Planning never uses this: pockets are
+    blocked sky.
+    """
+    best, best_d = line, abs(line - f.alt)
+    phi, _ = native_column(lambda a: f.alt, f.az, yaw, tilt_mag, tilt_dir)
+    for _hi, lo in pockets_near(phi):
+        phi_lo, _ = native_column(lambda a, lo=lo: lo, f.az, yaw, tilt_mag, tilt_dir)
+        floor = _rotate_scalar(phi_lo + yaw, lo, tilt_mag, tilt_dir)[1]
+        d = abs(floor - f.alt)
+        if d <= POCKET_TOL_DEG and d < best_d:
+            best, best_d = floor, d
+    return best
+
+
+def pocket_matched(fids, sample, yaw, tilt_mag, tilt_dir):
+    """Azimuths of the fiducials `predict` scored against a pocket floor."""
+    with_pk = predict(fids, sample, yaw, tilt_mag, tilt_dir)
+    bare = predict(fids, sample, yaw, tilt_mag, tilt_dir, use_pockets=False)
+    return [
+        f.az for f, a, b in zip(fids, with_pk, bare, strict=True) if math.isfinite(b) and a != b
+    ]
 
 
 def score(fids, photo, pitch):

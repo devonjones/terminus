@@ -46,6 +46,9 @@ SIZE = 1200
 EDGE_COLOUR = "#48e078"
 BOUND_COLOUR = "#ff5c5c"
 HORIZON_COLOUR = "#ffd640"
+POCKET_COLOUR = "#5ad7ff"
+PLANNING_COLOUR = "#ff8a3d"
+REMEASURED_COLOUR = "#ff4fd8"
 GAP_COLOUR = (255, 92, 92, 120)
 VOID_RGB = (18, 21, 27)
 BACKDROP_RGB = (11, 13, 17)
@@ -65,11 +68,27 @@ def project(image, coverage, solution, size=SIZE, floor=FLOOR_DEG):
             f"coverage {cov.shape[:2]} does not match the panorama {src.shape[:2]}; "
             "they must come from the same mosaic run"
         )
-    sh, sw = cov.shape[:2]
+    sy, sx, inside, _, _ = disc_index(cov.shape[:2], solution, size, floor)
+    have = inside & (cov[sy, sx] > 0)
+
+    rgb = np.zeros((size, size, 3), np.uint8)
+    rgb[:] = BACKDROP_RGB
+    rgb[inside & ~have] = VOID_RGB
+    rgb[have] = src[sy[have], sx[have]][..., :3]
+    return rgb, inside & ~have
+
+
+def disc_index(shape, solution, size=SIZE, floor=FLOOR_DEG):
+    """For every disc pixel: which panorama pixel is behind it, and where it is.
+
+    Returns (sy, sx, inside, true_az, true_alt). The ONE mapping every raster
+    layer goes through (the photograph, the sky outline, the pockets), so no
+    layer can drift from another under tilt.
+    """
+    sh, sw = shape
     span = 90.0 - floor
     centre = size // 2
     radius = centre - 1
-
     ys, xs = np.mgrid[0:size, 0:size]
     dx, dy = xs - centre, ys - centre
     rad = np.hypot(dx, dy)
@@ -78,21 +97,70 @@ def project(image, coverage, solution, size=SIZE, floor=FLOOR_DEG):
     # Screen y grows downward and azimuth grows clockwise from north, which is
     # up: atan2(dy, dx) is zero at east, so north needs the +90.
     true_az = (np.degrees(np.arctan2(dy, dx)) + 90.0) % 360.0
-
     phi, theta = rotate_inverse(
         true_az, true_alt, solution["pitch"], solution["tilt_mag"], solution["tilt_dir"]
     )
     phi = (phi - solution["yaw"]) % 360.0
-
     sx = np.clip(phi / 360.0 * sw, 0, sw - 1).astype(int)
     sy = np.clip((90.0 - theta) / 180.0 * sh, 0, sh - 1).astype(int)
-    have = inside & (cov[sy, sx] > 0)
+    return sy, sx, inside, true_az, true_alt
 
-    rgb = np.zeros((size, size, 3), np.uint8)
-    rgb[:] = BACKDROP_RGB
-    rgb[inside & ~have] = VOID_RGB
-    rgb[have] = src[sy[have], sx[have]][..., :3]
-    return rgb, inside & ~have
+
+def sky_layers(classes, coverage, solution, planning, size=SIZE, floor=FLOOR_DEG):
+    """The real sky outline and the pockets, as disc rasters (RGBA uint8 each).
+
+    HORIZON ACTUAL IS AN OUTLINE, NOT A FUNCTION OF AZIMUTH. A roof corner or
+    an overhang folds the sky's edge back on itself, which one altitude per
+    azimuth cannot draw. So the sky region is projected pixel by pixel through
+    `disc_index` (the photograph's own mapping) and its boundary is drawn.
+
+    Sky: labelled sky, covered, and contiguous with the open sky
+    (`skymask.connected_sky`, on the panorama itself, where the azimuth wraps; a
+    heater lid is not sky). No altitude clamp: true 0 deg is only known after
+    matching, so clipping at it would bake the fit's own error into the map.
+    Pockets: that sky where it lies below the planning line, which is the one
+    horizon a scheduler may use and stays one value per azimuth.
+    """
+    from scipy import ndimage
+
+    from .skymask import SKY_CLASS_ADE20K, connected_sky
+
+    cls, cov = np.asarray(classes), np.asarray(coverage)
+    if cls.shape != cov.shape:
+        raise ValueError(
+            f"class map {cls.shape} and coverage {cov.shape} differ: not the same mosaic run"
+        )
+    seen = (cov > 0) & (cls >= 0)
+    open_sky = connected_sky(cls == SKY_CLASS_ADE20K, seen)
+    sy, sx, inside, taz, talt = disc_index(cls.shape, solution, size, floor)
+    valid = inside & seen[sy, sx]
+    sky = valid & open_sky[sy, sx]
+    if not sky.any():
+        raise ValueError("no sky in the class map connects to the open sky")
+    # The horizon is where sky meets REAL terrain, not where it meets a pixel
+    # nobody photographed: an uncovered spot at the zenith is not an obstruction.
+    terrain = valid & (cls[sy, sx] != SKY_CLASS_ADE20K)
+    edge = sky & ndimage.binary_dilation(terrain, iterations=1)
+    edge = ndimage.binary_dilation(edge, iterations=1)
+    outline = np.zeros((size, size, 4), np.uint8)
+    outline[edge] = (*_hex_rgb(HORIZON_COLOUR), 255)
+    pocket = np.zeros((size, size, 4), np.uint8)
+    if planning:
+        p_az, p_alt = zip(*sorted((float(a) % 360.0, float(v)) for a, v in planning), strict=True)
+        plan_here = np.interp(taz, p_az, p_alt, period=360.0)
+        under = sky & (talt < plan_here) & ~edge
+        pocket[under] = (*_hex_rgb(POCKET_COLOUR), 105)
+    return outline, pocket
+
+
+def _svg_image(rgba, size):
+    """A raster layer drawn inside an SVG layer, so the layer toggles stay as they are."""
+    uri = _data_uri(rgba, "RGBA", "PNG", optimize=True)
+    return f'<image href="{uri}" x="0" y="0" width="{size}" height="{size}"/>'
+
+
+def _hex_rgb(h):
+    return tuple(int(h[i : i + 2], 16) for i in (1, 3, 5))
 
 
 def disc_xy(az, alt, size=SIZE, floor=FLOOR_DEG):
@@ -138,8 +206,13 @@ PAGE = """<!doctype html>
   text.cd {{ fill:#fff; font:700 30px ui-sans-serif,system-ui,sans-serif;
             paint-order:stroke; stroke:rgba(0,0,0,.5); stroke-width:4px; }}
   polygon.hz {{ fill:rgba(255,214,64,.10); stroke:{horizon}; stroke-width:3.5; }}
-  circle.edg {{ fill:none; stroke:{edge}; stroke-width:4; }}
+  circle.edg {{ fill:none; stroke:{edge}; stroke-width:4; pointer-events:all; cursor:help; }}
+  g.bnd {{ pointer-events:all; cursor:help; }}
+  circle.edg.rev {{ stroke:{remeasured}; stroke-width:5; }}
   g.bnd path {{ fill:none; stroke:{bound}; stroke-width:4; stroke-linecap:round; }}
+  g.pk line {{ stroke:{pocket}; stroke-width:5; stroke-linecap:round; opacity:.9; }}
+  path.pkb {{ fill:{pocket}; fill-opacity:.38; fill-rule:evenodd; stroke:none; }}
+  polygon.pl {{ fill:none; stroke:{planning}; stroke-width:3; stroke-dasharray:10 7; }}
   .bar {{ display:flex; flex-wrap:wrap; gap:9px; padding:14px 0 0; }}
   button {{ font:600 13px ui-sans-serif,system-ui,sans-serif; cursor:pointer; padding:7px 14px;
            border-radius:999px; border:1px solid var(--accent); background:var(--accent);
@@ -196,12 +269,16 @@ PAGE = """<!doctype html>
     <g class="ring">{rings}</g><g class="rl">{ring_labels}</g>{cardinals}
   </svg>
   <svg class="ov" data-layer="hz" viewBox="0 0 {size} {size}" aria-hidden="true">
-    <polygon class="hz" points="{horizon_points}"/>
+    {horizon_svg}
   </svg>
-  <svg class="ov" data-layer="pts" viewBox="0 0 {size} {size}" aria-hidden="true">{markers}</svg>
+  <svg class="ov" data-layer="pk" viewBox="0 0 {size} {size}" aria-hidden="true">{pocket_band}<g class="pk">{pocket_lines}</g></svg>
+  <svg class="ov" data-layer="pl" viewBox="0 0 {size} {size}" aria-hidden="true">{planning_poly}</svg>
+  <svg class="ov" data-layer="pts" viewBox="0 0 {size} {size}" role="group" aria-label="telescope columns">{markers}</svg>
 </div>
 <div class="bar">
   <button data-t="hz" aria-pressed="true">Horizon</button>
+  <button data-t="pk" aria-pressed="{pk_pressed}">Sky pockets</button>
+  <button data-t="pl" aria-pressed="{pl_pressed}">Planning horizon</button>
   <button data-t="pts" aria-pressed="{pts_pressed}">Telescope columns</button>
   <button data-t="gap" aria-pressed="false">Not photographed</button>
   <button data-t="grid" aria-pressed="true">Altitude grid</button>
@@ -209,7 +286,10 @@ PAGE = """<!doctype html>
 <p class="key">
   <span><i style="background:{horizon}"></i>horizon from the photographs</span>
   <span><i style="background:{edge}"></i>telescope edge</span>
+  <span><i style="background:{remeasured}"></i>telescope edge re-measured with autofocus</span>
   <span><i style="background:{bound}"></i>at the scope's tilt ceiling: horizon is <em>at least</em> this high</span>
+  <span><i style="background:{pocket}"></i>sky pocket: real sky between the actual and planning horizons, never planned into</span>
+  <span><i style="background:{planning}"></i>planning horizon: the actual line raised by how far it was seen to move</span>
 </p>
 {columns}
 {diagnostics}
@@ -679,7 +759,8 @@ def diagnostics(meta, attempts=(), frames_dir=None, frame_px=110, private=False,
 
 def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
          size=SIZE, floor=FLOOR_DEG, title="terminus horizon",
-         attempts=(), frames_dir=None, frame_px=110, private=False, notes=()):  # fmt: skip
+         attempts=(), frames_dir=None, frame_px=110, private=False, notes=(),
+         pockets=(), planning=(), sky_outline=None, sky_pockets=None, remeasured=()):  # fmt: skip
     """One self-contained HTML page. No network, no assets, no build step.
 
     `rows` is the ORIENTED mask — already in true azimuth — so the ring is drawn
@@ -706,6 +787,47 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         x, y = disc_xy(az, alt, size, floor)
         pts.append(f"{x:.1f},{y:.1f}")
 
+    # PLANNING HORIZON, (az, alt) in true coordinates from the same mask as the
+    # line: what a scheduler should respect, never below the actual line.
+    plan_pts = " ".join(
+        "{:.1f},{:.1f}".format(*disc_xy(float(a), float(al), size, floor))
+        for a, al in sorted(planning)
+    )
+    planning_poly = f'<polygon class="pl" points="{plan_pts}"/>' if plan_pts else ""
+    # POCKETS ARE THE BAND BETWEEN THE TWO LINES: sky that is really there (inside
+    # the actual line) but under the planning line. Even-odd fill of both rings.
+    pocket_band = ""
+    if plan_pts:
+        act_pts = " ".join(
+            "{:.1f},{:.1f}".format(*disc_xy(float(a), float(al), size, floor))
+            for a, al in sorted((float(a), float(al)) for a, al, *_ in rows)
+        )
+        pocket_band = f'<path class="pkb" d="M{act_pts} Z M{plan_pts} Z"/>'
+    # SKY POCKETS, (az, alt_hi, alt_lo) in TRUE coordinates, read off the same
+    # oriented mask as the line, so they need no rotation here.
+    pocket_lines = []
+    for az, hi, lo in pockets:
+        x1, y1 = disc_xy(float(az), float(hi), size, floor)
+        x2, y2 = disc_xy(float(az), float(lo), size, floor)
+        pocket_lines.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
+
+    # Hover text per column: which azimuth it is, what the scope measured, and
+    # the planning line there, so a column can be named from the picture.
+    plan_at = dict((int(round(float(a))) % 360, float(v)) for a, v in planning)
+    line_at = dict((int(round(float(a))) % 360, float(al)) for a, al, *_ in rows)
+
+    def _tip(f):
+        az = int(round(float(f.az))) % 360
+        kind = "at least " if getattr(f, "bound", False) else ""
+        bits = [f"az {az}", f"scope edge {kind}{float(f.alt):.2f}\u00b0"]
+        if az in remeasured:
+            bits.append("re-measured with autofocus")
+        if az in line_at:
+            bits.append(f"horizon {line_at[az]:.2f}\u00b0")
+        if az in plan_at:
+            bits.append(f"planning {plan_at[az]:.2f}\u00b0")
+        return html.escape(" \u00b7 ".join(bits))
+
     markers = []
     for f in fiducials:
         x, y = disc_xy(float(f.az), float(f.alt), size, floor)
@@ -715,10 +837,16 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
             # would assert a measurement nobody made.
             markers.append(
                 f'<g class="bnd"><path d="M{x:.1f} {y - 6:.1f} l 12 14 M{x:.1f} {y - 6:.1f} l -12 14"/>'
-                f'<path d="M{x:.1f} {y + 5:.1f} l 12 14 M{x:.1f} {y + 5:.1f} l -12 14"/></g>'
+                f'<path d="M{x:.1f} {y + 5:.1f} l 12 14 M{x:.1f} {y + 5:.1f} l -12 14"/>'
+                f"<title>{_tip(f)}</title></g>"
             )
         else:
-            markers.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="9" class="edg"/>')
+            # A column re-measured with autofocus and fine steps is a different
+            # grade of evidence from a coarse sweep column, so it looks different.
+            cls = "edg rev" if int(round(float(f.az))) % 360 in remeasured else "edg"
+            markers.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="9" class="{cls}"><title>{_tip(f)}</title></circle>'
+            )
 
     if image is not None and coverage is not None:
         rgb, gap = project(image, coverage, solution, size, floor)
@@ -765,9 +893,21 @@ def page(rows, solution, image=None, coverage=None, fiducials=(), meta=None,
         rings="".join(rings),
         ring_labels="".join(ring_labels),
         cardinals="".join(cardinals),
-        horizon_points=" ".join(pts),
+        horizon_svg=(
+            _svg_image(sky_outline, size)
+            if sky_outline is not None
+            else f'<polygon class="hz" points="{" ".join(pts)}"/>'
+        ),
         markers="".join(markers),
         pts_pressed="true" if markers else "false",
+        pocket_lines="".join(pocket_lines),
+        pk_pressed="true" if (pocket_lines or pocket_band or sky_pockets is not None) else "false",
+        pocket_band=_svg_image(sky_pockets, size) if sky_pockets is not None else pocket_band,
+        planning_poly=planning_poly,
+        pl_pressed="true" if planning_poly else "false",
+        planning=PLANNING_COLOUR,
+        remeasured=REMEASURED_COLOUR,
+        pocket=POCKET_COLOUR,
         columns=_columns_table(meta),
         banner=_banner(meta),
         diagnostics=diagnostics(meta, attempts, frames_dir, frame_px, private, notes),

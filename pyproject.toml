@@ -13,6 +13,7 @@ dependencies = [
     "cryptography",
     "astropy",
     "pyyaml",
+    "scipy>=1.17.1",
 ]
 
 [project.optional-dependencies]

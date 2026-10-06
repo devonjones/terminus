@@ -197,6 +197,30 @@ def test_horizon_rows_flags_clipped_columns():
     assert clipped[0] and not clipped[1]
 
 
+def test_pocket_intervals_finds_sky_below_the_horizon():
+    """Sky under an overhang is a pocket, a solid wall is not, and a one-row gap
+    counts only when one row is at least `min_deg` tall."""
+    import numpy as np
+
+    from terminus.skymask import pocket_intervals
+
+    h = 180  # one row per degree: row r is altitude 90 - r
+    sky = np.ones((h, 3), bool)
+    sky[30:, :] = False  # every column: horizon at row 30 (alt 60)
+    sky[50:60, 0] = True  # column 0: a 10-degree window onto the sky below it
+    sky[45, 1] = True  # column 1: a single-row speck of leaf gap
+    top = np.array([30.0, 30.0, 30.0])
+    out = pocket_intervals(sky, top, min_deg=0.5)
+    assert out[0] == [(40.0, 30.0)]  # rows 50..60 -> alt 40 down to 30
+    assert out[1] == [(45.0, 44.0)]  # one row is a full degree at this scale, so it counts
+    assert out[2] == []  # solid wall below the horizon
+    # at the real panorama scale (8 rows per degree) one row is 1/8 deg: speckle
+    fine = np.ones((1440, 1), bool)
+    fine[240:, 0] = False
+    fine[400, 0] = True
+    assert pocket_intervals(fine, np.array([240.0]), min_deg=0.5) == [[]]
+
+
 def test_upper_envelope_fills_narrow_gaps():
     """A gap narrower than mask resolution is not usable sky."""
     import numpy as np
@@ -9200,6 +9224,536 @@ def test_a_blank_reading_is_absent_not_zero():
     out = polar.diagnostics(_diag_meta(), blank)
     assert "254.0 to 254.0" in out, "the one real reading stands alone"
     assert "fell" not in out and "rose" not in out, "a blank must not invent a collapse"
+
+
+def test_pockets_survive_a_mask_round_trip(tmp_path):
+    """write_mask once dropped any field not in its list, so pockets vanished silently."""
+    import numpy as np
+
+    from terminus.export import load_columns, write_mask
+
+    p = tmp_path / "m.yaml"
+    write_mask(
+        str(p),
+        {10: {"alt": 30.0, "type": "tree", "pockets": [(np.float64(22.5), np.float64(19.0))]}},
+        [],
+        {"oriented": False},
+    )
+    assert "np.float64" not in p.read_text()
+    _, cols = load_columns(str(p))
+    assert cols[10]["pockets"] == [(22.5, 19.0)]
+
+
+def test_connected_sky_drops_isolated_blue():
+    """Sky must reach the open sky: a heater lid reflecting blue is not sky."""
+    import numpy as np
+
+    from terminus.skymask import connected_sky
+
+    sky = np.ones((8, 6), bool)
+    sky[3, :] = False  # a wall across the frame...
+    sky[3, 0] = True  # ...with a gap at the left edge
+    sky[5:, :] = False
+    sky[6, 3] = True  # a blue blob inside the terrain: the heater lid
+    kept = connected_sky(sky)
+    assert kept[4, 5]  # reached through the gap
+    assert not kept[6, 3]  # isolated, so not sky
+    assert not (kept & ~sky).any()  # never invents sky
+
+    # The panorama wraps: the right-hand pixel's only sky neighbour is across
+    # the 0/360 seam, so without the wrap it would be wrongly dropped.
+    wrap = np.array([[True, False, False, False], [True, False, False, True]])
+    assert connected_sky(wrap)[1, 3]
+
+
+def test_connected_sky_passes_through_unphotographed_strips():
+    """A strip nobody photographed is unknown, not a wall: sky below it still counts."""
+    import numpy as np
+
+    from terminus.skymask import connected_sky
+
+    sky = np.ones((10, 5), bool)
+    valid = np.ones((10, 5), bool)
+    valid[3, :] = False  # an uncovered ring under the zenith, all the way round
+    sky[7:, :] = False  # real terrain
+    sky[8, 2] = True  # and a reflection inside it
+    valid[8, 2] = True
+    kept = connected_sky(sky, valid)
+    assert kept[5, :].all()  # sky below the strip is still open sky
+    assert not kept[8, 2]  # the reflection is still not
+
+
+def _flat_sample(step=1, alt=35.0, pockets=None):
+    from terminus.guide import photo_sample
+
+    return photo_sample([(float(a), alt, "tree") for a in range(0, 360, step)], pockets)
+
+
+def test_a_pocket_floor_matches_only_an_edge_at_the_floor():
+    """An edge at a pocket's floor measures the floor; one partway up the pocket
+    agrees with neither boundary and stays a miss of the line."""
+    from terminus.orient import Fiducial, predict
+
+    sample = _flat_sample(pockets={180: [(30.0, 10.0)]})
+    fids = [
+        Fiducial(180, 10.5),
+        Fiducial(180, 20.0),
+        Fiducial(180, 7.0),
+        Fiducial(180, 10.0, bound=True),
+    ]
+    got = predict(fids, sample, 0.0, 0.0, 0.0)
+    assert got[0] == 10.0, "an edge at the floor is scored against the floor"
+    assert got[1] == 35.0, "mid-pocket is not the floor: scored against the line"
+    assert got[2] == 35.0, "beyond POCKET_TOL_DEG of the floor: the line"
+    assert got[3] == 35.0, "a bound is a ceiling, never a pocket measurement"
+
+
+def test_pocket_lookup_follows_yaw_and_coarse_columns():
+    """Pockets live at NATIVE azimuth and on whatever column grid the mask has."""
+    from terminus.orient import Fiducial, predict
+
+    sample = _flat_sample(step=10, pockets={150: [(30.0, 10.0)]})
+    got = predict([Fiducial(183, 10.0), Fiducial(150, 10.0)], sample, 30.0, 0.0, 0.0)
+    assert got[0] == 10.0, "true 183 is native 153; the nearest 10-degree column is 150"
+    assert got[1] == 35.0, "true 150 is native 120, which has no pocket"
+
+
+def test_a_pocket_floor_is_placed_with_its_own_tilt_shift():
+    """Tilt moves azimuth by an amount that depends on altitude, so the floor is
+    found at the native column whose FLOOR lands on the fiducial's azimuth."""
+    import numpy as np
+
+    from terminus.orient import Fiducial, _rotate_scalar, predict
+
+    yaw, tm, td, lo = 20.0, 10.0, 90.0, 10.0
+    sample = _flat_sample(pockets={a: [(30.0, lo)] for a in range(360)})
+    phis = np.arange(0.0, 360.0, 0.005)
+    landed = [_rotate_scalar(p + yaw, lo, tm, td) for p in phis]
+    i = int(np.argmin([abs((az - 200.0 + 180.0) % 360.0 - 180.0) for az, _ in landed]))
+    expected = landed[i][1]
+    got = predict([Fiducial(200, expected)], sample, yaw, tm, td)[0]
+    assert abs(got - expected) < 0.02, (got, expected)
+
+
+def test_pocket_matched_names_the_columns_scored_against_a_floor():
+    from terminus.orient import Fiducial, pocket_matched
+
+    sample = _flat_sample(pockets={180: [(30.0, 10.0)]})
+    fids = [Fiducial(180, 10.2), Fiducial(90, 35.0)]
+    assert pocket_matched(fids, sample, 0.0, 0.0, 0.0) == [180.0]
+
+
+def test_polar_draws_a_full_rotation_or_none_and_refuses_a_partial_one():
+    import pytest
+
+    from terminus.cli import _polar_solution
+    from terminus.export import MaskError
+
+    full = {"yaw": 183.75, "pitch": -1.3, "tilt_mag": 10.5, "tilt_dir": 285.0}
+    assert _polar_solution(full, "m.yaml")["yaw"] == 183.75
+    assert _polar_solution({}, "m.yaml") == {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "tilt_mag": 0.0,
+        "tilt_dir": 0.0,
+    }
+    with pytest.raises(MaskError, match="missing tilt_dir"):
+        _polar_solution({k: v for k, v in full.items() if k != "tilt_dir"}, "m.yaml")
+
+
+def test_a_malformed_pocket_is_refused_with_its_column(tmp_path):
+    import pytest
+
+    from terminus.export import MaskError, load_columns
+
+    for i, bad in enumerate(("[[10, 20]]", "[5]", "5", "[[.nan, 1]]", "[[.inf, 0]]")):
+        p = tmp_path / f"m{i}.yaml"
+        p.write_text(f"horizon:\n  12: {{alt: 30.0, type: tree, pockets: {bad}}}\n")
+        with pytest.raises(MaskError, match="column 12"):
+            load_columns(str(p))
+
+
+def _sky_classes(h=180, w=360, horizon_row=60):
+    """Native panorama classes: sky (ADE20K 2) above `horizon_row`, tree below."""
+    import numpy as np
+
+    from terminus.skymask import SKY_CLASS_ADE20K
+
+    cls = np.full((h, w), 4, np.int16)
+    cls[:horizon_row] = SKY_CLASS_ADE20K
+    return cls, np.ones((h, w), np.uint8)
+
+
+def test_connected_sky_keeps_the_open_sky_under_a_covered_zenith():
+    """Canopy over the zenith leaves no seed at the top; the open sky is still the
+    largest sky region, and a small reflection below the line is still dropped."""
+
+    from terminus.skymask import SKY_CLASS_ADE20K, connected_sky
+
+    cls, cov = _sky_classes()
+    cls[:6] = 4  # canopy overhead
+    cls[100:104, 50:54] = SKY_CLASS_ADE20K  # a heater lid
+    kept = connected_sky(cls == SKY_CLASS_ADE20K, cov > 0)
+    assert kept[30].all(), "the open sky band survives"
+    assert not kept[100:104, 50:54].any(), "the reflection does not"
+
+
+def test_sky_layers_draws_an_outline_under_a_covered_zenith_and_drops_reflections():
+    import numpy as np
+
+    from terminus import polar
+    from terminus.skymask import SKY_CLASS_ADE20K
+
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    cls, cov = _sky_classes()
+    cls[:6] = 4
+    outline, _ = polar.sky_layers(cls, cov, sol, None, size=200)
+    assert (outline[..., 3] > 0).sum() > 100, "a covered zenith must not blank the horizon"
+
+    plain, _ = polar.sky_layers(*_sky_classes(), sol, None, size=200)
+    lid = _sky_classes()[0]
+    lid[80:84, 100:104] = SKY_CLASS_ADE20K  # alt 6-10: on the disc, under the line
+    with_lid, _ = polar.sky_layers(lid, cov, sol, None, size=200)
+    assert np.array_equal(plain, with_lid), "a disconnected patch adds no outline"
+
+
+def test_sky_layers_refuses_mismatched_runs_and_puts_pockets_under_the_planning_line():
+    import pytest
+
+    from terminus import polar
+
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    cls, cov = _sky_classes()
+    with pytest.raises(ValueError, match="same mosaic run"):
+        polar.sky_layers(cls, cov[::2, ::2], sol, None, size=200)
+    _, none = polar.sky_layers(cls, cov, sol, [(a, 0.0) for a in range(0, 360, 10)], size=200)
+    assert not none[..., 3].any(), "planning below the sky line leaves no pocket"
+    _, some = polar.sky_layers(cls, cov, sol, [(a, 45.0) for a in range(0, 360, 10)], size=200)
+    assert some[..., 3].any(), "sky under a higher planning line is a pocket"
+
+
+def test_skymask_feeds_connected_sky_and_writes_pockets(tmp_path, monkeypatch, capsys):
+    """The wiring, not the helpers: what connected_sky keeps is what the mask is
+    built from, pocket_intervals' result lands in the file, and a panorama with
+    no sky at all is refused rather than written as a wall."""
+    import numpy as np
+    import pytest
+
+    from terminus import skymask
+    from terminus.cli import main
+    from terminus.export import load_columns
+
+    pano = tmp_path / "pano.png"
+    _synthetic_panorama(str(pano))
+    args = ["skymask", str(pano), "--backend", "heuristic", "--az-step", "30"]
+    main(args)
+    _, plain = load_columns(str(tmp_path / "pano_mask.yaml"))
+
+    real = skymask.connected_sky
+
+    def east_only(sky, valid=None):
+        return real(sky, valid) & (np.arange(sky.shape[1]) >= sky.shape[1] // 2)
+
+    monkeypatch.setattr(skymask, "connected_sky", east_only)
+    monkeypatch.setattr(
+        skymask, "pocket_intervals", lambda sky, top, valid=None: [[(20.0, 15.0)]] * sky.shape[1]
+    )
+    main(args)
+    _, cols = load_columns(str(tmp_path / "pano_mask.yaml"))
+    assert all(c.get("pockets") == [(20.0, 15.0)] for c in cols.values())
+    assert all(cols[a]["alt"] > plain[a]["alt"] for a in cols if a < 180), "kept sky ignored"
+    assert all(cols[a]["alt"] == plain[a]["alt"] for a in cols if a >= 180)
+
+    wall = tmp_path / "wall.png"
+    _synthetic_panorama(str(wall), blocked=(0, 720))
+    with pytest.raises(SystemExit):
+        main(["skymask", str(wall), "--backend", "heuristic", "--az-step", "30"])
+    assert "no labelled sky" in capsys.readouterr().err
+
+
+def test_the_page_draws_planning_pockets_and_remeasured_columns():
+    from terminus import polar
+    from terminus.orient import Fiducial
+
+    rows = [(float(az), 20.0, "tree") for az in range(0, 360, 10)]
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    page = polar.page(
+        rows, sol, fiducials=[Fiducial(0.0, 20.0)], size=200,
+        planning=[(float(a), 25.0) for a in range(0, 360, 10)],
+        pockets=[(90.0, 18.0, 12.0)], remeasured={0},
+    )  # fmt: skip
+    assert 'class="pl"' in page and 'class="pkb"' in page
+    assert page.count("<line x1") >= 1
+    assert 'class="edg rev"' in page
+
+
+def test_the_guided_loop_hands_its_pockets_to_the_sampler(monkeypatch):
+    """`run` must build its sampler WITH the pockets, or orient never scores a
+    pocket floor however well the helpers below it are tested."""
+    import pytest
+
+    from terminus import guide
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    def spy(rows, pockets=None):
+        seen["pockets"] = pockets
+        raise _Stop
+
+    monkeypatch.setattr(guide, "photo_sample", spy)
+    with pytest.raises(_Stop):
+        guide.run(
+            _synthetic_horizon(), None, pockets={90: [(20.0, 15.0)]}, log=lambda *a, **k: None
+        )
+    assert seen["pockets"] == {90: [(20.0, 15.0)]}
+
+
+def test_connected_sky_seeds_win_over_size_and_uncovered_is_never_sky(capsys):
+    """Seeded open sky beats a smaller disconnected blob. A speck of seeded sky,
+    or a seed in unphotographed pixels with no sky, does not: the largest sky
+    region outweighs it and is kept, and the run says so on stderr (warnings
+    are silenced package-wide). Unphotographed pixels never come back as sky."""
+    import numpy as np
+
+    from terminus.skymask import connected_sky
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:10] = True  # the open sky, reaching the top
+    sky[20:30, 10:40] = True  # a smaller blue blob, cut off from it
+    kept = connected_sky(sky)
+    assert kept[0:10].all() and not kept[20:30, 10:40].any()
+    assert "largest sky region" not in capsys.readouterr().err
+
+    sky = np.zeros((40, 60), bool)
+    sky[0, 5] = True  # a speck at the top: canopy over the zenith
+    sky[20:30, 10:40] = True  # the real sky, under the canopy
+    kept = connected_sky(sky)
+    assert kept[20:30, 10:40].all(), "a speck must not outweigh the sky"
+    assert kept[0, 5], "the rescue adds the largest region; it does not drop the seeded sky"
+    assert "largest sky region does not reach the top" in capsys.readouterr().err
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:5, 0:20] = True  # two seeded regions, 100 px each, reaching the top
+    sky[0:5, 35:55] = True
+    sky[20:30, 10:25] = True  # a 150 px blob: bigger than either, smaller than both
+    kept = connected_sky(sky)
+    assert not kept[20:30, 10:25].any(), "the blob must outweigh ALL seeded sky, not one region"
+    assert "largest sky region" not in capsys.readouterr().err
+
+    valid = np.ones((40, 60), bool)
+    valid[0:2] = False  # unphotographed strip at the top, touching no sky
+    sky = np.zeros((40, 60), bool)
+    sky[5:15] = True  # all the sky, under a canopy band in rows 2-4
+    kept = connected_sky(sky, valid)
+    assert kept[5:15].all(), "a seed with no sky in its region is not open sky"
+    assert not kept[~valid].any()
+
+    valid = np.ones((40, 60), bool)
+    valid[5:15, 40:60] = False  # a big unphotographed hole, bigger than any sky
+    sky = np.zeros((40, 60), bool)
+    sky[20:30, 0:20] = True  # largest sky region
+    sky[32:35, 30:35] = True  # small reflection
+    kept = connected_sky(sky, valid)
+    assert kept[20:30, 0:20].all() and not kept[32:35, 30:35].any()
+    assert not kept[~valid].any(), "unphotographed is passable, never returned as sky"
+
+    top_hole = np.ones((40, 60), bool)
+    top_hole[0:3] = False  # an unphotographed strip IN the open sky's own region
+    sky = np.zeros((40, 60), bool)
+    sky[3:20] = True
+    kept = connected_sky(sky, top_hole)
+    assert kept[3:20].all() and not kept[0:3].any()
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:5] = True
+    sky[20:25, 0:3] = True  # touches the LEFT edge only: not wrapped into anything
+    sky[20:25, 57:60] = True  # touches the right edge: wraps to the left patch
+    kept = connected_sky(sky)
+    assert not kept[20:25].any(), "two edge patches joined by the wrap are still one blob"
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:10, 0:30] = True  # open sky touching only the LEFT edge
+    sky[20:25, 50:60] = True  # a reflection touching only the RIGHT edge
+    kept = connected_sky(sky)
+    assert kept[0:10, 0:30].all() and not kept[20:25].any(), "edges merge only sky to sky"
+
+
+def test_sky_layers_ignores_coverage_holes_and_refuses_a_skyless_map():
+    import numpy as np
+    import pytest
+
+    from terminus import polar
+
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    cls, cov = _sky_classes()
+    full, _ = polar.sky_layers(cls, cov, sol, None, size=200)
+    holed = cov.copy()
+    holed[10:20, 100:140] = 0  # nobody photographed this patch of open sky
+    with_hole, _ = polar.sky_layers(cls, holed, sol, None, size=200)
+    assert (with_hole[..., 3] > 0).sum() <= (full[..., 3] > 0).sum(), "a hole is not terrain"
+    with pytest.raises(ValueError, match="no sky"):
+        polar.sky_layers(np.full_like(cls, 4), cov, sol, None, size=200)
+
+
+def test_pocket_lookup_does_not_reach_across_a_gap_in_the_mask():
+    """Columns 1-30 excluded: a fiducial at native 10 has no neighbour within
+    half a column, so column 0's pocket must not be borrowed for it."""
+    from terminus.guide import photo_sample
+
+    rows = [(float(a), 35.0, "tree") for a in range(360) if not 1 <= a <= 30]
+    sample = photo_sample(rows, {0: [(30.0, 10.0)]})
+    assert sample.pockets_near(0.4) == [(30.0, 10.0)]
+    assert sample.pockets_near(0.7) == (), "beyond half the 1-degree spacing"
+    assert sample.pockets_near(10.0) == ()
+    # Mixed spacing: 5 degrees to 175, then every 20. Column 200's reach is 10.
+    mixed = [(float(a), 35.0, "tree") for a in list(range(0, 180, 5)) + list(range(180, 360, 20))]
+    coarse = photo_sample(mixed, {200: [(30.0, 10.0)]})
+    assert coarse.pockets_near(208.0) == [(30.0, 10.0)]
+    assert coarse.pockets_near(211.0) == ()
+    # Column 180 sits between a 5-degree gap behind and a 20-degree gap ahead:
+    # its reach is the SMALLER one, so 188 is out of it.
+    edge = photo_sample(mixed, {180: [(30.0, 10.0)]})
+    assert edge.pockets_near(188.0) == ()
+    # Column 31's gap behind is 31 degrees, ahead 1: reach 0.5, not 15.5.
+    after = photo_sample(rows, {31: [(30.0, 10.0)]})
+    assert after.pockets_near(30.3) == ()
+    single = photo_sample([(90.0, 35.0, "tree")], {90: [(30.0, 10.0)]})
+    assert single.pockets_near(250.0) == [(30.0, 10.0)], "one column covers the circle"
+
+
+def test_pocket_matched_ignores_unreadable_columns():
+    from terminus.orient import Fiducial, pocket_matched
+
+    def blind(a):
+        return float("nan")
+
+    assert pocket_matched([Fiducial(90, 10.0)], blind, 0.0, 0.0, 0.0) == []
+
+
+def test_orient_hands_its_pockets_to_the_loop_and_reports_matches(tmp_path, monkeypatch, capsys):
+    """`_orient` must carry the mask's pockets into the loop and into the sampler
+    it scores with, and name the columns scored against a pocket floor."""
+    from terminus import guide
+    from terminus.cli import main
+    from terminus.export import write_mask
+    from terminus.orient import Fiducial
+
+    photo = tmp_path / "photo.yaml"
+    rows = {a: {"alt": 35.0, "type": "tree"} for a in range(0, 360, 5)}
+    rows[90]["pockets"] = [(30.0, 10.0)]
+    write_mask(str(photo), rows, [], {"oriented": False, "lat": 39.79, "lon": -104.89})
+    prof = tmp_path / "p.json"
+    prof.write_text('{"90": [[60, 80.0]]}')
+    seen = {}
+    sol = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "tilt_mag": 0.0,
+        "tilt_dir": 0.0,
+        "rms": 0.1,
+        "residuals": {90.0: 0.2, 180.0: 0.0},
+        "n": 2,
+        "n_bound": 0,
+    }
+
+    def fake_run(rows_, measure, **kw):
+        seen["pockets"] = kw.get("pockets")
+        steps = [guide.Step(90.0, fiducial=Fiducial(90.0, 10.2), solution=sol),
+                 guide.Step(180.0, fiducial=Fiducial(180.0, 35.0), solution=sol)]  # fmt: skip
+        return sol, steps
+
+    monkeypatch.setattr(guide, "run", fake_run)
+    try:
+        main(["orient", str(photo), "--replay", str(prof), "--out", str(tmp_path / "o.yaml")])
+    except SystemExit:
+        pass  # whatever the record-writing says about a two-column fit, the print is the point
+    assert seen["pockets"] == {90: [(30.0, 10.0)]}
+    assert "scored against a sky-pocket floor, not the line: az 90" in capsys.readouterr().out
+
+
+def test_polar_refuses_bad_inputs_through_the_command(tmp_path, capsys):
+    import numpy as np
+    import pytest
+    import yaml
+
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "m.yaml")
+    doc = yaml.safe_load(mask.read_text())
+    doc["horizon"][0]["pockets"] = [[10, 20]]
+    mask.write_text(yaml.safe_dump(doc))
+    with pytest.raises(SystemExit):
+        main(["polar", str(mask), "--no-frames", "--out", str(tmp_path / "a.html")])
+    assert "column 0" in capsys.readouterr().err
+
+    good = _oriented_mask(tmp_path / "g.yaml")
+    cls, cov = _sky_classes()
+    np.save(tmp_path / "c.npy", cls)
+    np.save(tmp_path / "cov.npy", cov[::2, ::2])
+    with pytest.raises(SystemExit):
+        main(["polar", str(good), "--no-frames", "--classes", str(tmp_path / "c.npy"),
+              "--out", str(tmp_path / "b.html")])  # fmt: skip
+    assert "--classes needs" in capsys.readouterr().err
+    from PIL import Image
+
+    Image.new("RGB", (360, 180), (120, 150, 200)).save(tmp_path / "pano.png")
+    with pytest.raises(SystemExit):
+        main(["polar", str(good), "--no-frames", "--classes", str(tmp_path / "c.npy"),
+              "--image", str(tmp_path / "pano.png"), "--coverage", str(tmp_path / "cov.npy"),
+              "--out", str(tmp_path / "c.html")])  # fmt: skip
+    assert "same mosaic run" in capsys.readouterr().err
+
+
+def test_the_closest_pocket_floor_wins_and_lookup_wraps_at_north():
+    """Two floors within tolerance: the nearer one is what the edge measured.
+    And the nearest column to native 359.7 is column 0, across the wrap."""
+    from terminus.guide import photo_sample
+    from terminus.orient import Fiducial, predict
+
+    rows = [(float(a), 35.0, "tree") for a in range(360)]
+    sample = photo_sample(rows, {180: [(30.0, 11.5), (11.0, 10.0)], 0: [(25.0, 20.0)]})
+    assert predict([Fiducial(180, 11.2)], sample, 0.0, 0.0, 0.0)[0] == 11.5
+    assert sample.pockets_near(359.7) == [(25.0, 20.0)]
+
+
+def test_pocket_lines_run_from_the_pocket_top_to_its_floor(tmp_path):
+    """Through the command: a pocket's segment is drawn from alt_hi down to
+    alt_lo at its own azimuth, and a bare `az: alt` column does not break it."""
+    import re
+
+    import yaml
+
+    from terminus import polar
+    from terminus.cli import main
+
+    mask = _oriented_mask(tmp_path / "m.yaml", yaw=0.0, pitch=0.0, tilt_mag=0.0, tilt_dir=0.0)
+    doc = yaml.safe_load(mask.read_text())
+    doc["horizon"][0]["pockets"] = [[18.0, 12.0]]
+    doc["horizon"][90] = 15.0
+    mask.write_text(yaml.safe_dump(doc))
+    out = tmp_path / "p.html"
+    main(["polar", str(mask), "--no-frames", "--out", str(out)])
+    lines = re.findall(
+        r'<line x1="([-\d.]+)" y1="([-\d.]+)" x2="([-\d.]+)" y2="([-\d.]+)"/>', out.read_text()
+    )
+    want = [f"{v:.1f}" for v in (*polar.disc_xy(0.0, 18.0), *polar.disc_xy(0.0, 12.0))]
+    assert want in [list(m) for m in lines], (want, lines)
+
+
+def test_planning_pockets_are_interpolated_across_north():
+    """A planning line known only at 350 and 10 still covers azimuth 0."""
+    from terminus import polar
+
+    sol = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
+    cls, cov = _sky_classes()
+    # 60 at 350 and 20 at 10: across north the line is 40 at az 0. Clamped to
+    # the nearest end instead it would read 20, under the sky band (> 30).
+    _, pk = polar.sky_layers(cls, cov, sol, [(350.0, 60.0), (10.0, 20.0), (180.0, 0.0)], size=200)
+    x, y = (int(round(v)) for v in polar.disc_xy(0.0, 35.0, 200))
+    assert pk[y, x, 3] > 0, "the pocket under the planning line at north is missing"
 
 
 def test_sun_check_refuses_a_target_inside_the_cone_and_allows_one_outside():

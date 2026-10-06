@@ -46,6 +46,7 @@ fraction above the horizon line" is the phrasing both fields read without
 objection.
 """
 
+import sys
 import warnings
 
 import numpy as np
@@ -315,6 +316,102 @@ def upper_envelope(rows, half_deg, px_per_deg):
 # ADE20K classes that behave like vegetation: gappy, seasonal, partly
 # transmissive. Everything else that blocks is treated as opaque structure.
 VEG_CLASSES_ADE20K = (4, 9, 17, 66)  # tree, grass, plant, flower
+
+
+def _wrap_roots(labels, n):
+    """Root of every label, with regions touching both panorama edges merged."""
+    root = list(range(n + 1))
+
+    def find(x):
+        while root[x] != x:
+            x = root[x]
+        return x
+
+    for a, b in zip(labels[:, 0], labels[:, -1], strict=True):
+        if a and b:
+            root[find(int(a))] = find(int(b))
+    return np.array([find(i) for i in range(n + 1)])
+
+
+def connected_sky(sky, valid=None):
+    """Keep only sky that connects to the open sky: sky must be CONTIGUOUS.
+
+    Seeds are the top row's passable pixels (labelled sky, or unphotographed).
+    Anything sky-coloured that
+    cannot reach a seed through other sky (4-connected, with azimuth wrapping at
+    0/360) is not sky: a reflection on a heater lid, a window, a blue tarp.
+    Because unphotographed pixels are passable, a coverage hole can bridge a
+    reflection to the open sky and keep it.
+
+    A canopy over the zenith can leave no seed, or only a speck of sky at the
+    top. So the largest sky region also counts as open sky whenever it outweighs
+    all the seeded sky together; a reflection is never the biggest patch of blue
+    in a panorama. That rescue is reported on stderr, not through `warnings`,
+    because importing terminus silences warnings (sweep.py).
+    """
+    from scipy import ndimage
+
+    h, w = sky.shape
+    if valid is None:
+        valid = np.ones((h, w), bool)
+    sky = sky & valid
+    # UNPHOTOGRAPHED IS PASSABLE, NOT A WALL. A coverage hole is unknown, not
+    # ground (M-19); treating it as a barrier cut columns off below a thin
+    # uncovered strip under the zenith and drew spikes to the centre.
+    passable = sky | ~valid
+    labels, n = ndimage.label(passable)
+    roots = _wrap_roots(labels, n)[labels]
+    sizes = np.bincount(roots[sky], minlength=n + 1)
+    open_ = set(roots[0][passable[0]].tolist())
+    big = int(np.argmax(sizes))
+    seeded = int(sizes[list(open_)].sum())
+    if sizes[big] > seeded:
+        print(
+            f"the largest sky region does not reach the top of the panorama; kept it as "
+            f"open sky ({sizes[big]} px, {100 * sizes[big] / sky.sum():.0f}% of the sky, "
+            f"against {seeded} px that does reach the top)",
+            file=sys.stderr,
+        )
+        open_.add(big)
+    return np.isin(roots, list(open_)) & sky
+
+
+def pocket_intervals(sky, top, valid=None, min_deg=0.5):
+    """Per column: the runs of SKY below that column's horizon (`top` row).
+
+    A pocket is sky seen through a canopy gap or under an overhang. For planning
+    it is blocked like any terrain, but a telescope edge measured inside one is
+    EXPLAINED, not a misfit: the scope saw real sky there, just not open sky.
+    Recording where the pockets are is what lets the fit tell the two apart.
+
+    Returns one list per column of (alt_hi, alt_lo) in degrees, for sky runs at
+    least `min_deg` tall; shorter runs are leaf speckle.
+    """
+    h, w = sky.shape
+    if valid is None:
+        valid = np.ones((h, w), bool)
+    deg_per_row = 180.0 / h
+    min_rows = max(1, int(round(min_deg / deg_per_row)))
+    out = []
+    for x in range(w):
+        if not np.isfinite(top[x]):
+            out.append([])
+            continue
+        t = int(top[x])
+        col = sky[t:, x] & valid[t:, x]
+        edges = np.diff(np.concatenate([[0], col.astype(np.int8), [0]]))
+        starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+        out.append(
+            [
+                (
+                    round(float(90.0 - (t + s) * deg_per_row), 2),
+                    round(float(90.0 - (t + e) * deg_per_row), 2),
+                )
+                for s, e in zip(starts, ends, strict=True)
+                if e - s >= min_rows
+            ]
+        )
+    return out
 
 
 def horizon_band(sky, valid=None, run=6):
