@@ -279,7 +279,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _set_spin(self, deg):
         if isinstance(deg, bool) or not isinstance(deg, (int, float)) or not -720 <= deg <= 720:
             return self._send(400, {"error": "deg must be a number of degrees"})
-        self.server.state["spin"] = float(deg) % 360.0
+        spin = float(deg) % 360.0
+        self.server.state["spin"] = spin if spin < 360.0 else 0.0  # -1e-20 % 360 == 360.0
         self._send(200, self.server.snapshot())
 
 
@@ -323,8 +324,16 @@ def main(argv=None):
         threading.Thread(target=_stop_on_eof, args=(server,), daemon=True).start()
         server.serve_forever()
     finally:
+        _shutdown(server)
+
+
+def _shutdown(server):
+    """Park first: the telescope outranks a half-done build. Each later step
+    still runs if the one before it fails."""
+    try:
+        server.scope.park()
+    finally:
         try:
             server.jobs.stop()
         finally:
-            server.scope.park()  # whatever happened to the build
             server.server_close()

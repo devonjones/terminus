@@ -169,10 +169,13 @@ export function horizonView(p: DiscProps): HTMLElement {
       from = [e.clientX, e.clientY];
       p.onSpinPreview(spin);
     });
-    stage.addEventListener("pointerup", () => {
+    // pointercancel (a touch interrupted, capture lost) ends the drag like a release.
+    const end = () => {
       if (from) p.onSpin(spin);
       from = null;
-    });
+    };
+    stage.addEventListener("pointerup", end);
+    stage.addEventListener("pointercancel", end);
   }
 
   const present: Record<Layer, boolean> = {

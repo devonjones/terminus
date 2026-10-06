@@ -322,6 +322,8 @@ describe("round-1 review", () => {
     release(); // A finishes last and must not land
     await new Promise((r) => setTimeout(r, 20));
     expect(URL.createObjectURL).toHaveBeenCalledTimes(2);
+    // B replaced the photos the mount had loaded, and released both.
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
   });
 
   it("keeps polling a build after one failed progress read", async () => {
@@ -431,6 +433,26 @@ describe("view details", () => {
     await waitFor(() => expect(api.setSpin).toHaveBeenCalledWith(100));
   });
 
+  it("a cancelled pointer ends the drag: later moves do not turn the disc", async () => {
+    const api = fakeApi({
+      getState: async () => state({ site, tab: "horizon", spin: 0 }),
+      setSpin: vi.fn(async (deg: number) => state({ site, tab: "horizon", spin: deg })),
+    });
+    await mount(root, api);
+    const stage = root.querySelector<HTMLElement>(".disc")!;
+    stage.getBoundingClientRect = () => ({ left: 0, top: 0, width: 200, height: 200 }) as DOMRect;
+    const at = (type: string, x: number, y: number) =>
+      stage.dispatchEvent(new MouseEvent(type, { clientX: x, clientY: y }));
+    at("pointerdown", 100, 0);
+    at("pointermove", 200, 100);
+    at("pointercancel", 200, 100);
+    await waitFor(() => expect(api.setSpin).toHaveBeenCalledWith(90));
+    const rotor = () => root.querySelector<HTMLElement>(".rotor")!.style.transform;
+    const before = rotor();
+    at("pointermove", 100, 200); // no button held: nothing turns
+    expect(rotor()).toBe(before);
+  });
+
   it("a site with no panorama says so; another site's build is not shown here", async () => {
     const other: Job = { site: "site-b", step: "mosaic", status: "running", log: [], error: null };
     await mount(
@@ -442,5 +464,48 @@ describe("view details", () => {
     );
     expect(root.textContent).not.toContain("Stitching");
     expect(root.textContent).toContain("This site has no panorama yet.");
+  });
+});
+
+describe("round-2 review", () => {
+  it("this site's running build shows progress, not 'no panorama yet'", async () => {
+    const running: Job = {
+      site: "site-a",
+      step: "mosaic",
+      status: "running",
+      log: [],
+      error: null,
+    };
+    await mount(
+      root,
+      fakeApi({
+        getState: async () =>
+          state({ site: { ...site, panorama: false }, tab: "panorama", job: running }),
+      }),
+    );
+    expect(root.textContent).toContain("Stitching");
+    expect(root.textContent).not.toContain("no panorama yet");
+  });
+
+  it("a site whose views fail to load does not keep showing the previous site", async () => {
+    let failing = false;
+    const api = fakeApi({
+      getState: async () => state({ site, tab: "horizon" }),
+      horizon: vi.fn(async () => {
+        if (failing)
+          throw new Error("engine /site/horizon: 422 this site's files could not be read");
+        return horizon();
+      }),
+      openSite: vi.fn(async () => state({ site, tab: "horizon" })),
+    });
+    await mount(root, api);
+    expect(root.querySelector("polygon.hz")).not.toBeNull(); // site A on screen
+    failing = true;
+    const select = root.querySelector("select")!;
+    select.value = "site-a";
+    select.dispatchEvent(new Event("change"));
+    expect((await findByRole(root, "alert")).textContent).toContain("could not be read");
+    expect(root.querySelector("polygon.hz")).toBeNull();
+    expect(root.textContent).toContain("This site has no horizon yet.");
   });
 });

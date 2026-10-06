@@ -45,9 +45,20 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
   // and the photos of the one it replaces are released.
   async function loadSite() {
     const mine = ++generation;
-    const views = v.st.site
-      ? await Promise.all([api.horizon(), api.disc(), api.image("panorama"), api.image("disc")])
-      : ([null, null, null, null] as const);
+    let views;
+    try {
+      views = v.st.site
+        ? await Promise.all([api.horizon(), api.disc(), api.image("panorama"), api.image("disc")])
+        : ([null, null, null, null] as const);
+    } catch (e) {
+      // Never leave the previous site's views up under the new site's name.
+      if (mine === generation) {
+        revoke(v.pano);
+        revoke(v.photo);
+        v.horizon = v.disc = v.pano = v.photo = null;
+      }
+      throw e;
+    }
     if (mine !== generation) return;
     revoke(v.pano);
     revoke(v.photo);

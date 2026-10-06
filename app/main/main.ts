@@ -98,7 +98,8 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
   });
 }
 
-// The app ships its own Hugin; in dev, a vendored copy if there is one, else PATH.
+// A packaged app will carry its own Hugin (terminus-71.6); in dev, a vendored copy
+// if there is one, else PATH.
 function huginDir(): string | undefined {
   if (app.isPackaged) return path.join(process.resourcesPath, "hugin", "bin");
   const vendored = path.resolve(__dirname, "..", "vendor", "hugin", "bin");

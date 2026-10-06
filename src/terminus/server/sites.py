@@ -55,14 +55,17 @@ def list_sites(root):
 def _claim(root, base):
     """Create and return a new, unused site folder under `root`. Atomic: two
     drops on the same day cannot get the same folder."""
-    os.makedirs(root, exist_ok=True)
-    for n in range(1, 1000):
-        slug = base if n == 1 else f"{base}-{n}"
-        try:
-            os.mkdir(os.path.join(root, slug))
-            return slug
-        except FileExistsError:
-            continue
+    try:
+        os.makedirs(root, exist_ok=True)
+        for n in range(1, 1000):
+            slug = base if n == 1 else f"{base}-{n}"
+            try:
+                os.mkdir(os.path.join(root, slug))
+                return slug
+            except FileExistsError:
+                continue
+    except OSError as e:
+        raise SiteError(f"could not create a site folder: {e.strerror}") from e
     raise SiteError("too many sites for one day")
 
 
@@ -85,9 +88,11 @@ def create_site(root, photos, today=None):
             raise SiteError("every photo must be an existing .jpg, .png or .tif file")
     slug = _claim(root, f"site-{(today or datetime.date.today()).isoformat()}")
     dest = os.path.join(root, slug, "photos")
+    what = "the site folder"
     try:
         os.mkdir(dest)
         for p in photos:
+            what = os.path.basename(p)
             name = os.path.basename(p)
             stem, ext = os.path.splitext(name)
             target, k = os.path.join(dest, name), 1
@@ -97,7 +102,7 @@ def create_site(root, photos, today=None):
             shutil.copy2(p, target)
     except OSError as e:
         shutil.rmtree(os.path.join(root, slug), ignore_errors=True)
-        raise SiteError(f"could not copy {os.path.basename(p)}: {e.strerror}") from e
+        raise SiteError(f"could not copy {what}: {e.strerror}") from e
     return slug
 
 
@@ -157,6 +162,11 @@ def exit_on_eof():
     try:
         sys.stdin.read()
     finally:
+        # The sidecar may have died without stopping us (killed, crashed), so
+        # take the Hugin tool we are running down with us: on POSIX we lead our
+        # own process group. On Windows the tool is left to finish.
+        if os.name != "nt" and os.getpgrp() == os.getpid():
+            os.killpg(0, signal.SIGKILL)
         os._exit(3)
 
 
@@ -168,15 +178,21 @@ def own_command():
 
 
 def kill_tree(proc):
-    """Kill the child and everything it started (the Hugin tool it is running)."""
-    if proc.poll() is not None:
-        return
+    """Kill the child and everything it started (the Hugin tool it is running).
+
+    Already gone counts as done. On POSIX the group is signalled even after the
+    child has exited, because a Hugin tool it started can outlive it.
+    """
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30
-        )
+        if proc.poll() is None:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30
+            )
     else:
-        os.killpg(proc.pid, signal.SIGKILL)  # the child leads its own process group
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # the child leads its own process group
+        except ProcessLookupError:
+            pass  # the whole group has already exited
     proc.wait(timeout=30)
 
 
@@ -247,7 +263,10 @@ class Jobs:
 
         def expire():
             expired.set()
-            kill_tree(proc)
+            try:
+                kill_tree(proc)
+            except Exception:  # the read loop below still ends, and reports the timeout
+                log.exception("could not kill the overrunning build")
 
         timer = threading.Timer(self._timeout, expire)
         timer.start()
@@ -261,15 +280,20 @@ class Jobs:
             code = proc.wait()
         except Exception as e:  # a bug in watching must not leave the job "running"
             log.exception("watching the build failed")
-            kill_tree(proc)
-            return self._fail(f"lost track of the build: {type(e).__name__}: {e}")
+            self._fail(f"lost track of the build: {type(e).__name__}: {e}")
+            try:
+                kill_tree(proc)
+            except Exception:
+                log.exception("could not kill the build")
+            return
         finally:
             timer.cancel()
             proc.stdout.close()
+            proc.stdin.close()
         self._finish(code, expired.is_set(), d)
 
     def _finish(self, code, expired, d):
-        step = self.state["step"]
+        step = self.state["step"] or "the build"
         if expired:
             return self._fail(f"{step} took longer than {self._timeout // 60} minutes")
         if code == 0:
@@ -284,8 +308,12 @@ class Jobs:
             return
         # cli.main prints "error: ..." and exits 1; a crash ends with its exception.
         errors = [x for x in self.state["log"] if x.startswith("error:")]
-        last = self.state["log"][-1] if self.state["log"] else ""
-        self._fail(errors[-1] if errors else f"{step} stopped (exit {code}): {last}".rstrip(": "))
+        if errors:
+            self._fail(errors[-1])
+        elif self.state["log"]:
+            self._fail(f"{step} stopped (exit {code}): {self.state['log'][-1]}")
+        else:
+            self._fail(f"{step} stopped (exit {code})")
 
     def stop(self):
         """Refuse new builds and kill a running one (the sidecar is exiting)."""

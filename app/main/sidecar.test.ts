@@ -158,6 +158,14 @@ describe("request", () => {
     expect(init.body).toBe('{"tab":"fit"}');
   });
 
+  it("gives a slow request (a big drop) the time it asks for", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({}) });
+    await request(sc, "/sites", { photos: [] }, 600_000);
+    expect(timeout).toHaveBeenCalledWith(600_000);
+    timeout.mockRestore();
+  });
+
   it("rejects a success response whose body is not JSON", async () => {
     fetchMock.mockResolvedValue({ ok: true, json: async () => JSON.parse("<html>") });
     await expect(request(sc, "/state")).rejects.toThrow(SyntaxError);

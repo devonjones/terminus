@@ -696,8 +696,8 @@ def test_create_site_refuses_relative_paths_and_links(tmp_path, monkeypatch):
 def test_a_slug_with_a_trailing_newline_is_not_a_slug(tmp_path):
     from terminus.server import sites
 
-    (tmp_path / "site-a").mkdir()
-    with pytest.raises(sites.SiteError):
+    (tmp_path / "site-a\n").mkdir()  # exists, so only the slug check can refuse it
+    with pytest.raises(sites.SiteError, match="not a site name"):
         sites.site_dir(str(tmp_path), "site-a\n")
 
 
@@ -873,3 +873,252 @@ def test_the_real_sidecar_builds_with_its_bundled_hugin_and_kills_it_on_exit(tmp
         watchdog.cancel()
         p.kill()
         p.wait()
+
+
+# ---- round-2 review ----
+
+
+def test_a_tiny_negative_spin_wraps_to_zero_not_360(serve):
+    s = serve()
+    st = call(s, "POST", "/site/spin", {"deg": -1e-20})[1]
+    assert st["spin"] == 0.0
+    conforms("AppState", st)
+
+
+@pytest.mark.parametrize("failing", [None, "park", "stop"])
+def test_shutdown_parks_first_and_every_step_survives_a_failure(failing):
+    calls = []
+
+    def step(name):
+        def run():
+            calls.append(name)
+            if name == failing:
+                raise RuntimeError(name)
+
+        return run
+
+    server = types.SimpleNamespace(
+        scope=types.SimpleNamespace(park=step("park")),
+        jobs=types.SimpleNamespace(stop=step("stop")),
+        server_close=step("close"),
+    )
+    if failing:
+        with pytest.raises(RuntimeError):
+            server_module._shutdown(server)
+    else:
+        server_module._shutdown(server)
+    assert calls == ["park", "stop", "close"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_kill_tree_takes_an_orphaned_grandchild_and_tolerates_a_gone_group(tmp_path):
+    from terminus.server import sites
+
+    pidfile = tmp_path / "g.pid"
+    child = subprocess.Popen(
+        [sys.executable, "-c", (
+            "import subprocess, sys, pathlib; "
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            f"pathlib.Path({str(pidfile)!r}).write_text(str(g.pid))"
+        )],  # fmt: skip
+        start_new_session=True,
+    )
+    child.wait(timeout=20)  # the child has exited; its grandchild lives on in the group
+    grandchild = int(pidfile.read_text())
+    sites.kill_tree(child)
+    for _ in range(100):
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the grandchild survived kill_tree")
+    sites.kill_tree(child)  # the group is gone now: still no error
+
+
+def test_a_child_that_dies_before_any_step_is_named_the_build(tmp_path):
+    jobs = FakeJobs("import sys; sys.exit(2)")
+    jobs.start("s", str(tmp_path)).join(10)
+    assert jobs.state["error"] == "the build stopped (exit 2)"
+
+
+def test_the_watcher_fails_the_job_even_if_the_kill_fails(tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    killed = []
+
+    def broken_kill(proc):
+        killed.append(proc.pid)
+        proc.kill()
+        raise ProcessLookupError("gone")
+
+    monkeypatch.setattr(sites, "kill_tree", broken_kill)
+    jobs = FakeJobs(
+        "print('@step mosaic'); print('hello', flush=True); import time; time.sleep(30)"
+    )
+    monkeypatch.setattr(jobs, "_log", lambda line: 1 / 0)  # a bug while watching
+    jobs.start("s", str(tmp_path)).join(10)
+    assert jobs.state["status"] == "failed"
+    assert jobs.state["error"].startswith("lost track of the build: ZeroDivisionError")
+    assert killed == [jobs._proc.pid], "the watcher must still try to kill the build"
+
+
+def test_a_finished_build_leaves_no_pipe_open(tmp_path):
+    jobs = FakeJobs()
+    jobs.start("s", str(tmp_path)).join(10)
+    assert jobs._proc.stdin.closed and jobs._proc.stdout.closed
+
+
+def test_a_failure_creating_the_site_folder_is_named_as_such(tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    real = os.mkdir
+
+    def mkdir(path, *a, **k):
+        if str(path).endswith("photos"):
+            raise OSError(13, "Permission denied")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(sites.os, "mkdir", mkdir)
+    with pytest.raises(sites.SiteError, match="could not copy the site folder: Permission denied"):
+        sites.create_site(str(tmp_path / "sites"), [_photo(tmp_path / "a.jpg")])
+    assert os.listdir(tmp_path / "sites") == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_a_build_child_that_loses_the_sidecar_takes_its_tool_down(tmp_path):
+    """Leader of its own group (as Jobs starts it): on EOF it kills the group,
+    so a Hugin tool it started cannot outlive a sidecar that died hard."""
+    pidfile = tmp_path / "tool.pid"
+    p = subprocess.Popen(
+        [sys.executable, "-c", (
+            "import subprocess, sys, threading, time, pathlib; from terminus.server import sites; "
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            f"pathlib.Path({str(pidfile)!r}).write_text(str(g.pid)); "
+            "threading.Thread(target=sites.exit_on_eof, daemon=True).start(); time.sleep(30)"
+        )],  # fmt: skip
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        time.sleep(0.05)
+    tool = int(pidfile.read_text())
+    p.stdin.close()
+    p.wait(timeout=10)
+    for _ in range(100):
+        try:
+            os.kill(tool, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the tool outlived the build child")
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not as root")
+def test_an_unwritable_sites_folder_says_so(serve, tmp_path):
+    root = tmp_path / "sites"
+    root.mkdir()
+    root.chmod(0o555)
+    try:
+        s = serve(sites_root=str(root), jobs=FakeJobs())
+        code, err = call(s, "POST", "/sites", {"photos": [_photo(tmp_path / "a.jpg")]})
+        assert code == 400 and err["error"].startswith("could not create a site folder")
+    finally:
+        root.chmod(0o755)
+
+
+def test_stop_after_a_finished_build_is_quiet(tmp_path):
+    """A normal quit after a build: the group is long gone, and stop() must not
+    raise (it would skip the rest of shutdown)."""
+    jobs = FakeJobs()
+    jobs.start("s", str(tmp_path)).join(10)
+    jobs.stop()
+    jobs.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fake Hugin tools are shell scripts")
+def test_the_pipeline_entry_point_exits_and_takes_its_tool_down_on_eof(tmp_path):
+    """`python -m terminus.server --pipeline` itself wires the EOF exit (not just
+    a test calling exit_on_eof)."""
+    import stat
+
+    from terminus import mosaic
+
+    hugin, pid = tmp_path / "hugin", tmp_path / "pto_gen.pid"
+    hugin.mkdir()
+    for name in mosaic.TOOLS:
+        tool = hugin / name
+        tool.write_text(
+            "#!/bin/sh\n" + (f"echo $$ > {pid}\nsleep 60\n" if name == "pto_gen" else "exit 0\n")
+        )
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+    d = _site(tmp_path, panorama=False)
+    _photo(d / "photos" / "b.jpg")
+    p = subprocess.Popen(
+        [sys.executable, "-m", "terminus.server", "--pipeline", str(d), "--hugin", str(hugin)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    for _ in range(400):
+        if pid.exists() and pid.read_text().strip():
+            break
+        time.sleep(0.05)
+    tool = int(pid.read_text())
+    p.stdin.close()
+    p.wait(timeout=20)
+    for _ in range(100):
+        try:
+            os.kill(tool, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the pipeline's Hugin tool outlived it")
+
+
+def test_a_busy_build_refuses_before_copying_anything(serve, tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    jobs = FakeJobs()
+    monkeypatch.setattr(jobs, "busy", lambda: True)
+    monkeypatch.setattr(sites, "create_site", lambda *a: pytest.fail("copied photos while busy"))
+    s = serve(sites_root=str(tmp_path / "sites"), jobs=jobs)
+    assert call(s, "POST", "/sites", {"photos": [_photo(tmp_path / "a.jpg")]})[0] == 400
+
+
+def test_a_drop_that_loses_the_race_to_build_leaves_no_folder(serve, tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    jobs = FakeJobs()
+    monkeypatch.setattr(jobs, "busy", lambda: False)  # passes the pre-check...
+
+    def lose(slug, d):  # ...but another drop started building first
+        raise sites.SiteError("a site is already being built")
+
+    monkeypatch.setattr(jobs, "start", lose)
+    root = tmp_path / "sites"
+    s = serve(sites_root=str(root), jobs=jobs)
+    assert call(s, "POST", "/sites", {"photos": [_photo(tmp_path / "a.jpg")]})[0] == 400
+    assert os.listdir(root) == []
+
+
+def test_identity_is_handed_out_as_a_copy_and_backend_must_be_text(tmp_path):
+    from terminus.export import write_mask
+    from terminus.server import views
+
+    sol = views.solution({"oriented": False})
+    sol["yaw"] = 99.0
+    assert views.IDENTITY["yaw"] == 0.0
+    d = _site(tmp_path)
+    write_mask(
+        d / "photo_mask.yaml", {0: {"alt": 5.0, "type": ""}}, [], {"oriented": False, "backend": 3}
+    )
+    assert views.horizon(str(d))["backend"] is None

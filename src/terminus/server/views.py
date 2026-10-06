@@ -157,7 +157,7 @@ def panorama_jpeg(d):
     path = _panorama(d)
     if path is None:
         return None
-    Image.MAX_IMAGE_PIXELS = None
+    Image.MAX_IMAGE_PIXELS = None  # our own panorama, not a decompression bomb
     with Image.open(path) as im:
         return _jpeg(im.convert("RGB"))
 
@@ -172,7 +172,7 @@ def disc_jpeg(d):
     sol = solution(meta) if meta is not None else None
     if pano is None or sol is None:
         return None
-    Image.MAX_IMAGE_PIXELS = None
+    Image.MAX_IMAGE_PIXELS = None  # our own panorama, not a decompression bomb
     with Image.open(pano) as im:
         image = im.convert("RGB")
     cov_path = os.path.join(d, "equirect.coverage.npy")
