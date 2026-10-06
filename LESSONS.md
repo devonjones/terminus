@@ -1677,6 +1677,13 @@ Three rules emerged:
    error appeared — because the code path that spends the telescope can be conditional on the Sun,
    and then the test's verdict depends on when CI happens to run.
 
+**A second instance made it a suite rule (terminus-72).** A test faked the mount at RA 12h
+Dec +20 and left the Sun real. In September daylight that pointing sits inside the Sun cone, so
+the escape path raised first and the test failed — 3 of 48 instants sampled across a year, all
+September days. A rule a test has to remember gets forgotten; `tests/conftest.py` now pins
+`sweep._now` for every test, and a test that wants a particular Sun says so with `when=` or a fake
+`Sky.sun`.
+
 ### E-18 — Prose asserts causes the data cannot support, and reviewers catch it late
 
 The code in this project is disciplined about never recording an unevidenced value (M-19, E-06).
