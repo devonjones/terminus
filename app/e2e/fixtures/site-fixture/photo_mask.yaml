@@ -1,0 +1,86 @@
+# terminus horizon mask (Seestar S50, EQ mode, RA/Dec goto).
+# !! UNORIENTED: azimuth is the panorama's own, NOT true north. Solve the
+# !! orientation before any planner consumes this.
+# type: tree (green/yellow; SEASONAL) | structure (permanent) | open.
+#   Empty means the column was measured but NOT NAMED, which is not the
+#   same as `open`. Either instrument can leave it empty: the scope reads
+#   type from colour and every silhouette is neutral after sunset, and the
+#   photo heuristic backend segments no classes at all. See type_source.
+# POSITION-SPECIFIC: the horizon from where the tripod stood. Moving a
+#   couple of metres NEARER a close obstruction shifts it by degrees (a
+#   2 m fence at 5 m: +11.9 closer, -5.9 further); along it, not at all. A
+#   distant ridge does not care. Re-measure if you move nearer or further.
+meta: { "oriented": False }
+horizon:
+  0: { alt: 10.0, type: tree }
+  5: { alt: 11.39, type: tree }
+  10: { alt: 12.74, type: tree }
+  15: { alt: 14.0, type: tree }
+  20: { alt: 15.14, type: tree }
+  25: { alt: 16.13, type: tree }
+  30: { alt: 16.93, type: tree }
+  35: { alt: 17.52, type: tree }
+  40: { alt: 17.88, type: tree }
+  45: { alt: 18.0, type: tree, pockets: [[12.0, 6.0]] }
+  50: { alt: 17.88, type: tree }
+  55: { alt: 17.52, type: tree }
+  60: { alt: 16.93, type: tree }
+  65: { alt: 16.13, type: tree }
+  70: { alt: 15.14, type: tree }
+  75: { alt: 14.0, type: tree }
+  80: { alt: 12.74, type: tree }
+  85: { alt: 11.39, type: tree }
+  90: { alt: 10.0, type: tree }
+  95: { alt: 8.61, type: tree }
+  100: { alt: 7.26, type: tree }
+  105: { alt: 6.0, type: tree }
+  110: { alt: 4.86, type: tree }
+  115: { alt: 3.87, type: tree }
+  120: { alt: 3.07, type: tree }
+  125: { alt: 2.48, type: tree }
+  130: { alt: 2.12, type: tree }
+  135: { alt: 2.0, type: tree }
+  140: { alt: 2.12, type: tree }
+  145: { alt: 2.48, type: tree }
+  150: { alt: 3.07, type: tree }
+  155: { alt: 3.87, type: tree }
+  160: { alt: 4.86, type: tree }
+  165: { alt: 6.0, type: tree }
+  170: { alt: 7.26, type: tree }
+  175: { alt: 8.61, type: tree }
+  180: { alt: 10.0, type: tree }
+  185: { alt: 11.39, type: tree }
+  190: { alt: 12.74, type: tree }
+  195: { alt: 14.0, type: tree }
+  200: { alt: 15.14, type: tree }
+  205: { alt: 16.13, type: tree }
+  210: { alt: 16.93, type: tree }
+  215: { alt: 17.52, type: tree }
+  220: { alt: 17.88, type: tree }
+  225: { alt: 18.0, type: tree }
+  230: { alt: 17.88, type: tree }
+  235: { alt: 17.52, type: tree }
+  240: { alt: 16.93, type: tree }
+  245: { alt: 16.13, type: tree }
+  250: { alt: 15.14, type: tree }
+  255: { alt: 14.0, type: tree }
+  260: { alt: 12.74, type: tree }
+  265: { alt: 11.39, type: tree }
+  270: { alt: 10.0, type: tree }
+  275: { alt: 8.61, type: tree }
+  280: { alt: 7.26, type: tree }
+  285: { alt: 6.0, type: tree }
+  290: { alt: 4.86, type: tree }
+  295: { alt: 3.87, type: tree }
+  300: { alt: 3.07, type: tree }
+  305: { alt: 2.48, type: tree }
+  310: { alt: 2.12, type: tree }
+  315: { alt: 2.0, type: tree }
+  320: { alt: 2.12, type: tree }
+  325: { alt: 2.48, type: tree }
+  330: { alt: 3.07, type: tree }
+  335: { alt: 3.87, type: tree }
+  340: { alt: 4.86, type: tree }
+  345: { alt: 6.0, type: tree }
+  350: { alt: 7.26, type: tree }
+  355: { alt: 8.61, type: tree }

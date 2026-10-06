@@ -1,0 +1,479 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Api",
+  "description": "Every payload the sidecar sends. tests/test_server.py validates responses against it, and app/src/api/generated.ts is generated from it.",
+  "type": "object",
+  "properties": {
+    "health": {
+      "$ref": "#/$defs/Health"
+    },
+    "state": {
+      "$ref": "#/$defs/AppState"
+    },
+    "sites": {
+      "$ref": "#/$defs/SiteList"
+    },
+    "horizon": {
+      "$ref": "#/$defs/Horizon"
+    },
+    "disc": {
+      "$ref": "#/$defs/Disc"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Health": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "AppState": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "site": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SiteSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tab": {
+          "type": "string"
+        },
+        "tabs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scope": {
+          "type": "object",
+          "properties": {
+            "link": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "link"
+          ],
+          "additionalProperties": false
+        },
+        "sun_mode": {
+          "enum": [
+            "sun",
+            "shade"
+          ]
+        },
+        "spin": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 360,
+          "description": "rough yaw of an unoriented site, degrees"
+        },
+        "job": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Job"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "log": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "only in /dev/state"
+        }
+      },
+      "required": [
+        "version",
+        "site",
+        "tab",
+        "tabs",
+        "scope",
+        "sun_mode",
+        "spin",
+        "job"
+      ],
+      "additionalProperties": false
+    },
+    "SiteSummary": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string"
+        },
+        "photos": {
+          "type": "integer"
+        },
+        "panorama": {
+          "type": "boolean"
+        },
+        "mask": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "slug",
+        "photos",
+        "panorama",
+        "mask"
+      ],
+      "additionalProperties": false
+    },
+    "SiteList": {
+      "type": "object",
+      "properties": {
+        "sites": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SiteSummary"
+          }
+        }
+      },
+      "required": [
+        "sites"
+      ],
+      "additionalProperties": false
+    },
+    "Job": {
+      "type": "object",
+      "properties": {
+        "site": {
+          "type": "string"
+        },
+        "step": {
+          "enum": [
+            "mosaic",
+            "skymask",
+            null
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "done",
+            "failed"
+          ]
+        },
+        "log": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "site",
+        "step",
+        "status",
+        "log",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "Solution": {
+      "type": "object",
+      "properties": {
+        "yaw": {
+          "type": "number"
+        },
+        "pitch": {
+          "type": "number"
+        },
+        "tilt_mag": {
+          "type": "number"
+        },
+        "tilt_dir": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "yaw",
+        "pitch",
+        "tilt_mag",
+        "tilt_dir"
+      ],
+      "additionalProperties": false
+    },
+    "Column": {
+      "type": "object",
+      "properties": {
+        "az": {
+          "type": "number"
+        },
+        "alt": {
+          "type": "number",
+          "description": "the actual horizon"
+        },
+        "type": {
+          "type": "string"
+        },
+        "planning": {
+          "type": "number"
+        },
+        "fuzz": {
+          "type": "number"
+        },
+        "bound": {
+          "type": "boolean"
+        },
+        "clipped": {
+          "type": "boolean"
+        },
+        "pockets": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2,
+            "description": "[alt_hi, alt_lo]: sky seen below the line"
+          }
+        }
+      },
+      "required": [
+        "az",
+        "alt"
+      ],
+      "additionalProperties": false
+    },
+    "FitColumn": {
+      "type": "object",
+      "properties": {
+        "az": {
+          "type": "number"
+        },
+        "alt": {
+          "type": "number"
+        },
+        "bound": {
+          "type": "boolean"
+        },
+        "used": {
+          "type": "boolean"
+        },
+        "residual": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "excluded_by": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "az"
+      ],
+      "additionalProperties": false
+    },
+    "Horizon": {
+      "type": "object",
+      "properties": {
+        "mask": {
+          "type": "string"
+        },
+        "oriented": {
+          "type": "boolean"
+        },
+        "solution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Solution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "fit": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FitColumn"
+          }
+        },
+        "settled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "the detector that read the horizon (e.g. \"heuristic\": no segmentation model ran)"
+        }
+      },
+      "required": [
+        "mask",
+        "oriented",
+        "solution",
+        "columns",
+        "fit",
+        "settled",
+        "backend"
+      ],
+      "additionalProperties": false
+    },
+    "XY": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "Disc": {
+      "type": "object",
+      "description": "Overlays for the polar disc, in disc pixels (N up, E right), from polar.disc_xy.",
+      "properties": {
+        "size": {
+          "type": "integer"
+        },
+        "floor": {
+          "type": "number"
+        },
+        "centre": {
+          "type": "integer"
+        },
+        "rings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "alt": {
+                "type": "number"
+              },
+              "r": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "alt",
+              "r"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "cardinals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "xy": {
+                "$ref": "#/$defs/XY"
+              }
+            },
+            "required": [
+              "label",
+              "xy"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "actual": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/XY"
+          }
+        },
+        "planning": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/XY"
+          }
+        },
+        "pockets": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/XY"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "fiducials": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "az": {
+                "type": "number"
+              },
+              "alt": {
+                "type": "number"
+              },
+              "bound": {
+                "type": "boolean"
+              },
+              "xy": {
+                "$ref": "#/$defs/XY"
+              }
+            },
+            "required": [
+              "az",
+              "alt",
+              "bound",
+              "xy"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "size",
+        "floor",
+        "centre",
+        "rings",
+        "cardinals",
+        "actual",
+        "planning",
+        "pockets",
+        "fiducials"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

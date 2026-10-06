@@ -1,9 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain, session, type IpcMainInvokeEvent } from "electron";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AppState } from "../src/api/types";
-import { request, startSidecar, stopSidecar, type Sidecar } from "./sidecar";
+import { request, startSidecar, stopSidecar, view, type Sidecar } from "./sidecar";
 
 // Dev mode exposes the Chromium DevTools protocol on 127.0.0.1 (Chromium's
 // default bind) so Playwright can drive the real window, and the sidecar's
@@ -34,6 +34,78 @@ function writeDevSession(sc: Sidecar) {
   console.log(`terminus dev session: ${file}`);
 }
 
+const PHOTO_EXTENSIONS = ["jpg", "jpeg", "png", "tif", "tiff"];
+
+// Every renderer call is checked here: the sender must be our page, and each
+// argument must have the shape the sidecar expects before it is forwarded.
+function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
+  const handle = (channel: string, fn: (...args: unknown[]) => unknown) =>
+    ipcMain.handle(channel, (e, ...args) => (fromOurPage(e), fn(...args)));
+  const shortString = (v: unknown, what: string) => {
+    if (typeof v !== "string" || v.length === 0 || v.length > 64)
+      throw new Error(`${what} must be a short string`);
+    return v;
+  };
+  // Copying hundreds of full-size photos takes longer than an ordinary call.
+  const create = (photos: string[]) => request<AppState>(sc, "/sites", { photos }, 10 * 60_000);
+
+  handle("state:get", () => request<AppState>(sc, "/state"));
+  handle("state:tab", (tab) =>
+    request<AppState>(sc, "/state/tab", { tab: shortString(tab, "tab") }),
+  );
+  handle("sites:list", () => request(sc, "/sites"));
+  handle("site:open", (slug) =>
+    request<AppState>(sc, "/site/open", { slug: shortString(slug, "site") }),
+  );
+  handle("site:spin", (deg) => {
+    if (typeof deg !== "number" || !Number.isFinite(deg)) throw new Error("spin must be a number");
+    return request<AppState>(sc, "/site/spin", { deg });
+  });
+  handle("site:horizon", () => view(sc, "/site/horizon"));
+  handle("site:disc", () => view(sc, "/site/disc"));
+  handle("site:image", (name) => {
+    if (name !== "panorama" && name !== "disc") throw new Error("unknown image");
+    return view(sc, `/site/${name}.jpg`);
+  });
+  // The file dialog is opened here, not in the page, so the page never chooses paths.
+  handle("site:pick", async () => {
+    const w = win();
+    const opts = {
+      title: "Choose the photographs of this site",
+      properties: ["openFile", "multiSelections"] as ("openFile" | "multiSelections")[],
+      filters: [{ name: "Photos", extensions: PHOTO_EXTENSIONS }],
+    };
+    const res = w ? await dialog.showOpenDialog(w, opts) : await dialog.showOpenDialog(opts);
+    return res.canceled || res.filePaths.length === 0 ? null : create(res.filePaths);
+  });
+  // Dropped files: the preload turns each File into its path. The sidecar checks
+  // that every one is an existing photo before copying anything.
+  handle("site:create", (paths) => {
+    if (
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      paths.length > 500 ||
+      !paths.every(
+        (p) =>
+          typeof p === "string" &&
+          p.length < 4096 &&
+          path.isAbsolute(p) &&
+          PHOTO_EXTENSIONS.includes(path.extname(p).slice(1).toLowerCase()),
+      )
+    )
+      throw new Error("expected a list of absolute photo paths");
+    return create(paths as string[]);
+  });
+}
+
+// A packaged app will carry its own Hugin (terminus-71.6); in dev, a vendored copy
+// if there is one, else PATH.
+function huginDir(): string | undefined {
+  if (app.isPackaged) return path.join(process.resourcesPath, "hugin", "bin");
+  const vendored = path.resolve(__dirname, "..", "vendor", "hugin", "bin");
+  return existsSync(vendored) ? vendored : undefined;
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1100,
@@ -48,6 +120,7 @@ function createWindow() {
     },
   });
   win.loadFile(indexHtml);
+  return win;
 }
 
 async function boot() {
@@ -56,9 +129,17 @@ async function boot() {
   const venvPython = process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python";
   const python = process.env.TERMINUS_PYTHON ?? path.join(repo, venvPython);
   mkdirSync(path.dirname(logPath()), { recursive: true });
+  const hugin = huginDir();
   const sc = (sidecar = await startSidecar({
     command: python,
-    args: ["-m", "terminus.server", ...(dev ? ["--dev"] : [])],
+    args: [
+      "-m",
+      "terminus.server",
+      "--sites",
+      path.join(app.getPath("userData"), "sites"),
+      ...(hugin ? ["--hugin", hugin] : []),
+      ...(dev ? ["--dev"] : []),
+    ],
     cwd: repo,
     logPath: logPath(),
     expectedVersion: app.getVersion(),
@@ -73,13 +154,10 @@ async function boot() {
   });
   if (dev) writeDevSession(sc);
 
-  ipcMain.handle("state:get", (e) => (fromOurPage(e), request<AppState>(sc, "/state")));
-  ipcMain.handle("state:tab", (e, tab: unknown) => {
-    fromOurPage(e);
-    if (typeof tab !== "string" || tab.length > 32) throw new Error("tab must be a short string");
-    return request<AppState>(sc, "/state/tab", { tab });
-  });
-  createWindow();
+  // Handlers before the window, so the page's first call finds them.
+  const holder: { win?: BrowserWindow } = {};
+  registerIpc(sc, () => holder.win);
+  holder.win = createWindow();
 }
 
 app.on("web-contents-created", (_e, wc) => {

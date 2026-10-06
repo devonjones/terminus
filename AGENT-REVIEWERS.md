@@ -603,8 +603,9 @@ Review the sidecar routes (`src/terminus/server/**`), their TypeScript side
 
 - Changes a route or payload on one side only.
 - Hand-writes TS types for a payload instead of generating them from the
-  sidecar's schema. Stage 0's `app/src/api/types.ts` is hand-written, and
-  generation is tracked (see the beads); do not re-flag it until then.
+  sidecar's schema. Payloads are defined once in `src/terminus/server/schema.json`;
+  `npm run gen:api` writes `app/src/api/generated.ts` (CI fails if it is stale), and
+  `tests/test_server.py` validates every response against the same file.
 - Makes a breaking change without a version bump. The UI refuses a sidecar of a
   different version, so the versions in `app/package.json`, `pyproject.toml` and
   `src/terminus/__init__.py` move together.

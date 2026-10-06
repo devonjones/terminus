@@ -49,22 +49,54 @@ function hello(proc: ChildProcess, command: string, timeoutMs: number) {
   });
 }
 
+// fetch's own message ("fetch failed") hides the reason; its cause carries it.
+async function call(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    const cause = (e as Error & { cause?: Error }).cause?.message;
+    throw new Error(cause ? `${(e as Error).message}: ${cause}` : (e as Error).message, {
+      cause: e,
+    });
+  }
+}
+
 export async function request<T = unknown>(
   sc: Pick<Sidecar, "url" | "token">,
   path: string,
   body?: unknown,
+  timeoutMs = 10_000,
 ): Promise<T> {
-  const res = await fetch(sc.url + path, {
+  const res = await call(sc.url + path, {
     method: body === undefined ? "GET" : "POST",
     headers: { Authorization: `Bearer ${sc.token}`, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => null);
     throw new Error(`engine ${path}: ${res.status} ${err?.error ?? ""}`.trim());
   }
   return res.json();
+}
+
+// A site view: JSON or image bytes, or null when the site has nothing there yet
+// (204). A 404 is a wrong route and throws like any other error.
+export async function view(
+  sc: Pick<Sidecar, "url" | "token">,
+  path: string,
+): Promise<unknown | Uint8Array | null> {
+  const res = await call(sc.url + path, {
+    headers: { Authorization: `Bearer ${sc.token}` },
+    signal: AbortSignal.timeout(60_000), // reprojecting the disc photo takes a moment
+  });
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(`engine ${path}: ${res.status} ${err?.error ?? ""}`.trim());
+  }
+  if (res.headers.get("Content-Type") === "application/json") return res.json();
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 export async function startSidecar(o: StartOptions): Promise<Sidecar> {

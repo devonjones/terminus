@@ -46,6 +46,8 @@ jobs:
         run: npm ci
       - name: Lint (eslint)
         run: npm run lint
+      - name: API types match the sidecar schema
+        run: npm run gen:api && git diff --exit-code src/api/generated.ts
       - name: Type check (tsc --noEmit)
         run: npm run typecheck
       - name: Format check (prettier)

@@ -25,6 +25,8 @@ const h = vi.hoisted(() => {
     startSidecar: vi.fn(),
     stopSidecar: vi.fn(async () => {}),
     request: vi.fn(async (_sc: unknown, p: string, body?: unknown) => ({ p, body })),
+    view: vi.fn(async (_sc: unknown, p: string) => ({ view: p })),
+    showOpenDialog: vi.fn(),
   };
 });
 
@@ -34,7 +36,7 @@ vi.mock("electron", () => ({
     static getAllWindows = () => [];
     loadFile = vi.fn();
   },
-  dialog: { showErrorBox: h.showErrorBox },
+  dialog: { showErrorBox: h.showErrorBox, showOpenDialog: h.showOpenDialog },
   ipcMain: { handle: (ch: string, fn: (...a: unknown[]) => unknown) => h.handlers.set(ch, fn) },
   session: { defaultSession: { setPermissionRequestHandler: vi.fn() } },
 }));
@@ -42,6 +44,7 @@ vi.mock("./sidecar", () => ({
   startSidecar: h.startSidecar,
   stopSidecar: h.stopSidecar,
   request: h.request,
+  view: h.view,
 }));
 
 let proc: EventEmitter & { exitCode: number | null; signalCode: string | null };
@@ -88,7 +91,7 @@ describe("IPC", () => {
     expect(h.request).not.toHaveBeenCalled();
   });
 
-  it.each([3, null, { tab: "fit" }, "x".repeat(33)])("refuses tab %j", async (tab) => {
+  it.each([3, null, { tab: "fit" }, "x".repeat(65), ""])("refuses tab %j", async (tab) => {
     await boot();
     expect(() => h.handlers.get("state:tab")!(ourPage, tab)).toThrow("short string");
     expect(h.request).not.toHaveBeenCalled();
@@ -122,6 +125,109 @@ describe("dev mode gating", () => {
     h.app.commandLine.hasSwitch.mockReturnValue(true);
     await boot();
     expect(h.app.exit).toHaveBeenCalledWith(1);
+  });
+});
+
+describe("site IPC", () => {
+  const call = (ch: string, ...args: unknown[]) => h.handlers.get(ch)!(ourPage, ...args);
+
+  it("forwards the site calls to their sidecar routes", async () => {
+    await boot();
+    expect(await call("sites:list")).toEqual({ p: "/sites", body: undefined });
+    expect(await call("site:open", "site-a")).toEqual({
+      p: "/site/open",
+      body: { slug: "site-a" },
+    });
+    expect(await call("site:spin", 120)).toEqual({ p: "/site/spin", body: { deg: 120 } });
+    expect(await call("site:horizon")).toEqual({ view: "/site/horizon" });
+    expect(await call("site:disc")).toEqual({ view: "/site/disc" });
+    expect(await call("site:image", "disc")).toEqual({ view: "/site/disc.jpg" });
+    expect(await call("site:create", ["/p/a.jpg"])).toEqual({
+      p: "/sites",
+      body: { photos: ["/p/a.jpg"] },
+    });
+  });
+
+  it.each([
+    ["site:open", [3]],
+    ["site:open", ["x".repeat(65)]],
+    ["site:spin", ["90"]],
+    ["site:spin", [Number.NaN]],
+    ["site:image", ["../secrets"]],
+    ["site:create", ["/p/a.jpg"]],
+    ["site:create", [[]]],
+    ["site:create", [[3]]],
+    ["site:create", [Array(501).fill("/p/a.jpg")]],
+    ["site:create", [["p/a.jpg"]]],
+    ["site:create", [["/p/notes.txt"]]],
+  ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
+    await boot();
+    expect(() => call(ch, ...args)).toThrow();
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.view).not.toHaveBeenCalled();
+  });
+
+  it("every site channel checks the sender frame", async () => {
+    await boot();
+    const evil = { senderFrame: { url: "https://evil.example/" } };
+    for (const ch of [
+      "sites:list",
+      "site:open",
+      "site:spin",
+      "site:horizon",
+      "site:disc",
+      "site:image",
+      "site:pick",
+      "site:create",
+    ])
+      expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
+  });
+
+  it("copying a drop gets a long timeout, not the ordinary 10 s", async () => {
+    await boot();
+    await call("site:create", ["/p/a.jpg"]);
+    expect((h.request.mock.calls[0] as unknown[])[3]).toBe(10 * 60_000);
+  });
+
+  it("the file dialog picks the photos; cancelling creates nothing", async () => {
+    await boot();
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] });
+    expect(await call("site:pick")).toBeNull();
+    expect(h.request).not.toHaveBeenCalled();
+    h.showOpenDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePaths: ["/p/a.jpg", "/p/b.jpg"],
+    });
+    expect(await call("site:pick")).toEqual({
+      p: "/sites",
+      body: { photos: ["/p/a.jpg", "/p/b.jpg"] },
+    });
+  });
+});
+
+describe("sidecar arguments", () => {
+  it("keeps sites under userData and, in dev with no vendored Hugin, passes none", async () => {
+    await boot();
+    const args: string[] = h.startSidecar.mock.calls[0][0].args;
+    const at = args.indexOf("--sites");
+    expect(args[at + 1]).toBe(path.join(os.tmpdir(), "terminus-main-test", "sites"));
+    expect(args).not.toContain("--hugin");
+  });
+
+  it("a packaged build always passes its bundled Hugin", async () => {
+    h.app.isPackaged = true;
+    const resources = (process as unknown as { resourcesPath?: string }).resourcesPath;
+    (process as unknown as { resourcesPath: string }).resourcesPath = "/opt/terminus/resources";
+    try {
+      await boot();
+      const args: string[] = h.startSidecar.mock.calls[0][0].args;
+      expect(args[args.indexOf("--hugin") + 1]).toBe(
+        path.join("/opt/terminus/resources", "hugin", "bin"),
+      );
+    } finally {
+      h.app.isPackaged = false;
+      (process as unknown as { resourcesPath?: string }).resourcesPath = resources;
+    }
   });
 });
 
