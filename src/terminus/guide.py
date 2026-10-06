@@ -49,6 +49,11 @@ def photo_sample(rows, pockets=None):
     stretch is not what the yaw is solved against. It becomes wrong only if a
     fiducial lands inside the gap, which is the caller's business to avoid; the
     same bridging is what `Horizon` has always done.
+
+    `pockets` is `{native az: [(alt_hi, alt_lo), ...]}`, the sky seen below the
+    line. When given, the sampler carries `sample.pockets_near(az)`, which
+    `orient.predict` reads to score an edge at a pocket's floor; otherwise that
+    attribute is None.
     """
     pts = sorted((float(az), float(alt)) for az, alt, *_ in rows)
     if not pts:

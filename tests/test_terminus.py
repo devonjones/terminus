@@ -9532,7 +9532,16 @@ def test_connected_sky_seeds_win_over_size_and_uncovered_is_never_sky(capsys):
     sky[20:30, 10:40] = True  # the real sky, under the canopy
     kept = connected_sky(sky)
     assert kept[20:30, 10:40].all(), "a speck must not outweigh the sky"
-    assert "largest sky region" in capsys.readouterr().err
+    assert kept[0, 5], "the rescue adds the largest region; it does not drop the seeded sky"
+    assert "largest sky region does not reach the top" in capsys.readouterr().err
+
+    sky = np.zeros((40, 60), bool)
+    sky[0:5, 0:20] = True  # two seeded regions, 100 px each, reaching the top
+    sky[0:5, 35:55] = True
+    sky[20:30, 10:25] = True  # a 150 px blob: bigger than either, smaller than both
+    kept = connected_sky(sky)
+    assert not kept[20:30, 10:25].any(), "the blob must outweigh ALL seeded sky, not one region"
+    assert "largest sky region" not in capsys.readouterr().err
 
     valid = np.ones((40, 60), bool)
     valid[0:2] = False  # unphotographed strip at the top, touching no sky
@@ -9604,6 +9613,13 @@ def test_pocket_lookup_does_not_reach_across_a_gap_in_the_mask():
     coarse = photo_sample(mixed, {200: [(30.0, 10.0)]})
     assert coarse.pockets_near(208.0) == [(30.0, 10.0)]
     assert coarse.pockets_near(211.0) == ()
+    # Column 180 sits between a 5-degree gap behind and a 20-degree gap ahead:
+    # its reach is the SMALLER one, so 188 is out of it.
+    edge = photo_sample(mixed, {180: [(30.0, 10.0)]})
+    assert edge.pockets_near(188.0) == ()
+    # Column 31's gap behind is 31 degrees, ahead 1: reach 0.5, not 15.5.
+    after = photo_sample(rows, {31: [(30.0, 10.0)]})
+    assert after.pockets_near(30.3) == ()
     single = photo_sample([(90.0, 35.0, "tree")], {90: [(30.0, 10.0)]})
     assert single.pockets_near(250.0) == [(30.0, 10.0)], "one column covers the circle"
 

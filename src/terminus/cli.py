@@ -637,8 +637,6 @@ def cmd_polar(sc, cfg, args):  # sc unused; polar is offline
 
     # SKY POCKETS FROM THE ORIENTED MASK ITSELF, already in true coordinates
     # because they were read off the same reprojected class map as the line.
-    # Rotating the photo's native pockets here instead leaned them sideways by
-    # an altitude-dependent amount under tilt and drew some in open sky.
     entries = {az: e for az, e in _mask_entries(args.mask).items() if isinstance(e, dict)}
     # load_mask above has already refused a malformed pocket, naming its column.
     pockets = [

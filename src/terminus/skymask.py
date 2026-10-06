@@ -336,8 +336,8 @@ def _wrap_roots(labels, n):
 def connected_sky(sky, valid=None):
     """Keep only sky that connects to the open sky: sky must be CONTIGUOUS.
 
-    Seeds are the top row's passable pixels (labelled sky, or unphotographed),
-    counted only where their region holds real sky. Anything sky-coloured that
+    Seeds are the top row's passable pixels (labelled sky, or unphotographed).
+    Anything sky-coloured that
     cannot reach a seed through other sky (4-connected, with azimuth wrapping at
     0/360) is not sky: a reflection on a heater lid, a window, a blue tarp.
     Because unphotographed pixels are passable, a coverage hole can bridge a
@@ -364,10 +364,12 @@ def connected_sky(sky, valid=None):
     sizes = np.bincount(roots[sky], minlength=n + 1)
     open_ = set(roots[0][passable[0]].tolist())
     big = int(np.argmax(sizes))
-    if sizes[big] and big not in open_ and sizes[big] > sum(sizes[r] for r in open_):
+    seeded = int(sizes[list(open_)].sum())
+    if sizes[big] > seeded:
         print(
-            f"no open sky reaches the top of the panorama: kept the largest sky region "
-            f"({sizes[big]} px, {100 * sizes[big] / sky.sum():.0f}% of the sky)",
+            f"the largest sky region does not reach the top of the panorama; kept it as "
+            f"open sky ({sizes[big]} px, {100 * sizes[big] / sky.sum():.0f}% of the sky, "
+            f"against {seeded} px that does reach the top)",
             file=sys.stderr,
         )
         open_.add(big)
