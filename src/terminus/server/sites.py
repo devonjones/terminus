@@ -8,16 +8,17 @@ A site is a folder under the sites root that the app owns:
     <root>/<slug>/oriented.yaml      `terminus orient` output, when there is one
 
 The same files the CLI writes, so the CLI can still open a site. The pipeline
-runs the engine in-process: the app ships its own frozen Python and Hugin and
-must not depend on a `terminus` command or anything else on the machine.
+runs the engine's own code in a child process of this program (see `Jobs`):
+the app ships its own frozen Python and Hugin and must not depend on a
+`terminus` command or anything else on the machine.
 """
 
-import contextlib
 import datetime
-import io
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 
 PHOTO_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
@@ -108,29 +109,47 @@ def pipeline(d):
     ]
 
 
-class _Lines(io.TextIOBase):
-    """A write target that keeps the last lines, for showing progress."""
+STEP = "@step "  # how the pipeline child announces each step on stdout
+JOB_TIMEOUT_S = 2 * 60 * 60  # a stitch of hundreds of photos is slow, but not this slow
 
-    def __init__(self, sink):
-        self.sink, self.buf = sink, ""
 
-    def write(self, s):
-        self.buf += s
-        *done, self.buf = self.buf.split("\n")
-        for line in done:
-            if line.strip():
-                self.sink(line)
-        return len(s)
+def run_pipeline(d, run=None):
+    """The child process's whole job: run each step in its main thread.
+
+    Raises SystemExit on the first step that fails, after cli.main has printed
+    its "error: ..." line.
+    """
+    from .. import cli
+
+    run = run or cli.main
+    for step, argv in pipeline(d):
+        print(STEP + step, flush=True)
+        run(argv)
+
+
+def own_command():
+    """How this program starts itself: the frozen sidecar, or `python -m` in dev."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "terminus.server"]
 
 
 class Jobs:
-    """One pipeline at a time, run on a worker thread; its state is read by /state."""
+    """One pipeline at a time, each in a child process the job thread watches.
 
-    def __init__(self, run=None):
-        from .. import cli
+    The child, not this process, loads the native code (Hugin, scipy, OpenBLAS):
+    the sidecar will hold the telescope, and a hang or crash in stitching must
+    not take down the process that parks it. It also sidesteps a Windows
+    loader-lock deadlock seen when a worker thread first loaded scipy's BLAS
+    while the HTTP server was starting threads.
+    """
 
-        self._run = run or cli.main
+    def __init__(self, command=None, hugin=None, timeout=JOB_TIMEOUT_S):
+        self._command = command or own_command
+        self._hugin = hugin
+        self._timeout = timeout
         self._lock = threading.Lock()
+        self._proc = None
         self.state = None
 
     def _log(self, line):
@@ -143,26 +162,57 @@ class Jobs:
             if self.state and self.state["status"] == "running":
                 raise SiteError("a site is already being built")
             self.state = {"site": slug, "step": None, "status": "running", "log": [], "error": None}
-        t = threading.Thread(target=self._work, args=(d,), daemon=True)
+            cmd = [*self._command(), "--pipeline", d]
+            if self._hugin:
+                cmd += ["--hugin", self._hugin]
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+        t = threading.Thread(target=self._watch, args=(self._proc,), daemon=True)
         t.start()
         return t
 
-    def _work(self, d):
-        out = _Lines(self._log)
+    def _watch(self, proc):
+        expired = threading.Event()
+
+        def expire():
+            expired.set()
+            proc.kill()
+
+        timer = threading.Timer(self._timeout, expire)
+        timer.start()
         try:
-            for step, argv in pipeline(d):
-                self.state["step"] = step
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                    self._run(argv)
-        except SystemExit as e:
-            # cli.main reports its errors as "error: ..." on stderr and exits 1;
-            # that line is already in the log, so name it as the failure.
-            errors = [x for x in self.state["log"] if x.startswith("error:")]
-            self.state["error"] = errors[-1] if errors else f"{self.state['step']} exited {e.code}"
-            self.state["status"] = "failed"
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line.startswith(STEP):
+                    self.state["step"] = line[len(STEP) :]
+                elif line.strip():
+                    self._log(line)
+            code = proc.wait()
+        finally:
+            timer.cancel()
+            proc.stdout.close()
+        if code == 0:
+            self.state["status"] = "done"
             return
-        except Exception as e:  # anything else is a bug; keep the sidecar up and say so
-            self.state["error"] = f"{self.state['step']} crashed: {type(e).__name__}: {e}"
-            self.state["status"] = "failed"
-            return
-        self.state["status"] = "done"
+        errors = [x for x in self.state["log"] if x.startswith("error:")]
+        if expired.is_set():
+            self.state["error"] = (
+                f"{self.state['step']} took longer than {self._timeout // 60} minutes"
+            )
+        else:
+            # cli.main prints "error: ..." and exits 1; a crash prints a traceback.
+            self.state["error"] = (
+                errors[-1] if errors else f"{self.state['step']} stopped (exit {code})"
+            )
+        self.state["status"] = "failed"
+
+    def stop(self):
+        """Kill a running build (the sidecar is exiting)."""
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.kill()

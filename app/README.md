@@ -101,6 +101,15 @@ app/scripts/win-dev.sh state   # /dev/state via Windows curl.exe
 Read the screenshot from WSL at
 `/mnt/c/Users/<you>/AppData/Roaming/terminus/dev/screenshot.png`.
 
+To build sites on Windows, vendor Hugin into the Windows copy once (an
+administrative extract installs nothing and touches no PATH). Run this from
+`%LOCALAPPDATA%\terminus`, with the MSI from hugin.sourceforge.io:
+
+```bat
+msiexec /a Hugin-2025.0.1-win64.msi /qn TARGETDIR=%LOCALAPPDATA%\terminus\src\app\vendor\hugin-msi
+move src\app\vendor\hugin-msi\Hugin src\app\vendor\hugin
+```
+
 `run` excludes `.git`, `.venv`, `node_modules`, `captures/`, `scratch/`, `*.pem`
 and `config.toml`, so the interop key never leaves WSL. On first run, and
 whenever `pyproject.toml` or `package-lock.json` changes, it builds a Windows

@@ -277,25 +277,31 @@ def _stop_on_eof(server):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m terminus.server", description=__doc__)
     p.add_argument("--dev", action="store_true", help="enable /dev/state")
-    p.add_argument("--sites", required=True, help="the folder that holds the app's sites")
+    p.add_argument("--sites", help="the folder that holds the app's sites (required to serve)")
     p.add_argument("--hugin", help="the bundled Hugin tools; default: look them up on PATH")
+    p.add_argument("--pipeline", metavar="SITE", help=argparse.SUPPRESS)  # the build child
     args = p.parse_args(argv)
     if args.hugin:
         from .. import mosaic
 
         mosaic.HUGIN_BIN = args.hugin
+    if args.pipeline:
+        return sites.run_pipeline(args.pipeline)
+    if not args.sites:
+        p.error("--sites is required")
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     # A POSIX kill (SIGTERM) must still reach the park in `finally`.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     os.makedirs(args.sites, exist_ok=True)
-    server = Sidecar(dev=args.dev, sites_root=args.sites)
+    server = Sidecar(dev=args.dev, sites_root=args.sites, jobs=sites.Jobs(hugin=args.hugin))
     try:
         print(json.dumps({"port": server.port, "token": server.token}), flush=True)
         log.info("terminus sidecar %s on 127.0.0.1:%d dev=%s", __version__, server.port, args.dev)
         threading.Thread(target=_stop_on_eof, args=(server,), daemon=True).start()
         server.serve_forever()
     finally:
+        server.jobs.stop()
         server.scope.park()
         server.server_close()

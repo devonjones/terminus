@@ -269,22 +269,25 @@ def _site(root, slug="site-2026-10-05", oriented=False, panorama=True):
     return d
 
 
+def child(script):
+    """A Jobs command that runs `script` in place of the pipeline child."""
+    return lambda: [sys.executable, "-c", script]
+
+
+OK_CHILD = (
+    "import sys; print('@step mosaic'); print('registered 18 frames'); "
+    "print('@step skymask'); print('args', sys.argv[1:]); sys.exit(0)"
+)
+
+
 class FakeJobs(server_module.sites.Jobs):
-    """The real Jobs, with the engine replaced by a recorder (no Hugin in tests)."""
+    """The real Jobs, with a scripted child in place of the pipeline (no Hugin)."""
 
-    def __init__(self, fail=None):
-        self.calls = []
-
-        def run(argv):
-            self.calls.append(argv)
-            if fail == argv[0]:
-                print(f"error: {argv[0]} could not register the photos", file=sys.stderr)
-                raise SystemExit(1)
-
-        super().__init__(run=run)
+    def __init__(self, script=OK_CHILD, **kw):
+        super().__init__(command=child(script), **kw)
 
     def wait(self):
-        for _ in range(200):
+        for _ in range(500):
             if self.state and self.state["status"] != "running":
                 return self.state
             time.sleep(0.01)
@@ -332,56 +335,79 @@ def test_site_dir_refuses_anything_but_an_existing_slug(tmp_path, slug):
     assert sites.site_dir(str(tmp_path), "site-a") == str(tmp_path / "site-a")
 
 
-def test_the_pipeline_runs_mosaic_then_skymask_on_the_site(tmp_path):
-    jobs = FakeJobs()
+def test_the_pipeline_child_runs_mosaic_then_skymask_on_the_site(tmp_path, capsys):
+    from terminus.server import sites
+
     d = _site(tmp_path, panorama=False)
-    jobs.start("site-2026-10-05", str(d)).join(5)
-    assert jobs.state["status"] == "done" and jobs.state["error"] is None
-    assert [argv[0] for argv in jobs.calls] == ["mosaic", "skymask"]
-    mosaic, skymask = jobs.calls
+    calls = []
+    sites.run_pipeline(str(d), run=calls.append)
+    assert [argv[0] for argv in calls] == ["mosaic", "skymask"]
+    mosaic, skymask = calls
     assert mosaic[1] == str(d / "photos") and mosaic[-1] == str(d / "equirect")
     assert skymask[1] == str(d / "equirect.png") and skymask[-1] == str(d / "photo_mask.yaml")
-    conforms("Job", jobs.state)
+    assert capsys.readouterr().out == "@step mosaic\n@step skymask\n"
+
+
+def test_a_build_follows_the_childs_steps_and_log(tmp_path):
+    jobs = FakeJobs(hugin="/bundle/hugin/bin")
+    jobs.start("site-a", str(tmp_path)).join(10)
+    st = jobs.state
+    assert st["status"] == "done" and st["step"] == "skymask" and st["error"] is None
+    assert st["log"][0] == "registered 18 frames"
+    assert st["log"][1] == f"args {['--pipeline', str(tmp_path), '--hugin', '/bundle/hugin/bin']}"
+    conforms("Job", st)
 
 
 def test_a_failed_step_is_reported_with_the_engines_own_message(tmp_path):
-    jobs = FakeJobs(fail="mosaic")
-    jobs.start("s", str(_site(tmp_path))).join(5)
+    jobs = FakeJobs(
+        "import sys; print('@step mosaic'); "
+        "print('error: no frame could be constrained', file=sys.stderr); sys.exit(1)"
+    )
+    jobs.start("s", str(tmp_path)).join(10)
+    assert jobs.state["status"] == "failed" and jobs.state["step"] == "mosaic"
+    assert jobs.state["error"] == "error: no frame could be constrained"
+
+
+def test_a_crashing_child_fails_the_build_not_the_sidecar(tmp_path):
+    jobs = FakeJobs("print('@step skymask', flush=True); raise RuntimeError('bug')")
+    jobs.start("s", str(tmp_path)).join(10)
     assert jobs.state["status"] == "failed"
-    assert jobs.state["error"] == "error: mosaic could not register the photos"
-    assert [argv[0] for argv in jobs.calls] == ["mosaic"], "skymask must not run on no panorama"
+    assert jobs.state["error"] == "skymask stopped (exit 1)"
+    assert any("RuntimeError: bug" in line for line in jobs.state["log"]), "the traceback is kept"
 
 
-def test_a_crashing_step_fails_the_job_not_the_sidecar(tmp_path):
+def test_a_build_that_overruns_is_killed_and_says_why(tmp_path):
+    jobs = FakeJobs("import time; print('@step mosaic', flush=True); time.sleep(30)", timeout=0.5)
+    t0 = time.monotonic()
+    jobs.start("s", str(tmp_path)).join(10)
+    assert time.monotonic() - t0 < 10
+    assert jobs.state["status"] == "failed" and "took longer than" in jobs.state["error"]
+
+
+def test_only_one_site_builds_at_a_time_and_stop_kills_it(tmp_path):
     from terminus.server import sites
 
-    def boom(argv):
-        raise RuntimeError("bug")
-
-    jobs = sites.Jobs(run=boom)
-    jobs.start("s", str(_site(tmp_path))).join(5)
-    assert jobs.state["status"] == "failed"
-    assert jobs.state["error"] == "mosaic crashed: RuntimeError: bug"
-
-
-def test_only_one_site_builds_at_a_time(tmp_path):
-    from terminus.server import sites
-
-    gate = threading.Event()
-    jobs = sites.Jobs(run=lambda argv: gate.wait(5))
-    t = jobs.start("a", str(_site(tmp_path)))
+    jobs = FakeJobs("import time; time.sleep(30)")
+    t = jobs.start("a", str(tmp_path))
     with pytest.raises(sites.SiteError, match="already"):
         jobs.start("b", str(tmp_path))
-    gate.set()
-    t.join(5)
+    jobs.stop()
+    t.join(10)
+    assert jobs.state["status"] == "failed"
 
 
-def test_progress_lines_reach_the_job_log(tmp_path):
+def test_the_real_child_runs_the_engine_and_reports_its_error(tmp_path):
+    """`python -m terminus.server --pipeline` is the child the sidecar starts.
+    With one 8-pixel photo the engine fails (no Hugin, or nothing to register),
+    and its own "error: ..." line must come back as the build's error."""
     from terminus.server import sites
 
-    jobs = sites.Jobs(run=lambda argv: print(f"working on {argv[0]}"))
-    jobs.start("s", str(_site(tmp_path))).join(5)
-    assert jobs.state["log"] == ["working on mosaic", "working on skymask"]
+    d = _site(tmp_path, panorama=False)
+    env_hugin = str(tmp_path / "no-hugin")  # an empty bundle: mosaic refuses at once
+    jobs = sites.Jobs(hugin=env_hugin)
+    jobs.start("s", str(d)).join(60)
+    assert jobs.state["status"] == "failed" and jobs.state["step"] == "mosaic"
+    assert jobs.state["error"].startswith("error: hugin tools missing from")
 
 
 def test_new_site_route_copies_photos_and_starts_the_build(serve, tmp_path):
