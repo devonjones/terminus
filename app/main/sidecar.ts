@@ -67,6 +67,24 @@ export async function request<T = unknown>(
   return res.json();
 }
 
+// A site view: JSON or image bytes, or null when the site has nothing there yet (404).
+export async function view(
+  sc: Pick<Sidecar, "url" | "token">,
+  path: string,
+): Promise<unknown | Uint8Array | null> {
+  const res = await fetch(sc.url + path, {
+    headers: { Authorization: `Bearer ${sc.token}` },
+    signal: AbortSignal.timeout(60_000), // reprojecting the disc photo takes a moment
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(`engine ${path}: ${res.status} ${err?.error ?? ""}`.trim());
+  }
+  if (res.headers.get("Content-Type") === "application/json") return res.json();
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 export async function startSidecar(o: StartOptions): Promise<Sidecar> {
   const proc = spawn(o.command, o.args, { cwd: o.cwd, stdio: "pipe", windowsHide: true });
   const log = createWriteStream(o.logPath, { flags: "a" });

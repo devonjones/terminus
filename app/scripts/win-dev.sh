@@ -28,7 +28,7 @@ run)
   rsync -a --delete \
     --exclude .git --exclude .venv --exclude node_modules --exclude /app/dist \
     --exclude /captures --exclude /scratch --exclude '*.pem' --exclude config.toml \
-    --exclude test-results --exclude playwright-report \
+    --exclude test-results --exclude playwright-report --exclude /app/vendor \
     "$repo/" "$dst/"
   if [ ! -x "$dst/.venv/Scripts/python.exe" ] || ! cmp -s "$dst/pyproject.toml" "$dst/.venv/pyproject.stamp"; then
     win "$dst" "python -m venv .venv && .venv\\Scripts\\python -m pip install -q -e ."

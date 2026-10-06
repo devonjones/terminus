@@ -2032,6 +2032,32 @@ def test_hugin_probe_reports_rather_than_raising():
         assert terminus.mosaic.hugin_available() is True
 
 
+def test_a_bundled_hugin_dir_is_used_instead_of_path(tmp_path, monkeypatch):
+    """The desktop app ships its own Hugin: with HUGIN_BIN set, every tool comes
+    from that directory and PATH is never consulted, even when it has Hugin."""
+    import os
+    import stat
+    from unittest.mock import patch
+
+    import pytest
+
+    from terminus import mosaic
+
+    monkeypatch.setattr(mosaic, "HUGIN_BIN", str(tmp_path))
+    with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
+        assert mosaic.hugin_available() is False, "PATH must not stand in for the bundle"
+        with pytest.raises(mosaic.MosaicError, match=str(tmp_path)):
+            mosaic.require_hugin()
+    ext = ".exe" if os.name == "nt" else ""
+    for name in mosaic.TOOLS:
+        tool = tmp_path / (name + ext)
+        tool.write_text("#!/bin/sh\necho bundled $0\n")
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+    assert mosaic.hugin_available() is True
+    if os.name != "nt":
+        assert mosaic._run(["nona", "-o", "x"]).strip() == f"bundled {tmp_path / 'nona'}"
+
+
 # ---- offline photo CLI (terminus-19) ---------------------------------------
 def _synthetic_panorama(path, w=720, h=360, blocked=None):
     """A panorama with a sinusoidal green skyline, optionally blocked to the top."""

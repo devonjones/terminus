@@ -1,7 +1,7 @@
 // Launch the real app (Electron + Python sidecar from the repo's .venv) and drive it.
 import { _electron as electron, expect, test } from "@playwright/test";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -18,14 +18,29 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
   await expect(win.locator("h1")).toHaveText("Horizon");
   await expect(win.getByRole("tab", { selected: true })).toHaveText("Horizon");
 
-  // The renderer sees two named calls and nothing of Node or Electron.
+  // The renderer sees named calls only, and nothing of Node or Electron.
   expect(
     await win.evaluate(() => ({
       api: Object.keys(window.terminus).sort(),
       require: typeof (globalThis as { require?: unknown }).require,
       process: typeof (globalThis as { process?: unknown }).process,
     })),
-  ).toEqual({ api: ["getState", "setTab"], require: "undefined", process: "undefined" });
+  ).toEqual({
+    api: [
+      "createSite",
+      "disc",
+      "getState",
+      "horizon",
+      "image",
+      "listSites",
+      "openSite",
+      "pickPhotos",
+      "setSpin",
+      "setTab",
+    ],
+    require: "undefined",
+    process: "undefined",
+  });
 
   const log = path.join(await app.evaluate(({ app }) => app.getPath("logs")), "sidecar.log");
   const before = readFileSync(log, "utf8").length;
@@ -51,5 +66,43 @@ test("--dev: dev-snap attaches over CDP, clicks, and saves a screenshot and /dev
     expect(readFileSync(path.join(out, "screenshot.png")).subarray(1, 4).toString()).toBe("PNG");
   } finally {
     await app.close();
+  }
+});
+
+test("stage 1: open a built site, see its panorama and disc, spin it, read the fit tab", async () => {
+  const app = await electron.launch({ args: [appDir] });
+  const sites = path.join(await app.evaluate(({ app }) => app.getPath("userData")), "sites");
+  const site = path.join(sites, "site-fixture");
+  rmSync(site, { recursive: true, force: true });
+  cpSync(path.join(__dirname, "fixtures", "site-fixture"), site, { recursive: true });
+  try {
+    const win = await app.firstWindow();
+    await win.reload(); // pick up the site copied in after launch
+    await win.getByLabel("Site").selectOption("site-fixture");
+    await expect(win.locator("footer")).toContainText("site: site-fixture");
+
+    await win.getByRole("tab", { name: "Panorama" }).click();
+    await expect(win.locator("img.pano")).toBeVisible();
+
+    await win.getByRole("tab", { name: "Horizon" }).click();
+    await expect(win.locator(".disc .rotor img")).toBeVisible(); // the reprojected photo
+    expect(await win.locator("polygon.hz").getAttribute("points")).toMatch(
+      /^[\d.]+,[\d.]+( [\d.]+,[\d.]+){71}$/,
+    );
+    await expect(win.locator("line.pk")).toHaveCount(1);
+    await expect(win.locator("text.cd")).toHaveText(["N", "E", "S", "W"]);
+    await expect(win.getByText("UNORIENTED")).toBeVisible();
+
+    const slider = win.getByRole("slider");
+    await slider.fill("90");
+    await slider.dispatchEvent("change");
+    await expect(win.locator(".rotor")).toHaveAttribute("style", /rotate\(90deg\)/);
+    expect(await win.evaluate(() => window.terminus.getState().then((s) => s.spin))).toBe(90);
+
+    await win.getByRole("tab", { name: "Fit" }).click();
+    await expect(win.getByText("No telescope fit for this site yet")).toBeVisible();
+  } finally {
+    await app.close();
+    rmSync(site, { recursive: true, force: true });
   }
 });

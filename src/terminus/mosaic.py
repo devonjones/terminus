@@ -43,12 +43,28 @@ class MosaicError(RuntimeError):
     pass
 
 
+# Where the Hugin tools live. None means PATH, which suits the CLI on a machine
+# where someone installed Hugin. The desktop app ships its own Hugin and sets
+# this, so it never depends on what the user's machine has.
+HUGIN_BIN = None
+
+
+def _tool(name):
+    """The path of one Hugin tool, or None if it is not there."""
+    if HUGIN_BIN is None:
+        return shutil.which(name)
+    path = os.path.join(HUGIN_BIN, name + (".exe" if os.name == "nt" else ""))
+    return path if os.path.isfile(path) else None
+
+
 def hugin_available():
-    return all(shutil.which(t) for t in TOOLS)
+    return all(_tool(t) for t in TOOLS)
 
 
 def require_hugin():
-    missing = [t for t in TOOLS if not shutil.which(t)]
+    missing = [t for t in TOOLS if not _tool(t)]
+    if missing and HUGIN_BIN is not None:
+        raise MosaicError(f"hugin tools missing from {HUGIN_BIN}: " + ", ".join(missing))
     if missing:
         raise MosaicError(
             "hugin command line tools not found: "
@@ -59,6 +75,7 @@ def require_hugin():
 
 
 def _run(cmd, cwd=None):
+    cmd = [_tool(cmd[0]) or cmd[0], *cmd[1:]]
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if p.returncode != 0:
         raise MosaicError(f"{cmd[0]} failed: {p.stderr.strip()[:400]}")

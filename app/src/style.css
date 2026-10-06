@@ -31,3 +31,150 @@ footer {
 footer {
   opacity: 0.8;
 }
+header {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem 0.5rem 0;
+}
+select,
+header button,
+.drop button,
+.bar button {
+  font: inherit;
+  padding: 0.35rem 0.8rem;
+  border-radius: 4px;
+  border: 1px solid #8886;
+  background: none;
+  color: inherit;
+}
+.drop {
+  border: 2px dashed #8888;
+  border-radius: 8px;
+  padding: 3rem 1rem;
+  text-align: center;
+}
+.job pre {
+  font-size: 0.8rem;
+  opacity: 0.8;
+  white-space: pre-wrap;
+}
+.banner.warn {
+  margin: 0.5rem 1rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 4px;
+  border: 1px solid #c8862a;
+}
+img.pano {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* The polar disc. Colours are polar.py's, so the app and `terminus polar` read alike;
+   the disc is always drawn over a dark photo, whatever the theme. */
+.disc {
+  position: relative;
+  width: min(100%, 72vh);
+  aspect-ratio: 1;
+  touch-action: none;
+  border-radius: 50%;
+  overflow: hidden;
+  background: #0b0d11;
+}
+.disc .rotor,
+.disc > svg,
+.disc .rotor img,
+.disc .rotor svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.disc .rotor img {
+  border-radius: 50%;
+}
+.hz {
+  fill: rgba(255, 214, 64, 0.1);
+  stroke: #ffd640;
+  stroke-width: 3.5;
+}
+.pl {
+  fill: none;
+  stroke: #ff8a3d;
+  stroke-width: 3;
+  stroke-dasharray: 10 7;
+}
+.pk {
+  stroke: #5ad7ff;
+  stroke-width: 5;
+  stroke-linecap: round;
+}
+.edg {
+  fill: none;
+  stroke: #48e078;
+  stroke-width: 4;
+}
+.bnd {
+  fill: none;
+  stroke: #ff5c5c;
+  stroke-width: 4;
+}
+.grid circle {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.34);
+  stroke-width: 1.5;
+}
+.grid text {
+  fill: rgba(255, 255, 255, 0.7);
+  font:
+    500 19px ui-monospace,
+    monospace;
+}
+.grid text.cd {
+  fill: #fff;
+  font:
+    700 30px system-ui,
+    sans-serif;
+}
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0.6rem 0;
+}
+.bar button[aria-pressed="false"] {
+  opacity: 0.55;
+}
+.bar button.actual {
+  border-color: #ffd640;
+}
+.bar button.planning {
+  border-color: #ff8a3d;
+  border-style: dashed;
+}
+.bar button.pockets {
+  border-color: #5ad7ff;
+}
+.bar button.fiducials {
+  border-color: #48e078;
+}
+.note {
+  opacity: 0.85;
+  max-width: 60rem;
+}
+table.fit {
+  border-collapse: collapse;
+  font:
+    0.85rem/1.5 ui-monospace,
+    monospace;
+}
+table.fit th,
+table.fit td {
+  text-align: left;
+  padding: 0.2rem 1rem 0.2rem 0;
+  border-bottom: 1px solid #8884;
+}
+table.fit tr.unused td {
+  opacity: 0.6;
+}

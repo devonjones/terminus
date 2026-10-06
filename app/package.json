@@ -14,7 +14,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
-    "e2e": "npm run build && playwright test e2e"
+    "e2e": "npm run build && playwright test e2e",
+    "gen:api": "json2ts -i ../src/terminus/server/schema.json -o src/api/generated.ts --no-additionalProperties --bannerComment \"// Generated from src/terminus/server/schema.json by npm run gen:api. Do not edit.\" && prettier --write src/api/generated.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -25,6 +26,7 @@
     "esbuild": "^0.28.2",
     "eslint": "^10.12.0",
     "jsdom": "^29.1.1",
+    "json-schema-to-typescript": "^16.0.0",
     "prettier": "^3.9.9",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.71.1",
