@@ -7,7 +7,7 @@ const logStream = new PassThrough();
 vi.mock("node:fs", () => ({ createWriteStream: () => logStream }));
 
 import { spawn } from "node:child_process";
-import { request, startSidecar, stopSidecar } from "./sidecar";
+import { request, startSidecar, stopSidecar, view } from "./sidecar";
 
 class FakeProc extends EventEmitter {
   stdin = new PassThrough();
@@ -177,5 +177,41 @@ describe("request", () => {
     await expect(request(sc, "/state/tab", { tab: "x" })).rejects.toThrow(
       "engine /state/tab: 400 unknown tab",
     );
+  });
+});
+
+describe("view", () => {
+  const sc = { url: "http://127.0.0.1:9", token: "t" };
+  const res = (status: number, type: string, body: unknown) => ({
+    ok: status < 400,
+    status,
+    headers: { get: () => type },
+    json: async () => body,
+    arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+  });
+
+  it("204 means the site has nothing there yet", async () => {
+    fetchMock.mockResolvedValue(res(204, "", null));
+    expect(await view(sc, "/site/disc.jpg")).toBeNull();
+  });
+
+  it("404 is a wrong route and throws, never reads as an empty site", async () => {
+    fetchMock.mockResolvedValue(res(404, "application/json", { error: "not found" }));
+    await expect(view(sc, "/site/nope")).rejects.toThrow("engine /site/nope: 404 not found");
+  });
+
+  it("returns JSON for JSON and bytes for images", async () => {
+    fetchMock.mockResolvedValue(res(200, "application/json", { mask: "m" }));
+    expect(await view(sc, "/site/horizon")).toEqual({ mask: "m" });
+    fetchMock.mockResolvedValue(res(200, "image/jpeg", null));
+    expect(await view(sc, "/site/disc.jpg")).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it("a network failure names its cause, not just 'fetch failed'", async () => {
+    fetchMock.mockRejectedValue(
+      Object.assign(new TypeError("fetch failed"), { cause: new Error("connect ECONNREFUSED") }),
+    );
+    await expect(view(sc, "/site/disc")).rejects.toThrow("fetch failed: connect ECONNREFUSED");
+    await expect(request(sc, "/state")).rejects.toThrow("fetch failed: connect ECONNREFUSED");
   });
 });

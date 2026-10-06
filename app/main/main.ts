@@ -46,7 +46,8 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
       throw new Error(`${what} must be a short string`);
     return v;
   };
-  const create = (photos: string[]) => request<AppState>(sc, "/sites", { photos });
+  // Copying hundreds of full-size photos takes longer than an ordinary call.
+  const create = (photos: string[]) => request<AppState>(sc, "/sites", { photos }, 10 * 60_000);
 
   handle("state:get", () => request<AppState>(sc, "/state"));
   handle("state:tab", (tab) =>
@@ -84,9 +85,15 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
       !Array.isArray(paths) ||
       paths.length === 0 ||
       paths.length > 500 ||
-      !paths.every((p) => typeof p === "string" && p.length > 0 && p.length < 4096)
+      !paths.every(
+        (p) =>
+          typeof p === "string" &&
+          p.length < 4096 &&
+          path.isAbsolute(p) &&
+          PHOTO_EXTENSIONS.includes(path.extname(p).slice(1).toLowerCase()),
+      )
     )
-      throw new Error("expected a list of photo paths");
+      throw new Error("expected a list of absolute photo paths");
     return create(paths as string[]);
   });
 }
@@ -121,6 +128,7 @@ async function boot() {
   const venvPython = process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python";
   const python = process.env.TERMINUS_PYTHON ?? path.join(repo, venvPython);
   mkdirSync(path.dirname(logPath()), { recursive: true });
+  const hugin = huginDir();
   const sc = (sidecar = await startSidecar({
     command: python,
     args: [
@@ -128,7 +136,7 @@ async function boot() {
       "terminus.server",
       "--sites",
       path.join(app.getPath("userData"), "sites"),
-      ...(huginDir() ? ["--hugin", huginDir()!] : []),
+      ...(hugin ? ["--hugin", hugin] : []),
       ...(dev ? ["--dev"] : []),
     ],
     cwd: repo,

@@ -60,7 +60,7 @@ def solution(meta):
     rotation and no photograph to place.
     """
     if not is_oriented(meta):
-        return IDENTITY
+        return dict(IDENTITY)
     try:
         return polar.solution_from_meta(meta)
     except ValueError:
@@ -92,6 +92,9 @@ def horizon(d):
         "columns": columns,
         "fit": fit,
         "settled": settled if isinstance(settled, bool) else None,
+        # Which detector read the horizon. "heuristic" means no segmentation
+        # model ran, and the user should know their horizon was read the rough way.
+        "backend": meta.get("backend") if isinstance(meta.get("backend"), str) else None,
     }
 
 
@@ -137,23 +140,26 @@ def disc(d):
     }
 
 
-def _jpeg(array, quality=85):
-    from PIL import Image
-
+def _jpeg(image, quality=85):
     buf = io.BytesIO()
-    Image.fromarray(array).save(buf, "JPEG", quality=quality, optimize=True)
+    image.save(buf, "JPEG", quality=quality, optimize=True)
     return buf.getvalue()
+
+
+def _panorama(d):
+    path = os.path.join(d, "equirect.png")
+    return path if os.path.isfile(path) else None
 
 
 def panorama_jpeg(d):
     from PIL import Image
 
-    path = os.path.join(d, "equirect.png")
-    if not os.path.isfile(path):
+    path = _panorama(d)
+    if path is None:
         return None
-    import numpy as np
-
-    return _jpeg(np.asarray(Image.open(path).convert("RGB")))
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(path) as im:
+        return _jpeg(im.convert("RGB"))
 
 
 def disc_jpeg(d):
@@ -161,14 +167,15 @@ def disc_jpeg(d):
     import numpy as np
     from PIL import Image
 
-    pano = os.path.join(d, "equirect.png")
+    pano = _panorama(d)
     _, meta, _ = _load(d)
     sol = solution(meta) if meta is not None else None
-    if not os.path.isfile(pano) or sol is None:
+    if pano is None or sol is None:
         return None
     Image.MAX_IMAGE_PIXELS = None
-    image = Image.open(pano).convert("RGB")
+    with Image.open(pano) as im:
+        image = im.convert("RGB")
     cov_path = os.path.join(d, "equirect.coverage.npy")
     coverage = np.load(cov_path) if os.path.isfile(cov_path) else np.ones(image.size[::-1])
     rgb, _gap = polar.project(image, coverage, sol, SIZE, FLOOR)
-    return _jpeg(rgb)
+    return _jpeg(Image.fromarray(rgb))

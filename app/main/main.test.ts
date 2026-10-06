@@ -158,6 +158,8 @@ describe("site IPC", () => {
     ["site:create", [[]]],
     ["site:create", [[3]]],
     ["site:create", [Array(501).fill("/p/a.jpg")]],
+    ["site:create", [["p/a.jpg"]]],
+    ["site:create", [["/p/notes.txt"]]],
   ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
     await boot();
     expect(() => call(ch, ...args)).toThrow();
@@ -179,6 +181,12 @@ describe("site IPC", () => {
       "site:create",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
+  });
+
+  it("copying a drop gets a long timeout, not the ordinary 10 s", async () => {
+    await boot();
+    await call("site:create", ["/p/a.jpg"]);
+    expect((h.request.mock.calls[0] as unknown[])[3]).toBe(10 * 60_000);
   });
 
   it("the file dialog picks the photos; cancelling creates nothing", async () => {

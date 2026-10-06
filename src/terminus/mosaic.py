@@ -44,7 +44,7 @@ class MosaicError(RuntimeError):
 
 
 # Where the Hugin tools live. None means PATH, which suits the CLI on a machine
-# where someone installed Hugin. The desktop app ships its own Hugin and sets
+# where someone installed Hugin. The desktop app will ship its own Hugin and set
 # this, so it never depends on what the user's machine has.
 HUGIN_BIN = None
 
@@ -75,7 +75,11 @@ def require_hugin():
 
 
 def _run(cmd, cwd=None):
-    cmd = [_tool(cmd[0]) or cmd[0], *cmd[1:]]
+    tool = _tool(cmd[0])
+    if tool is None and HUGIN_BIN is not None:
+        # Never fall back to PATH: the app must run the Hugin it ships.
+        raise MosaicError(f"{cmd[0]} is missing from {HUGIN_BIN}")
+    cmd = [tool or cmd[0], *cmd[1:]]
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if p.returncode != 0:
         raise MosaicError(f"{cmd[0]} failed: {p.stderr.strip()[:400]}")

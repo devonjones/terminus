@@ -36,10 +36,13 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import signal
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import yaml
 
 from .. import __version__
 from ..export import MaskError
@@ -109,6 +112,7 @@ class Sidecar(ThreadingHTTPServer):
             try:
                 site = sites.summary(self.sites_root, self.slug)
             except sites.SiteError:
+                log.warning("site %s is gone from disk; closing it", self.slug)
                 self.slug = None
         return {**self.state, "site": site, "job": self.jobs.state}
 
@@ -172,10 +176,13 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     def _site_view(self, make):
-        """Send a view of the open site; 404 when it does not have one yet."""
+        """Send a view of the open site; 204 when it has nothing there yet (so a
+        404 always means a wrong route, never an empty site)."""
         out = make(self.server.site_dir())
         if out is None:
-            return self._send(404, {"error": "this site has nothing to show here yet"})
+            self.send_response(204)
+            self.end_headers()
+            return
         if isinstance(out, bytes):
             return self._send_bytes(out, "image/jpeg")
         return self._send(200, out)
@@ -233,6 +240,12 @@ class _Handler(BaseHTTPRequestHandler):
             # The mask is the app's own file, but its path is nobody's business
             # in an error; the reason is.
             self._send(422, {"error": str(e).replace(str(self.server.sites_root), "<sites>")})
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            log.exception("%s: a site file could not be read", self.path)
+            self._send(422, {"error": f"this site's files could not be read ({type(e).__name__})"})
+        except Exception:
+            log.exception("%s failed", self.path)
+            self._send(500, {"error": "internal error; see sidecar.log"})
 
     def _set_tab(self, tab):
         if tab not in TABS:
@@ -243,10 +256,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _new_site(self, photos):
         sv = self.server
+        if sv.jobs.busy():  # refuse before copying anything or changing the open site
+            raise sites.SiteError("a site is already being built")
         slug = sites.create_site(sv.sites_root, photos)
+        d = sites.site_dir(sv.sites_root, slug)
         log.info("site %s: %d photos, building", slug, len(photos))
+        try:
+            sv.jobs.start(slug, d)
+        except sites.SiteError:  # another drop won the race to build
+            shutil.rmtree(d, ignore_errors=True)
+            raise
         sv.slug, sv.state["spin"] = slug, 0.0
-        sv.jobs.start(slug, sites.site_dir(sv.sites_root, slug))
         self._send(200, sv.snapshot())
 
     def _open_site(self, slug):
@@ -286,6 +306,7 @@ def main(argv=None):
 
         mosaic.HUGIN_BIN = args.hugin
     if args.pipeline:
+        threading.Thread(target=sites.exit_on_eof, daemon=True).start()
         return sites.run_pipeline(args.pipeline)
     if not args.sites:
         p.error("--sites is required")
@@ -302,6 +323,8 @@ def main(argv=None):
         threading.Thread(target=_stop_on_eof, args=(server,), daemon=True).start()
         server.serve_forever()
     finally:
-        server.jobs.stop()
-        server.scope.park()
-        server.server_close()
+        try:
+            server.jobs.stop()
+        finally:
+            server.scope.park()  # whatever happened to the build
+            server.server_close()

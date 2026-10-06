@@ -33,26 +33,26 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     layers: new Set(LAYERS.map((l) => l.key)),
     error: "",
   };
-  let keepFocus = false;
   let polling = false;
+  let generation = 0;
 
   const fail = (e: Error) => ((v.error = e.message), render());
-  const blob = (bytes: Uint8Array | null, old: string | null) => {
-    if (old) URL.revokeObjectURL(old);
-    return bytes
-      ? URL.createObjectURL(new Blob([bytes as BlobPart], { type: "image/jpeg" }))
-      : null;
-  };
+  const toUrl = (bytes: Uint8Array | null) =>
+    bytes ? URL.createObjectURL(new Blob([bytes as BlobPart], { type: "image/jpeg" })) : null;
+  const revoke = (url: string | null) => url && URL.revokeObjectURL(url);
 
+  // Loads can overlap (open a site, then another): only the newest one lands,
+  // and the photos of the one it replaces are released.
   async function loadSite() {
-    v.horizon = v.disc = null;
-    v.pano = blob(null, v.pano);
-    v.photo = blob(null, v.photo);
-    if (!v.st.site) return render();
-    v.horizon = await api.horizon();
-    v.disc = await api.disc();
-    v.pano = blob(await api.image("panorama"), null);
-    v.photo = blob(await api.image("disc"), null);
+    const mine = ++generation;
+    const views = v.st.site
+      ? await Promise.all([api.horizon(), api.disc(), api.image("panorama"), api.image("disc")])
+      : ([null, null, null, null] as const);
+    if (mine !== generation) return;
+    revoke(v.pano);
+    revoke(v.photo);
+    [v.horizon, v.disc] = [views[0], views[1]];
+    [v.pano, v.photo] = [toUrl(views[2]), toUrl(views[3])];
     render();
   }
 
@@ -69,6 +69,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         await loadSite();
       } catch (e) {
         fail(e as Error);
+        poll(); // a hiccup in reading progress does not stop the build
       }
     }, 1000);
   }
@@ -82,18 +83,20 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     poll();
   }
 
-  const newSite = () => api.pickPhotos().then(adopt, fail);
+  const newSite = () => api.pickPhotos().then(adopt).catch(fail);
 
   function siteBar(): HTMLElement {
     const pick = el("select", {}, el("option", { value: "", textContent: "Choose a site…" }));
     pick.setAttribute("aria-label", "Site");
+    pick.dataset.focus = "site";
     for (const s of v.sites)
       pick.append(el("option", { value: s.slug, textContent: `${s.slug} (${s.photos} photos)` }));
     pick.value = v.st.site?.slug ?? "";
     pick.addEventListener("change", () => {
-      if (pick.value) api.openSite(pick.value).then(adopt, fail);
+      if (pick.value) api.openSite(pick.value).then(adopt).catch(fail);
     });
     const add = el("button", { textContent: "New site…" });
+    add.dataset.focus = "new-site";
     add.addEventListener("click", newSite);
     return el("header", {}, pick, add);
   }
@@ -106,9 +109,12 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         const b = el("button", { textContent: title(t) });
         b.setAttribute("role", "tab");
         b.setAttribute("aria-selected", String(t === v.st.tab));
+        b.dataset.focus = `tab:${t}`;
         b.addEventListener("click", () => {
-          keepFocus = true;
-          api.setTab(t).then((next) => ((v.st = next), (v.error = ""), render()), fail);
+          api
+            .setTab(t)
+            .then((next) => ((v.st = next), (v.error = ""), render()))
+            .catch(fail);
         });
         return b;
       }),
@@ -135,8 +141,14 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         onSpinPreview: (deg) => {
           const rotor = root.querySelector<HTMLElement>(".rotor");
           if (rotor) rotor.style.transform = `rotate(${deg}deg)`;
+          const shown = root.querySelector(".spin-value");
+          if (shown) shown.textContent = ` ${Math.round(deg)}°`;
         },
-        onSpin: (deg) => api.setSpin(deg).then((next) => ((v.st = next), render()), fail),
+        onSpin: (deg) =>
+          api
+            .setSpin(deg)
+            .then((next) => ((v.st = next), render()))
+            .catch(fail),
       });
     }
     return el("p", { textContent: LATER[tab] ?? "" });
@@ -157,10 +169,11 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       alert.setAttribute("role", "alert");
       parts.splice(2, 0, alert);
     }
+    // Re-rendering replaces every control, so hand focus back to the one that
+    // had it (a tab, a layer toggle, the spin slider), found by its key.
+    const focused = (root.ownerDocument.activeElement as HTMLElement | null)?.dataset?.focus;
     root.replaceChildren(...parts);
-    // Re-rendering replaced the button that had focus; give it to the selected tab.
-    if (keepFocus) root.querySelector<HTMLElement>('[aria-selected="true"]')?.focus();
-    keepFocus = false;
+    if (focused) root.querySelector<HTMLElement>(`[data-focus="${focused}"]`)?.focus();
   }
 
   // Photos dropped anywhere on the window start a new site.
@@ -169,7 +182,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     e.preventDefault();
     const files = [...(e.dataTransfer?.files ?? [])].filter((f) => PHOTO.test(f.name));
     if (files.length === 0) return fail(new Error("Drop photographs: .jpg, .png or .tif files."));
-    api.createSite(files).then(adopt, fail);
+    api.createSite(files).then(adopt).catch(fail);
   });
 
   await loadSite();

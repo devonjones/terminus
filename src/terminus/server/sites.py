@@ -8,15 +8,17 @@ A site is a folder under the sites root that the app owns:
     <root>/<slug>/oriented.yaml      `terminus orient` output, when there is one
 
 The same files the CLI writes, so the CLI can still open a site. The pipeline
-runs the engine's own code in a child process of this program (see `Jobs`):
-the app ships its own frozen Python and Hugin and must not depend on a
-`terminus` command or anything else on the machine.
+runs the engine's own code in a child process of this program (see `Jobs`).
+The packaged app will ship its own frozen Python and Hugin (terminus-71.6), so
+nothing here may depend on a `terminus` command or anything else on the machine.
 """
 
 import datetime
+import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -25,6 +27,8 @@ PHOTO_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 MAX_LOG = 40
 
+log = logging.getLogger("terminus.server")
+
 
 class SiteError(ValueError):
     """A request about sites that cannot be honoured; the message is for the user."""
@@ -32,7 +36,7 @@ class SiteError(ValueError):
 
 def site_dir(root, slug):
     """The folder of one existing site. Refuses anything that is not a plain slug."""
-    if not isinstance(slug, str) or not SLUG.match(slug):
+    if not isinstance(slug, str) or not SLUG.fullmatch(slug):
         raise SiteError("not a site name")
     path = os.path.join(root, slug)
     if not os.path.isdir(path):
@@ -44,36 +48,56 @@ def list_sites(root):
     if not os.path.isdir(root):
         return []
     return sorted(
-        s for s in os.listdir(root) if SLUG.match(s) and os.path.isdir(os.path.join(root, s))
+        s for s in os.listdir(root) if SLUG.fullmatch(s) and os.path.isdir(os.path.join(root, s))
     )
+
+
+def _claim(root, base):
+    """Create and return a new, unused site folder under `root`. Atomic: two
+    drops on the same day cannot get the same folder."""
+    os.makedirs(root, exist_ok=True)
+    for n in range(1, 1000):
+        slug = base if n == 1 else f"{base}-{n}"
+        try:
+            os.mkdir(os.path.join(root, slug))
+            return slug
+        except FileExistsError:
+            continue
+    raise SiteError("too many sites for one day")
 
 
 def create_site(root, photos, today=None):
     """Copy the photographs into a new site folder and return its slug.
 
-    Every path must be an existing image file; nothing is copied unless all of
-    them are, so a bad drop leaves no half-made site behind.
+    Every path must be an existing image file (absolute, not a link); nothing is
+    left behind unless all of them copy, so a bad drop leaves no half-made site.
     """
     if not isinstance(photos, list) or not photos or len(photos) > 500:
         raise SiteError("expected a list of 1 to 500 photo paths")
     for p in photos:
-        if not isinstance(p, str) or not p.lower().endswith(PHOTO_EXTS) or not os.path.isfile(p):
+        if not (
+            isinstance(p, str)
+            and os.path.isabs(p)
+            and p.lower().endswith(PHOTO_EXTS)
+            and os.path.isfile(p)
+            and not os.path.islink(p)
+        ):
             raise SiteError("every photo must be an existing .jpg, .png or .tif file")
-    base = f"site-{(today or datetime.date.today()).isoformat()}"
-    slug, n = base, 1
-    while os.path.exists(os.path.join(root, slug)):
-        n += 1
-        slug = f"{base}-{n}"
+    slug = _claim(root, f"site-{(today or datetime.date.today()).isoformat()}")
     dest = os.path.join(root, slug, "photos")
-    os.makedirs(dest)
-    for p in photos:
-        name = os.path.basename(p)
-        stem, ext = os.path.splitext(name)
-        target, k = os.path.join(dest, name), 1
-        while os.path.exists(target):  # two drops with the same file name
-            k += 1
-            target = os.path.join(dest, f"{stem}-{k}{ext}")
-        shutil.copy2(p, target)
+    try:
+        os.mkdir(dest)
+        for p in photos:
+            name = os.path.basename(p)
+            stem, ext = os.path.splitext(name)
+            target, k = os.path.join(dest, name), 1
+            while os.path.exists(target):  # two drops with the same file name
+                k += 1
+                target = os.path.join(dest, f"{stem}-{k}{ext}")
+            shutil.copy2(p, target)
+    except OSError as e:
+        shutil.rmtree(os.path.join(root, slug), ignore_errors=True)
+        raise SiteError(f"could not copy {os.path.basename(p)}: {e.strerror}") from e
     return slug
 
 
@@ -127,11 +151,33 @@ def run_pipeline(d, run=None):
         run(argv)
 
 
+def exit_on_eof():
+    """Exit the build child at once when the sidecar goes away (its end of our
+    stdin closes), so a build never outlives the app."""
+    try:
+        sys.stdin.read()
+    finally:
+        os._exit(3)
+
+
 def own_command():
     """How this program starts itself: the frozen sidecar, or `python -m` in dev."""
     if getattr(sys, "frozen", False):
         return [sys.executable]
     return [sys.executable, "-m", "terminus.server"]
+
+
+def kill_tree(proc):
+    """Kill the child and everything it started (the Hugin tool it is running)."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30
+        )
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)  # the child leads its own process group
+    proc.wait(timeout=30)
 
 
 class Jobs:
@@ -150,39 +196,58 @@ class Jobs:
         self._timeout = timeout
         self._lock = threading.Lock()
         self._proc = None
+        self._closed = False
         self.state = None
 
+    def busy(self):
+        return bool(self.state and self.state["status"] == "running")
+
     def _log(self, line):
-        log = self.state["log"]
-        log.append(line)
-        del log[:-MAX_LOG]
+        log.info("build: %s", line)
+        lines = self.state["log"]
+        lines.append(line)
+        del lines[:-MAX_LOG]
+
+    def _fail(self, error):
+        self.state["error"] = error
+        self.state["status"] = "failed"
 
     def start(self, slug, d):
+        """Start building site `d`. Returns the watching thread, or None if the
+        child could not even start (the job is then already marked failed)."""
         with self._lock:
-            if self.state and self.state["status"] == "running":
+            if self._closed:
+                raise SiteError("the engine is shutting down")
+            if self.busy():
                 raise SiteError("a site is already being built")
             self.state = {"site": slug, "step": None, "status": "running", "log": [], "error": None}
             cmd = [*self._command(), "--pipeline", d]
             if self._hugin:
                 cmd += ["--hugin", self._hugin]
-            self._proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-            )
-        t = threading.Thread(target=self._watch, args=(self._proc,), daemon=True)
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,  # held open; the child exits when it closes
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    start_new_session=os.name != "nt",
+                )
+            except OSError as e:
+                log.exception("build of %s could not start", slug)
+                self._fail(f"the build could not start: {e.strerror or e}")
+                return None
+        t = threading.Thread(target=self._watch, args=(self._proc, d), daemon=True)
         t.start()
         return t
 
-    def _watch(self, proc):
+    def _watch(self, proc, d):
         expired = threading.Event()
 
         def expire():
             expired.set()
-            proc.kill()
+            kill_tree(proc)
 
         timer = threading.Timer(self._timeout, expire)
         timer.start()
@@ -194,25 +259,38 @@ class Jobs:
                 elif line.strip():
                     self._log(line)
             code = proc.wait()
+        except Exception as e:  # a bug in watching must not leave the job "running"
+            log.exception("watching the build failed")
+            kill_tree(proc)
+            return self._fail(f"lost track of the build: {type(e).__name__}: {e}")
         finally:
             timer.cancel()
             proc.stdout.close()
+        self._finish(code, expired.is_set(), d)
+
+    def _finish(self, code, expired, d):
+        step = self.state["step"]
+        if expired:
+            return self._fail(f"{step} took longer than {self._timeout // 60} minutes")
         if code == 0:
+            missing = [
+                f
+                for f in ("equirect.png", "photo_mask.yaml")
+                if not os.path.isfile(os.path.join(d, f))
+            ]
+            if missing:
+                return self._fail(f"the build finished but wrote no {', '.join(missing)}")
             self.state["status"] = "done"
             return
+        # cli.main prints "error: ..." and exits 1; a crash ends with its exception.
         errors = [x for x in self.state["log"] if x.startswith("error:")]
-        if expired.is_set():
-            self.state["error"] = (
-                f"{self.state['step']} took longer than {self._timeout // 60} minutes"
-            )
-        else:
-            # cli.main prints "error: ..." and exits 1; a crash prints a traceback.
-            self.state["error"] = (
-                errors[-1] if errors else f"{self.state['step']} stopped (exit {code})"
-            )
-        self.state["status"] = "failed"
+        last = self.state["log"][-1] if self.state["log"] else ""
+        self._fail(errors[-1] if errors else f"{step} stopped (exit {code}): {last}".rstrip(": "))
 
     def stop(self):
-        """Kill a running build (the sidecar is exiting)."""
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.kill()
+        """Refuse new builds and kill a running one (the sidecar is exiting)."""
+        with self._lock:
+            self._closed = True
+            proc = self._proc
+        if proc is not None:
+            kill_tree(proc)

@@ -9856,3 +9856,18 @@ def test_run_sweep_skips_a_column_inside_the_sun_cone():
     assert skipped == [90] and scanned == [270]
     assert sorted(mask) == [270]
     assert 90 not in pointed, "the mount must never be sent up the Sun's column"
+
+
+def test_a_missing_bundled_tool_is_an_error_not_a_path_lookup(tmp_path, monkeypatch):
+    """With HUGIN_BIN set, _run must never fall back to PATH, even for a tool
+    that require_hugin was not asked about."""
+    from unittest.mock import patch
+
+    import pytest
+
+    from terminus import mosaic
+
+    monkeypatch.setattr(mosaic, "HUGIN_BIN", str(tmp_path))
+    with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
+        with pytest.raises(mosaic.MosaicError, match="nona is missing from"):
+            mosaic._run(["nona", "-o", "x"])

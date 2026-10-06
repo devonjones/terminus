@@ -23,6 +23,7 @@ const horizon = (over: Partial<Horizon> = {}): Horizon => ({
   columns: [],
   fit: [],
   settled: null,
+  backend: null,
   ...over,
 });
 const disc: Disc = {
@@ -292,5 +293,154 @@ describe("fit", () => {
   it("says so when there is no fit", async () => {
     await mount(root, fakeApi({ getState: async () => state({ site, tab: "fit" }) }));
     expect(root.textContent).toContain("No telescope fit for this site yet");
+  });
+});
+
+describe("round-1 review", () => {
+  it("an overlapping, stale site load is dropped and its photos released", async () => {
+    let release!: () => void;
+    let holdNext = false;
+    const api = fakeApi({
+      getState: async () => state({ site, tab: "horizon" }),
+      image: vi.fn(async () => {
+        if (holdNext) {
+          holdNext = false;
+          await new Promise<void>((r) => (release = r)); // the first open's photo is slow
+        }
+        return new Uint8Array([1]);
+      }),
+    });
+    await mount(root, api);
+    vi.mocked(URL.createObjectURL).mockClear();
+    const select = root.querySelector("select")!;
+    select.value = "site-a";
+    holdNext = true;
+    select.dispatchEvent(new Event("change")); // load A: stalls on its photo
+    await vi.waitFor(() => expect(release).toBeDefined());
+    select.dispatchEvent(new Event("change")); // load B: completes first
+    await vi.waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(2));
+    release(); // A finishes last and must not land
+    await new Promise((r) => setTimeout(r, 20));
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps polling a build after one failed progress read", async () => {
+    vi.useFakeTimers();
+    const running: Job = {
+      site: "site-a",
+      step: "mosaic",
+      status: "running",
+      log: [],
+      error: null,
+    };
+    let reads = 0;
+    const api = fakeApi({
+      getState: vi.fn(async () => {
+        reads++;
+        if (reads === 2) throw new Error("engine busy");
+        return state({ site, job: running, tab: "panorama" });
+      }),
+    });
+    await mount(root, api);
+    await vi.advanceTimersByTimeAsync(1100);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(reads).toBeGreaterThanOrEqual(3);
+  });
+
+  it("an error inside adopt reaches the banner instead of vanishing", async () => {
+    let lists = 0;
+    const api = fakeApi({
+      listSites: async () => {
+        if (lists++ > 0) throw new Error("sites unreadable");
+        return { sites: [site] };
+      },
+    });
+    await mount(root, api);
+    const select = root.querySelector("select")!;
+    select.value = "site-a";
+    select.dispatchEvent(new Event("change"));
+    expect((await findByRole(root, "alert")).textContent).toBe("sites unreadable");
+  });
+
+  it("focus survives a layer toggle and a spin change", async () => {
+    await mount(root, fakeApi({ getState: async () => state({ site, tab: "horizon" }) }));
+    const toggle = getByRole(root, "button", { name: /Sky pockets/ });
+    toggle.focus();
+    toggle.click();
+    expect((document.activeElement as HTMLElement).dataset.focus).toBe("layer:pockets");
+    const slider = getByRole(root, "slider") as HTMLInputElement;
+    slider.focus();
+    slider.value = "40";
+    slider.dispatchEvent(new Event("input"));
+    expect(root.querySelector(".spin-value")!.textContent).toBe(" 40°");
+    slider.dispatchEvent(new Event("change"));
+    await waitFor(() => expect((document.activeElement as HTMLElement).dataset.focus).toBe("spin"));
+  });
+
+  it("says when the heuristic detector read the horizon", async () => {
+    await mount(
+      root,
+      fakeApi({
+        getState: async () => state({ site, tab: "horizon" }),
+        horizon: async () => horizon({ backend: "heuristic" }),
+      }),
+    );
+    expect(root.textContent).toContain("Read with the heuristic detector");
+  });
+});
+
+describe("view details", () => {
+  it("a ceiling-bound column is a chevron that says 'at least'", async () => {
+    const bound: Disc = { ...disc, fiducials: [{ az: 330, alt: 60, bound: true, xy: [400, 300] }] };
+    await mount(
+      root,
+      fakeApi({ getState: async () => state({ site, tab: "horizon" }), disc: async () => bound }),
+    );
+    expect(root.querySelector("circle.edg")).toBeNull();
+    expect(root.querySelector("path.bnd title")!.textContent).toBe(
+      "az 330: telescope edge at least 60.0°",
+    );
+  });
+
+  it("a column the mask excluded says so in the fit table", async () => {
+    const fit = [
+      { az: 190, alt: 32.5, used: false, excluded_by: "mask", reason: "dawn transition" },
+    ];
+    await mount(
+      root,
+      fakeApi({
+        getState: async () => state({ site, tab: "fit" }),
+        horizon: async () => horizon({ fit }),
+      }),
+    );
+    const cells = [...root.querySelectorAll("tbody td")].map((c) => c.textContent);
+    expect(cells).toEqual(["190", "32.5", "edge", "excluded", "dawn transition"]);
+  });
+
+  it("dragging the disc a quarter turn clockwise commits +90 to the spin", async () => {
+    const api = fakeApi({ getState: async () => state({ site, tab: "horizon", spin: 10 }) });
+    await mount(root, api);
+    const stage = root.querySelector<HTMLElement>(".disc")!;
+    stage.getBoundingClientRect = () => ({ left: 0, top: 0, width: 200, height: 200 }) as DOMRect;
+    const at = (type: string, x: number, y: number) =>
+      stage.dispatchEvent(new MouseEvent(type, { clientX: x, clientY: y }));
+    at("pointerdown", 100, 0); // top: north
+    at("pointermove", 200, 100); // right: east
+    expect(root.querySelector<HTMLElement>(".rotor")!.style.transform).toBe("rotate(100deg)");
+    at("pointerup", 200, 100);
+    await waitFor(() => expect(api.setSpin).toHaveBeenCalledWith(100));
+  });
+
+  it("a site with no panorama says so; another site's build is not shown here", async () => {
+    const other: Job = { site: "site-b", step: "mosaic", status: "running", log: [], error: null };
+    await mount(
+      root,
+      fakeApi({
+        getState: async () =>
+          state({ site: { ...site, panorama: false }, tab: "panorama", job: other }),
+      }),
+    );
+    expect(root.textContent).not.toContain("Stitching");
+    expect(root.textContent).toContain("This site has no panorama yet.");
   });
 });

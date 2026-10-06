@@ -7,16 +7,16 @@ rough spin for a site the telescope has not oriented yet.
 
 ## Layout
 
-| Path                      | What                                                                      |
-| ------------------------- | ------------------------------------------------------------------------- |
-| `main/`                   | Electron main process. `sidecar.ts` starts, checks and stops the engine   |
-| `preload/`                | The contextBridge: named calls only (`TerminusApi` in `src/api/types.ts`) |
-| `src/`                    | Front end (plain TypeScript, no framework)                                |
-| `src/api/generated.ts`    | Payload types, generated from `../src/terminus/server/schema.json`        |
-| `scripts/dev-snap.mjs`    | Attach over CDP: click, screenshot, save `/dev/state`                     |
-| `scripts/win-dev.sh`      | Run on Windows from a WSL checkout                                        |
-| `e2e/`                    | Playwright-Electron smoke tests against the real sidecar                  |
-| `../src/terminus/server/` | The sidecar: `python -m terminus.server [--dev]`                          |
+| Path                      | What                                                                       |
+| ------------------------- | -------------------------------------------------------------------------- |
+| `main/`                   | Electron main process. `sidecar.ts` starts, checks and stops the engine    |
+| `preload/`                | The contextBridge: named calls only (`TerminusApi` in `src/api/types.ts`)  |
+| `src/`                    | Front end (plain TypeScript, no framework)                                 |
+| `src/api/generated.ts`    | Payload types, generated from `../src/terminus/server/schema.json`         |
+| `scripts/dev-snap.mjs`    | Attach over CDP: click, screenshot, save `/dev/state`                      |
+| `scripts/win-dev.sh`      | Run on Windows from a WSL checkout                                         |
+| `e2e/`                    | Playwright-Electron smoke tests against the real sidecar                   |
+| `../src/terminus/server/` | The sidecar: `python -m terminus.server --sites DIR [--hugin DIR] [--dev]` |
 
 ## How the pieces talk
 
@@ -28,6 +28,14 @@ and refuses a sidecar whose version differs from `package.json`, so bump
 (a pytest checks it). The renderer never sees the token or a file path: it calls
 named IPC functions, and main checks each argument before forwarding it.
 
+Quitting closes the sidecar's stdin, and the sidecar parks the scope and
+exits. If the main process crashes, the OS closes the pipe, so the sidecar
+still parks. A kill (the fallback after 5 s) skips the park on Windows.
+
+The sidecar's stderr, including every line of a site build, goes to
+`<logs>/sidecar.log`: `%APPDATA%\terminus\logs` on Windows,
+`~/.config/terminus/logs` on Linux.
+
 Every payload is defined once, in `src/terminus/server/schema.json`.
 `npm run gen:api` writes the TS types from it (CI fails if they are stale), and
 `tests/test_server.py` validates every sidecar response against it.
@@ -35,31 +43,32 @@ Every payload is defined once, in `src/terminus/server/schema.json`.
 ## Sites
 
 A site is a folder the app owns, under `<userData>/sites/<slug>/`. A new site
-copies the dropped (or chosen) photos into `photos/`, then the sidecar runs
-`terminus mosaic` and `terminus skymask` in-process on a worker thread. These
-are the same code and the same files as the CLI (`equirect.png`,
-`equirect.coverage.npy`, `photo_mask.yaml`), but no `terminus` command or
-Python install is needed. A site that `terminus orient` has written an
-`oriented.yaml` into shows that mask instead.
+copies the dropped (or chosen) photos into `photos/`. Then the sidecar starts a
+child process of its own executable (`--pipeline <site>`), which runs
+`terminus mosaic` and `terminus skymask`. These are the same code and the same
+files as the CLI (`equirect.png`, `equirect.coverage.npy`, `photo_mask.yaml`),
+but no `terminus` command or Python install is needed. A site that
+`terminus orient` has written an `oriented.yaml` into shows that mask instead.
+
+The build runs in a child, not in the sidecar, because the sidecar will hold the
+telescope: a hang or native crash while stitching must not take down the
+process that parks it. A 2 h timeout, or the sidecar exiting, kills the child
+and the Hugin tool it is running.
 
 What the app draws comes from the engine: the disc overlays are
 `polar.disc_xy` pixels and the disc photo is `polar.project`, so nothing is
-re-projected in JavaScript. Rough spin rotates the photo and its lines together,
-and the sidecar keeps the angle (`state.spin`) for export.
+re-projected in JavaScript. Rough spin rotates the photo and its lines
+together. For now the angle lives only in the sidecar's memory (`state.spin`)
+and resets when a site is opened; export (terminus-71.7) will keep it.
 
-**Hugin ships with the app.** A packaged build passes `--hugin
+**Hugin will ship with the app** (terminus-71.6, which also owes Hugin's GPL
+notices and source offer). A packaged build will pass `--hugin
 <resources>/hugin/bin`, and the engine runs every Hugin tool from there
 (`mosaic.HUGIN_BIN`), never from PATH. In dev, main passes `app/vendor/hugin/bin`
-if it exists, and otherwise the sidecar falls back to PATH. Bundling the
-binaries is terminus-71.6.
+if it exists, and otherwise the sidecar falls back to PATH.
 
 Known limit: quitting while a site is building leaves it half-built; nothing
-resumes it yet.
-
-Quitting closes the sidecar's stdin, and the sidecar parks the scope and
-exits. If the main process crashes, the OS closes the pipe, so the sidecar
-still parks. A kill (the fallback after 5 s) skips the park on Windows. The sidecar's stderr goes to `<logs>/sidecar.log`, which is
-`%APPDATA%\terminus\logs` on Windows and `~/.config/terminus/logs` on Linux.
+resumes it yet (terminus-82).
 
 ## Develop
 

@@ -62,6 +62,10 @@ export interface Horizon {
   columns: Column[];
   fit: FitColumn[];
   settled: boolean | null;
+  /**
+   * the detector that read the horizon (e.g. "heuristic": no segmentation model ran)
+   */
+  backend: string | null;
 }
 export interface Solution {
   yaw: number;

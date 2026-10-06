@@ -178,3 +178,6 @@ table.fit td {
 table.fit tr.unused td {
   opacity: 0.6;
 }
+.bar button[aria-pressed="true"]::before {
+  content: "✓ ";
+}

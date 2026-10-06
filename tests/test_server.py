@@ -79,13 +79,37 @@ def test_app_and_sidecar_versions_match():
 )
 @pytest.mark.parametrize(
     "method,path",
-    [("GET", "/health"), ("GET", "/state"), ("GET", "/dev/state"), ("POST", "/state/tab")],
+    [
+        ("GET", "/health"),
+        ("GET", "/state"),
+        ("GET", "/dev/state"),
+        ("POST", "/state/tab"),
+        ("GET", "/sites"),
+        ("POST", "/sites"),
+        ("POST", "/site/open"),
+        ("POST", "/site/spin"),
+        ("GET", "/site/horizon"),
+        ("GET", "/site/disc"),
+        ("GET", "/site/panorama.jpg"),
+        ("GET", "/site/disc.jpg"),
+    ],
 )
-def test_refuses_without_token_host_or_with_origin(serve, method, path, headers, token, code):
-    s = serve()
-    status, _ = call(s, method, path, {"tab": "fit"}, headers=headers, token=token)
+def test_refuses_without_token_host_or_with_origin(
+    serve, tmp_path, method, path, headers, token, code
+):
+    _site(tmp_path / "sites")
+    s = serve(sites_root=str(tmp_path / "sites"), jobs=FakeJobs())
+    s.slug = "site-2026-10-05"
+    body = {
+        "tab": "fit",
+        "slug": "site-2026-10-05",
+        "deg": 90,
+        "photos": [_photo(tmp_path / "a.jpg")],
+    }
+    status, _ = call(s, method, path, body, headers=headers, token=token)
     assert status == code
-    assert s.state["tab"] == "connect"
+    assert s.state["tab"] == "connect" and s.state["spin"] == 0.0
+    assert os.listdir(tmp_path / "sites") == ["site-2026-10-05"], "a refused drop made a site"
 
 
 def test_localhost_host_is_accepted(serve):
@@ -274,9 +298,11 @@ def child(script):
     return lambda: [sys.executable, "-c", script]
 
 
+# A child that "builds" the site: announces both steps and writes the outputs.
 OK_CHILD = (
-    "import sys; print('@step mosaic'); print('registered 18 frames'); "
-    "print('@step skymask'); print('args', sys.argv[1:]); sys.exit(0)"
+    "import sys, pathlib; d = pathlib.Path(sys.argv[2]); print('@step mosaic'); "
+    "print('registered 18 frames'); print('@step skymask'); print('args', sys.argv[1:]); "
+    "(d / 'equirect.png').write_bytes(b'x'); (d / 'photo_mask.yaml').write_text('x')"
 )
 
 
@@ -372,7 +398,7 @@ def test_a_crashing_child_fails_the_build_not_the_sidecar(tmp_path):
     jobs = FakeJobs("print('@step skymask', flush=True); raise RuntimeError('bug')")
     jobs.start("s", str(tmp_path)).join(10)
     assert jobs.state["status"] == "failed"
-    assert jobs.state["error"] == "skymask stopped (exit 1)"
+    assert jobs.state["error"] == "skymask stopped (exit 1): RuntimeError: bug"
     assert any("RuntimeError: bug" in line for line in jobs.state["log"]), "the traceback is kept"
 
 
@@ -487,7 +513,7 @@ def test_disc_overlays_are_polar_disc_xy(serve, tmp_path):
     assert east["label"] == "E" and east["xy"][0] > disc["centre"], "east is right"
 
 
-def test_site_images_are_jpegs_and_absent_ones_are_404(serve, tmp_path):
+def test_site_images_are_jpegs_and_absent_ones_are_204(serve, tmp_path):
     _site(tmp_path, slug="site-a")
     _site(tmp_path, slug="site-b", panorama=False)
     s = serve(sites_root=str(tmp_path))
@@ -496,8 +522,10 @@ def test_site_images_are_jpegs_and_absent_ones_are_404(serve, tmp_path):
         code, data = call(s, "GET", path)
         assert code == 200 and data[:3] == b"\xff\xd8\xff", path
     call(s, "POST", "/site/open", {"slug": "site-b"})
-    assert call(s, "GET", "/site/panorama.jpg")[0] == 404
-    assert call(s, "GET", "/site/disc.jpg")[0] == 404
+    # 204, not 404: a 404 is a wrong route, and the app must be able to tell.
+    assert call(s, "GET", "/site/panorama.jpg")[0] == 204
+    assert call(s, "GET", "/site/disc.jpg")[0] == 204
+    assert call(s, "GET", "/site/nope.jpg")[0] == 404
 
 
 def test_open_refuses_unknown_and_traversing_names(serve, tmp_path):
@@ -534,3 +562,311 @@ def test_every_state_response_matches_the_schema(serve, tmp_path):
     conforms("AppState", call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})[1])
     conforms("AppState", call(s, "POST", "/state/tab", {"tab": "horizon"})[1])
     conforms("AppState", call(s, "GET", "/dev/state")[1])
+
+
+# ---- round-1 review: lifecycle, refusals, and the gaps reviewers proved by mutation ----
+
+
+def test_a_drop_during_a_build_is_refused_before_anything_changes(serve, tmp_path):
+    jobs = FakeJobs("import time; time.sleep(30)")
+    root = tmp_path / "sites"
+    _site(root, slug="site-a")
+    s = serve(sites_root=str(root), jobs=jobs)
+    call(s, "POST", "/site/open", {"slug": "site-a"})
+    call(s, "POST", "/site/spin", {"deg": 45})
+    assert call(s, "POST", "/sites", {"photos": [_photo(tmp_path / "a.jpg")]})[0] == 200
+    building = call(s, "GET", "/state")[1]["site"]["slug"]
+    code, err = call(s, "POST", "/sites", {"photos": [_photo(tmp_path / "b.jpg")]})
+    assert code == 400 and "already" in err["error"]
+    assert sorted(os.listdir(root)) == sorted(["site-a", building]), "no orphan site"
+    assert call(s, "GET", "/state")[1]["site"]["slug"] == building, "the open site did not move"
+    jobs.stop()
+
+
+def test_a_build_that_cannot_start_fails_and_frees_the_next(tmp_path):
+    from terminus.server import sites
+
+    jobs = sites.Jobs(command=lambda: [str(tmp_path / "no-such-program")])
+    assert jobs.start("a", str(tmp_path)) is None
+    assert jobs.state["status"] == "failed" and "could not start" in jobs.state["error"]
+    jobs._command = child(OK_CHILD)
+    jobs.start("b", str(tmp_path)).join(10)
+    assert jobs.state["status"] == "done"
+
+
+def test_a_build_that_writes_nothing_is_not_done(tmp_path):
+    jobs = FakeJobs("print('@step skymask')")
+    jobs.start("s", str(tmp_path)).join(10)
+    assert jobs.state["status"] == "failed"
+    assert jobs.state["error"] == "the build finished but wrote no equirect.png, photo_mask.yaml"
+
+
+def test_the_build_log_is_capped_but_complete_in_sidecar_log(tmp_path, caplog):
+    from terminus.server import sites
+
+    jobs = FakeJobs("[print(i) for i in range(100)]")
+    jobs.start("s", str(tmp_path)).join(10)
+    assert jobs.state["log"] == [str(i) for i in range(100 - sites.MAX_LOG, 100)]
+    assert "build: 0" in caplog.text and "build: 99" in caplog.text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups; Windows uses taskkill /T")
+def test_stop_kills_the_build_and_its_grandchildren_and_closes_jobs(tmp_path):
+    from terminus.server import sites
+
+    pidfile = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time, pathlib; "
+        f"g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(g.pid)); print('@step mosaic', flush=True); time.sleep(60)"
+    )
+    jobs = FakeJobs(script)
+    t = jobs.start("s", str(tmp_path))
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        time.sleep(0.05)
+    grandchild = int(pidfile.read_text())
+    jobs.stop()
+    t.join(10)
+    for _ in range(100):  # the grandchild was killed with its group
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the Hugin-like grandchild outlived stop()")
+    with pytest.raises(sites.SiteError, match="shutting down"):
+        jobs.start("again", str(tmp_path))
+
+
+def test_the_build_child_exits_when_the_sidecar_goes_away(tmp_path):
+    """The child holds a pipe from the sidecar; when it closes, the child exits
+    at once instead of finishing a build nobody will see."""
+    p = subprocess.Popen(
+        [sys.executable, "-c", (
+            "import threading, time; from terminus.server import sites; "
+            "threading.Thread(target=sites.exit_on_eof, daemon=True).start(); time.sleep(30)"
+        )],  # fmt: skip
+        stdin=subprocess.PIPE,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    time.sleep(1.5)
+    p.stdin.close()
+    assert p.wait(timeout=10) == 3
+
+
+def test_create_site_rolls_back_a_failed_copy(tmp_path, monkeypatch):
+    import shutil
+
+    from terminus.server import sites
+
+    a, b = _photo(tmp_path / "a.jpg"), _photo(tmp_path / "b.jpg")
+    real = shutil.copy2
+
+    def copy2(src, dst):
+        if src == b:
+            raise OSError(28, "No space left on device")
+        return real(src, dst)
+
+    monkeypatch.setattr(sites.shutil, "copy2", copy2)
+    root = tmp_path / "sites"
+    with pytest.raises(sites.SiteError, match="could not copy b.jpg: No space left"):
+        sites.create_site(str(root), [a, b])
+    assert os.listdir(root) == []
+
+
+def test_create_site_refuses_relative_paths_and_links(tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    real = _photo(tmp_path / "a.jpg")
+    (tmp_path / "link.jpg").symlink_to(real)
+    monkeypatch.chdir(tmp_path)
+    for bad in (["a.jpg"], [str(tmp_path / "link.jpg")]):
+        with pytest.raises(sites.SiteError):
+            sites.create_site(str(tmp_path / "sites"), bad)
+    with pytest.raises(sites.SiteError):
+        sites.create_site(str(tmp_path / "sites"), [real] * 501)
+
+
+def test_a_slug_with_a_trailing_newline_is_not_a_slug(tmp_path):
+    from terminus.server import sites
+
+    (tmp_path / "site-a").mkdir()
+    with pytest.raises(sites.SiteError):
+        sites.site_dir(str(tmp_path), "site-a\n")
+
+
+def test_list_sites_shows_only_site_folders(tmp_path):
+    from terminus.server import sites
+
+    (tmp_path / "site-a").mkdir()
+    (tmp_path / "Not A Site").mkdir()
+    (tmp_path / "site-file").write_text("x")
+    assert sites.list_sites(str(tmp_path)) == ["site-a"]
+
+
+def test_opening_or_creating_a_site_resets_the_spin(serve, tmp_path):
+    root = tmp_path / "sites"
+    _site(root, slug="site-a")
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": "site-a"})
+    call(s, "POST", "/site/spin", {"deg": 90})
+    assert call(s, "POST", "/site/open", {"slug": "site-a"})[1]["spin"] == 0.0
+    call(s, "POST", "/site/spin", {"deg": 90})
+    assert call(s, "POST", "/sites", {"photos": [_photo(tmp_path / "a.jpg")]})[1]["spin"] == 0.0
+
+
+def test_a_site_deleted_from_disk_closes_with_a_log_line(serve, tmp_path, caplog):
+    import shutil
+
+    d = _site(tmp_path)
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
+    shutil.rmtree(d)
+    assert call(s, "GET", "/state")[1]["site"] is None
+    assert "gone from disk" in caplog.text
+
+
+def test_none_strings_in_the_meta_never_reach_the_ui(tmp_path):
+    """The meta block is a Python literal, so absent values come back as "None"."""
+    from terminus.server import views
+
+    d = _site(tmp_path, oriented=True)
+    text = (d / "oriented.yaml").read_text().replace("'fit_settled': True", "'fit_settled': 'None'")
+    text = text.replace("'residual': 0.4", "'residual': 'None', 'reason': 'None'")
+    text = text.replace("{'az': 300.0,", "{'az': 'None', 'x': 300.0,")
+    (d / "oriented.yaml").write_text(text)
+    h = views.horizon(str(d))
+    conforms("Horizon", h)
+    assert h["settled"] is None
+    assert h["fit"][0] == {"az": 90.0, "alt": 5.4, "used": True}
+    assert [f["az"] for f in h["fit"]] == [90.0, 200.0], "an az of 'None' is no column"
+
+
+def test_a_scope_only_sweep_has_no_photo_to_place(serve, tmp_path):
+    from terminus.export import write_mask
+
+    d = _site(tmp_path)
+    (d / "photo_mask.yaml").unlink()
+    write_mask(d / "oriented.yaml", {10: {"alt": 5.0, "type": "tree"}}, [], {"backend": "segment"})
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
+    h = call(s, "GET", "/site/horizon")[1]
+    assert h["oriented"] is True and h["solution"] is None and h["backend"] == "segment"
+    assert call(s, "GET", "/site/disc.jpg")[0] == 204, "no rotation: nothing places the photo"
+
+
+def test_the_disc_photo_renders_without_a_coverage_array(serve, tmp_path):
+    d = _site(tmp_path)
+    (d / "equirect.coverage.npy").unlink()
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
+    code, data = call(s, "GET", "/site/disc.jpg")
+    assert code == 200 and data[:3] == b"\xff\xd8\xff"
+
+
+def test_disc_rings_sit_at_their_altitudes(serve, tmp_path):
+    from terminus import polar
+
+    _site(tmp_path)
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
+    disc = call(s, "GET", "/site/disc")[1]
+    conforms("Disc", disc)
+    for ring in disc["rings"]:  # a ring's radius is where disc_xy puts that altitude
+        x, y = polar.disc_xy(0.0, ring["alt"], polar.SIZE, polar.FLOOR_DEG)
+        assert ring["r"] == pytest.approx(disc["centre"] - y, abs=0.1)
+
+
+@pytest.mark.parametrize(
+    "name,content,path",
+    [
+        ("photo_mask.yaml", b"horizon: [unclosed", "/site/horizon"),
+        ("equirect.png", b"not a png", "/site/panorama.jpg"),
+    ],
+)
+def test_unreadable_site_files_are_a_clean_422_not_a_dropped_connection(
+    serve, tmp_path, name, content, path
+):
+    d = _site(tmp_path)
+    (d / name).write_bytes(content)
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
+    code, err = call(s, "GET", path)
+    assert code == 422 and "could not be read" in err["error"]
+    assert str(tmp_path) not in err["error"]
+
+
+def test_an_unexpected_error_is_a_500_and_the_server_lives(serve, tmp_path, monkeypatch):
+    from terminus.server import views
+
+    _site(tmp_path)
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
+    monkeypatch.setattr(views, "disc", lambda d: 1 / 0)
+    code, err = call(s, "GET", "/site/disc")
+    assert code == 500 and err == {"error": "internal error; see sidecar.log"}
+    assert call(s, "GET", "/health")[0] == 200
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fake Hugin tools are shell scripts")
+def test_the_real_sidecar_builds_with_its_bundled_hugin_and_kills_it_on_exit(tmp_path):
+    """End to end in real processes: --hugin reaches the build child (the fake
+    pto_gen it runs is the bundled one), and closing the sidecar's stdin kills
+    the build's whole tree, Hugin tool included."""
+    import stat
+
+    from terminus import mosaic
+
+    hugin, pid = tmp_path / "hugin", tmp_path / "pto_gen.pid"
+    hugin.mkdir()
+    for name in mosaic.TOOLS:
+        body = f"echo $$ > {pid}\nsleep 60\n" if name == "pto_gen" else "exit 0\n"
+        tool = hugin / name
+        tool.write_text("#!/bin/sh\n" + body)
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+    sites_root = tmp_path / "sites"
+    p = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "terminus.server",
+            "--sites",
+            str(sites_root),
+            "--hugin",
+            str(hugin),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    watchdog = threading.Timer(60, p.kill)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        s = types.SimpleNamespace(**json.loads(p.stdout.readline()))
+        photos = [_photo(tmp_path / f"{i}.jpg") for i in range(2)]
+        assert call(s, "POST", "/sites", {"photos": photos})[0] == 200
+        for _ in range(400):
+            if pid.exists() and pid.read_text().strip():
+                break
+            time.sleep(0.05)
+        tool_pid = int(pid.read_text())  # the bundled pto_gen is running
+        p.stdin.close()
+        assert p.wait(timeout=20) == 0
+        for _ in range(100):
+            try:
+                os.kill(tool_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the Hugin tool outlived the sidecar")
+    finally:
+        watchdog.cancel()
+        p.kill()
+        p.wait()

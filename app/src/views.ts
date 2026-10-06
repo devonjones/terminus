@@ -26,12 +26,10 @@ export function jobPanel(job: Job): HTMLElement {
     mosaic: "Stitching the photos into a panorama",
     skymask: "Reading the horizon off it",
   };
-  const head =
-    job.status === "running"
-      ? `${job.step ? steps[job.step] : "Starting"}…`
-      : job.status === "failed"
-        ? `Building this site failed: ${job.error ?? "no reason given"}`
-        : "Built.";
+  let head = "Built.";
+  if (job.status === "running") head = `${job.step ? steps[job.step] : "Starting"}…`;
+  if (job.status === "failed")
+    head = `Building this site failed: ${job.error ?? "no reason given"}`;
   const p = el("p", { textContent: head });
   if (job.status === "failed") p.setAttribute("role", "alert");
   else p.setAttribute("role", "status");
@@ -45,6 +43,7 @@ export function jobPanel(job: Job): HTMLElement {
 
 export function dropZone(onPick: () => void): HTMLElement {
   const pick = el("button", { textContent: "Choose photos…" });
+  pick.dataset.focus = "pick";
   pick.addEventListener("click", onPick);
   return el(
     "div",
@@ -55,9 +54,10 @@ export function dropZone(onPick: () => void): HTMLElement {
 }
 
 export function panoramaView(st: AppState, pano: string | null, onPick: () => void): HTMLElement {
+  // Only this site's own build matters here; another site building elsewhere does not.
+  const job = st.job && st.site && st.job.site === st.site.slug ? st.job : null;
   const parts: Node[] = [];
-  if (st.job && st.site && st.job.site === st.site.slug && st.job.status !== "done")
-    parts.push(jobPanel(st.job));
+  if (job && job.status !== "done") parts.push(jobPanel(job));
   if (pano)
     parts.push(
       el("img", {
@@ -67,7 +67,8 @@ export function panoramaView(st: AppState, pano: string | null, onPick: () => vo
       }),
     );
   else if (!st.site) parts.push(dropZone(onPick));
-  else if (!st.job) parts.push(el("p", { textContent: "This site has no panorama yet." }));
+  else if (job?.status !== "running")
+    parts.push(el("p", { textContent: "This site has no panorama yet." }));
   return el("div", {}, ...parts);
 }
 
@@ -159,7 +160,7 @@ export function horizonView(p: DiscProps): HTMLElement {
     };
     stage.addEventListener("pointerdown", (e) => {
       from = [e.clientX, e.clientY];
-      stage.setPointerCapture(e.pointerId);
+      stage.setPointerCapture?.(e.pointerId);
     });
     stage.addEventListener("pointermove", (e) => {
       if (!from) return;
@@ -184,15 +185,25 @@ export function horizonView(p: DiscProps): HTMLElement {
   const toggles = LAYERS.filter((l) => present[l.key]).map((l) => {
     const b = el("button", { textContent: l.label, className: `layer ${l.key}` });
     b.setAttribute("aria-pressed", String(p.layers.has(l.key)));
+    b.dataset.focus = `layer:${l.key}`;
     b.addEventListener("click", () => p.onToggle(l.key));
     return b;
   });
 
   const parts: Node[] = [stage, el("div", { className: "bar" }, ...toggles)];
+  if (h.backend === "heuristic")
+    parts.push(
+      el("p", {
+        className: "note",
+        textContent:
+          "Read with the heuristic detector (no segmentation model was available): check the line against the photo.",
+      }),
+    );
   if (spinning) {
     const slider = el("input", { type: "range", min: "0", max: "359", step: "1" });
     slider.value = String(Math.round(p.spin));
     slider.setAttribute("aria-label", "Rough north: turn the disc until north is up");
+    slider.dataset.focus = "spin";
     slider.addEventListener("input", () => p.onSpinPreview(Number(slider.value)));
     slider.addEventListener("change", () => p.onSpin(Number(slider.value)));
     parts.push(
@@ -203,7 +214,13 @@ export function horizonView(p: DiscProps): HTMLElement {
           "Drag the disc or use the slider until north is up. That is a rough guess; " +
           "the telescope fit (Orient) is what pins it.",
       }),
-      el("label", {}, "Rough north ", slider, ` ${Math.round(p.spin)}°`),
+      el(
+        "label",
+        {},
+        "Rough north ",
+        slider,
+        el("span", { className: "spin-value", textContent: ` ${Math.round(p.spin)}°` }),
+      ),
     );
   } else if (h.solution) {
     const s = h.solution;
