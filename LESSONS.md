@@ -1678,11 +1678,12 @@ Three rules emerged:
    and then the test's verdict depends on when CI happens to run.
 
 **A second instance made it a suite rule (terminus-72).** A test faked the mount at RA 12h
-Dec +20 and left the Sun real. In September daylight that pointing sits inside the Sun cone, so
-the escape path raised first and the test failed — 3 of 48 instants sampled across a year, all
-September days. A rule a test has to remember gets forgotten; `tests/conftest.py` now pins
-`sweep._now` for every test, and a test that wants a particular Sun says so with `when=` or a fake
-`Sky.sun`.
+Dec +20 and left the Sun real. From mid-September to early October that pointing sits inside the
+Sun cone, so in daylight the escape path raised first and the test failed. A year sampled on the
+15th of each month at four times of day caught it at 3 of 48 instants, all on 15 September; it
+also failed on 22 September and on 5 October, when CI went red. A rule a test has to remember gets
+forgotten; `tests/conftest.py` now pins `sweep._now` for every test, and a test that wants a
+particular Sun says so with `when=` or a fake `Sky.sun`.
 
 ### E-18 — Prose asserts causes the data cannot support, and reviewers catch it late
 
