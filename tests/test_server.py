@@ -286,6 +286,7 @@ def _site(root, slug="site-2026-10-05", oriented=False, panorama=True):
             "fit_fiducials": [
                 {"az": 90.0, "alt": 5.4, "used": True, "residual": 0.4},
                 {"az": 200.0, "alt": 40.0, "bound": True, "used": True},
+                {"az": 250.0, "alt": 12.0, "used": False, "reason": "outlier"},
                 {"az": 300.0, "alt": None, "used": False, "reason": "no edge in the search window"},
             ],
         }  # fmt: skip
@@ -484,8 +485,8 @@ def test_an_oriented_site_shows_its_solution_and_fit(serve, tmp_path):
     conforms("Horizon", h)
     assert h["mask"] == "oriented.yaml" and h["oriented"] is True and h["settled"] is True
     assert h["solution"] == {"yaw": 186.2, "pitch": -1.5, "tilt_mag": 7.1, "tilt_dir": 300.0}
-    assert [f["az"] for f in h["fit"]] == [90.0, 200.0, 300.0]
-    assert h["fit"][2] == {"az": 300.0, "used": False, "reason": "no edge in the search window"}
+    assert [f["az"] for f in h["fit"]] == [90.0, 200.0, 250.0, 300.0]
+    assert h["fit"][3] == {"az": 300.0, "used": False, "reason": "no edge in the search window"}
 
 
 def test_disc_overlays_are_polar_disc_xy(serve, tmp_path):
@@ -562,6 +563,8 @@ def test_every_state_response_matches_the_schema(serve, tmp_path):
     conforms("AppState", call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})[1])
     conforms("AppState", call(s, "POST", "/state/tab", {"tab": "horizon"})[1])
     conforms("AppState", call(s, "GET", "/dev/state")[1])
+    conforms("AppState", call(s, "POST", "/site/spin", {"deg": 359.5})[1])
+    conforms("Disc", call(s, "GET", "/site/disc")[1])  # the unoriented site's disc
 
 
 # ---- round-1 review: lifecycle, refusals, and the gaps reviewers proved by mutation ----
@@ -742,7 +745,7 @@ def test_none_strings_in_the_meta_never_reach_the_ui(tmp_path):
     conforms("Horizon", h)
     assert h["settled"] is None
     assert h["fit"][0] == {"az": 90.0, "alt": 5.4, "used": True}
-    assert [f["az"] for f in h["fit"]] == [90.0, 200.0], "an az of 'None' is no column"
+    assert [f["az"] for f in h["fit"]] == [90.0, 200.0, 250.0], "an az of 'None' is no column"
 
 
 def test_a_scope_only_sweep_has_no_photo_to_place(serve, tmp_path):
