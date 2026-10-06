@@ -1,8 +1,22 @@
-import type { AppState, Disc, Horizon, SiteSummary, TerminusApi } from "./api/types";
-import { el, fitView, horizonView, LAYERS, panoramaView, type Layer } from "./views";
+import type { AppState, Disc, Frames, Horizon, SiteSummary, TerminusApi } from "./api/types";
+import { decode, pick, type Footprint } from "./frames";
+import {
+  buildTitle,
+  buildView,
+  el,
+  fitView,
+  horizonView,
+  jobPanel,
+  LAYERS,
+  manageView,
+  panoramaView,
+  type BuildImages,
+  type Layer,
+} from "./views";
 
 const title = (s: string) => s[0].toUpperCase() + s.slice(1);
 const PHOTO = /\.(jpe?g|png|tiff?)$/i;
+const PHOTO_LOADS = 4; // photos fetched at once for the curation strip
 const LATER: Record<string, string> = {
   connect: "Connecting the telescope arrives with the Alpaca driver.",
   orient: "Orienting against the telescope arrives in a later stage.",
@@ -16,8 +30,19 @@ interface View {
   disc: Disc | null;
   pano: string | null; // blob: URLs
   photo: string | null;
+  outline: string | null;
   layers: Set<Layer>;
   error: string;
+  // Curation: the site's photos, their pictures, and the ones the user wants off.
+  frames: Frames | null;
+  disagree: string | null;
+  thumbs: Map<string, string>;
+  footprints: Map<string, string>;
+  fps: Footprint[];
+  pending: Set<string>;
+  showDisagree: boolean;
+  build: BuildImages; // what a running build has produced so far
+  managing: boolean; // the site list is showing instead of the tab
 }
 
 // Render the app: a site picker, the tab bar, the active tab and a status line.
@@ -30,16 +55,40 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     disc: null,
     pano: null,
     photo: null,
+    outline: null,
     layers: new Set(LAYERS.map((l) => l.key)),
     error: "",
+    frames: null,
+    disagree: null,
+    thumbs: new Map(),
+    footprints: new Map(),
+    fps: [],
+    pending: new Set(),
+    showDisagree: false,
+    build: {
+      thumbs: new Map(),
+      layers: new Map(),
+      verdicts: new Map(),
+      progress: null,
+      progressN: 0,
+    },
+    managing: false,
   };
   let polling = false;
   let generation = 0;
 
   const fail = (e: Error) => ((v.error = e.message), render());
-  const toUrl = (bytes: Uint8Array | null) =>
-    bytes ? URL.createObjectURL(new Blob([bytes as BlobPart], { type: "image/jpeg" })) : null;
+  const toUrl = (bytes: Uint8Array | null, type = "image/jpeg") =>
+    bytes ? URL.createObjectURL(new Blob([bytes as BlobPart], { type })) : null;
   const revoke = (url: string | null) => url && URL.revokeObjectURL(url);
+  const revokeFrames = () => {
+    revoke(v.disagree);
+    for (const url of [...v.thumbs.values(), ...v.footprints.values()]) revoke(url);
+    v.disagree = null;
+    v.thumbs = new Map();
+    v.footprints = new Map();
+    v.fps = [];
+  };
 
   // Loads can overlap (open a site, then another): only the newest one lands,
   // and the photos of the one it replaces are released.
@@ -48,23 +97,126 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     let views;
     try {
       views = v.st.site
-        ? await Promise.all([api.horizon(), api.disc(), api.image("panorama"), api.image("disc")])
-        : ([null, null, null, null] as const);
+        ? await Promise.all([
+            api.horizon(),
+            api.disc(),
+            api.image("panorama"),
+            api.image("disc"),
+            api.frames(),
+            api.image("disagree"),
+            api.image("outline"),
+          ])
+        : ([null, null, null, null, null, null, null] as const);
     } catch (e) {
       if (mine !== generation) return; // a newer load owns the screen
       // Never leave the previous site's views up under the new site's name.
       revoke(v.pano);
       revoke(v.photo);
-      v.horizon = v.disc = v.pano = v.photo = null;
+      revoke(v.outline);
+      revokeFrames();
+      v.horizon = v.disc = v.pano = v.photo = v.outline = v.frames = null;
       throw e;
     }
     if (mine !== generation) return;
     revoke(v.pano);
     revoke(v.photo);
-    [v.horizon, v.disc] = [views[0], views[1]];
+    revoke(v.outline);
+    revokeFrames();
+    [v.horizon, v.disc, v.frames] = [views[0], views[1], views[4]];
+    v.outline = toUrl(views[6], "image/png");
     [v.pano, v.photo] = [toUrl(views[2]), toUrl(views[3])];
+    v.disagree = toUrl(views[5], "image/png");
+    v.pending = new Set(v.frames?.frames.filter((f) => f.off).map((f) => f.name));
+    render();
+    if (v.frames) await loadPhotos(mine, v.frames);
+  }
+
+  // The strip's thumbnails and the hover footprints: one small picture per photo,
+  // fetched after the panorama is on screen.
+  async function loadPhotos(mine: number, frames: Frames) {
+    const thumbs = new Map<string, string>();
+    const footprints = new Map<string, string>();
+    const fps: Footprint[] = [];
+    const one = async (f: Frames["frames"][number]) => {
+      const [thumb, fp] = await Promise.all([
+        api.frameImage("thumb", f.name),
+        f.box ? api.frameImage("footprint", f.name) : null,
+      ]);
+      const t = toUrl(thumb);
+      if (t) thumbs.set(f.name, t);
+      const m = toUrl(fp, "image/png");
+      if (m && fp && f.box) {
+        footprints.set(f.name, m);
+        // Hover needs the mask's pixels; without a canvas the strip still works.
+        await decode(f.name, f.box, fp).then(
+          (d) => fps.push(d),
+          (e: Error) => console.warn(`no hover for ${f.name}: ${e.message}`),
+        );
+      }
+    };
+    // A few at a time: each thumbnail decodes a full-size photo in the engine.
+    const queue = [...frames.frames];
+    await Promise.all(
+      Array.from({ length: PHOTO_LOADS }, async () => {
+        for (let f = queue.shift(); f; f = queue.shift()) await one(f);
+      }),
+    );
+    if (mine !== generation) {
+      for (const url of [...thumbs.values(), ...footprints.values()]) revoke(url);
+      return;
+    }
+    [v.thumbs, v.footprints, v.fps] = [thumbs, footprints, fps];
     render();
   }
+
+  // A new build replaces every layer, so the last one's pictures go.
+  function startBuild() {
+    const b = v.build;
+    for (const url of [...b.thumbs.values(), ...b.layers.values(), ...b.verdicts.values()])
+      revoke(url);
+    revoke(b.progress);
+    v.build = {
+      thumbs: new Map(),
+      layers: new Map(),
+      verdicts: new Map(),
+      progress: null,
+      progressN: 0,
+    };
+  }
+
+  // Fetch a few of the pictures the running build has produced and we lack.
+  async function fetchBuild() {
+    const job = v.st.job;
+    if (!job || job.site !== v.st.site?.slug) return;
+    const b = v.build;
+    const wants: [Map<string, string>, string, () => Promise<Uint8Array | null>, string][] = [];
+    for (const f of job.frames) {
+      if (!b.thumbs.has(f.name))
+        wants.push([b.thumbs, f.name, () => api.frameImage("thumb", f.name), "image/jpeg"]);
+      if (f.layer && !b.layers.has(f.layer)) {
+        const layer = f.layer;
+        wants.push([b.layers, layer, () => api.buildImage("layer", layer), "image/webp"]);
+      }
+      if (f.layer && f.state === "judged" && !b.verdicts.has(f.layer)) {
+        const layer = f.layer;
+        wants.push([b.verdicts, layer, () => api.buildImage("verdict", layer), "image/png"]);
+      }
+    }
+    for (const [into, key, get, type] of wants.slice(0, PHOTO_LOADS * 2)) {
+      const url = toUrl(await get(), type);
+      if (url) into.set(key, url);
+    }
+    if (job.outline > b.progressN) {
+      const seen = job.outline;
+      const url = toUrl(await api.image("progress"), "image/png");
+      if (url) [b.progress, b.progressN] = [(revoke(b.progress), url), seen];
+    }
+  }
+
+  const curate = (off: string[], restitch: boolean) => {
+    startBuild();
+    return api.curate(off, restitch).then(adopt).catch(fail);
+  };
 
   // While a site is building, refresh its progress; load the site once it is done.
   function poll() {
@@ -74,7 +226,10 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       polling = false;
       try {
         v.st = await api.getState();
-        if (v.st.job?.status === "running") return (render(), poll());
+        if (v.st.job?.status === "running") {
+          await fetchBuild();
+          return (render(), poll());
+        }
         v.sites = (await api.listSites()).sites;
         await loadSite();
       } catch (e) {
@@ -93,22 +248,42 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     poll();
   }
 
-  const newSite = () => api.pickPhotos().then(adopt).catch(fail);
+  const newSite = () => {
+    startBuild();
+    return api.pickPhotos().then(adopt).catch(fail);
+  };
 
   function siteBar(): HTMLElement {
     const pick = el("select", {}, el("option", { value: "", textContent: "Choose a site…" }));
     pick.setAttribute("aria-label", "Site");
     pick.dataset.focus = "site";
     for (const s of v.sites)
-      pick.append(el("option", { value: s.slug, textContent: `${s.slug} (${s.photos} photos)` }));
+      pick.append(el("option", { value: s.slug, textContent: `${s.name} (${s.photos} photos)` }));
     pick.value = v.st.site?.slug ?? "";
     pick.addEventListener("change", () => {
+      v.managing = false;
       if (pick.value) api.openSite(pick.value).then(adopt).catch(fail);
     });
+    const parts: Node[] = [pick];
+    const open = v.st.site;
+    if (open) {
+      // The open site's name, edited in place: Enter or leaving the box saves it.
+      const name = el("input", { type: "text", value: open.name, className: "site-name" });
+      name.setAttribute("aria-label", "Site name");
+      name.dataset.focus = "site-name";
+      name.addEventListener("keydown", (e) => e.key === "Enter" && name.blur());
+      name.addEventListener("change", () => {
+        if (name.value.trim() && name.value.trim() !== open.name) renameSite(open.slug, name.value);
+      });
+      parts.push(name);
+    }
     const add = el("button", { textContent: "New site…" });
     add.dataset.focus = "new-site";
     add.addEventListener("click", newSite);
-    return el("header", {}, pick, add);
+    const manage = el("button", { textContent: v.managing ? "Done" : "Manage sites…" });
+    manage.dataset.focus = "manage";
+    manage.addEventListener("click", () => ((v.managing = !v.managing), render()));
+    return el("header", {}, ...parts, add, manage);
   }
 
   function tabBar(): HTMLElement {
@@ -133,9 +308,61 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     return nav;
   }
 
+  const renameSite = (slug: string, name: string) =>
+    api
+      .renameSite(slug, name)
+      .then(async (next) => ((v.st = next), (v.sites = (await api.listSites()).sites), render()))
+      .catch(fail);
+
+  const deleteSite = (slug: string, name: string) => {
+    if (!confirm(`Delete "${name}" and its copies of the photos? This cannot be undone.`)) return;
+    api
+      .deleteSite(slug)
+      .then(async (next) => {
+        v.st = next;
+        v.sites = (await api.listSites()).sites;
+        await loadSite();
+      })
+      .catch(fail);
+  };
+
   function content(): Node {
+    if (v.managing)
+      return manageView(
+        v.sites,
+        v.st.site?.slug ?? null,
+        v.st.job?.status === "running" ? v.st.job.site : null,
+        renameSite,
+        deleteSite,
+      );
     const tab = v.st.tab;
-    if (tab === "panorama") return panoramaView(v.st, v.pano, newSite);
+    const job = v.st.job;
+    if (tab === "panorama" && job?.frames.length && job.site === v.st.site?.slug) {
+      if (job.status === "running") return buildView(job, v.build);
+      if (job.status === "failed") return el("div", {}, jobPanel(job), buildView(job, v.build));
+    }
+    if (tab === "panorama")
+      return panoramaView(
+        v.st,
+        v.pano,
+        newSite,
+        v.frames && {
+          frames: v.frames,
+          disagree: v.disagree,
+          thumbs: v.thumbs,
+          footprints: v.footprints,
+          hit: (x, y) => pick(v.fps, x, y),
+          pending: v.pending,
+          showDisagree: v.showDisagree,
+          onToggle: (name) => (
+            v.pending.has(name) ? v.pending.delete(name) : v.pending.add(name),
+            render()
+          ),
+          onShowDisagree: (on) => ((v.showDisagree = on), render()),
+          onApply: (restitch) => curate([...v.pending], restitch),
+        },
+        v.st.site?.panorama ? () => curate([], false) : null,
+      );
     if (tab === "fit") return fitView(v.horizon);
     if (tab === "horizon") {
       if (!v.st.site) return el("p", { textContent: "Choose or create a site first." });
@@ -144,6 +371,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         horizon: v.horizon,
         disc: v.disc,
         photo: v.photo,
+        outline: v.outline,
         spin: v.st.spin,
         layers: v.layers,
         onToggle: (l) => (v.layers.has(l) ? v.layers.delete(l) : v.layers.add(l), render()),
@@ -166,7 +394,16 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
 
   function render() {
     const s = v.st;
-    const panel = el("section", {}, el("h1", { textContent: title(s.tab) }), content());
+    // While this site builds, the heading says what the build is doing.
+    const job = s.job;
+    const building = s.tab === "panorama" && job?.status === "running" && job.site === s.site?.slug;
+    const heading = building ? `${title(s.tab)}: ${buildTitle(job)}` : title(s.tab);
+    const panel = el(
+      "section",
+      {},
+      el("h1", { textContent: v.managing ? "Sites" : heading }),
+      content(),
+    );
     panel.setAttribute("role", "tabpanel");
     const status = el(
       "footer",
@@ -192,6 +429,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     e.preventDefault();
     const files = [...(e.dataTransfer?.files ?? [])].filter((f) => PHOTO.test(f.name));
     if (files.length === 0) return fail(new Error("Drop photographs: .jpg, .png or .tif files."));
+    startBuild();
     api.createSite(files).then(adopt).catch(fail);
   });
 

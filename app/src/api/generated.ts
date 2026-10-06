@@ -15,6 +15,7 @@ export interface Api {
   sites?: SiteList;
   horizon?: Horizon;
   disc?: Disc;
+  frames?: Frames;
 }
 export interface Health {
   ok: true;
@@ -44,13 +45,82 @@ export interface SiteSummary {
   photos: number;
   panorama: boolean;
   mask: boolean;
+  /**
+   * the user's name for the site (the slug until renamed)
+   */
+  name: string;
+  /**
+   * when anything in the site last changed (local time, ISO 8601, minutes)
+   */
+  updated: string;
 }
 export interface Job {
   site: string;
-  step: "mosaic" | "skymask" | null;
+  step: "mosaic" | "reblend" | "skymask" | "horizon" | null;
   status: "running" | "done" | "failed";
   log: string[];
   error: string | null;
+  /**
+   * what the current step is doing
+   */
+  phase: "matching" | "solving" | "placing" | "segmenting" | "blending" | "judging" | null;
+  canvas: [number, number] | null;
+  frames: BuildFrame[];
+  /**
+   * the photos being worked on right now
+   */
+  active: string[];
+  /**
+   * photo pairs found to share matches, as cpfind reports them
+   */
+  pairs: Pair[];
+  /**
+   * photo pairs compared so far
+   */
+  compared: number;
+  /**
+   * what the phase is doing right now, in words (e.g. cpfind's own stages)
+   */
+  detail: string | null;
+  /**
+   * times the horizon so far has been redrawn (fetch /site/progress.png when it changes)
+   */
+  outline: number;
+}
+/**
+ * One photo's progress through a build.
+ */
+export interface BuildFrame {
+  name: string;
+  state: "listed" | "matched" | "dropped" | "placed" | "off" | "judged";
+  /**
+   * control points tying it to the others
+   */
+  points?: number;
+  /**
+   * the photos it shares control points with
+   */
+  links?: string[];
+  /**
+   * why the stitch dropped it
+   */
+  reason?: string;
+  /**
+   * its remapped layer in work/
+   */
+  layer?: string;
+  /**
+   * [x, y, width, height] on the panorama
+   *
+   * @minItems 4
+   * @maxItems 4
+   */
+  box?: [number, number, number, number];
+}
+export interface Pair {
+  a: string;
+  b: string;
+  matches: number;
 }
 export interface SiteList {
   sites: SiteSummary[];
@@ -110,13 +180,35 @@ export interface Disc {
     label: string;
     xy: XY;
   }[];
-  actual: XY[];
   planning: XY[];
-  pockets: [XY, XY][];
   fiducials: {
     az: number;
     alt: number;
     bound: boolean;
     xy: XY;
   }[];
+}
+/**
+ * The photos of a curatable site.
+ */
+export interface Frames {
+  width: number;
+  height: number;
+  frames: Frame[];
+}
+export interface Frame {
+  name: string;
+  /**
+   * its remapped layer in work/; null when the last stitch left it out
+   */
+  layer: string | null;
+  box: [number, number, number, number] | null;
+  /**
+   * turned off by the user
+   */
+  off: boolean;
+  /**
+   * left out by the stitch: too few control points
+   */
+  dropped: boolean;
 }

@@ -1,10 +1,17 @@
 // @vitest-environment jsdom
 import { findByRole, findByText, getByRole, waitFor } from "@testing-library/dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AppState, Disc, Horizon, Job, TerminusApi } from "./api/types";
+import type { AppState, Disc, Frame, Frames, Horizon, Job, TerminusApi } from "./api/types";
 import { mount } from "./renderer";
 
-const site = { slug: "site-a", photos: 3, panorama: true, mask: true };
+const site = {
+  slug: "site-a",
+  name: "site-a",
+  updated: "2026-10-06T16:00",
+  photos: 3,
+  panorama: true,
+  mask: true,
+};
 const state = (over: Partial<AppState> = {}): AppState => ({
   version: "0.1.0",
   site: null,
@@ -35,17 +42,10 @@ const disc: Disc = {
     { label: "N", xy: [600, 70] },
     { label: "E", xy: [1130, 600] },
   ],
-  actual: [
-    [600, 300],
-    [900, 600],
-    [600, 900],
-  ],
-  planning: [],
-  pockets: [
-    [
-      [600, 320],
-      [600, 400],
-    ],
+  planning: [
+    [600, 280],
+    [920, 600],
+    [600, 920],
   ],
   fiducials: [{ az: 90, alt: 10, bound: false, xy: [850, 600] }],
 };
@@ -60,9 +60,15 @@ function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
     pickPhotos: vi.fn(async () => null),
     createSite: vi.fn(async () => (st = { ...st, site })),
     setSpin: vi.fn(async (deg: number) => (st = { ...st, spin: deg })),
+    renameSite: vi.fn(async () => st),
+    deleteSite: vi.fn(async () => (st = { ...st, site: null })),
     horizon: vi.fn(async () => horizon()),
     disc: vi.fn(async () => disc),
     image: vi.fn(async () => null),
+    frames: vi.fn(async () => null),
+    frameImage: vi.fn(async () => null),
+    buildImage: vi.fn(async () => null),
+    curate: vi.fn(async () => st),
     ...over,
   };
 }
@@ -161,6 +167,14 @@ describe("new site", () => {
       status: "running",
       log: ["registered 18 frames"],
       error: null,
+      phase: null,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+      detail: null,
+      outline: 0,
     };
     let built = false;
     const api = fakeApi({
@@ -191,6 +205,14 @@ describe("new site", () => {
       status: "failed",
       log: [],
       error: "error: no frame could be constrained",
+      phase: null,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+      detail: null,
+      outline: 0,
     };
     await mount(
       root,
@@ -204,6 +226,7 @@ describe("horizon", () => {
   async function horizonTab(over: Partial<TerminusApi> = {}) {
     const api = fakeApi({
       getState: async () => state({ site, tab: "horizon", spin: 30 }),
+      image: async (name: string) => (name === "outline" ? new Uint8Array([1]) : null),
       ...over,
     });
     await mount(root, api);
@@ -212,15 +235,12 @@ describe("horizon", () => {
 
   it("draws the sidecar's disc pixels exactly as given", async () => {
     await horizonTab();
-    expect(root.querySelector("polygon.hz")!.getAttribute("points")).toBe(
-      "600,300 900,600 600,900",
+    // The actual horizon is the sky's outline, a raster; planning is a line.
+    expect(root.querySelector(".rotor img.outline")).not.toBeNull();
+    expect(root.querySelector("polygon.pl")!.getAttribute("points")).toBe(
+      "600,280 920,600 600,920",
     );
-    const pk = root.querySelector("line.pk")!;
-    expect([pk.getAttribute("x1"), pk.getAttribute("y1"), pk.getAttribute("y2")]).toEqual([
-      "600",
-      "320",
-      "400",
-    ]);
+    expect(root.querySelector("line.pk, polygon.hz")).toBeNull(); // no pockets, no column line
     expect(root.querySelector("circle.edg title")!.textContent).toBe("az 90: telescope edge 10.0°");
     expect([...root.querySelectorAll("text.cd")].map((t) => t.textContent)).toEqual(["N", "E"]);
   });
@@ -228,10 +248,10 @@ describe("horizon", () => {
   it("offers toggles only for layers the site has, and they hide the layer", async () => {
     await horizonTab();
     const names = [...root.querySelectorAll(".bar button")].map((b) => b.textContent);
-    expect(names).toEqual(["Horizon", "Sky pockets", "Telescope columns", "Altitude grid"]);
-    getByRole(root, "button", { name: "Sky pockets" }).click();
-    expect(root.querySelector("line.pk")).toBeNull();
-    expect(getByRole(root, "button", { name: "Sky pockets" }).getAttribute("aria-pressed")).toBe(
+    expect(names).toEqual(["Horizon", "Planning horizon", "Telescope columns", "Altitude grid"]);
+    getByRole(root, "button", { name: "Horizon" }).click();
+    expect(root.querySelector("img.outline")).toBeNull();
+    expect(getByRole(root, "button", { name: "Horizon" }).getAttribute("aria-pressed")).toBe(
       "false",
     );
   });
@@ -240,7 +260,7 @@ describe("horizon", () => {
     const api = await horizonTab();
     const rotor = root.querySelector<HTMLElement>(".rotor")!;
     expect(rotor.style.transform).toBe("rotate(30deg)");
-    expect(rotor.querySelector("polygon.hz")).not.toBeNull();
+    expect(rotor.querySelector("img.outline")).not.toBeNull(); // turns with the photo
     expect(rotor.querySelector("text.cd")).toBeNull();
     const slider = getByRole(root, "slider") as HTMLInputElement;
     slider.value = "120";
@@ -302,7 +322,9 @@ describe("round-1 review", () => {
     let holdNext = false;
     const api = fakeApi({
       getState: async () => state({ site, tab: "horizon" }),
-      image: vi.fn(async () => {
+      // The two photographs; a site with no disagreement map yet.
+      image: vi.fn(async (name: string) => {
+        if (name === "disagree" || name === "outline") return null;
         if (holdNext) {
           holdNext = false;
           await new Promise<void>((r) => (release = r)); // the first open's photo is slow
@@ -331,7 +353,9 @@ describe("round-1 review", () => {
     let holdNext = false;
     const api = fakeApi({
       getState: async () => state({ site, tab: "horizon" }),
-      image: vi.fn(async () => {
+      // The two photographs; a site with no disagreement map yet.
+      image: vi.fn(async (name: string) => {
+        if (name === "disagree" || name === "outline") return null;
         if (holdNext) {
           holdNext = false;
           await new Promise<void>((_, r) => (reject = r)); // the first open fails, late
@@ -361,6 +385,14 @@ describe("round-1 review", () => {
       status: "running",
       log: [],
       error: null,
+      phase: null,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+      detail: null,
+      outline: 0,
     };
     let reads = 0;
     const api = fakeApi({
@@ -393,10 +425,10 @@ describe("round-1 review", () => {
 
   it("focus survives a layer toggle and a spin change", async () => {
     await mount(root, fakeApi({ getState: async () => state({ site, tab: "horizon" }) }));
-    const toggle = getByRole(root, "button", { name: /Sky pockets/ });
+    const toggle = getByRole(root, "button", { name: /Planning horizon/ });
     toggle.focus();
     toggle.click();
-    expect((document.activeElement as HTMLElement).dataset.focus).toBe("layer:pockets");
+    expect((document.activeElement as HTMLElement).dataset.focus).toBe("layer:planning");
     const slider = getByRole(root, "slider") as HTMLInputElement;
     slider.focus();
     slider.value = "40";
@@ -481,7 +513,21 @@ describe("view details", () => {
   });
 
   it("a site with no panorama says so; another site's build is not shown here", async () => {
-    const other: Job = { site: "site-b", step: "mosaic", status: "running", log: [], error: null };
+    const other: Job = {
+      site: "site-b",
+      step: "mosaic",
+      status: "running",
+      log: [],
+      error: null,
+      phase: null,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+      detail: null,
+      outline: 0,
+    };
     await mount(
       root,
       fakeApi({
@@ -502,6 +548,14 @@ describe("round-2 review", () => {
       status: "running",
       log: [],
       error: null,
+      phase: null,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+      detail: null,
+      outline: 0,
     };
     await mount(
       root,
@@ -523,19 +577,311 @@ describe("round-2 review", () => {
           throw new Error("engine /site/horizon: 422 this site's files could not be read");
         return horizon();
       }),
-      image: async () => new Uint8Array([1]),
+      image: async (name: string) => (name === "disagree" ? null : new Uint8Array([1])),
       openSite: vi.fn(async () => state({ site, tab: "horizon" })),
     });
     await mount(root, api);
-    expect(root.querySelector("polygon.hz")).not.toBeNull(); // site A on screen
+    expect(root.querySelector("img.outline")).not.toBeNull(); // site A on screen
     vi.mocked(URL.revokeObjectURL).mockClear();
     failing = true;
     const select = root.querySelector("select")!;
     select.value = "site-a";
     select.dispatchEvent(new Event("change"));
     expect((await findByRole(root, "alert")).textContent).toContain("could not be read");
-    expect(root.querySelector("polygon.hz")).toBeNull();
+    expect(root.querySelector("img.outline")).toBeNull();
     expect(root.textContent).toContain("This site has no horizon yet.");
-    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2); // site A's photos released
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(3); // site A's photos and outline released
+  });
+});
+
+describe("curating the photos", () => {
+  const frames = (over: Partial<Frame>[] = []): Frames => ({
+    width: 100,
+    height: 50,
+    frames: (
+      [
+        { name: "a.jpg", layer: "layer0000.tif", box: [0, 0, 60, 50], off: false, dropped: false },
+        { name: "b.jpg", layer: "layer0001.tif", box: [40, 0, 60, 50], off: false, dropped: false },
+        { name: "c.jpg", layer: null, box: null, off: false, dropped: true },
+      ] as Frame[]
+    ).map((f, i) => ({ ...f, ...over[i] })),
+  });
+  const curating = (f = frames(), over: Partial<TerminusApi> = {}) =>
+    fakeApi({
+      getState: async () => state({ site, tab: "panorama" }),
+      image: async (name: string) => new Uint8Array([name === "disagree" ? 2 : 1]),
+      frames: async () => f,
+      frameImage: async () => new Uint8Array([1]),
+      ...over,
+    });
+  const photo = (name: string) => getByRole(root, "button", { name: new RegExp(name) });
+
+  it("lists every photo, and says which the stitch could not place", async () => {
+    await mount(root, curating());
+    await waitFor(() => expect(root.querySelectorAll(".strip button")).toHaveLength(3));
+    expect(photo("c.jpg").textContent).toContain("the stitch could not place it");
+    expect(photo("c.jpg").getAttribute("aria-pressed")).toBe("false"); // not in the panorama
+    expect(photo("c.jpg").classList.contains("off")).toBe(true);
+    expect(photo("a.jpg").getAttribute("aria-pressed")).toBe("true");
+    expect(root.textContent).toContain("0 of 3 photos off · 1 the stitch could not place");
+  });
+
+  it("turning a photo off is pending until re-blended, then sent", async () => {
+    const api = curating();
+    await mount(root, api);
+    const reblend = await findByRole(root, "button", { name: "Re-blend" });
+    expect((reblend as HTMLButtonElement).disabled).toBe(true); // nothing changed yet
+    photo("b.jpg").click();
+    expect(photo("b.jpg").getAttribute("aria-pressed")).toBe("false");
+    expect(root.textContent).toContain("1 of 3 photos off");
+    expect(api.curate).not.toHaveBeenCalled();
+    getByRole(root, "button", { name: "Re-blend" }).click();
+    expect(api.curate).toHaveBeenCalledWith(["b.jpg"], false);
+  });
+
+  it("bringing back a photo the stitch left out takes a re-stitch", async () => {
+    const api = curating(frames([{}, { off: true, layer: null, box: null }]));
+    await mount(root, api);
+    await findByRole(root, "button", { name: /b\.jpg/ });
+    expect(photo("b.jpg").textContent).not.toContain("re-stitch"); // still off: nothing to bring back
+    photo("b.jpg").click();
+    expect(photo("b.jpg").textContent).toContain("re-stitch to bring it back");
+    expect((getByRole(root, "button", { name: "Re-blend" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    getByRole(root, "button", { name: "Re-stitch" }).click();
+    expect(api.curate).toHaveBeenCalledWith([], true);
+  });
+
+  it("hovering a photo in the strip highlights where it sits", async () => {
+    await mount(root, curating());
+    await waitFor(() =>
+      expect(root.querySelectorAll(".strip img[src='blob:fake']")).toHaveLength(3),
+    );
+    const hl = root.querySelector<HTMLElement>(".hl")!;
+    expect(hl.hidden).toBe(true);
+    photo("b.jpg").dispatchEvent(new Event("mouseenter"));
+    expect(hl.hidden).toBe(false);
+    expect([hl.style.left, hl.style.width]).toEqual(["40%", "60%"]);
+    expect(root.querySelector(".here")!.textContent).toBe("b.jpg: click to turn it off.");
+    photo("b.jpg").dispatchEvent(new Event("mouseleave"));
+    expect(hl.hidden).toBe(true);
+  });
+
+  it("the disagreement map is a layer the user turns on", async () => {
+    await mount(root, curating());
+    const box = (await findByRole(root, "checkbox", {
+      name: /where the photos disagree/,
+    })) as HTMLInputElement;
+    expect(root.querySelector<HTMLImageElement>(".veil")!.hidden).toBe(true);
+    box.click();
+    expect(root.querySelector<HTMLImageElement>(".veil")!.hidden).toBe(false);
+  });
+
+  it("controls are disabled while a build runs", async () => {
+    const running: Job = {
+      site: "site-a",
+      step: "reblend",
+      status: "running",
+      log: [],
+      error: null,
+      phase: null,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+      detail: null,
+      outline: 0,
+    };
+    await mount(
+      root,
+      curating(frames(), { getState: async () => state({ site, tab: "panorama", job: running }) }),
+    );
+    expect((await findByText(root, /Blending the photos/)).textContent).toContain(
+      "voting on the sky",
+    );
+    expect((getByRole(root, "button", { name: "Re-stitch" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect((photo("a.jpg") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("fetches a site's photos a few at a time, not all at once", async () => {
+    let inFlight = 0;
+    let most = 0;
+    const many = frames();
+    many.frames = Array.from({ length: 12 }, (_, i) => ({
+      name: `p${i}.jpg`,
+      layer: null,
+      box: null,
+      off: false,
+      dropped: false,
+    }));
+    await mount(
+      root,
+      curating(many, {
+        frameImage: vi.fn(async () => {
+          most = Math.max(most, ++inFlight);
+          await new Promise((r) => setTimeout(r, 5));
+          inFlight--;
+          return new Uint8Array([1]);
+        }),
+      }),
+    );
+    await waitFor(() =>
+      expect(root.querySelectorAll(".strip img[src='blob:fake']")).toHaveLength(12),
+    );
+    expect(most).toBe(4);
+  });
+
+  it("a site built before curation offers to prepare its photos", async () => {
+    const api = curating(frames(), { frames: async () => null });
+    await mount(root, api);
+    (await findByRole(root, "button", { name: "Prepare the photos for curation" })).click();
+    expect(api.curate).toHaveBeenCalledWith([], false);
+  });
+});
+
+describe("watching a build", () => {
+  const job = (over: Partial<Job> = {}): Job => ({
+    site: "site-a",
+    step: "mosaic",
+    status: "running",
+    log: [],
+    error: null,
+    phase: "matching",
+    canvas: [100, 50],
+    frames: [
+      { name: "a.jpg", state: "matched", points: 40, links: ["b.jpg"] },
+      { name: "b.jpg", state: "matched", points: 40, links: ["a.jpg"] },
+      { name: "c.jpg", state: "dropped", points: 0, reason: "0 control points (needs 12)" },
+    ],
+    active: ["a.jpg", "b.jpg"],
+    pairs: [{ a: "a.jpg", b: "b.jpg", matches: 40 }],
+    compared: 3,
+    detail: null,
+    outline: 0,
+    ...over,
+  });
+  const watching = (j: Job) =>
+    fakeApi({
+      getState: async () => state({ site: { ...site, panorama: false }, tab: "panorama", job: j }),
+      frameImage: async () => new Uint8Array([1]),
+      buildImage: vi.fn(async () => new Uint8Array([1])),
+    });
+
+  it("while matching, draws the pairs found and outlines the pair just reported", async () => {
+    await mount(root, watching(job()));
+    expect((await findByRole(root, "status")).textContent).toContain(
+      "Matching the photos against each other",
+    );
+    expect(root.querySelector("h1")!.textContent).toBe("Panorama: Matching");
+    const edges = root.querySelectorAll(".graph .edge");
+    expect(edges).toHaveLength(1);
+    expect(edges[0].classList.contains("hot")).toBe(true);
+    expect(root.querySelectorAll(".graph .node.hot")).toHaveLength(2);
+    expect(root.querySelector(".graph .node.dropped title")!.textContent).toContain(
+      "0 control points",
+    );
+    expect(root.textContent).toContain("3 pairs compared, 1 share points");
+  });
+
+  it("draws the horizon so far over the panorama as each photo is judged", async () => {
+    const judging = job({
+      step: "reblend",
+      phase: "judging",
+      outline: 3,
+      frames: [{ name: "a.jpg", state: "judged", layer: "layer0000.tif", box: [0, 0, 60, 50] }],
+    });
+    const image = vi.fn(async (name: string) => (name === "progress" ? new Uint8Array([1]) : null));
+    await mount(root, { ...watching(judging), image });
+    await waitFor(() => expect(root.querySelector(".live img.progress")).not.toBeNull(), {
+      timeout: 3000,
+    });
+    expect(image).toHaveBeenCalledWith("progress");
+  });
+
+  it("the heading names cpfind's own stage as matching moves through them", async () => {
+    await mount(root, watching(job({ detail: "comparing neighbouring photos" })));
+    await waitFor(() =>
+      expect(root.querySelector("h1")!.textContent).toBe(
+        "Panorama: Matching — comparing neighbouring photos",
+      ),
+    );
+  });
+
+  it("once photos land, shows the panorama and outlines the one being worked on", async () => {
+    const placing = job({
+      phase: "placing",
+      frames: [
+        { name: "a.jpg", state: "placed", layer: "layer0000.tif", box: [0, 0, 60, 50] },
+        { name: "b.jpg", state: "matched", points: 40 },
+      ],
+      active: ["a.jpg"],
+    });
+    const api = watching(placing);
+    await mount(root, api);
+    // The layer arrives on the next progress poll.
+    await waitFor(() => expect(root.querySelector(".live img")).not.toBeNull(), { timeout: 3000 });
+    expect(root.querySelector(".graph")).toBeNull();
+    expect(root.querySelector(".live img")!.classList.contains("hot")).toBe(true);
+    expect(root.querySelectorAll(".live .hl")).toHaveLength(1); // the same wash as hovering
+    expect(api.buildImage).toHaveBeenCalledWith("layer", "layer0000.tif");
+    const rows = root.querySelectorAll(".progress li");
+    expect(rows[0].classList.contains("hot")).toBe(true);
+    expect(rows[1].classList.contains("hot")).toBe(false);
+  });
+});
+
+describe("managing sites", () => {
+  it("renames the open site from the top bar", async () => {
+    const api = fakeApi({ getState: async () => state({ site, tab: "panorama" }) });
+    await mount(root, api);
+    const name = getByRole(root, "textbox", { name: "Site name" }) as HTMLInputElement;
+    name.value = "Back yard";
+    name.dispatchEvent(new Event("change"));
+    expect(api.renameSite).toHaveBeenCalledWith("site-a", "Back yard");
+  });
+
+  it("lists every site and deletes one only after the user confirms", async () => {
+    const api = fakeApi({ getState: async () => state({ site, tab: "panorama" }) });
+    await mount(root, api);
+    getByRole(root, "button", { name: "Manage sites…" }).click();
+    expect(root.querySelector("h1")!.textContent).toBe("Sites");
+    expect(root.querySelector("table.sites tbody tr")!.textContent).toContain("2026-10-06 16:00");
+    const ask = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
+    getByRole(root, "button", { name: "Delete site-a" }).click();
+    expect(api.deleteSite).not.toHaveBeenCalled();
+    ask.mockReturnValueOnce(true);
+    getByRole(root, "button", { name: "Delete site-a" }).click();
+    expect(api.deleteSite).toHaveBeenCalledWith("site-a");
+    ask.mockRestore();
+  });
+
+  it("the site being built cannot be deleted", async () => {
+    const running: Job = {
+      site: "site-a",
+      step: "mosaic",
+      status: "running",
+      log: [],
+      error: null,
+      phase: null,
+      detail: null,
+      outline: 0,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+    };
+    await mount(
+      root,
+      fakeApi({ getState: async () => state({ site, tab: "panorama", job: running }) }),
+    );
+    getByRole(root, "button", { name: "Manage sites…" }).click();
+    expect(
+      (getByRole(root, "button", { name: "Delete site-a" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
   });
 });

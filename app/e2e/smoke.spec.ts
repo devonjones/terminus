@@ -27,14 +27,20 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
     })),
   ).toEqual({
     api: [
+      "buildImage",
       "createSite",
+      "curate",
+      "deleteSite",
       "disc",
+      "frameImage",
+      "frames",
       "getState",
       "horizon",
       "image",
       "listSites",
       "openSite",
       "pickPhotos",
+      "renameSite",
       "setSpin",
       "setTab",
     ],
@@ -85,11 +91,13 @@ test("stage 1: open a built site, see its panorama and disc, spin it, read the f
     await expect(win.locator("img.pano")).toBeVisible();
 
     await win.getByRole("tab", { name: "Horizon" }).click();
-    await expect(win.locator(".disc .rotor img")).toBeVisible(); // the reprojected photo
-    expect(await win.locator("polygon.hz").getAttribute("points")).toMatch(
-      /^[\d.]+,[\d.]+( [\d.]+,[\d.]+){71}$/,
+    await expect(win.locator(".disc .rotor img").first()).toBeVisible(); // the reprojected photo
+    // The actual horizon is the sky's outline (a raster); planning is one line.
+    await expect(win.locator(".disc .rotor img.outline")).toBeVisible();
+    expect(await win.locator("polygon.pl").getAttribute("points")).toMatch(
+      /^[\d.]+,[\d.]+( [\d.]+,[\d.]+){359}$/,
     );
-    await expect(win.locator("line.pk")).toHaveCount(1);
+    await expect(win.locator("line.pk, polygon.hz")).toHaveCount(0);
     await expect(win.locator("text.cd")).toHaveText(["N", "E", "S", "W"]);
     await expect(win.getByText("UNORIENTED")).toBeVisible();
 

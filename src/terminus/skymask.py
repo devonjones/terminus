@@ -316,6 +316,14 @@ def upper_envelope(rows, half_deg, px_per_deg):
 # ADE20K classes that behave like vegetation: gappy, seasonal, partly
 # transmissive. Everything else that blocks is treated as opaque structure.
 VEG_CLASSES_ADE20K = (4, 9, 17, 66)  # tree, grass, plant, flower
+TERRAIN_CLASS = 1  # ADE20K "building": terrain whose kind is unknown (a colour vote)
+
+
+def type_name(cls):
+    """ADE20K class -> the mask's vocabulary. -1 means nothing was segmented."""
+    if cls < 0:
+        return ""
+    return "tree" if cls in VEG_CLASSES_ADE20K else "structure"
 
 
 def _wrap_roots(labels, n):
@@ -331,6 +339,19 @@ def _wrap_roots(labels, n):
         if a and b:
             root[find(int(a))] = find(int(b))
     return np.array([find(i) for i in range(n + 1)])
+
+
+def sky_outline(votes, cover):
+    """Where the contiguous sky meets real terrain, from a running frame vote:
+    the horizon as far as the frames judged so far can tell (for watching a
+    build, in panorama space; the map itself comes from terminus.reproject)."""
+    from scipy import ndimage
+
+    sky = votes * 2 > cover
+    valid = cover > 0
+    open_sky = connected_sky(sky, valid)
+    edge = open_sky & ndimage.binary_dilation(valid & ~sky)
+    return ndimage.binary_dilation(edge, iterations=2)
 
 
 def connected_sky(sky, valid=None):

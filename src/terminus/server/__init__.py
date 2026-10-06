@@ -26,6 +26,16 @@ Routes (payload shapes: schema.json beside this file):
   GET  /site/horizon      the open site's columns, orientation and fit record
   GET  /site/disc         the polar disc's overlays, in disc pixels
   GET  /site/panorama.jpg, /site/disc.jpg   the photographs
+  GET  /site/frames       the photos: where each sits on the panorama, which are off
+  GET  /site/frame/footprint.png?name=, /site/frame/thumb.jpg?name=   one photo
+  GET  /site/disagree.png where the photos outvoted each other on sky
+  GET  /site/outline.png  the actual horizon: the sky's outline, as a disc overlay
+  GET  /site/frame/layer.webp?layer=, /site/frame/verdict.png?layer=   a build's
+                          remapped photo and its sky verdict, as they are made
+  POST /site/rename       {"slug": name, "name": text}: the site's display name
+  POST /site/delete       {"slug": name}: remove the site (not while it is building)
+  POST /site/frames       {"off": [name, ...], "restitch": bool}: rebuild without those
+                          photos, re-blending the stitched ones or stitching afresh
   GET  /dev/state         state plus recent log lines; exists only with --dev
 """
 
@@ -41,6 +51,7 @@ import signal
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
@@ -79,6 +90,9 @@ class Sidecar(ThreadingHTTPServer):
     # Threads, so an idle or slow connection cannot hold up shutdown (and the
     # park behind it); daemon threads, so shutdown does not wait for them.
     daemon_threads = True
+    # The listen backlog. The default of 5 refuses connections on Windows when the
+    # app fetches a site's photos in parallel (Linux absorbs the burst instead).
+    request_queue_size = 64
     # SO_REUSEADDR on Windows lets another process bind the same port.
     allow_reuse_address = False
 
@@ -184,7 +198,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if isinstance(out, bytes):
-            return self._send_bytes(out, "image/jpeg")
+            kind = "image/jpeg"
+            if out[:4] == b"\x89PNG":
+                kind = "image/png"
+            elif out[8:12] == b"WEBP":
+                kind = "image/webp"
+            return self._send_bytes(out, kind)
         return self._send(200, out)
 
     def do_GET(self):
@@ -206,6 +225,22 @@ class _Handler(BaseHTTPRequestHandler):
             "/site/disc": lambda: self._site_view(views.disc),
             "/site/panorama.jpg": lambda: self._site_view(views.panorama_jpeg),
             "/site/disc.jpg": lambda: self._site_view(views.disc_jpeg),
+            "/site/frames": lambda: self._site_view(views.frames),
+            "/site/frame/footprint.png": lambda: self._site_view(
+                lambda d: views.footprint_png(d, self._name())
+            ),
+            "/site/frame/thumb.jpg": lambda: self._site_view(
+                lambda d: views.thumb_jpg(d, self._name())
+            ),
+            "/site/disagree.png": lambda: self._site_view(views.disagree_png),
+            "/site/outline.png": lambda: self._site_view(views.outline_png),
+            "/site/progress.png": lambda: self._site_view(views.progress_png),
+            "/site/frame/layer.webp": lambda: self._site_view(
+                lambda d: views.layer_webp(d, self._query("layer"))
+            ),
+            "/site/frame/verdict.png": lambda: self._site_view(
+                lambda d: views.verdict_png(d, self._query("layer"))
+            ),
         }
         if sv.dev:
             routes["/dev/state"] = lambda: self._send(
@@ -225,11 +260,23 @@ class _Handler(BaseHTTPRequestHandler):
             "/sites": lambda: self._new_site(body.get("photos")),
             "/site/open": lambda: self._open_site(body.get("slug")),
             "/site/spin": lambda: self._set_spin(body.get("deg")),
+            "/site/frames": lambda: self._curate(body.get("off"), body.get("restitch", False)),
+            "/site/rename": lambda: self._rename(body.get("slug"), body.get("name")),
+            "/site/delete": lambda: self._delete(body.get("slug")),
         }
         self._dispatch(routes)
 
+    def _query(self, key):
+        values = parse_qs(urlsplit(self.path).query).get(key, [])
+        if len(values) != 1:
+            raise sites.SiteError(f"expected one ?{key}=")
+        return values[0]
+
+    def _name(self):
+        return self._query("name")
+
     def _dispatch(self, routes):
-        route = routes.get(self.path)
+        route = routes.get(urlsplit(self.path).path)
         if route is None:
             return self._send(404, {"error": "not found"})
         try:
@@ -269,6 +316,42 @@ class _Handler(BaseHTTPRequestHandler):
         sv.slug, sv.state["spin"] = slug, 0.0
         self._send(200, sv.snapshot())
 
+    def _curate(self, off, restitch):
+        """Turn photos off (or back on) and rebuild the open site without them. A
+        photo the last stitch left out has no layer to re-blend: bringing it back
+        takes a re-stitch."""
+        sv = self.server
+        d = sv.site_dir()
+        listed = {f["name"] for f in (views.frames(d) or {}).get("frames", ())}
+        if not isinstance(off, list) or not all(isinstance(n, str) and n in listed for n in off):
+            raise sites.SiteError("off must list photos of this site")
+        if not isinstance(restitch, bool):
+            raise sites.SiteError("restitch must be true or false")
+        if sv.jobs.busy():
+            raise sites.SiteError("a site is already being built")
+        sites.set_frames_off(d, off)
+        kind = "build" if restitch else "reblend"
+        log.info("site %s: %d photos off, %s", sv.slug, len(off), kind)
+        sv.jobs.start(sv.slug, d, kind)
+        self._send(200, sv.snapshot())
+
+    def _rename(self, slug, name):
+        sites.rename_site(self.server.sites_root, slug, name)
+        log.info("site %s renamed", slug)
+        self._send(200, self.server.snapshot())
+
+    def _delete(self, slug):
+        sv = self.server
+        sites.site_dir(sv.sites_root, slug)  # refuses an unknown or malformed name
+        job = sv.jobs.state
+        if sv.jobs.busy() and job and job["site"] == slug:
+            raise sites.SiteError("this site is being built; wait for it to finish")
+        sites.delete_site(sv.sites_root, slug)
+        if sv.slug == slug:
+            sv.slug, sv.state["spin"] = None, 0.0
+        log.info("site %s deleted", slug)
+        self._send(200, sv.snapshot())
+
     def _open_site(self, slug):
         sv = self.server
         sites.site_dir(sv.sites_root, slug)  # refuses an unknown or malformed name
@@ -286,7 +369,10 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _stop_on_eof(server):
     try:
-        sys.stdin.read()
+        if os.name == "nt":
+            sites._poll_until_closed()  # never block in a stdin read on Windows (E-19)
+        else:
+            sys.stdin.read()
         log.info("stdin closed, shutting down")
     except Exception:
         # No usable stdin means no way to be told to stop: stop now, not never.
@@ -301,6 +387,7 @@ def main(argv=None):
     p.add_argument("--sites", help="the folder that holds the app's sites (required to serve)")
     p.add_argument("--hugin", help="the bundled Hugin tools; default: look them up on PATH")
     p.add_argument("--pipeline", metavar="SITE", help=argparse.SUPPRESS)  # the build child
+    p.add_argument("--kind", choices=sites.KINDS, default="build", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if args.hugin:
         from .. import mosaic
@@ -308,7 +395,7 @@ def main(argv=None):
         mosaic.HUGIN_BIN = args.hugin
     if args.pipeline:
         threading.Thread(target=sites.exit_on_eof, daemon=True).start()
-        return sites.run_pipeline(args.pipeline)
+        return sites.run_pipeline(args.pipeline, args.kind)
     if not args.sites:
         p.error("--sites is required")
     logging.basicConfig(

@@ -1852,6 +1852,8 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
     from . import mosaic
 
     mosaic.require_hugin()  # raises MosaicError naming what to install
+    if getattr(args, "events", False):
+        _watch_events(mosaic)
     work = args.work or os.path.join(args.image_dir.rstrip("/") + "_mosaic")
     os.makedirs(work, exist_ok=True)
     base = args.out or os.path.join(work, "equirect")
@@ -1862,6 +1864,7 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
         lens=args.lens,
         min_points=args.min_points,
         celeste=not args.no_celeste,
+        exclude=set(getattr(args, "exclude", ())),
     )
     counts = mosaic.control_point_counts(pto)
     kept = [n for n in counts if n not in dropped]
@@ -1876,9 +1879,13 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
         raise mosaic.MosaicError("no frame could be constrained; nothing to render")
 
     tiffs, final = mosaic.render(pto, work, width=args.width, height=args.height)
-    img, coverage, gains = mosaic.composite(tiffs, args.width, args.height)
-    Image.fromarray(img).save(base + ".png")
-    np.save(base + ".coverage.npy", coverage)
+    mosaic._emit(working=[])
+    layers_only = getattr(args, "layers_only", False)
+    gains = []
+    if not layers_only:
+        img, coverage, gains = mosaic.composite(tiffs, args.width, args.height)
+        Image.fromarray(img).save(base + ".png")
+        np.save(base + ".coverage.npy", coverage)
     figure_path = None
     if getattr(args, "photometric", False):
         # The SAME geometric solve, rendered a second time with Hugin's
@@ -1914,14 +1921,228 @@ def cmd_mosaic(sc, cfg, args):  # sc, cfg unused: offline
     )
     if args.segment:
         _segment_frames(args, mosaic, final, base, work)
-    covered = float((coverage > 0).any(axis=0).mean()) * 100.0
-    print(f"wrote {base}.png ({args.width}x{args.height}, {covered:.0f}% of azimuth covered)")
-    print(f"wrote {base}.coverage.npy and {base}.manifest.json")
+    if layers_only:
+        print(
+            f"wrote {len(tiffs)} layers in {work} and {base}.manifest.json; blend them with reblend"
+        )
+    else:
+        covered = float((coverage > 0).any(axis=0).mean()) * 100.0
+        print(f"wrote {base}.png ({args.width}x{args.height}, {covered:.0f}% of azimuth covered)")
+        print(f"wrote {base}.coverage.npy and {base}.manifest.json")
     if figure_path:
         print(
             f"wrote {figure_path} (photometric FIGURE render: use it for polar "
             "backdrops and papers; measurements keep coming from the plain render)"
         )
+
+
+def cmd_reblend(sc, cfg, args):  # sc, cfg unused: offline
+    """Re-blend a stitched panorama from its frames, some turned off, and vote on
+    the sky frame by frame. No Hugin: the frames are already remapped, and
+    dropping one barely moves the others, so their layers are reused as they are.
+    """
+    import glob
+    import json
+
+    import numpy as np
+    from PIL import Image
+
+    from . import mosaic, skymask
+
+    final = os.path.join(args.work, "final.pto")
+    if not os.path.isfile(final):
+        raise SeestarError(
+            f"{args.work} holds no stitched panorama (no final.pto); run mosaic first"
+        )
+    names = mosaic.source_images(final)
+    layers = sorted(glob.glob(os.path.join(args.work, "layer*.tif")))
+    if len(layers) != len(names):
+        raise SeestarError(
+            f"{args.work} has {len(layers)} layers for {len(names)} frames; re-run mosaic"
+        )
+    width, height = mosaic.canvas_size(final)
+    if args.events:
+        _watch_events(mosaic)
+    off = set(args.off)
+    for name in sorted(off - {os.path.basename(n) for n in names}):
+        print(f"{name} is not in this panorama (left out of the stitch)")
+    kept = [
+        path for name, path in zip(names, layers, strict=True) if os.path.basename(name) not in off
+    ]
+    if not kept:
+        raise SeestarError("every frame is turned off; nothing to blend")
+    manifest = {}
+    if os.path.isfile(args.out + ".manifest.json"):
+        with open(args.out + ".manifest.json") as fh:
+            manifest = json.load(fh)
+    counts, need = manifest.get("control_points", {}), manifest.get("min_points")
+    mosaic._emit(canvas=[width, height])
+    for name in manifest.get("dropped", ()):
+        c = counts.get(name, 0)
+        mosaic._emit(name=name, state="dropped", points=c,
+                     reason=f"{c} control points (needs {need})")  # fmt: skip
+    for name, path in zip(names, layers, strict=True):
+        name = os.path.basename(name)
+        if name in off:
+            mosaic._emit(name=name, state="off")
+        else:
+            box = list(mosaic.footprint(path)[0])
+            mosaic._emit(name=name, state="placed", layer=os.path.basename(path), box=box)
+    print(f"blending {len(kept)} of {len(names)} frames", flush=True)
+    mosaic._emit(phase="blending")
+    # Each frame's gains and sky verdict are kept beside its layer and reused
+    # until a re-stitch rewrites the layer, so turning a frame off or on
+    # re-solves nothing for the others.
+    cache_path = os.path.join(args.work, "cache.json")
+    cache = {}
+    if os.path.isfile(cache_path):
+        with open(cache_path) as fh:
+            cache = json.load(fh)
+    stamp = {os.path.basename(p): os.stat(p).st_mtime_ns for p in kept}
+    if all(cache.get(k, {}).get("stamp") == s for k, s in stamp.items()):
+        gains = [cache[os.path.basename(p)]["gain"] for p in kept]
+        rgb_gains = [cache[os.path.basename(p)]["rgb"] for p in kept]
+    else:
+        everyone = [os.path.basename(n) for n, p in zip(names, layers, strict=True) if p in kept]
+        mosaic._emit(detail="evening out brightness across the photos", working=everyone)
+        loaded = [mosaic._layer(p) for p in kept]
+        gains, rgb_gains = mosaic.solve_gains(loaded), mosaic.channel_gains(loaded).tolist()
+        cache = {
+            k: {"stamp": s, "gain": float(g), "rgb": rg}
+            for (k, s), g, rg in zip(stamp.items(), gains, rgb_gains, strict=True)
+        }
+        with open(cache_path, "w") as fh:
+            json.dump(cache, fh)
+    mosaic._emit(detail="building the panorama the horizon is read from", working=[])
+    img, coverage, _gains = mosaic.composite(kept, width, height, gains=gains)
+    Image.fromarray(img).save(args.out + ".png")
+    np.save(args.out + ".coverage.npy", coverage)
+    # For the eye only: colour-matched and feathered. Measurements never read it.
+    by_layer = {
+        os.path.basename(p): os.path.basename(n) for n, p in zip(names, layers, strict=True)
+    }
+    mosaic._emit(detail="feathering the seams")
+    shown = mosaic.blend(
+        kept,
+        width,
+        height,
+        gains=rgb_gains,
+        on_frame=lambda path: mosaic._emit(working=[by_layer[os.path.basename(path)]]),
+    )
+    Image.fromarray(shown).save(args.out + ".display.jpg", quality=90)
+    print("voting on the sky frame by frame", flush=True)
+    mosaic._emit(phase="judging")
+
+    def verdict_png(path):
+        return os.path.join(
+            args.work, "sky_" + os.path.splitext(os.path.basename(path))[0] + ".png"
+        )
+
+    def known(path):
+        verdict = verdict_png(path)
+        if os.path.isfile(verdict) and os.stat(verdict).st_mtime_ns >= os.stat(path).st_mtime_ns:
+            mosaic._emit(name=by_layer[os.path.basename(path)], state="judged")
+            return np.asarray(Image.open(verdict)) > 0
+        return None
+
+    def judged(path, mine, _origin):
+        Image.fromarray(np.where(mine, 255, 0).astype(np.uint8)).save(verdict_png(path))
+        mosaic._emit(name=by_layer[os.path.basename(path)], state="judged")
+
+    sky_class = skymask.SKY_CLASS_ADE20K
+    drawn = [0]
+
+    def draw_progress(votes, cover):
+        """The horizon so far, for the app to lay over the panorama it is watching."""
+        edge = skymask.sky_outline(votes, cover)
+        rgba = np.zeros(edge.shape + (4,), np.uint8)
+        rgba[edge] = (255, 214, 64, 255)
+        small = Image.fromarray(rgba, "RGBA").resize((width // 2, height // 2))
+        tmp = os.path.join(args.work, "progress.tmp.png")
+        small.save(tmp)
+        os.replace(tmp, os.path.join(args.work, "progress.png"))
+        drawn[0] += 1
+        mosaic._emit(outline=drawn[0])
+
+    label_layers = sorted(glob.glob(os.path.join(args.work, "label*.tif")))
+    if len(label_layers) == len(layers):
+        # The frames were segmented (mosaic --segment): vote on their labels.
+        # combine_terrain_biased keeps each obstruction's own class, so a tree
+        # stays a tree (and earns the planning line's tree buffer).
+        label_of = dict(zip(layers, label_layers, strict=True))
+        run_votes = np.zeros((height, width), np.int32)
+        run_cover = np.zeros((height, width), np.int32)
+        for path in kept:
+            mosaic._emit(working=[by_layer[os.path.basename(path)]])
+            rgb, m, ox, oy = mosaic._layer(label_of[path])
+            own = (rgb[..., 0] == sky_class) & m
+            Image.fromarray(np.where(own, 255, 0).astype(np.uint8)).save(verdict_png(path))
+            ys, xs = np.nonzero(m)
+            Y, X = ys + oy, xs + ox
+            ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
+            run_cover[Y[ok], X[ok]] += 1
+            run_votes[Y[ok], X[ok]] += own[ys[ok], xs[ok]]
+            draw_progress(run_votes, run_cover)
+            mosaic._emit(name=by_layer[os.path.basename(path)], state="judged")
+        classes, votes, cover = mosaic.combine_terrain_biased(
+            [label_of[p] for p in kept], width, height
+        )
+        sky = classes == sky_class
+        covered = cover > 0
+        unanimous = covered & (votes == cover)
+        strict = np.where(sky, np.where(unanimous, sky_class, 4), classes)  # disputed sky: tree
+        outvoted = np.where(sky, cover - votes, votes)
+        disagree = np.where(covered, outvoted / np.maximum(cover, 1), 0.0)
+    else:
+        px_per_deg = width / 360.0
+        sky, disagree, votes, cover = mosaic.vote_sky(
+            kept,
+            width,
+            height,
+            lambda rgb, valid: skymask.heuristic_sky(rgb, valid=valid, px_per_deg=px_per_deg),
+            on_frame=judged,
+            margin=int(np.ceil(15.0 * px_per_deg)),  # heuristic_sky's half_deg reach
+            known=known,
+            on_start=lambda path: mosaic._emit(working=[by_layer[os.path.basename(path)]]),
+            counts=True,
+            on_vote=draw_progress,
+        )
+        # A colour vote knows sky from not-sky, not what the obstruction is.
+        covered = cover > 0
+        terrain = np.where(covered, skymask.TERRAIN_CLASS, -1)
+        classes = np.where(sky, sky_class, terrain)
+        strict = np.where(covered & (votes == cover), sky_class, terrain)
+    np.save(args.out + ".sky.npy", sky)
+    # The class maps `terminus horizon` reads: terrain-biased (the vote), strict
+    # (sky only where every covering frame agreed) and the frame count.
+    np.save(args.out + ".terrain.classes.npy", classes)
+    np.save(args.out + ".strict.classes.npy", strict)
+    np.save(args.out + ".cover.npy", cover.astype(np.int16))
+    np.save(args.out + ".disagree.npy", disagree.astype(np.float16))
+
+    image_dir = manifest.get("image_dir")
+    photos = sorted(os.listdir(image_dir)) if image_dir and os.path.isdir(image_dir) else []
+    placed = {os.path.basename(n): path for n, path in zip(names, layers, strict=True)}
+    frames = []
+    for name in sorted(set(photos) | set(placed)):
+        box = list(mosaic.footprint(placed[name])[0]) if name in placed else None
+        frames.append({
+            "name": name,
+            "layer": os.path.basename(placed[name]) if name in placed else None,
+            "box": box,
+            "off": name in off,
+            "dropped": name in manifest.get("dropped", ()),
+        })  # fmt: skip
+    with open(args.out + ".frames.json", "w") as fh:
+        json.dump({"width": width, "height": height, "frames": frames}, fh, indent=1)
+    print(f"wrote {args.out}.png, .sky.npy, .disagree.npy and .frames.json")
+
+
+def _watch_events(mosaic):
+    """Print mosaic's progress events as `@event {json}` lines for the app."""
+    import json
+
+    mosaic.EVENTS = lambda event: print("@event " + json.dumps(event), flush=True)
 
 
 def _segment_frames(args, mosaic, final, base, work):
@@ -1954,16 +2175,21 @@ def _segment_frames(args, mosaic, final, base, work):
     label_dir = os.path.join(work, "labels")
     os.makedirs(label_dir, exist_ok=True)
     label_for = {}
+    mosaic._emit(phase="segmenting")
     for i, name in enumerate(names, 1):
         src = os.path.join(os.path.dirname(final), name)
-        print(f"  segmenting frame {i}/{len(names)}: {os.path.basename(name)}", flush=True)
-        classes = skymask.segment_classes(Image.open(src).convert("RGB"))
-        # The class id in all three channels: nona remaps RGB, and reading one
-        # channel back is simpler than persuading it to carry a palette.
-        lab = np.repeat(classes.astype(np.uint8)[:, :, None], 3, axis=2)
-        path = os.path.join(label_dir, f"{i:03d}.png")
-        Image.fromarray(lab).save(path)
+        # Kept by photo name: a re-stitch does not segment a photo twice.
+        path = os.path.join(label_dir, os.path.splitext(os.path.basename(name))[0] + ".png")
+        mosaic._emit(working=[os.path.basename(name)])
+        if not os.path.isfile(path):
+            print(f"  segmenting frame {i}/{len(names)}: {os.path.basename(name)}", flush=True)
+            classes = skymask.segment_classes(Image.open(src).convert("RGB"))
+            # The class id in all three channels: nona remaps RGB, and reading one
+            # channel back is simpler than persuading it to carry a palette.
+            lab = np.repeat(classes.astype(np.uint8)[:, :, None], 3, axis=2)
+            Image.fromarray(lab).save(path)
         label_for[name] = os.path.relpath(path, os.path.dirname(final))
+    mosaic._emit(working=[])
     layers = mosaic.remap_labels(final, work, label_for)
     classes = mosaic.combine_labels(layers, args.width, args.height)
     np.save(base + ".classes.npy", classes)
@@ -1972,12 +2198,9 @@ def _segment_frames(args, mosaic, final, base, work):
 
 
 def _type_name(cls):
-    """ADE20K class -> the mask's vocabulary. -1 means nothing was segmented."""
-    from .skymask import VEG_CLASSES_ADE20K
+    from .skymask import type_name
 
-    if cls < 0:
-        return ""
-    return "tree" if cls in VEG_CLASSES_ADE20K else "structure"
+    return type_name(cls)
 
 
 def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
@@ -2019,7 +2242,15 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
                 "from the same mosaic run"
             )
 
-    if seg is not None:
+    if args.sky:
+        sky = np.load(args.sky)
+        if sky.shape != (h, w):
+            raise SeestarError(
+                f"sky {sky.shape} does not match the image {(h, w)}; it must come from "
+                "the same reblend"
+            )
+        backend = "heuristic (per-frame vote)"
+    elif seg is not None:
         # THE ALTITUDES COME FROM THE FRAMES TOO, not just the obstruction type.
         # For a long time only the type did, and the two were indistinguishable
         # from outside: a mask written before the per-frame labels existed and
@@ -2129,6 +2360,40 @@ def cmd_skymask(sc, cfg, args):  # sc, cfg unused: offline
     print("not exporting: an unoriented mask must not be handed to a planner")
 
 
+def cmd_horizon(sc, cfg, args):  # sc, cfg unused: offline
+    """The horizon map: actual and planning per azimuth, from one reprojection of
+    the frames' own class maps (see terminus.reproject)."""
+    import numpy as np
+    import yaml
+
+    from .export import write_mask
+    from .reproject import true_horizon
+
+    maps = {}
+    for key in ("terrain.classes", "strict.classes", "cover", "coverage"):
+        path = f"{args.base}.{key}.npy"
+        if not os.path.isfile(path):
+            raise SeestarError(f"{path} is missing; run `terminus reblend` first")
+        maps[key] = np.load(path)
+    meta = {"oriented": False, "source": os.path.abspath(args.base)}
+    solution = None
+    if args.solution:
+        with open(args.solution) as fh:
+            meta = yaml.safe_load(fh)["meta"]
+        solution = {k: float(meta[k]) for k in ("yaw", "pitch", "tilt_mag", "tilt_dir")}
+    mask = true_horizon(
+        maps["terrain.classes"], maps["strict.classes"], maps["cover"], maps["coverage"], solution
+    )
+    if not mask:
+        raise SeestarError("no column has a horizon; check the photos' coverage")
+    meta = dict(meta, note="actual + planning horizons from one reprojection (terminus horizon)")
+    write_mask(args.out, mask, [], meta)
+    fuzz = [c["fuzz"] for c in mask.values()]
+    print(
+        f"wrote {args.out}: {len(mask)} columns, planning above actual by up to {max(fuzz):.1f} deg"
+    )
+
+
 NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
 # Offline: no scope, no network, and no config.toml — a user with photographs
 # and no telescope must not be made to write one.
@@ -2136,7 +2401,7 @@ NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
 # never looks at cfg. Demanding config.toml for it meant a machine with no
 # telescope could not re-export its own mask — and it was CI, which has no
 # config.toml, that surfaced this rather than any local run.
-OFFLINE = {"mosaic", "skymask", "export", "polar"}
+OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar"}
 
 
 def _is_offline(args):
@@ -2362,6 +2627,18 @@ def main(argv=None):
     mo.add_argument("--height", type=int, default=1440)
     mo.add_argument("--no-celeste", action="store_true", help="skip cpfind's sky filter")
     mo.add_argument(
+        "--layers-only",
+        action="store_true",
+        help="stop after remapping the frames: no blend, no .png (for `terminus reblend`)",
+    )
+    mo.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="FRAME",
+        help="leave this photo out of the stitch (repeatable)",
+    )
+    mo.add_argument(
         "--segment",
         action="store_true",
         help="segment each FRAME and warp the labels through the same solve, writing "
@@ -2378,6 +2655,30 @@ def main(argv=None):
         "seams stay hard (a visible seam is how you check the registration)",
     )
 
+    rb = sub.add_parser(
+        "reblend",
+        help="re-blend a stitched panorama with some frames off, voting on the sky frame by frame",
+    )
+    rb.add_argument("work", help="the mosaic --work folder (final.pto and its layers)")
+    rb.add_argument("--out", required=True, help="output basename, as given to mosaic --out")
+    rb.add_argument(
+        "--off", action="append", default=[], metavar="FRAME", help="leave this frame out"
+    )
+    for sp in (mo, rb):
+        sp.add_argument("--events", action="store_true", help="print progress as @event lines")
+
+    hz = sub.add_parser(
+        "horizon", help="the horizon map (actual + planning) from reblend's class maps"
+    )
+    hz.add_argument("base", help="the --out basename given to reblend (e.g. site/equirect)")
+    hz.add_argument("--out", required=True)
+    hz.add_argument(
+        "--solution",
+        default=None,
+        help="a mask whose meta carries yaw/pitch/tilt (an oriented mask); "
+        "without it the map stays in the panorama's own azimuth",
+    )
+
     sk = sub.add_parser("skymask", help="read a horizon off a panorama (UNORIENTED)")
     sk.add_argument("image")
     sk.add_argument("--backend", choices=("auto", "segment", "heuristic"), default="auto")
@@ -2392,6 +2693,12 @@ def main(argv=None):
         default=None,
         help="the .classes.npy from `terminus mosaic --segment`: obstruction types "
         "read from the frames themselves rather than from the stitched panorama",
+    )
+    sk.add_argument(
+        "--sky",
+        default=None,
+        help="the .sky.npy from `terminus reblend`: the frames' own sky vote, used "
+        "instead of classifying the blended panorama",
     )
     sk.add_argument("--out", default=None)
     sk.add_argument("--az-step", type=float, default=1.0)
@@ -2422,6 +2729,8 @@ def main(argv=None):
         "export": cmd_export,
         "polar": cmd_polar,
         "mosaic": cmd_mosaic,
+        "reblend": cmd_reblend,
+        "horizon": cmd_horizon,
         "skymask": cmd_skymask,
         "orient": cmd_orient,
     }

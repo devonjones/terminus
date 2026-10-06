@@ -35,6 +35,9 @@ function writeDevSession(sc: Sidecar) {
 }
 
 const PHOTO_EXTENSIONS = ["jpg", "jpeg", "png", "tif", "tiff"];
+// A photo's file name as the sidecar lists it; the sidecar refuses any it does not.
+const isName = (n: unknown): n is string =>
+  typeof n === "string" && n.length > 0 && n.length < 256 && !/[\\/]/.test(n);
 
 // Every renderer call is checked here: the sender must be our page, and each
 // argument must have the shape the sidecar expects before it is forwarded.
@@ -57,6 +60,13 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
   handle("site:open", (slug) =>
     request<AppState>(sc, "/site/open", { slug: shortString(slug, "site") }),
   );
+  handle("site:rename", (slug, name) => {
+    if (typeof name !== "string" || name.length > 200) throw new Error("expected a site name");
+    return request<AppState>(sc, "/site/rename", { slug: shortString(slug, "site"), name });
+  });
+  handle("site:delete", (slug) =>
+    request<AppState>(sc, "/site/delete", { slug: shortString(slug, "site") }),
+  );
   handle("site:spin", (deg) => {
     if (typeof deg !== "number" || !Number.isFinite(deg)) throw new Error("spin must be a number");
     return request<AppState>(sc, "/site/spin", { deg });
@@ -64,8 +74,30 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
   handle("site:horizon", () => view(sc, "/site/horizon"));
   handle("site:disc", () => view(sc, "/site/disc"));
   handle("site:image", (name) => {
+    if (name === "disagree" || name === "outline" || name === "progress")
+      return view(sc, `/site/${name}.png`);
     if (name !== "panorama" && name !== "disc") throw new Error("unknown image");
     return view(sc, `/site/${name}.jpg`);
+  });
+  handle("site:frames", () => view(sc, "/site/frames"));
+  handle("site:frame-image", (kind, name) => {
+    if (kind !== "footprint" && kind !== "thumb") throw new Error("unknown frame image");
+    if (!isName(name)) throw new Error("expected a photo name");
+    const file = kind === "footprint" ? "footprint.png" : "thumb.jpg";
+    return view(sc, `/site/frame/${file}?name=${encodeURIComponent(name)}`);
+  });
+  handle("site:build-image", (kind, layer) => {
+    if (kind !== "layer" && kind !== "verdict") throw new Error("unknown build image");
+    if (typeof layer !== "string" || !/^layer\d{4}\.tif$/.test(layer))
+      throw new Error("expected a layer file name");
+    const file = kind === "layer" ? "layer.webp" : "verdict.png";
+    return view(sc, `/site/frame/${file}?layer=${layer}`);
+  });
+  handle("site:curate", (off, restitch) => {
+    if (!Array.isArray(off) || off.length > 500 || !off.every(isName))
+      throw new Error("expected a list of photo names");
+    if (typeof restitch !== "boolean") throw new Error("restitch must be a boolean");
+    return request<AppState>(sc, "/site/frames", { off, restitch });
   });
   // The file dialog is opened here, not in the page, so the page never chooses paths.
   handle("site:pick", async () => {

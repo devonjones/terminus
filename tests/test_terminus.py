@@ -9871,3 +9871,107 @@ def test_a_missing_bundled_tool_is_an_error_not_a_path_lookup(tmp_path, monkeypa
     with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
         with pytest.raises(mosaic.MosaicError, match="nona is missing from"):
             mosaic._run(["nona", "-o", "x"])
+
+
+def _sky_layer(path, sky_cols, box):
+    """A remapped frame inside `box`: blue (sky) in the canvas columns
+    `sky_cols`, brown elsewhere."""
+    import numpy as np
+    from PIL import Image
+
+    x0, y0, x1, y1 = box
+    rgba = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+    rgba[..., :3] = (120, 80, 40)
+    for x in range(x0, x1):
+        if x in sky_cols:
+            rgba[:, x - x0, :3] = (80, 120, 220)
+    rgba[..., 3] = 255
+    Image.fromarray(rgba, "RGBA").save(
+        path, tiffinfo={286: ((x0, 1),), 287: ((y0, 1),), 282: ((1, 1),), 283: ((1, 1),)}
+    )
+    return str(path)
+
+
+def _blue(rgb, valid):
+    return (rgb[..., 2] > rgb[..., 0]) & valid
+
+
+def test_vote_sky_needs_a_strict_majority_and_reports_who_was_outvoted(tmp_path):
+    """Terrain wins a tie: a horizon placed too high costs a target, one too low
+    sends the scope into a roof."""
+    from terminus.mosaic import vote_sky
+
+    paths = [
+        _sky_layer(tmp_path / "a.tif", {0, 1, 2}, (0, 0, 4, 2)),  # col 3: terrain
+        _sky_layer(tmp_path / "b.tif", {0, 1}, (0, 0, 4, 2)),  # cols 2, 3: terrain
+        _sky_layer(tmp_path / "c.tif", {0, 2}, (0, 0, 3, 2)),
+    ]
+    sky, disagree = vote_sky(paths, 6, 2, _blue)
+    assert sky[0].tolist() == [True, True, True, False, False, False]
+    # col 0 unanimous sky; col 1 2-of-3 (c outvoted); col 2 2-of-3 (b outvoted);
+    # col 3 unanimous terrain.
+    assert disagree[0, :4].round(3).tolist() == [0.0, 0.333, 0.333, 0.0]
+    assert disagree[0, 4:].tolist() == [0.0, 0.0], "no frame covers here"
+
+
+def test_vote_sky_breaks_a_tie_toward_terrain(tmp_path):
+    from terminus.mosaic import vote_sky
+
+    paths = [
+        _sky_layer(tmp_path / "a.tif", {0}, (0, 0, 1, 1)),
+        _sky_layer(tmp_path / "b.tif", set(), (0, 0, 1, 1)),
+    ]
+    sky, disagree = vote_sky(paths, 1, 1, _blue)
+    assert not sky[0, 0] and disagree[0, 0] == 0.5
+
+
+def test_canvas_size_reads_the_projects_panorama_line(tmp_path):
+    from terminus.mosaic import MosaicError, canvas_size
+
+    pto = tmp_path / "final.pto"
+    pto.write_text('p f2 w2880 h1440 v360 n"TIFF_m"\ni w4000 h3000 n"a.jpg"\n')
+    assert canvas_size(str(pto)) == (2880, 1440)
+    pto.write_text('i w4000 h3000 n"a.jpg"\n')
+    with pytest.raises(MosaicError):
+        canvas_size(str(pto))
+
+
+def test_cpfind_progress_becomes_events(monkeypatch):
+    from terminus import mosaic
+
+    seen = []
+    monkeypatch.setattr(mosaic, "EVENTS", seen.append)
+    follow = mosaic._follow_cpfind(["a.jpg", "b.jpg", "c.jpg"])
+    for line in (
+        "--- Analyze Images ---",
+        "i1 : Analyzing image...",
+        "i0 : Analyzing image...",
+        "i1 : Caching keypoints...",
+        "--- Find matches ---",
+        "i0 <> i2 : Found 17 matches",
+        "--- Something cpfind adds one day ---",
+        "Using 11 threads",
+    ):
+        follow(line)
+    assert seen == [
+        {"detail": "finding features in each photo"},
+        {"working": ["b.jpg"]},
+        {"working": ["a.jpg", "b.jpg"]},
+        {"working": ["a.jpg"]},
+        {"detail": "comparing neighbouring photos"},
+        {"pair": ["a.jpg", "c.jpg"], "matches": 17, "working": ["a.jpg", "c.jpg"]},
+    ], "unknown stages and chatter are ignored"
+
+
+def test_sky_outline_runs_where_the_open_sky_meets_terrain():
+    import numpy as np
+
+    from terminus.skymask import sky_outline
+
+    votes = np.zeros((20, 30), np.int32)
+    cover = np.full((20, 30), 2, np.int32)
+    votes[:8] = 2  # sky above row 8
+    votes[14:16, 10:12] = 2  # a sky-coloured patch inside the ground: not open sky
+    edge = sky_outline(votes, cover)
+    assert edge[7].all(), "the line runs along the last sky row"
+    assert not edge[:4].any() and not edge[11:].any(), "nowhere else: not the patch"

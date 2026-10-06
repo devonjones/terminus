@@ -303,7 +303,8 @@ def child(script):
 OK_CHILD = (
     "import sys, pathlib; d = pathlib.Path(sys.argv[2]); print('@step mosaic'); "
     "print('registered 18 frames'); print('@step skymask'); print('args', sys.argv[1:]); "
-    "(d / 'equirect.png').write_bytes(b'x'); (d / 'photo_mask.yaml').write_text('x')"
+    "(d / 'equirect.png').write_bytes(b'x'); (d / 'photo_mask.yaml').write_text('x'); "
+    "(d / 'horizon.yaml').write_text('x')"
 )
 
 
@@ -362,17 +363,41 @@ def test_site_dir_refuses_anything_but_an_existing_slug(tmp_path, slug):
     assert sites.site_dir(str(tmp_path), "site-a") == str(tmp_path / "site-a")
 
 
-def test_the_pipeline_child_runs_mosaic_then_skymask_on_the_site(tmp_path, capsys):
+def test_the_pipeline_child_stitches_reblends_then_reads_the_voted_sky(tmp_path, capsys):
     from terminus.server import sites
 
     d = _site(tmp_path, panorama=False)
     calls = []
     sites.run_pipeline(str(d), run=calls.append)
-    assert [argv[0] for argv in calls] == ["mosaic", "skymask"]
-    mosaic, skymask = calls
-    assert mosaic[1] == str(d / "photos") and mosaic[-1] == str(d / "equirect")
+    assert [argv[0] for argv in calls] == ["mosaic", "reblend", "skymask", "horizon"]
+    mosaic, reblend, skymask, horizon = calls
+    assert mosaic[1] == str(d / "photos") and mosaic[mosaic.index("--out") + 1] == str(
+        d / "equirect"
+    )
+    assert reblend[1:] == [str(d / "work"), "--out", str(d / "equirect"), "--events"]
+    assert "--events" in mosaic, "the app watches each photo's progress"
+    assert "--layers-only" in mosaic, "reblend does the blending; the stitch must not too"
     assert skymask[1] == str(d / "equirect.png") and skymask[-1] == str(d / "photo_mask.yaml")
-    assert capsys.readouterr().out == "@step mosaic\n@step skymask\n"
+    assert skymask[skymask.index("--sky") + 1] == str(d / "equirect.sky.npy")
+    assert horizon[1:] == [str(d / "equirect"), "--out", str(d / "horizon.yaml")]
+    assert capsys.readouterr().out == "@step mosaic\n@step reblend\n@step skymask\n@step horizon\n"
+
+
+def test_photos_turned_off_are_left_out_of_both_a_stitch_and_a_reblend(tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    monkeypatch.setattr(sites, "segmentation_installed", lambda: False)
+    d = _site(tmp_path, panorama=False)
+    sites.set_frames_off(str(d), ["b.jpg", "a.jpg"])
+    build = dict(sites.pipeline(str(d), "build"))
+    assert build["mosaic"][-4:] == ["--exclude", "a.jpg", "--exclude", "b.jpg"]
+    assert build["reblend"][-4:] == ["--off", "a.jpg", "--off", "b.jpg"]
+    reblend = sites.pipeline(str(d), "reblend")
+    assert [s for s, _ in reblend] == [
+        "reblend",
+        "skymask",
+        "horizon",
+    ], "a reblend never re-stitches"
 
 
 def test_a_build_follows_the_childs_steps_and_log(tmp_path):
@@ -381,7 +406,9 @@ def test_a_build_follows_the_childs_steps_and_log(tmp_path):
     st = jobs.state
     assert st["status"] == "done" and st["step"] == "skymask" and st["error"] is None
     assert st["log"][0] == "registered 18 frames"
-    assert st["log"][1] == f"args {['--pipeline', str(tmp_path), '--hugin', '/bundle/hugin/bin']}"
+    assert st["log"][1] == (
+        f"args {['--pipeline', str(tmp_path), '--kind', 'build', '--hugin', '/bundle/hugin/bin']}"
+    )
     conforms("Job", st)
 
 
@@ -466,7 +493,9 @@ def test_open_site_and_read_an_unoriented_horizon(serve, tmp_path):
     assert call(s, "GET", "/site/horizon")[0] == 400, "no site open yet"
     code, st = call(s, "POST", "/site/open", {"slug": "site-2026-10-05"})
     assert code == 200
-    assert st["site"] == {"slug": "site-2026-10-05", "photos": 1, "panorama": True, "mask": True}
+    site = {k: st["site"][k] for k in ("slug", "name", "photos", "panorama", "mask")}
+    assert site == {"slug": "site-2026-10-05", "name": "site-2026-10-05", "photos": 1,
+                    "panorama": True, "mask": True}  # fmt: skip
     code, h = call(s, "GET", "/site/horizon")
     assert code == 200
     conforms("Horizon", h)
@@ -504,9 +533,10 @@ def test_disc_overlays_are_polar_disc_xy(serve, tmp_path):
     def xy(az, alt):
         return [round(v, 1) for v in polar.disc_xy(az, alt, polar.SIZE, polar.FLOOR_DEG)]
 
-    assert disc["actual"] == [xy(0, 20.0), xy(90, 5.0), xy(180, 12.5), xy(270, 30.0)]
     assert disc["planning"] == [xy(0, 22.0), xy(180, 13.0)]
-    assert disc["pockets"] == [[xy(0, 15.0), xy(0, 10.0)]]
+    # The actual horizon is the outline raster (outline.png), and pockets are
+    # just the band between it and planning: neither is a list of points.
+    assert "actual" not in disc and "pockets" not in disc
     # Only the columns the fit used, with the ceiling-bound one marked.
     assert [(f["az"], f["bound"]) for f in disc["fiducials"]] == [(90.0, False), (200.0, True)]
     north, east = disc["cardinals"][0], disc["cardinals"][1]
@@ -601,7 +631,9 @@ def test_a_build_that_writes_nothing_is_not_done(tmp_path):
     jobs = FakeJobs("print('@step skymask')")
     jobs.start("s", str(tmp_path)).join(10)
     assert jobs.state["status"] == "failed"
-    assert jobs.state["error"] == "the build finished but wrote no equirect.png, photo_mask.yaml"
+    assert jobs.state["error"] == (
+        "the build finished but wrote no equirect.png, photo_mask.yaml, horizon.yaml"
+    )
 
 
 def test_the_build_log_is_capped_but_complete_in_sidecar_log(tmp_path, caplog):
@@ -1173,3 +1205,348 @@ def test_identity_is_handed_out_as_a_copy_and_backend_must_be_text(tmp_path):
         d / "photo_mask.yaml", {0: {"alt": 5.0, "type": ""}}, [], {"oriented": False, "backend": 3}
     )
     assert views.horizon(str(d))["backend"] is None
+
+
+def _stitched(d, names=("a.jpg", "b.jpg"), dropped=("c.jpg",)):
+    """A site whose photos `mosaic` has stitched: final.pto, one layer per placed
+    photo (left half sky, right half ground), and the manifest. No Hugin."""
+    import numpy as np
+    from PIL import Image
+
+    work = d / "work"
+    work.mkdir()
+    lines = ['p f2 w8 h4 v360 n"TIFF_m"'] + [f'i w8 h8 n"{n}"' for n in names]
+    (work / "final.pto").write_text("\n".join(lines) + "\n")
+    for i, n in enumerate(names):
+        _photo(d / "photos" / n)
+        rgba = np.zeros((4, 8, 4), np.uint8)
+        rgba[:, :4, :3], rgba[:, 4:, :3], rgba[..., 3] = (80, 120, 220), (120, 80, 40), 255
+        Image.fromarray(rgba, "RGBA").save(
+            work / f"layer{i:04d}.tif",
+            tiffinfo={286: ((0, 1),), 287: ((0, 1),), 282: ((1, 1),), 283: ((1, 1),)},
+        )
+    for n in dropped:
+        _photo(d / "photos" / n)
+    (d / "equirect.manifest.json").write_text(
+        json.dumps({"image_dir": str(d / "photos"), "dropped": list(dropped)})
+    )
+
+
+def _reblend(d, *off):
+    from terminus import cli, skymask
+
+    real = skymask.heuristic_sky
+    skymask.heuristic_sky = lambda rgb, valid, px_per_deg: (rgb[..., 2] > rgb[..., 0]) & valid
+    try:
+        args = ["reblend", str(d / "work"), "--out", str(d / "equirect")]
+        cli.main(args + [a for n in off for a in ("--off", n)])
+    finally:
+        skymask.heuristic_sky = real
+
+
+def test_reblend_leaves_frames_out_and_lists_every_photo(tmp_path, capsys):
+    import numpy as np
+
+    d = _site(tmp_path, panorama=False)
+    _stitched(d)
+    _reblend(d, "b.jpg", "a.jpg-typo")
+    assert "a.jpg-typo is not in this panorama" in capsys.readouterr().out
+    listed = json.loads((d / "equirect.frames.json").read_text())
+    conforms("Frames", listed)
+    by = {f["name"]: f for f in listed["frames"]}
+    assert set(by) == {"a.jpg", "b.jpg", "c.jpg"}
+    assert by["a.jpg"] == {"name": "a.jpg", "layer": "layer0000.tif", "box": [0, 0, 8, 4],
+                           "off": False, "dropped": False}  # fmt: skip
+    assert by["b.jpg"]["off"] and by["b.jpg"]["layer"] == "layer0001.tif"
+    assert by["c.jpg"] == {"name": "c.jpg", "layer": None, "box": None, "off": False,
+                           "dropped": True}  # fmt: skip
+    coverage = np.load(d / "equirect.coverage.npy")
+    assert (coverage == 1).all(), "b is off, so only a was blended"
+    sky = np.load(d / "equirect.sky.npy")
+    assert sky[:, :4].all() and not sky[:, 4:].any()
+
+
+def test_reblend_refuses_to_turn_every_frame_off(tmp_path, capsys):
+    d = _site(tmp_path, panorama=False)
+    _stitched(d)
+    with pytest.raises(SystemExit):
+        _reblend(d, "a.jpg", "b.jpg")
+    assert "every frame is turned off" in capsys.readouterr().err
+
+
+def test_skymask_reads_the_voted_sky_and_says_so(tmp_path, capsys):
+    import numpy as np
+    from PIL import Image
+
+    from terminus import cli
+    from terminus.export import load_columns
+
+    d = tmp_path
+    img = np.zeros((36, 72, 3), np.uint8)
+    img[:] = (120, 80, 40)  # the panorama looks like ground everywhere...
+    Image.fromarray(img).save(d / "p.png")
+    sky = np.zeros((36, 72), bool)
+    sky[:12] = True  # ...but the frames voted the top third sky
+    np.save(d / "p.sky.npy", sky)
+    cli.main(
+        ["skymask", str(d / "p.png"), "--sky", str(d / "p.sky.npy"), "--out", str(d / "m.yaml")]
+    )
+    meta, cols = load_columns(str(d / "m.yaml"))
+    assert meta["backend"] == "heuristic (per-frame vote)"
+    assert abs(cols[0]["alt"] - 30.0) < 3.0
+    np.save(d / "bad.npy", sky[:, :10])
+    with pytest.raises(SystemExit):
+        cli.main(["skymask", str(d / "p.png"), "--sky", str(d / "bad.npy")])
+    assert "does not match the image" in capsys.readouterr().err
+
+
+def _curatable(tmp_path):
+    root = tmp_path / "sites"
+    d = _site(root, panorama=True)
+    _stitched(d)
+    _reblend(d)
+    return root, d
+
+
+def test_frames_routes_serve_a_curated_site(serve, tmp_path):
+    root, d = _curatable(tmp_path)
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    code, listed = call(s, "GET", "/site/frames")
+    assert code == 200 and [f["name"] for f in listed["frames"]] == ["a.jpg", "b.jpg", "c.jpg"]
+    conforms("Frames", listed)
+    code, png = call(s, "GET", "/site/frame/footprint.png?name=a.jpg")
+    assert code == 200 and png[:4] == b"\x89PNG"
+    assert call(s, "GET", "/site/frame/footprint.png?name=c.jpg")[0] == 204, "dropped: no layer"
+    code, jpg = call(s, "GET", "/site/frame/thumb.jpg?name=c.jpg")
+    assert code == 200 and jpg[:2] == b"\xff\xd8"
+    code, png = call(s, "GET", "/site/disagree.png")
+    assert code == 200 and png[:4] == b"\x89PNG"
+
+
+def test_frame_routes_refuse_a_name_the_site_does_not_list(serve, tmp_path):
+    root, d = _curatable(tmp_path)
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    for q in ("?name=../../etc/passwd", "?name=zz.jpg", "", "?name=a.jpg&name=b.jpg"):
+        code, err = call(s, "GET", "/site/frame/thumb.jpg" + q)
+        assert code == 400, q
+
+
+def test_an_uncurated_site_has_no_frames_yet(serve, tmp_path):
+    root = tmp_path / "sites"
+    d = _site(root)
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    assert call(s, "GET", "/site/frames")[0] == 204
+    assert call(s, "GET", "/site/disagree.png")[0] == 204
+
+
+def test_turning_photos_off_records_them_and_reblends(serve, tmp_path):
+    from terminus.server import sites
+
+    root, d = _curatable(tmp_path)
+    jobs = FakeJobs("import sys; print('args', sys.argv[1:])")
+    s = serve(sites_root=str(root), jobs=jobs)
+    call(s, "POST", "/site/open", {"slug": d.name})
+    assert call(s, "POST", "/site/frames", {"off": ["zz.jpg"]})[0] == 400
+    assert call(s, "POST", "/site/frames", {"off": "a.jpg"})[0] == 400
+    assert sites.frames_off(str(d)) == [], "a refused request changes nothing"
+    code, st = call(s, "POST", "/site/frames", {"off": ["b.jpg"]})
+    assert code == 200 and st["job"]["site"] == d.name
+    jobs.wait()
+    assert sites.frames_off(str(d)) == ["b.jpg"]
+    assert "'--kind', 'reblend'" in jobs.state["log"][0]
+
+
+def test_restitch_runs_a_full_build(serve, tmp_path):
+    root, d = _curatable(tmp_path)
+    jobs = FakeJobs("import sys; print('args', sys.argv[1:])")
+    s = serve(sites_root=str(root), jobs=jobs)
+    call(s, "POST", "/site/open", {"slug": d.name})
+    assert call(s, "POST", "/site/frames", {"off": [], "restitch": "yes"})[0] == 400
+    assert call(s, "POST", "/site/frames", {"off": [], "restitch": True})[0] == 200
+    jobs.wait()
+    assert "'--kind', 'build'" in jobs.state["log"][0]
+
+
+def test_curation_is_refused_while_a_build_runs(serve, tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    root, d = _curatable(tmp_path)
+    jobs = FakeJobs()
+    monkeypatch.setattr(jobs, "busy", lambda: True)
+    s = serve(sites_root=str(root), jobs=jobs)
+    call(s, "POST", "/site/open", {"slug": d.name})
+    assert call(s, "POST", "/site/frames", {"off": ["b.jpg"]})[0] == 400
+    assert sites.frames_off(str(d)) == []
+
+
+def test_a_build_folds_progress_events_into_its_state(tmp_path):
+    script = (
+        "import json\n"
+        "e = lambda **k: print('@event ' + json.dumps(k), flush=True)\n"
+        "e(phase='matching'); e(detail='comparing neighbouring photos')\n"
+        "e(name='a.jpg', state='listed'); e(name='b.jpg', state='listed')\n"
+        "e(pair=['a.jpg', 'b.jpg'], matches=40, working=['a.jpg', 'b.jpg'])\n"
+        "e(pair=['a.jpg', 'c.jpg'], matches=0, working=['a.jpg', 'c.jpg'])\n"
+        "e(name='a.jpg', state='matched', points=40)\n"
+        "e(outline=1); e(outline=2)\n"
+        "e(phase='placing', canvas=[8, 4])\n"
+        "e(name='a.jpg', state='placed', layer='layer0000.tif', box=[0, 0, 8, 4])\n"
+        "e(working=['a.jpg'], detail='feathering the seams')\n"
+        "print('@step skymask', flush=True)\n"
+        "print('@event not json')\n"
+        "import sys; sys.exit(1)\n"
+    )
+    jobs = FakeJobs(script)
+    jobs.start("s", str(tmp_path)).join(10)
+    st = jobs.state
+    conforms("Job", st)
+    assert st["phase"] == "placing" and st["canvas"] == [8, 4]
+    assert st["detail"] is None and st["active"] == [], "a new step clears both"
+    assert st["compared"] == 2 and st["pairs"] == [{"a": "a.jpg", "b": "b.jpg", "matches": 40}]
+    assert st["outline"] == 2, "the horizon so far was redrawn twice"
+    a = next(f for f in st["frames"] if f["name"] == "a.jpg")
+    assert a == {"name": "a.jpg", "state": "placed", "points": 40, "layer": "layer0000.tif",
+                 "box": [0, 0, 8, 4]}, "fields merge: placing keeps the matched points"  # fmt: skip
+
+
+def test_the_panorama_and_disc_show_the_feathered_blend_when_there_is_one(serve, tmp_path):
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    root = tmp_path / "sites"
+    d = _site(root)  # equirect.png: blue sky over black ground
+    shown = np.zeros((36, 72, 3), np.uint8)
+    shown[:] = (220, 30, 30)  # the display blend, unmistakably red
+    Image.fromarray(shown).save(d / "equirect.display.jpg")
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    code, pano = call(s, "GET", "/site/panorama.jpg")
+    assert code == 200 and pano == (d / "equirect.display.jpg").read_bytes()
+    code, disc = call(s, "GET", "/site/disc.jpg")
+    rgb = np.asarray(Image.open(io.BytesIO(disc)).convert("RGB")).reshape(-1, 3)
+    lit = rgb[rgb.sum(axis=1) > 60]
+    assert code == 200 and lit[:, 0].mean() > 2 * lit[:, 2].mean(), "the disc is drawn from it too"
+
+
+def test_reblend_writes_the_class_maps_the_horizon_is_read_from(tmp_path):
+    import numpy as np
+
+    from terminus.skymask import SKY_CLASS_ADE20K as SKY
+
+    d = _site(tmp_path, panorama=False)
+    _stitched(d)  # two frames, each sky on the left half
+    _reblend(d)
+    terrain = np.load(d / "equirect.terrain.classes.npy")
+    strict = np.load(d / "equirect.strict.classes.npy")
+    cover = np.load(d / "equirect.cover.npy")
+    assert (cover == 2).all()
+    assert (terrain[:, :4] == SKY).all() and (terrain[:, 4:] != SKY).all()
+    assert (strict == terrain).all(), "both frames agree everywhere, so strict == voted"
+
+
+def test_the_horizon_map_has_actual_and_planning_and_planning_is_never_lower(tmp_path):
+    import numpy as np
+
+    from terminus import cli
+    from terminus.export import load_columns
+    from terminus.skymask import SKY_CLASS_ADE20K as SKY
+
+    H, W = 180, 360
+    terrain = np.full((H, W), 1)
+    terrain[:80] = SKY  # sky above alt 10 everywhere
+    strict = terrain.copy()
+    strict[70:80, :90] = 1  # one frame saw terrain up to alt 20 in the first quarter (wind)
+    base = tmp_path / "equirect"
+    np.save(f"{base}.terrain.classes.npy", terrain)
+    np.save(f"{base}.strict.classes.npy", strict)
+    np.save(f"{base}.cover.npy", np.full((H, W), 2, np.int16))
+    np.save(f"{base}.coverage.npy", np.ones((H, W)))
+    cli.main(["horizon", str(base), "--out", str(tmp_path / "h.yaml")])
+    meta, cols = load_columns(str(tmp_path / "h.yaml"))
+    assert meta["oriented"] is False and len(cols) == 360
+    assert abs(cols[200]["alt"] - 10.0) < 1.01 and cols[200]["planning"] == cols[200]["alt"]
+    assert abs(cols[45]["planning"] - 20.0) < 1.01, "planning rises to the terrain any frame saw"
+    assert all(c["planning"] >= c["alt"] for c in cols.values())
+
+
+def test_the_outline_is_a_disc_overlay_once_the_class_maps_exist(serve, tmp_path):
+    root = tmp_path / "sites"
+    d = _site(root)
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    assert call(s, "GET", "/site/outline.png")[0] == 204, "built before the class maps"
+    _stitched(d)
+    _reblend(d)
+    code, png = call(s, "GET", "/site/outline.png")
+    assert code == 200 and png[:4] == b"\x89PNG"
+
+
+def test_a_stitch_segments_each_photo_when_segmentation_is_installed(tmp_path, monkeypatch):
+    from terminus.server import sites
+
+    d = _site(tmp_path, panorama=False)
+    monkeypatch.setattr(sites, "segmentation_installed", lambda: True)
+    assert "--segment" in dict(sites.pipeline(str(d), "build"))["mosaic"]
+    monkeypatch.setattr(sites, "segmentation_installed", lambda: False)
+    assert "--segment" not in dict(sites.pipeline(str(d), "build"))["mosaic"]
+
+
+def test_a_reblend_draws_the_horizon_so_far_after_each_frame(serve, tmp_path, capsys):
+    from terminus import mosaic
+
+    root = tmp_path / "sites"
+    d = _site(root)
+    _stitched(d)
+    seen = []
+    mosaic.EVENTS = seen.append
+    try:
+        _reblend(d)
+    finally:
+        mosaic.EVENTS = None
+    assert [e["outline"] for e in seen if "outline" in e] == [1, 2], "one redraw per frame"
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    code, png = call(s, "GET", "/site/progress.png")
+    assert code == 200 and png[:4] == b"\x89PNG"
+
+
+def test_a_site_can_be_renamed_without_moving_its_folder(serve, tmp_path):
+    root = tmp_path / "sites"
+    d = _site(root)
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    sites = call(s, "GET", "/sites")[1]["sites"]
+    assert sites[0]["name"] == d.name, "a site is named after its folder until renamed"
+    conforms("SiteList", {"sites": sites})
+    for bad in ("", "   ", "x" * 81, 3):
+        assert call(s, "POST", "/site/rename", {"slug": d.name, "name": bad})[0] == 400, bad
+    assert call(s, "POST", "/site/rename", {"slug": "nope", "name": "Back yard"})[0] == 400
+    assert call(s, "POST", "/site/rename", {"slug": d.name, "name": "  Back yard  "})[0] == 200
+    assert call(s, "GET", "/sites")[1]["sites"][0]["name"] == "Back yard"
+    assert d.is_dir(), "the folder keeps its slug"
+
+
+def test_deleting_a_site_removes_it_and_closes_it(serve, tmp_path):
+    root = tmp_path / "sites"
+    a, b = _site(root, slug="site-a"), _site(root, slug="site-b")
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": "site-a"})
+    code, st = call(s, "POST", "/site/delete", {"slug": "site-a"})
+    assert code == 200 and st["site"] is None and not a.exists() and b.exists()
+    assert call(s, "POST", "/site/delete", {"slug": "site-a"})[0] == 400, "already gone"
+    assert call(s, "POST", "/site/delete", {"slug": "../sites"})[0] == 400
+
+
+def test_a_site_being_built_cannot_be_deleted(serve, tmp_path, monkeypatch):
+    root = tmp_path / "sites"
+    d = _site(root, slug="site-a")
+    jobs = FakeJobs()
+    jobs.state = {"site": "site-a", "status": "running"}
+    monkeypatch.setattr(jobs, "busy", lambda: True)
+    s = serve(sites_root=str(root), jobs=jobs)
+    code, err = call(s, "POST", "/site/delete", {"slug": "site-a"})
+    assert code == 400 and "being built" in err["error"] and d.exists()

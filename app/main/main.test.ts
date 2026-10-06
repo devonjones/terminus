@@ -146,6 +146,26 @@ describe("site IPC", () => {
       p: "/sites",
       body: { photos: ["/p/a.jpg"] },
     });
+    expect(await call("site:image", "disagree")).toEqual({ view: "/site/disagree.png" });
+    expect(await call("site:rename", "site-a", "Back yard")).toEqual({
+      p: "/site/rename",
+      body: { slug: "site-a", name: "Back yard" },
+    });
+    expect(await call("site:delete", "site-a")).toEqual({
+      p: "/site/delete",
+      body: { slug: "site-a" },
+    });
+    expect(await call("site:frames")).toEqual({ view: "/site/frames" });
+    expect(await call("site:frame-image", "thumb", "a b&c.jpg")).toEqual({
+      view: "/site/frame/thumb.jpg?name=a%20b%26c.jpg",
+    });
+    expect(await call("site:frame-image", "footprint", "a.jpg")).toEqual({
+      view: "/site/frame/footprint.png?name=a.jpg",
+    });
+    expect(await call("site:curate", ["a.jpg"], true)).toEqual({
+      p: "/site/frames",
+      body: { off: ["a.jpg"], restitch: true },
+    });
   });
 
   it.each([
@@ -160,6 +180,14 @@ describe("site IPC", () => {
     ["site:create", [Array(501).fill("/p/a.jpg")]],
     ["site:create", [["p/a.jpg"]]],
     ["site:create", [["/p/notes.txt"]]],
+    ["site:frame-image", ["layer", "a.jpg"]],
+    ["site:frame-image", ["thumb", "../a.jpg"]],
+    ["site:frame-image", ["thumb", "a\\b.jpg"]],
+    ["site:frame-image", ["thumb", ""]],
+    ["site:curate", ["a.jpg", false]],
+    ["site:curate", [["a.jpg"], "yes"]],
+    ["site:curate", [["x/a.jpg"], false]],
+    ["site:curate", [Array(501).fill("a.jpg"), false]],
   ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
     await boot();
     expect(() => call(ch, ...args)).toThrow();
@@ -179,6 +207,11 @@ describe("site IPC", () => {
       "site:image",
       "site:pick",
       "site:create",
+      "site:frames",
+      "site:frame-image",
+      "site:curate",
+      "site:rename",
+      "site:delete",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
   });
