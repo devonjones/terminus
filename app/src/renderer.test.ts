@@ -326,6 +326,33 @@ describe("round-1 review", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
   });
 
+  it("a stale load that fails says nothing and leaves the newer site's photos", async () => {
+    let reject!: (e: Error) => void;
+    let holdNext = false;
+    const api = fakeApi({
+      getState: async () => state({ site, tab: "horizon" }),
+      image: vi.fn(async () => {
+        if (holdNext) {
+          holdNext = false;
+          await new Promise<void>((_, r) => (reject = r)); // the first open fails, late
+        }
+        return new Uint8Array([1]);
+      }),
+    });
+    await mount(root, api);
+    const select = root.querySelector("select")!;
+    select.value = "site-a";
+    holdNext = true;
+    select.dispatchEvent(new Event("change")); // load A: stalls, then fails
+    await vi.waitFor(() => expect(reject).toBeDefined());
+    select.dispatchEvent(new Event("change")); // load B: lands
+    await vi.waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2));
+    reject(new Error("engine /site/disc.jpg: 500"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2); // B's photos are still in use
+  });
+
   it("keeps polling a build after one failed progress read", async () => {
     vi.useFakeTimers();
     const running: Job = {
@@ -496,10 +523,12 @@ describe("round-2 review", () => {
           throw new Error("engine /site/horizon: 422 this site's files could not be read");
         return horizon();
       }),
+      image: async () => new Uint8Array([1]),
       openSite: vi.fn(async () => state({ site, tab: "horizon" })),
     });
     await mount(root, api);
     expect(root.querySelector("polygon.hz")).not.toBeNull(); // site A on screen
+    vi.mocked(URL.revokeObjectURL).mockClear();
     failing = true;
     const select = root.querySelector("select")!;
     select.value = "site-a";
@@ -507,5 +536,6 @@ describe("round-2 review", () => {
     expect((await findByRole(root, "alert")).textContent).toContain("could not be read");
     expect(root.querySelector("polygon.hz")).toBeNull();
     expect(root.textContent).toContain("This site has no horizon yet.");
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2); // site A's photos released
   });
 });

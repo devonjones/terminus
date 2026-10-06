@@ -169,7 +169,7 @@ export function horizonView(p: DiscProps): HTMLElement {
       from = [e.clientX, e.clientY];
       p.onSpinPreview(spin);
     });
-    // pointercancel (a touch interrupted, capture lost) ends the drag like a release.
+    // pointercancel (the browser took over the touch) ends the drag like a release.
     const end = () => {
       if (from) p.onSpin(spin);
       from = null;

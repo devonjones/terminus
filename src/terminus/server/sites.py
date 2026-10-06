@@ -88,12 +88,12 @@ def create_site(root, photos, today=None):
             raise SiteError("every photo must be an existing .jpg, .png or .tif file")
     slug = _claim(root, f"site-{(today or datetime.date.today()).isoformat()}")
     dest = os.path.join(root, slug, "photos")
-    what = "the site folder"
+    what = "create the photos folder"
     try:
         os.mkdir(dest)
         for p in photos:
-            what = os.path.basename(p)
             name = os.path.basename(p)
+            what = f"copy {name}"
             stem, ext = os.path.splitext(name)
             target, k = os.path.join(dest, name), 1
             while os.path.exists(target):  # two drops with the same file name
@@ -102,7 +102,7 @@ def create_site(root, photos, today=None):
             shutil.copy2(p, target)
     except OSError as e:
         shutil.rmtree(os.path.join(root, slug), ignore_errors=True)
-        raise SiteError(f"could not copy {what}: {e.strerror}") from e
+        raise SiteError(f"could not {what}: {e.strerror}") from e
     return slug
 
 
@@ -177,12 +177,22 @@ def own_command():
     return [sys.executable, "-m", "terminus.server"]
 
 
-def kill_tree(proc):
-    """Kill the child and everything it started (the Hugin tool it is running).
+def _reap(proc):
+    """Wait for the child, then kill anything it left in its group (a Hugin tool
+    can outlive it). The group is signalled while the child is still an unreaped
+    zombie, so its pid cannot have been reused by an unrelated process."""
+    if os.name != "nt":
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return proc.wait()
 
-    Already gone counts as done. On POSIX the group is signalled even after the
-    child has exited, because a Hugin tool it started can outlive it.
-    """
+
+def kill_tree(proc):
+    """Kill a running child and everything it started (the Hugin tool it is
+    running). A group that has already gone counts as done."""
     if os.name == "nt":
         if proc.poll() is None:
             subprocess.run(
@@ -265,7 +275,7 @@ class Jobs:
             expired.set()
             try:
                 kill_tree(proc)
-            except Exception:  # the read loop below still ends, and reports the timeout
+            except Exception:  # the timeout is still reported once the build ends
                 log.exception("could not kill the overrunning build")
 
         timer = threading.Timer(self._timeout, expire)
@@ -277,7 +287,7 @@ class Jobs:
                     self.state["step"] = line[len(STEP) :]
                 elif line.strip():
                     self._log(line)
-            code = proc.wait()
+            code = _reap(proc)
         except Exception as e:  # a bug in watching must not leave the job "running"
             log.exception("watching the build failed")
             self._fail(f"lost track of the build: {type(e).__name__}: {e}")
@@ -320,5 +330,5 @@ class Jobs:
         with self._lock:
             self._closed = True
             proc = self._proc
-        if proc is not None:
+        if proc is not None and proc.returncode is None:  # a reaped pid may be reused
             kill_tree(proc)

@@ -937,6 +937,34 @@ def test_kill_tree_takes_an_orphaned_grandchild_and_tolerates_a_gone_group(tmp_p
     sites.kill_tree(child)  # the group is gone now: still no error
 
 
+def test_a_finished_build_takes_its_leftover_tool_down_and_stop_leaves_its_pid_alone(
+    tmp_path, monkeypatch
+):
+    """The watcher sweeps the group before reaping the child; after that the pid
+    may belong to anyone, so stop() must not signal it."""
+    from terminus.server import sites
+
+    pidfile = tmp_path / "g.pid"
+    jobs = FakeJobs(
+        "import subprocess, sys, pathlib; "
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(g.pid))"
+    )  # a tool still holding the pipe keeps the build running until the timeout
+    jobs.start("s", str(tmp_path)).join(20)
+    grandchild = int(pidfile.read_text())
+    for _ in range(100):
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the build's leftover tool outlived it")
+    monkeypatch.setattr(sites.os, "killpg", lambda *a: pytest.fail("signalled a reaped pid"))
+    jobs.stop()
+
+
 def test_a_child_that_dies_before_any_step_is_named_the_build(tmp_path):
     jobs = FakeJobs("import sys; sys.exit(2)")
     jobs.start("s", str(tmp_path)).join(10)
@@ -981,7 +1009,9 @@ def test_a_failure_creating_the_site_folder_is_named_as_such(tmp_path, monkeypat
         return real(path, *a, **k)
 
     monkeypatch.setattr(sites.os, "mkdir", mkdir)
-    with pytest.raises(sites.SiteError, match="could not copy the site folder: Permission denied"):
+    with pytest.raises(
+        sites.SiteError, match="could not create the photos folder: Permission denied"
+    ):
         sites.create_site(str(tmp_path / "sites"), [_photo(tmp_path / "a.jpg")])
     assert os.listdir(tmp_path / "sites") == []
 

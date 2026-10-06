@@ -51,12 +51,11 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         ? await Promise.all([api.horizon(), api.disc(), api.image("panorama"), api.image("disc")])
         : ([null, null, null, null] as const);
     } catch (e) {
+      if (mine !== generation) return; // a newer load owns the screen
       // Never leave the previous site's views up under the new site's name.
-      if (mine === generation) {
-        revoke(v.pano);
-        revoke(v.photo);
-        v.horizon = v.disc = v.pano = v.photo = null;
-      }
+      revoke(v.pano);
+      revoke(v.photo);
+      v.horizon = v.disc = v.pano = v.photo = null;
       throw e;
     }
     if (mine !== generation) return;
