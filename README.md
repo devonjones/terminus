@@ -435,6 +435,8 @@ refractor at the Sun can destroy the sensor. Use at your own risk.
   skyline-to-obstruction-profile before, and what is different here. If you
   know of prior work, please open an issue.
 - **[LESSONS.md](LESSONS.md)** — the full decisions-and-lessons log, developer-facing.
+- **[app/README.md](app/README.md)** — the desktop app (in development): how to build,
+  test and run it, including the dev mode an agent drives.
 
 ## Credits
 
