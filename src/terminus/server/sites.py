@@ -181,12 +181,12 @@ def _reap(proc):
     """Wait for the child, then kill anything it left in its group (a Hugin tool
     can outlive it). The group is signalled while the child is still an unreaped
     zombie, so its pid cannot have been reused by an unrelated process."""
-    if os.name != "nt":
-        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+    if hasattr(os, "waitid"):  # not on Windows, nor macOS before Python 3.13
         try:
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        except (ChildProcessError, ProcessLookupError):
+            pass  # kill_tree (the timeout, or stop) already took the group, or it is gone
     return proc.wait()
 
 

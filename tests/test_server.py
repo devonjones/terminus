@@ -950,8 +950,16 @@ def test_a_finished_build_takes_its_leftover_tool_down_and_stop_leaves_its_pid_a
         "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
         f"pathlib.Path({str(pidfile)!r}).write_text(str(g.pid))"
-    )  # a tool still holding the pipe keeps the build running until the timeout
+    )  # off the pipe, so the build ends with the tool still running
+    real_killpg, signalled = os.killpg, []
+
+    def killpg(pgid, sig):  # the child must still be an unreaped zombie
+        signalled.append(os.path.exists(f"/proc/{pgid}"))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(sites.os, "killpg", killpg)
     jobs.start("s", str(tmp_path)).join(20)
+    assert signalled == [True], "the group must be signalled before the child is reaped"
     grandchild = int(pidfile.read_text())
     for _ in range(100):
         try:
@@ -963,6 +971,19 @@ def test_a_finished_build_takes_its_leftover_tool_down_and_stop_leaves_its_pid_a
         raise AssertionError("the build's leftover tool outlived it")
     monkeypatch.setattr(sites.os, "killpg", lambda *a: pytest.fail("signalled a reaped pid"))
     jobs.stop()
+
+
+def test_a_build_reaped_by_its_timeout_kill_still_reports_the_timeout(tmp_path, monkeypatch):
+    """The timer's kill_tree reaps the child, racing the watcher's waitid."""
+    from terminus.server import sites
+
+    def reaped(*a):
+        raise ChildProcessError(10, "No child processes")
+
+    monkeypatch.setattr(sites.os, "waitid", reaped)
+    jobs = FakeJobs("import time; time.sleep(30)", timeout=0.3)
+    jobs.start("s", str(tmp_path)).join(20)
+    assert "took longer than" in jobs.state["error"], jobs.state["error"]
 
 
 def test_a_child_that_dies_before_any_step_is_named_the_build(tmp_path):
