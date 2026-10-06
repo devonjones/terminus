@@ -9200,3 +9200,79 @@ def test_a_blank_reading_is_absent_not_zero():
     out = polar.diagnostics(_diag_meta(), blank)
     assert "254.0 to 254.0" in out, "the one real reading stands alone"
     assert "fell" not in out and "rose" not in out, "a blank must not invent a collapse"
+
+
+def test_sun_check_refuses_a_target_inside_the_cone_and_allows_one_outside():
+    """The guard itself, with a real Pointer: every other SunGuard in the suite
+    comes from a faked mount, a patched _sun_check, or escape()."""
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from terminus.sweep import Pointer, Sky, SunGuard
+
+    ptr = Pointer(MagicMock(), Sky(39.7917, -104.894, 1600), 30, 5)
+    with patch.object(Sky, "sun", lambda self, when=None: (180.0, 40.0)):
+        with pytest.raises(SunGuard, match="from Sun"):
+            ptr._sun_check(180.0, 40.0)
+        with pytest.raises(SunGuard):
+            ptr._sun_check(200.0, 40.0)  # 15 deg away: still inside a 30 deg cone
+        ptr._sun_check(0.0, 40.0)  # opposite side of the sky
+    with patch.object(Sky, "sun", lambda self, when=None: (180.0, -10.0)):
+        ptr._sun_check(180.0, 0.0)  # Sun below the horizon: nothing to guard against
+
+
+def test_the_real_clock_is_the_current_utc_instant(monkeypatch):
+    """`_now` is what every Sun position is computed from, and the suite freezes
+    it (tests/conftest.py). So check the real one here: a stale or wrong-zone
+    clock would aim the Sun guard at a Sun that is not there."""
+    import datetime
+
+    monkeypatch.undo()  # lift the suite-wide freeze for this test
+    from terminus import sweep
+
+    then = datetime.datetime.now(datetime.UTC)
+    got = sweep._now().to_datetime(timezone=datetime.UTC)
+    assert abs((got - then).total_seconds()) < 5
+
+
+def test_run_sweep_skips_a_column_inside_the_sun_cone():
+    """The sweep's own Sun check, unpatched: a column the Sun sits on is recorded
+    as skipped and the mount is never sent along it. Before the suite's clock
+    was pinned, daytime CI ran this path by accident and asserted nothing."""
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    from terminus.sweep import Pointer, Sky, run_sweep
+
+    sky = Sky(39.7917, -104.894, 1600)
+    sc = MagicMock()
+    sc.equ_coord.return_value = (12.0, 20.0)
+    sc.capture_rgb.return_value = np.full((8, 8, 3), 120.0, dtype=np.float32)
+    cfg = {
+        "sun_cone_deg": 30, "slew_step_deg": 5, "az_step": 30, "alt_min": 0,
+        "alt_max": 60, "alt_tol": 2.5, "clear_thresh": 0.6,
+    }  # fmt: skip
+    scanned, pointed = [], []
+
+    def fake_scan(ptr, sc_, az, *a, **k):
+        ptr.point_to(az, 0.0)  # the real scan climbs the column from the bottom
+        scanned.append(az)
+        return 20.0, "edge", "tree", []
+
+    def record(self, az, alt):
+        pointed.append(az)
+        return az, alt
+
+    with (
+        patch.object(Sky, "sun", lambda self, when=None: (90.0, 30.0)),  # up, in the east
+        patch.object(Pointer, "point_to", record),
+        patch("terminus.sweep.scan_horizon", fake_scan),
+    ):
+        mask, skipped, _ = run_sweep(
+            sc, sky, cfg, dry=False, log=lambda *a, **k: None, azimuths=[90, 270]
+        )
+    assert skipped == [90] and scanned == [270]
+    assert sorted(mask) == [270]
+    assert 90 not in pointed, "the mount must never be sent up the Sun's column"
