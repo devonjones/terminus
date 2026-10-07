@@ -440,10 +440,10 @@ table.sites button {
    the bottom, so the whole canvas is always in view. */
 .live,
 .stage {
-  width: min(100%, calc((100vh - 240px) * 2));
+  width: min(100%, calc((100vh - 270px) * 2)); /* room below for the legend */
 }
 svg.graph {
-  width: min(100%, calc((100vh - 240px) * 1000 / 560));
+  width: min(100%, calc((100vh - 270px) * 1000 / 560));
 }
 
 @media (prefers-color-scheme: dark) {

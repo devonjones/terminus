@@ -822,11 +822,10 @@ def _export(args, base, allow):
     if args.pvsyst:
         from .export import to_pvsyst_hor
 
-        meta, rows, planned = load_planning(args.mask)
+        meta, rows = load_planning(args.mask)  # final: no further buffer
         hor = base + ".HOR"
-        buffer = {"tree_buffer": 0.0} if planned else {}  # planning already carries it
         with open(hor, "w") as f:
-            f.write(to_pvsyst_hor(rows, meta, allow_unoriented=allow, **buffer))
+            f.write(to_pvsyst_hor(rows, meta, 0.0, allow_unoriented=allow))
         print(f"wrote {hor} (set rotation Clockwise, north azimuth 0 on import)")
     if not (args.skysafari or args.landscape):
         # Checked here rather than in `_texture`, which this return would skip
@@ -842,8 +841,8 @@ def _export(args, base, allow):
 
     from .landscape import to_skysafari_png, write_landscape
 
-    meta, rows, planned = load_planning(args.mask)
-    buffer = {"tree_buffer": 0.0} if planned else {}  # planning already carries it
+    meta, rows = load_planning(args.mask)  # final: no further buffer
+    buffer = {"tree_buffer": 0.0}
     texture, coverage = _texture(args)
     if args.skysafari:
         png = to_skysafari_png(
@@ -1962,6 +1961,8 @@ def cmd_reblend(sc, cfg, args):  # sc, cfg unused: offline
     off = set(args.off)
     for name in sorted(off - set(layers)):
         print(f"{name} is not in this panorama (left out of the stitch)")
+    if not any(layers.values()):
+        raise SeestarError(f"{args.work} holds no remapped layers; re-run mosaic")
     kept = [p for n, p in layers.items() if p and n not in off]
     if not kept:
         raise SeestarError("every frame is turned off; nothing to blend")
@@ -2005,18 +2006,16 @@ def cmd_reblend(sc, cfg, args):  # sc, cfg unused: offline
     print("voting on the sky frame by frame", flush=True)
     mosaic._emit(phase="judging")
     progress = rb._Progress(args.work, width, height, names_of)
-    labels = rb.frame_files(args.work, names, "label")
-    label_of = {p: labels[n] for p, n in names_of.items()}
-    if all(label_of[p] for p in kept):
+    labels = rb.fresh_labels(args.work, names, layers, kept)
+    previous = _vote_backend(args.out, quiet=True)
+    if labels is not None:
         backend = "segment (per-frame vote)"
-        classes, strict, votes, cover = rb.vote_labels(
-            {p: label_of[p] for p in kept}, width, height, progress
-        )
+        classes, strict, votes, cover = rb.vote_labels(labels, width, height, progress)
     else:
-        if any(labels.values()):
-            print("some frames have no segmentation labels: voting by colour instead")
         backend = "heuristic (per-frame vote)"
-        classes, strict, votes, cover = rb.vote_colours(kept, width, height, progress)
+        # Verdicts saved by a segmented vote are not the colour vote's to reuse.
+        reuse = previous.startswith("heuristic")
+        classes, strict, votes, cover = rb.vote_colours(kept, width, height, progress, reuse)
     sky = classes == rb.SKY
     outvoted = np.where(sky, cover - votes, votes)
     disagree = np.where(cover > 0, outvoted / np.maximum(cover, 1), 0.0)
@@ -2040,15 +2039,20 @@ def cmd_reblend(sc, cfg, args):  # sc, cfg unused: offline
     )
 
 
-def _vote_backend(base):
+def _vote_backend(base, quiet=False):
     """Which vote reblend ran for `base` (from <base>.vote.json)."""
     import json
 
+    path = base + ".vote.json"
     try:
-        with open(base + ".vote.json") as fh:
+        with open(path) as fh:
             return json.load(fh)["backend"]
-    except (OSError, ValueError, KeyError):
-        return "per-frame vote (unrecorded)"
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        if not quiet:
+            print(f"warning: {path} is unreadable ({type(e).__name__}); backend unrecorded")
+    return "per-frame vote (unrecorded)"
 
 
 def _watch_events(mosaic):

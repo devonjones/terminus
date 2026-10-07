@@ -133,7 +133,7 @@ export interface Horizon {
   fit: FitColumn[];
   settled: boolean | null;
   /**
-   * the vote that read the horizon: "segment (per-frame vote)", or "heuristic ..." when the frames were judged by colour
+   * the vote that read the horizon, e.g. "segment (per-frame vote)"; a value starting "heuristic" means the frames were judged by colour
    */
   backend: string | null;
 }

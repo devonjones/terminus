@@ -173,22 +173,26 @@ def load_mask(path):
     return meta, sorted((az, c["alt"], c.get("type", "")) for az, c in cols.items())
 
 
-def load_planning(path):
-    """(meta, [(az, alt, type)], planned): what a planner should treat as blocked.
+def load_planning(path, tree_buffer=None):
+    """(meta, [(az, alt, type)]): what a planner should treat as blocked, final.
 
-    A map from `terminus horizon` carries two lines: `alt`, the actual outline
-    (for matching scope edges), and `planning`, raised wherever terrain was seen
-    to move and already buffered where only one frame saw a tree. Planners get
-    the planning line; `planned` says it is there, so callers do not add the tree
-    buffer a second time. A mask without `planning` comes back as `load_mask`.
+    A map from `terminus horizon` carries two lines per column: `alt`, the
+    actual outline (for matching scope edges), and `planning`, raised wherever
+    terrain was seen to move and already buffered where only one frame saw a
+    tree. A column with `planning` exports that; a column without it gets the
+    tree buffer here (TREE_BUFFER_DEG unless given). Callers pass these rows on
+    with no buffer of their own.
     """
+    tree_buffer = TREE_BUFFER_DEG if tree_buffer is None else tree_buffer
     meta, cols = load_columns(path)
-    planned = any("planning" in c for c in cols.values())
-    rows = sorted(
-        (az, max(c["alt"], c["planning"]) if "planning" in c else c["alt"], c.get("type", ""))
-        for az, c in cols.items()
-    )
-    return meta, rows, planned
+    rows = []
+    for az, c in cols.items():
+        if "planning" in c:
+            alt = max(c["alt"], c["planning"])
+        else:
+            alt = apply_tree_buffer([(az, c["alt"], c.get("type", ""))], tree_buffer)[0][1]
+        rows.append((az, alt, c.get("type", "")))
+    return meta, sorted(rows)
 
 
 def parse_pockets(raw):
@@ -522,10 +526,9 @@ def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriente
     # Deliberately does NOT buffer here: the exporters do it themselves, so a
     # caller reaching past this wrapper still gets the margin. Buffering in both
     # places would apply it twice.
-    meta, rows, planned = load_planning(mask_path)
+    meta, rows = load_planning(mask_path, tree_buffer)  # final: no further buffer
     require_oriented(meta, allow_unoriented)
-    if planned:
-        tree_buffer = 0.0  # the planning line already carries it
+    tree_buffer = 0.0
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
         # Forward the override: to_nina_hrz checks again for the benefit of

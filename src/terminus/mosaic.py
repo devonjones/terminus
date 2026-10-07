@@ -234,22 +234,8 @@ def solve(
     for n in keep:
         _emit(name=n, state="listed")
     _emit(phase="matching")
+    stage = _stage(image_dir, work_dir, keep)
     for _attempt in range(6):
-        # Kept between runs: cpfind caches each photo's keypoints beside it
-        # (`--cache`), so a re-stitch does not find them all over again.
-        stage = os.path.join(work_dir, "stage")
-        os.makedirs(stage, exist_ok=True)
-        for n in keep:
-            src, dst = os.path.join(image_dir, n), os.path.join(stage, n)
-            s = os.stat(src)
-            if os.path.isfile(dst):
-                d = os.stat(dst)
-                if (d.st_size, d.st_mtime_ns) == (s.st_size, s.st_mtime_ns):
-                    continue  # the same photo: its cached keypoints still hold
-            shutil.copy2(src, dst)  # copy2 keeps the mtime the check above compares
-            key = os.path.splitext(dst)[0] + ".key"
-            if os.path.isfile(key):
-                os.remove(key)  # a different photo under the same name
         pto = os.path.join(stage, "project.pto")
         _run(["pto_gen", "-o", pto] + [os.path.join(stage, n) for n in keep])
         if lens:
@@ -287,6 +273,27 @@ def solve(
     _emit(phase="solving")
     _run(["autooptimiser", "-a", "-l", "-s", "-o", solved, clean])
     return solved, dropped
+
+
+def _stage(image_dir, work_dir, names):
+    """Copy the photos into work/stage, which is kept between runs: cpfind caches
+    each photo's keypoints beside it (`--cache`), so a re-stitch does not find
+    them all over again. A photo that differs from its staged copy (size or
+    mtime) is copied afresh and its stale keypoints dropped."""
+    stage = os.path.join(work_dir, "stage")
+    os.makedirs(stage, exist_ok=True)
+    for n in names:
+        src, dst = os.path.join(image_dir, n), os.path.join(stage, n)
+        s = os.stat(src)
+        if os.path.isfile(dst):
+            d = os.stat(dst)
+            if (d.st_size, d.st_mtime_ns) == (s.st_size, s.st_mtime_ns):
+                continue  # the same photo: its cached keypoints still hold
+        shutil.copy2(src, dst)  # copy2 keeps the mtime the check above compares
+        key = os.path.splitext(dst)[0] + ".key"
+        if os.path.isfile(key):
+            os.remove(key)  # a different photo under the same name
+    return stage
 
 
 def _nona_render(pto, work_dir, prefix, one_by_one=False):

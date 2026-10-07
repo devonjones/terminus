@@ -1246,8 +1246,6 @@ def _stitched(d, names=("a.jpg", "b.jpg"), dropped=("c.jpg",), labels=None, off_
     (work / "final.pto").write_text("\n".join(lines) + "\n")
     for i, n in enumerate(names):
         _photo(d / "photos" / n)
-        if labels is not None:
-            _label(work / f"label{i:04d}.tif", labels[i])
         if n in off_canvas:
             continue
         rgba = np.zeros((4, 8, 4), np.uint8)
@@ -1256,6 +1254,9 @@ def _stitched(d, names=("a.jpg", "b.jpg"), dropped=("c.jpg",), labels=None, off_
             work / f"layer{i:04d}.tif",
             tiffinfo={286: ((0, 1),), 287: ((0, 1),), 282: ((1, 1),), 283: ((1, 1),)},
         )
+    if labels is not None:  # remapped after the photos, as a stitch does
+        for i, classes in enumerate(labels):
+            _label(work / f"label{i:04d}.tif", classes)
     for n in dropped:
         _photo(d / "photos" / n)
     (d / "equirect.manifest.json").write_text(
@@ -1603,10 +1604,14 @@ def test_the_terrain_biased_vote_keeps_ties_and_the_obstructions_class(tmp_path)
     classes, votes, cover = combine_terrain_biased(
         [str(tmp_path / "a.tif"), str(tmp_path / "b.tif")], 4, 1,
         on_start=seen.append, on_vote=lambda v, c: seen.append(int(c.sum())),
+        on_frame=lambda p, sky: seen.append(sky[0].tolist()),
     )  # fmt: skip
     assert classes[0].tolist() == [SKY_, TREE_, TREE_, WALL_], "a 1-1 tie is terrain, of its kind"
     assert votes[0].tolist() == [2, 1, 0, 1] and cover[0].tolist() == [2, 2, 2, 2]
-    assert seen == [str(tmp_path / "a.tif"), 4, str(tmp_path / "b.tif"), 8]
+    assert seen == [
+        str(tmp_path / "a.tif"), [True, True, False, True], 4,
+        str(tmp_path / "b.tif"), [True, False, False, False], 8,
+    ], "each frame's own verdict, then the vote so far"  # fmt: skip
 
 
 def test_a_segmented_reblend_votes_on_the_labels_and_says_so(tmp_path):
@@ -1765,8 +1770,14 @@ def test_reblend_reuses_cached_gains_and_verdicts_until_a_layer_changes(tmp_path
         args = ["reblend", str(d / "work"), "--out", str(d / "equirect")]
         cli.main(args + [a for n in off for a in ("--off", n)])
 
+    import numpy as np
+
     run()
     first = (len(solves), len(judged))
+    sky = np.load(d / "equirect.sky.npy")
+    run()  # everything from cache: the same verdicts, not merely no new ones
+    assert (np.load(d / "equirect.sky.npy") == sky).all()
+    assert (len(solves), len(judged)) == first
     run("b.jpg")  # turning a frame off re-solves nothing and judges nothing again
     assert (len(solves), len(judged)) == first
     layer = d / "work" / "layer0000.tif"
@@ -1899,3 +1910,116 @@ def test_an_unreadable_rotation_is_logged_not_silent(caplog):
     caplog.clear()
     assert views.solution({"oriented": True}) is None, "a scope-only sweep: nothing to say"
     assert "unreadable" not in caplog.text
+
+
+def test_terrain_of_unknown_kind_claims_no_type():
+    import numpy as np
+
+    from terminus.reproject import true_horizon
+    from terminus.skymask import TERRAIN_CLASS, type_name
+
+    t = np.full((180, 360), TERRAIN_CLASS)
+    t[:80] = SKY_
+    assert {c["type"] for c in true_horizon(*_maps(t)).values()} == {""}
+    assert type_name(TERRAIN_CLASS) == "" and type_name(TREE_) == "tree"
+
+
+def test_terminus_horizon_records_the_vote_and_applies_the_solution(tmp_path):
+    import numpy as np
+    import yaml
+
+    from terminus import cli
+    from terminus.export import load_columns
+
+    t = np.full((180, 360), WALL_)
+    t[:80] = SKY_
+    t[40:80, 0:10] = WALL_  # a taller wall at panorama azimuth 0-10
+    base = tmp_path / "equirect"
+    for key, arr in zip(("terrain.classes", "strict.classes", "cover", "coverage"), _maps(t),
+                        strict=True):  # fmt: skip
+        np.save(f"{base}.{key}.npy", arr)
+    (tmp_path / "equirect.vote.json").write_text('{"backend": "segment (per-frame vote)"}')
+    sol = tmp_path / "oriented.yaml"
+    sol.write_text(yaml.safe_dump({"meta": {"oriented": True, "yaw": 90.0, "pitch": 0.0,
+                                            "tilt_mag": 0.0, "tilt_dir": 0.0}}))  # fmt: skip
+    out = str(tmp_path / "h.yaml")
+    cli.main(["horizon", str(base), "--out", out, "--solution", str(sol)])
+    meta, cols = load_columns(out)
+    assert meta["backend"] == "segment (per-frame vote)" and meta["yaw"] == 90.0
+    assert cols[95]["alt"] == pytest.approx(50.0, abs=1.01), "the solution's yaw is applied"
+
+
+def test_a_layer_running_off_the_canvas_is_clipped():
+    import numpy as np
+
+    from terminus.mosaic import _placed
+
+    m = np.ones((2, 4), bool)
+    ys, xs, Y, X = _placed(m, -1, 0, 5, 1)  # starts left of the canvas; canvas is 1 row
+    assert sorted(zip(Y.tolist(), X.tolist(), strict=True)) == [(0, 0), (0, 1), (0, 2)]
+    assert sorted(zip(ys.tolist(), xs.tolist(), strict=True)) == [(0, 1), (0, 2), (0, 3)]
+    _, _, Y, X = _placed(m, 3, 0, 5, 2)  # runs off the right
+    assert X.max() == 4 and len(X) == 4
+
+
+def test_reblend_with_no_layers_says_to_stitch(tmp_path, capsys):
+    import os
+
+    d = _site(tmp_path, panorama=False)
+    _stitched(d)
+    for f in (d / "work").glob("layer*.tif"):
+        os.remove(f)
+    with pytest.raises(SystemExit):
+        _reblend(d)
+    assert "holds no remapped layers; re-run mosaic" in capsys.readouterr().err
+
+
+def test_labels_older_than_their_layers_are_not_used(tmp_path, capsys):
+    import os
+
+    import numpy as np
+
+    sky_left = np.full((4, 8), TREE_)
+    sky_left[:, :4] = SKY_
+    d = _site(tmp_path, panorama=False)
+    _stitched(d, dropped=(), labels=[sky_left, sky_left])
+    for f in (d / "work").glob("label*.tif"):  # from an earlier, segmented stitch
+        st = os.stat(f)
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns - 10**10))
+    _reblend(d)
+    assert "voting by colour instead" in capsys.readouterr().out
+    assert json.loads((d / "equirect.vote.json").read_text())["backend"].startswith("heuristic")
+
+
+def test_a_colour_vote_does_not_reuse_a_segmented_runs_verdicts(tmp_path, monkeypatch):
+    import numpy as np
+    from PIL import Image
+
+    from terminus import cli, skymask
+
+    d = _site(tmp_path, panorama=False)
+    _stitched(d, dropped=())
+    (d / "equirect.vote.json").write_text('{"backend": "segment (per-frame vote)"}')
+    for i in range(2):  # verdicts a segmented vote left behind: all sky
+        Image.fromarray(np.full((4, 8), 255, np.uint8)).save(d / "work" / f"sky_layer{i:04d}.png")
+    judged = []
+
+    def colour(rgb, valid, px_per_deg):
+        judged.append(1)
+        return (rgb[..., 2] > rgb[..., 0]) & valid
+
+    monkeypatch.setattr(skymask, "heuristic_sky", colour)
+    cli.main(["reblend", str(d / "work"), "--out", str(d / "equirect")])
+    assert len(judged) == 2, "every frame judged afresh by colour"
+    sky = np.load(d / "equirect.sky.npy")
+    assert sky[:, :4].all() and not sky[:, 4:].any()
+
+
+def test_a_corrupt_vote_record_says_so(tmp_path, capsys):
+    from terminus import cli
+
+    (tmp_path / "x.vote.json").write_text("{not json")
+    assert cli._vote_backend(str(tmp_path / "x")) == "per-frame vote (unrecorded)"
+    assert "x.vote.json is unreadable" in capsys.readouterr().out
+    assert cli._vote_backend(str(tmp_path / "missing")) == "per-frame vote (unrecorded)"
+    assert capsys.readouterr().out == "", "a missing record is not a warning"

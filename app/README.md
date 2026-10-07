@@ -68,9 +68,9 @@ needed:
    the contiguous sky (`polar.sky_layers`) and the planning line from the map.
 
 A site that `terminus orient` has written an `oriented.yaml` into shows that
-mask instead. Each photo's gains and sky verdict are cached beside its layer, so
-turning photos off and re-blending (`--kind reblend`) takes seconds; turning one
-back on that was never blended re-solves the gains for all of them.
+mask instead. Each photo's sky verdict is cached beside its layer and the gains in
+`work/cache.json`, so turning photos off and re-blending (`--kind reblend`) takes
+seconds; a set that includes a photo not in the cache re-solves the gains.
 
 The pipeline prints `@step` and `@event` lines, which the sidecar folds into
 the job state the page polls: each photo's progress, the photo being worked on

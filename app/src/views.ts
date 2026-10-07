@@ -615,8 +615,7 @@ export function horizonView(p: DiscProps): HTMLElement {
     parts.push(
       el("p", {
         className: "note",
-        textContent:
-          "Read with the heuristic detector (no segmentation model was available): check the line against the photo.",
+        textContent: "Read by colour, not by segmentation: check the line against the photo.",
       }),
     );
   if (spinning) {

@@ -9990,3 +9990,14 @@ def test_export_writes_the_planning_line_without_a_second_tree_buffer(tmp_path):
     }
     assert alts == {18.0}, "the planning line, already buffered: not 10, not 21"
     assert Horizon.from_mask(str(mask)).altitude_at(45) == 18.0, "planners get planning too"
+
+
+def test_a_mixed_mask_buffers_the_trees_that_have_no_planning_line(tmp_path):
+    from terminus.export import TREE_BUFFER_DEG, load_planning, write_mask
+
+    mask = tmp_path / "m.yaml"
+    cols = {0: {"alt": 5.0, "planning": 7.0, "type": "tree"}, 180: {"alt": 5.0, "type": "tree"},
+            90: {"alt": 5.0, "type": "structure"}}  # fmt: skip
+    write_mask(str(mask), cols, [], {"oriented": True})
+    _meta, rows = load_planning(str(mask))
+    assert {az: alt for az, alt, _ in rows} == {0: 7.0, 90: 5.0, 180: 5.0 + TREE_BUFFER_DEG}

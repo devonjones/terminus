@@ -2,9 +2,9 @@
 and vote on the sky frame by frame, writing the maps the horizon is read from.
 
 No Hugin: the frames are already remapped, one layer each, and dropping a frame
-barely moves the others, so their layers are reused as they are. Everything a
-frame contributes is cached beside its layer (gains, sky verdict) until a
-re-stitch rewrites the layer.
+barely moves the others, so their layers are reused as they are. What a frame
+contributes is cached until a re-stitch rewrites its layer: its sky verdict
+beside the layer (work/sky_layerNNNN.png), the gains in work/cache.json.
 """
 
 import json
@@ -29,12 +29,30 @@ def frame_files(work, names, prefix):
     return out
 
 
+def fresh_labels(work, names, layers, kept):
+    """{kept layer: its label layer} when every kept frame has a label remapped
+    with or after its photo (a stitch remaps labels right after the photos), or
+    None: a label older than its layer is from an earlier stitch."""
+    labels = frame_files(work, names, "label")
+    out = {}
+    for name, layer in layers.items():
+        if layer not in kept:
+            continue
+        label = labels.get(name)
+        if label is None or os.stat(label).st_mtime_ns < os.stat(layer).st_mtime_ns:
+            if any(labels.values()):
+                print("some frames have no current segmentation labels: voting by colour instead")
+            return None
+        out[layer] = label
+    return out
+
+
 def frame_gains(work, kept, names_of):
     """Per-frame gains (one, and one per colour channel) for the kept layers.
 
-    Cached by each layer's mtime. Turning frames off reuses the cache; a set
-    that includes a frame never blended before re-solves the gains for all of
-    them (they are relative to each other)."""
+    Cached in work/cache.json by each layer's mtime, for the set last solved.
+    Turning frames off reuses it; a set that includes a frame not in it
+    re-solves the gains for all of them (they are relative to each other)."""
     path = os.path.join(work, "cache.json")
     cache = {}
     if os.path.isfile(path):
@@ -118,7 +136,7 @@ def vote_labels(labels, width, height, progress):
     return classes, strict, votes, cover
 
 
-def vote_colours(kept, width, height, progress):
+def vote_colours(kept, width, height, progress, reuse=True):
     """The vote by colour, where nothing was segmented: (classes, strict, votes, cover).
     It knows sky from not-sky but not what an obstruction is."""
     px_per_deg = width / 360.0
@@ -129,7 +147,7 @@ def vote_colours(kept, width, height, progress):
         lambda rgb, valid: skymask.heuristic_sky(rgb, valid=valid, px_per_deg=px_per_deg),
         on_frame=lambda p, sky, _origin: progress.judged(p, sky),
         margin=int(np.ceil(COLOUR_REACH_DEG * px_per_deg)),
-        known=progress.known,
+        known=progress.known if reuse else None,
         on_start=progress.start,
         counts=True,
         on_vote=progress.vote,

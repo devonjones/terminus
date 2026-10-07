@@ -472,15 +472,22 @@ describe("overlapping loads, polling and failures", () => {
     await waitFor(() => expect((document.activeElement as HTMLElement).dataset.focus).toBe("spin"));
   });
 
-  it("says when the heuristic detector read the horizon", async () => {
-    await mount(
-      root,
-      fakeApi({
-        getState: async () => state({ site, tab: "horizon" }),
-        horizon: async () => horizon({ backend: "heuristic" }),
-      }),
+  it("says when the horizon was read by colour, and not when it was segmented", async () => {
+    const shown = async (backend: string) => {
+      root.replaceChildren();
+      await mount(
+        root,
+        fakeApi({
+          getState: async () => state({ site, tab: "horizon" }),
+          horizon: async () => horizon({ backend }),
+        }),
+      );
+      return root.textContent ?? "";
+    };
+    expect(await shown("heuristic (per-frame vote)")).toContain(
+      "Read by colour, not by segmentation",
     );
-    expect(root.textContent).toContain("Read with the heuristic detector");
+    expect(await shown("segment (per-frame vote)")).not.toContain("Read by colour");
   });
 });
 
