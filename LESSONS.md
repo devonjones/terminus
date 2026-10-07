@@ -156,6 +156,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `D-15` A file at a canonical path is not evidence that it is current
 - `D-16` Checkpoint attempts, not successes — and re-judge saved profiles on load
 - `D-17` A tree's horizon is the top of its canopy, when the frames can see it
+- `D-18` In shade the Sun cone shrinks to about 10 deg; it is never lifted
 
 ---
 
@@ -1992,3 +1993,12 @@ horizon is where the canopy starts, read top-down as the first frame that is not
 The leafy band below it is what the second horizon is for (planning versus actual, with the
 fuzz between). An under-canopy reading (the last 50% crossing below the leaves, 6.39 at az
 330 against a canopy top near 17.5) is a different quantity, not a better one.
+
+### D-18 — In shade the Sun cone shrinks to about 10 deg; it is never lifted
+
+Devon, 2026-10-07, after a morning in which the 30-degree cone and the mount's horizon
+floor together left no route out of the east. The in-sun / in-shade switch is set only
+by the human, in the app, and resets to IN SUN whenever the app starts. In shade the
+cone shrinks to about 10 degrees rather than disappearing: shade is partial and it moves,
+so pointing at the Sun or right beside it stays refused. Not chosen: lifting the guard
+entirely, and an in-shade setting that expires on a timer.
