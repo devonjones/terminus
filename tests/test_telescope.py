@@ -433,3 +433,19 @@ def test_a_near_fit_refines_out_of_a_poor_tilt_seed(site):
     seed = {**NEAR, "tilt_mag": 12.0}  # the truth is 2.0
     fit = telescope.refit(str(site), columns(site, measured(site, azs)), near=seed)
     assert abs(fit["solution"]["tilt_mag"] - TRUE["tilt_mag"]) < 0.5
+
+
+def test_the_columns_command_imports_without_a_config_and_refuses_a_fit_of_three(
+    site, tmp_path, monkeypatch, capsys
+):
+    from terminus import cli
+
+    monkeypatch.chdir(tmp_path)  # no config.toml here
+    alts = measured(site, [20, 110, 200])
+    fids = tmp_path / "f.yaml"
+    write_mask(str(fids), {az: (alt, "structure") for az, alt in alts.items()}, [], {})
+    cli.main(["columns", str(site), "--import", str(fids)])
+    assert "3 columns into" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli.main(["columns", str(site), "--fit"])
+    assert "four" in capsys.readouterr().err

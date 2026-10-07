@@ -194,10 +194,10 @@ def cmd_columns(sc, cfg, args):
         n = sum(1 for c in doc["columns"] if c["frames"])
         print(f"{len(doc['columns'])} columns into {args.site} ({n} with frames)")
     if args.fit:
-        v = telescope.fit_all(args.site)
-        f = v["fit"]
-        if f is None:
-            raise MaskError("fewer than four included columns: nothing to fit")
+        try:
+            f = telescope.fit_all(args.site)["fit"]
+        except telescope.ColumnError as e:
+            raise MaskError(str(e)) from e
         s, m = f["solution"], f["summary"]
         print(
             f"yaw {s['yaw']:.2f} pitch {s['pitch']:.2f} tilt {s['tilt_mag']:.2f} toward "

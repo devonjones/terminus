@@ -113,3 +113,25 @@ def test_blocked_above_and_open_below_are_never_the_same_answer():
 def test_an_unknown_verdict_is_refused_not_read_as_terrain():
     with pytest.raises(ValueError, match="unknown verdict"):
         column_edge([(30.0, Verdict("sky", 1.0)), (20.0, Verdict("Edge", 0.4))])
+
+
+def _split(left, right):
+    """Features: the left half one value, the right half another (log L, B-R, G-R)."""
+    f = np.zeros((80, 45, 3), np.float32)
+    f[:, :22], f[:, 22:] = left, right
+    return f + np.random.default_rng(0).normal(0, 0.01, f.shape).astype(np.float32)
+
+
+def test_by_day_colour_alone_makes_an_edge():
+    """Sunlit siding can match the sky's brightness; only its colour gives it away."""
+    sky_, wall = (10.0, 0.5, 0.5), (10.0, 0.1, 0.4)
+    v = judge.judge_features(_split(sky_, wall), np.array(sky_, np.float32))
+    assert v.kind == "edge" and 0.4 < v.sky < 0.6
+
+
+def test_at_night_colour_does_not_decide():
+    """At night the colour ratios are noise: a frame as bright as the sky is sky."""
+    sky_ = np.array((7.0, 0.5, 0.5), np.float32)
+    f = _split((7.0, 0.05, 0.4), (7.0, 0.05, 0.4))
+    assert judge.judge_features(f, sky_, night=True).kind == "sky"
+    assert judge.judge_features(f, sky_, night=False).kind == "terrain"  # by day it would not be
