@@ -1,6 +1,6 @@
 [project]
 name = "terminus-horizon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Measure your local horizon with a Seestar S50 and export it for N.I.N.A., Stellarium, and planning tools"
 readme = "README.md"
 license = "Apache-2.0"

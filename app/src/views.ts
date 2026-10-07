@@ -92,13 +92,18 @@ const PHASE_TITLES: Record<string, string> = {
 };
 
 // The build's phase for the page heading: "Matching — comparing neighbouring photos".
+// The last two steps have no phases of their own: their names stand in.
+const STEP_TITLES: Record<string, string> = {
+  skymask: "Reading the horizon",
+  horizon: "Drawing the horizons",
+};
+const STEP_LINES: Record<string, string> = {
+  skymask: "Reading the horizon off the panorama",
+  horizon: "Drawing the horizon and the planning horizon",
+};
+
 export function buildTitle(job: Job): string {
-  const phase =
-    job.step === "skymask"
-      ? "Reading the horizon"
-      : job.step === "horizon"
-        ? "Drawing the horizons"
-        : (PHASE_TITLES[job.phase ?? ""] ?? "Starting");
+  const phase = STEP_TITLES[job.step ?? ""] ?? PHASE_TITLES[job.phase ?? ""] ?? "Starting";
   return job.detail ? `${phase} — ${job.detail}` : phase;
 }
 
@@ -120,9 +125,6 @@ const STATES: Record<BuildFrame["state"], string> = {
   judged: "judged",
 };
 
-// A build as it happens: each photo appears on the panorama as it is laid down,
-// its sky verdict washes over it as it is judged, and the list says where every
-// photo is up to, including the ones the stitch had to leave out and why.
 // cpfind's matching, as it happens: the photos on a ring in the order they were
 // taken (roughly their order round the horizon), and a line for every pair found
 // to share points, thicker for more. A photo nothing reaches is one the stitch
@@ -178,14 +180,12 @@ function matchGraph(job: Job, imgs: BuildImages): SVGElement {
   return svg("svg", { class: "graph", viewBox: `0 0 ${W} ${H}`, role: "img" }, g);
 }
 
+// A build as it happens: each photo appears on the panorama as it is laid down,
+// its sky verdict washes over it as it is judged, and the list says where every
+// photo is up to, including the ones the stitch had to leave out and why.
 export function buildView(job: Job, imgs: BuildImages): HTMLElement {
   const [W, H] = job.canvas ?? [2, 1];
-  const head =
-    job.step === "skymask"
-      ? "Reading the horizon off the panorama"
-      : job.step === "horizon"
-        ? "Drawing the horizon and the planning horizon"
-        : (PHASES[job.phase ?? ""] ?? "Starting");
+  const head = STEP_LINES[job.step ?? ""] ?? PHASES[job.phase ?? ""] ?? "Starting";
   const status = el("p", {
     className: "phase",
     textContent: job.status === "running" ? `${head}${job.detail ? `: ${job.detail}` : ""}…` : "",
@@ -255,11 +255,18 @@ export function buildView(job: Job, imgs: BuildImages): HTMLElement {
   // Until photos start landing on the panorama, the matching is the picture.
   const matching = !job.frames.some((f) => f.layer);
   const shown: Node = matching ? matchGraph(job, imgs) : live;
+  const legend = el(
+    "p",
+    { className: "legend" },
+    matching
+      ? "Blue lines: photos found to share points (thicker for more). Yellow: the pair just compared. Red: a photo the stitch could not place."
+      : "Yellow wash and edge: the photo being worked on. Blue: sky, as each photo judged it. Yellow line: the horizon so far.",
+  );
   const compared = job.compared
     ? ` · ${job.compared} pairs compared, ${job.pairs.length} share points`
     : "";
   summary.textContent += compared;
-  return el("div", { className: "build" }, status, shown, summary, list);
+  return el("div", { className: "build" }, status, shown, legend, summary, list);
 }
 
 // Every site, to rename or delete. The one being built cannot be deleted.
@@ -421,13 +428,10 @@ function curateView(pano: string, p: CurateProps, busy: boolean): HTMLElement {
     // A photo the stitch could not place is not in the panorama either: it shows
     // as off. Clicking it still decides whether the next re-stitch tries it again.
     const shownOff = off || f.dropped;
-    const note = f.dropped
-      ? off
-        ? "the stitch could not place it; left out of re-stitches"
-        : "the stitch could not place it"
-      : !f.layer && !off
-        ? "re-stitch to bring it back"
-        : "";
+    let note = "";
+    if (f.dropped && off) note = "the stitch could not place it; left out of re-stitches";
+    else if (f.dropped) note = "the stitch could not place it";
+    else if (!f.layer && !off) note = "re-stitch to bring it back";
     const b = el(
       "button",
       { className: shownOff ? "off" : "", disabled: busy, title: f.name },
@@ -607,7 +611,7 @@ export function horizonView(p: DiscProps): HTMLElement {
   });
 
   const parts: Node[] = [stage, el("div", { className: "bar" }, ...toggles)];
-  if (h.backend === "heuristic")
+  if (h.backend?.startsWith("heuristic"))
     parts.push(
       el("p", {
         className: "note",

@@ -30,6 +30,7 @@ Routes (payload shapes: schema.json beside this file):
   GET  /site/frame/footprint.png?name=, /site/frame/thumb.jpg?name=   one photo
   GET  /site/disagree.png where the photos outvoted each other on sky
   GET  /site/outline.png  the actual horizon: the sky's outline, as a disc overlay
+  GET  /site/progress.png the horizon so far, while a build is judging
   GET  /site/frame/layer.webp?layer=, /site/frame/verdict.png?layer=   a build's
                           remapped photo and its sky verdict, as they are made
   POST /site/rename       {"slug": name, "name": text}: the site's display name

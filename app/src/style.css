@@ -1,5 +1,7 @@
 :root {
   color-scheme: light dark;
+  /* Warning text: 4.5:1 or better on the page in either theme. */
+  --warn-text: #b3261e;
   font-family: system-ui, sans-serif;
 }
 body {
@@ -252,6 +254,7 @@ table.fit tr.unused td {
 }
 .strip button.hot {
   border-color: #ffd23a;
+  box-shadow: 0 0 0 1px #5a4500; /* a dark ring: yellow alone vanishes on a light page */
 }
 .strip button.off img {
   opacity: 0.3;
@@ -325,8 +328,8 @@ table.fit tr.unused td {
 }
 .progress li.dropped .chip,
 .progress li.dropped small {
-  color: #e0533a;
-  border-color: #e0533a;
+  color: var(--warn-text);
+  border-color: var(--warn-text);
   opacity: 1;
 }
 .progress li.judged .chip {
@@ -441,4 +444,18 @@ table.sites button {
 }
 svg.graph {
   width: min(100%, calc((100vh - 240px) * 1000 / 560));
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --warn-text: #ff7a66;
+  }
+}
+.legend {
+  font-size: 0.8rem;
+  opacity: 0.85;
+  margin: 0.3rem 0 0;
+}
+.legend b {
+  font-weight: 600;
 }

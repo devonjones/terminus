@@ -1,9 +1,10 @@
 # terminus desktop app
 
 An Electron window over the Python engine, plus a dev mode an agent can drive.
-Stage 1 (terminus-71.1): drop in the photographs of a site, and the app stitches
-them, reads the horizon, and shows the panorama and the polar disc, with a
-rough spin for a site the telescope has not oriented yet.
+Drop in the photographs of a site, and the app stitches them while you watch,
+lets you turn photos off and re-blend, reads the horizon (actual and planning),
+and shows the panorama and the polar disc, with a rough spin for a site the
+telescope has not oriented yet.
 
 ## Layout
 
@@ -68,7 +69,8 @@ needed:
 
 A site that `terminus orient` has written an `oriented.yaml` into shows that
 mask instead. Each photo's gains and sky verdict are cached beside its layer, so
-turning photos off and re-blending (`--kind reblend`) takes seconds.
+turning photos off and re-blending (`--kind reblend`) takes seconds; turning one
+back on that was never blended re-solves the gains for all of them.
 
 The pipeline prints `@step` and `@event` lines, which the sidecar folds into
 the job state the page polls: each photo's progress, the photo being worked on

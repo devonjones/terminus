@@ -6,6 +6,7 @@ re-implemented in JavaScript (where it could drift into a mirrored picture).
 """
 
 import io
+import logging
 import math
 import os
 import re
@@ -13,6 +14,8 @@ import re
 from .. import polar
 from ..export import is_oriented, load_columns
 from .sites import SiteError, mask_path
+
+log = logging.getLogger("terminus.server")
 
 SIZE, FLOOR = polar.SIZE, polar.FLOOR_DEG
 # An unoriented mask is in the panorama's own azimuth: drawn with no rotation,
@@ -64,8 +67,10 @@ def solution(meta):
         return dict(IDENTITY)
     try:
         return polar.solution_from_meta(meta)
-    except ValueError:
-        return None
+    except ValueError as e:
+        if any(k in meta for k in ("yaw", "pitch", "tilt_mag", "tilt_dir")):
+            log.warning("the mask's rotation is unreadable (%s): nothing places the photo", e)
+        return None  # a scope-only sweep: no rotation, no photograph to place
 
 
 def horizon(d):
@@ -93,8 +98,8 @@ def horizon(d):
         "columns": columns,
         "fit": fit,
         "settled": settled if isinstance(settled, bool) else None,
-        # Which detector read the horizon. "heuristic" means no segmentation
-        # model ran, and the user should know their horizon was read the rough way.
+        # Which vote read the horizon. A "heuristic ..." backend means the frames
+        # were judged by colour, not segmented: the user should know.
         "backend": meta.get("backend") if isinstance(meta.get("backend"), str) else None,
     }
 

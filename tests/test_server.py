@@ -92,6 +92,17 @@ def test_app_and_sidecar_versions_match():
         ("GET", "/site/disc"),
         ("GET", "/site/panorama.jpg"),
         ("GET", "/site/disc.jpg"),
+        ("GET", "/site/frames"),
+        ("GET", "/site/frame/thumb.jpg?name=a.jpg"),
+        ("GET", "/site/frame/footprint.png?name=a.jpg"),
+        ("GET", "/site/frame/layer.webp?layer=layer0000.tif"),
+        ("GET", "/site/frame/verdict.png?layer=layer0000.tif"),
+        ("GET", "/site/disagree.png"),
+        ("GET", "/site/outline.png"),
+        ("GET", "/site/progress.png"),
+        ("POST", "/site/frames"),
+        ("POST", "/site/rename"),
+        ("POST", "/site/delete"),
     ],
 )
 def test_refuses_without_token_host_or_with_origin(
@@ -237,7 +248,7 @@ def test_process_prints_port_and_token_and_parks_on_exit(stop, tmp_path):
         assert "park: no scope linked" in p.stderr.read()
 
 
-# ---- sites, the pipeline job, the views, and the schema contract (stage 1) ----
+# ---- sites, the pipeline job, the views, and the schema contract ----
 
 SCHEMA = json.loads((ROOT / "src/terminus/server/schema.json").read_text())
 
@@ -407,7 +418,8 @@ def test_a_build_follows_the_childs_steps_and_log(tmp_path):
     assert st["status"] == "done" and st["step"] == "skymask" and st["error"] is None
     assert st["log"][0] == "registered 18 frames"
     assert st["log"][1] == (
-        f"args {['--pipeline', str(tmp_path), '--kind', 'build', '--hugin', '/bundle/hugin/bin']}"
+        # The sites folder is scrubbed from what the page sees.
+        f"args {['--pipeline', '<sites>/' + tmp_path.name, '--kind', 'build', '--hugin', '/bundle/hugin/bin']}"
     )
     conforms("Job", st)
 
@@ -597,7 +609,7 @@ def test_every_state_response_matches_the_schema(serve, tmp_path):
     conforms("Disc", call(s, "GET", "/site/disc")[1])  # the unoriented site's disc
 
 
-# ---- round-1 review: lifecycle, refusals, and the gaps reviewers proved by mutation ----
+# ---- lifecycle, refusals, and the gaps found by mutation ----
 
 
 def test_a_drop_during_a_build_is_refused_before_anything_changes(serve, tmp_path):
@@ -907,7 +919,7 @@ def test_the_real_sidecar_builds_with_its_bundled_hugin_and_kills_it_on_exit(tmp
         p.wait()
 
 
-# ---- round-2 review ----
+# ---- shutdown order, kills and reaping ----
 
 
 def test_a_tiny_negative_spin_wraps_to_zero_not_360(serve):
@@ -1207,9 +1219,24 @@ def test_identity_is_handed_out_as_a_copy_and_backend_must_be_text(tmp_path):
     assert views.horizon(str(d))["backend"] is None
 
 
-def _stitched(d, names=("a.jpg", "b.jpg"), dropped=("c.jpg",)):
+def _label(path, classes):
+    """A warped LABEL layer: the class id in every channel, covering the canvas."""
+    import numpy as np
+    from PIL import Image
+
+    rgba = np.zeros(classes.shape + (4,), np.uint8)
+    rgba[..., :3] = classes[..., None]
+    rgba[..., 3] = 255
+    Image.fromarray(rgba, "RGBA").save(
+        path, tiffinfo={286: ((0, 1),), 287: ((0, 1),), 282: ((1, 1),), 283: ((1, 1),)}
+    )
+
+
+def _stitched(d, names=("a.jpg", "b.jpg"), dropped=("c.jpg",), labels=None, off_canvas=()):
     """A site whose photos `mosaic` has stitched: final.pto, one layer per placed
-    photo (left half sky, right half ground), and the manifest. No Hugin."""
+    photo (left half sky, right half ground), and the manifest. No Hugin.
+    `labels` (one class map per photo) adds segmentation label layers;
+    `off_canvas` photos get no layer, as nona does for a frame off the canvas."""
     import numpy as np
     from PIL import Image
 
@@ -1219,6 +1246,10 @@ def _stitched(d, names=("a.jpg", "b.jpg"), dropped=("c.jpg",)):
     (work / "final.pto").write_text("\n".join(lines) + "\n")
     for i, n in enumerate(names):
         _photo(d / "photos" / n)
+        if labels is not None:
+            _label(work / f"label{i:04d}.tif", labels[i])
+        if n in off_canvas:
+            continue
         rgba = np.zeros((4, 8, 4), np.uint8)
         rgba[:, :4, :3], rgba[:, 4:, :3], rgba[..., 3] = (80, 120, 220), (120, 80, 40), 255
         Image.fromarray(rgba, "RGBA").save(
@@ -1292,8 +1323,12 @@ def test_skymask_reads_the_voted_sky_and_says_so(tmp_path, capsys):
         ["skymask", str(d / "p.png"), "--sky", str(d / "p.sky.npy"), "--out", str(d / "m.yaml")]
     )
     meta, cols = load_columns(str(d / "m.yaml"))
-    assert meta["backend"] == "heuristic (per-frame vote)"
+    assert meta["backend"] == "per-frame vote (unrecorded)", "no record: it does not guess"
     assert abs(cols[0]["alt"] - 30.0) < 3.0
+    (d / "p.vote.json").write_text('{"backend": "segment (per-frame vote)"}')
+    out = str(d / "m.yaml")
+    cli.main(["skymask", str(d / "p.png"), "--sky", str(d / "p.sky.npy"), "--out", out])
+    assert load_columns(out)[0]["backend"] == "segment (per-frame vote)"
     np.save(d / "bad.npy", sky[:, :10])
     with pytest.raises(SystemExit):
         cli.main(["skymask", str(d / "p.png"), "--sky", str(d / "bad.npy")])
@@ -1550,3 +1585,317 @@ def test_a_site_being_built_cannot_be_deleted(serve, tmp_path, monkeypatch):
     s = serve(sites_root=str(root), jobs=jobs)
     code, err = call(s, "POST", "/site/delete", {"slug": "site-a"})
     assert code == 400 and "being built" in err["error"] and d.exists()
+
+
+SKY_, TREE_, WALL_ = 2, 4, 1  # ADE20K: sky, tree, building
+
+
+def test_the_terrain_biased_vote_keeps_ties_and_the_obstructions_class(tmp_path):
+    import numpy as np
+
+    from terminus.mosaic import combine_terrain_biased
+
+    a = np.array([[SKY_, SKY_, TREE_, SKY_]])
+    b = np.array([[SKY_, TREE_, TREE_, WALL_]])
+    _label(tmp_path / "a.tif", a)
+    _label(tmp_path / "b.tif", b)
+    seen = []
+    classes, votes, cover = combine_terrain_biased(
+        [str(tmp_path / "a.tif"), str(tmp_path / "b.tif")], 4, 1,
+        on_start=seen.append, on_vote=lambda v, c: seen.append(int(c.sum())),
+    )  # fmt: skip
+    assert classes[0].tolist() == [SKY_, TREE_, TREE_, WALL_], "a 1-1 tie is terrain, of its kind"
+    assert votes[0].tolist() == [2, 1, 0, 1] and cover[0].tolist() == [2, 2, 2, 2]
+    assert seen == [str(tmp_path / "a.tif"), 4, str(tmp_path / "b.tif"), 8]
+
+
+def test_a_segmented_reblend_votes_on_the_labels_and_says_so(tmp_path):
+    import numpy as np
+
+    sky_left = np.full((4, 8), TREE_)
+    sky_left[:, :4] = SKY_
+    one_more = sky_left.copy()
+    one_more[:, 4] = SKY_  # this frame alone calls column 4 sky
+    d = _site(tmp_path, panorama=False)
+    _stitched(
+        d, names=("a.jpg", "b.jpg", "c2.jpg"), dropped=(), labels=[sky_left, one_more, sky_left]
+    )
+    _reblend(d)
+    classes = np.load(d / "equirect.terrain.classes.npy")
+    strict = np.load(d / "equirect.strict.classes.npy")
+    assert (classes[:, :4] == SKY_).all() and (classes[:, 4:] == TREE_).all(), "a tree stays a tree"
+    assert (strict[:, :4] == SKY_).all(), "sky every frame agreed on"
+    assert (
+        json.loads((d / "equirect.vote.json").read_text())["backend"] == "segment (per-frame vote)"
+    )
+
+
+def test_a_disputed_sky_pixel_is_not_strict_sky(tmp_path):
+    import numpy as np
+
+    sky_left = np.full((4, 8), TREE_)
+    sky_left[:, :4] = SKY_
+    less = sky_left.copy()
+    less[:, 3] = TREE_  # one of three frames calls column 3 terrain
+    d = _site(tmp_path, panorama=False)
+    _stitched(d, names=("a.jpg", "b.jpg", "c2.jpg"), dropped=(), labels=[sky_left, sky_left, less])
+    _reblend(d)
+    classes = np.load(d / "equirect.terrain.classes.npy")
+    strict = np.load(d / "equirect.strict.classes.npy")
+    assert (classes[:, 3] == SKY_).all(), "two of three is a majority"
+    assert (strict[:, 3] != SKY_).all(), "but not unanimous: the planning line sees terrain there"
+
+
+def _maps(terrain, strict=None, cover=2):
+    import numpy as np
+
+    strict = terrain if strict is None else strict
+    return terrain, strict, np.full(terrain.shape, cover, np.int16), np.ones(terrain.shape)
+
+
+def test_the_planning_line_buffers_a_tree_only_one_frame_saw():
+    import numpy as np
+
+    from terminus.export import TREE_BUFFER_DEG
+    from terminus.reproject import true_horizon
+
+    t = np.full((180, 360), TREE_)
+    t[:80] = SKY_  # sky down to alt 10
+    two = true_horizon(*_maps(t, cover=2))
+    one = true_horizon(*_maps(t, cover=1))
+    assert two[200]["planning"] == two[200]["alt"], "two frames saw the edge hold still"
+    assert one[200]["planning"] == pytest.approx(one[200]["alt"] + TREE_BUFFER_DEG)
+    assert one[200]["type"] == "tree"
+
+
+def test_the_actual_line_dips_into_a_pocket_the_planning_line_does_not():
+    import numpy as np
+
+    from terminus.reproject import true_horizon
+
+    t = np.full((180, 360), WALL_)
+    t[:80] = SKY_  # sky down to alt 10 ...
+    t[80:100, 100:112] = SKY_  # ... lower, to alt -10, at az 100-111 ...
+    t[70:80, 100:110] = WALL_  # ... under an overhang from alt 10 to 20 over az 100-109
+    cols = true_horizon(*_maps(t))
+    assert cols[105]["alt"] == pytest.approx(-10.0, abs=1.01), "actual reaches round into it"
+    assert cols[105]["planning"] == pytest.approx(20.0, abs=1.01), "planning: the overhang"
+    assert cols[200]["alt"] == pytest.approx(10.0, abs=1.01)
+
+
+def test_a_column_whose_obstruction_runs_off_the_photos_is_marked_clipped():
+    import numpy as np
+
+    from terminus.reproject import true_horizon
+
+    t = np.full((180, 360), SKY_)
+    t[100:] = WALL_
+    t[:, 50:60] = WALL_  # a wall that fills its columns to the top
+    cols = true_horizon(*_maps(t))
+    assert cols[55]["clipped"] is True and cols[200]["clipped"] is False
+
+
+def test_the_reprojection_applies_the_solution_the_way_orient_rotates():
+    from terminus.orient import rotate
+    from terminus.reproject import index_map
+
+    H, W = 180, 360
+    sol = {"yaw": 30.0, "pitch": 4.0, "tilt_mag": 6.0, "tilt_dir": 120.0}
+    sy, sx = index_map(H, W, sol)
+    for taz, talt in ((10.5, 20.5), (200.5, -5.5), (300.5, 45.5)):
+        # The panorama pixel the photo shows at a true direction is where the
+        # solution's forward rotation sends that panorama pixel.
+        x, y = int(taz), int(90.0 - talt)
+        paz, palt = (sx[y, x] + 0.5) / W * 360.0, 90.0 - (sy[y, x] + 0.5) / H * 180.0
+        raz, ralt = rotate(
+            (paz + sol["yaw"]) % 360.0, palt, sol["pitch"], sol["tilt_mag"], sol["tilt_dir"]
+        )
+        assert abs((raz - taz + 180) % 360 - 180) < 1.5 and abs(ralt - talt) < 1.5, (taz, talt)
+
+
+def test_yaw_moves_the_horizon_to_its_true_azimuth():
+    import numpy as np
+
+    from terminus.reproject import true_horizon
+
+    t = np.full((180, 360), WALL_)
+    t[:80] = SKY_
+    t[:, 0:10] = WALL_  # a tall notch at panorama azimuth 0-10
+    t[:40, 0:10] = SKY_  # (sky above alt 50 there)
+    cols = true_horizon(*_maps(t), {"yaw": 90.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0})
+    assert cols[95]["alt"] == pytest.approx(50.0, abs=1.01), "panorama az 5 is true az 95"
+    assert cols[5]["alt"] == pytest.approx(10.0, abs=1.01)
+
+
+def test_layer_and_verdict_images_serve_only_layer_names(serve, tmp_path):
+    root, d = _curatable(tmp_path)
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    call(s, "POST", "/site/open", {"slug": d.name})
+    code, webp = call(s, "GET", "/site/frame/layer.webp?layer=layer0000.tif")
+    assert code == 200 and webp[8:12] == b"WEBP"
+    code, png = call(s, "GET", "/site/frame/verdict.png?layer=layer0000.tif")
+    assert code == 200 and png[:4] == b"\x89PNG"
+    assert call(s, "GET", "/site/frame/layer.webp?layer=layer0009.tif")[0] == 204
+    for bad in ("../site.json", "layer0000.png", "x/layer0000.tif", "layer00000.tif"):
+        assert call(s, "GET", f"/site/frame/layer.webp?layer={bad}")[0] == 400, bad
+        assert call(s, "GET", f"/site/frame/verdict.png?layer={bad}")[0] == 400, bad
+
+
+def test_reblend_reuses_cached_gains_and_verdicts_until_a_layer_changes(tmp_path, monkeypatch):
+    import os
+
+    from terminus import mosaic, skymask
+
+    d = _site(tmp_path, panorama=False)
+    _stitched(d)
+    solves, judged = [], []
+    real_solve = mosaic.solve_gains
+    monkeypatch.setattr(
+        mosaic, "solve_gains", lambda *a, **k: solves.append(1) or real_solve(*a, **k)
+    )
+
+    def colour(rgb, valid, px_per_deg):
+        judged.append(1)
+        return (rgb[..., 2] > rgb[..., 0]) & valid
+
+    monkeypatch.setattr(skymask, "heuristic_sky", colour)
+    from terminus import cli
+
+    def run(*off):
+        args = ["reblend", str(d / "work"), "--out", str(d / "equirect")]
+        cli.main(args + [a for n in off for a in ("--off", n)])
+
+    run()
+    first = (len(solves), len(judged))
+    run("b.jpg")  # turning a frame off re-solves nothing and judges nothing again
+    assert (len(solves), len(judged)) == first
+    layer = d / "work" / "layer0000.tif"
+    st = os.stat(layer)
+    os.utime(layer, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a re-stitch rewrote it
+    run()
+    assert len(solves) > first[0] and len(judged) == first[1] + 1, "only the changed frame again"
+
+
+def test_vote_sky_crops_each_frame_to_its_own_columns(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    from terminus.mosaic import vote_sky
+
+    rgba = np.zeros((4, 6, 4), np.uint8)
+    rgba[:2, :, :3], rgba[2:, :, :3], rgba[..., 3] = (80, 120, 220), (120, 80, 40), 255
+    path = tmp_path / "l.tif"
+    Image.fromarray(rgba, "RGBA").save(
+        path, tiffinfo={286: ((10, 1),), 287: ((0, 1),), 282: ((1, 1),), 283: ((1, 1),)}
+    )  # a frame at canvas columns 10-15
+    seen = []
+
+    def blue(rgb, valid):
+        seen.append(rgb.shape)
+        return (rgb[..., 2] > rgb[..., 0]) & valid
+
+    sky, _ = vote_sky([str(path)], 30, 4, blue, margin=3)
+    assert seen == [(4, 12, 3)], "its 6 columns and 3 either side, full height"
+    assert (
+        sky[:2, 10:16].all()
+        and not sky[2:].any()
+        and not sky[:, :10].any()
+        and not sky[:, 16:].any()
+    )
+
+
+def test_a_frame_warped_off_the_canvas_is_left_out_not_fatal(tmp_path, capsys):
+    d = _site(tmp_path, panorama=False)
+    _stitched(d, names=("a.jpg", "b.jpg", "e.jpg"), dropped=(), off_canvas=("b.jpg",))
+    _reblend(d)
+    assert "b.jpg was warped off the canvas" in capsys.readouterr().out
+    by = {f["name"]: f for f in json.loads((d / "equirect.frames.json").read_text())["frames"]}
+    assert by["b.jpg"]["layer"] is None and by["b.jpg"]["dropped"] is True
+    assert by["e.jpg"]["layer"] == "layer0002.tif", "layers are matched by index, not by count"
+
+
+def test_an_unreadable_site_name_keeps_the_folder_name(serve, tmp_path):
+    root = tmp_path / "sites"
+    d = _site(root, slug="site-a")
+    _site(root, slug="site-b")
+    (d / "site.json").write_text("{not json")
+    s = serve(sites_root=str(root), jobs=FakeJobs())
+    code, listed = call(s, "GET", "/sites")
+    assert code == 200 and [x["name"] for x in listed["sites"]] == ["site-a", "site-b"]
+
+
+def test_a_hugin_tool_that_cannot_start_is_a_mosaic_error(tmp_path, monkeypatch):
+    from terminus import mosaic
+
+    tool = tmp_path / "pto_gen"
+    tool.write_text("not a program")  # present but not executable
+    monkeypatch.setattr(mosaic, "HUGIN_BIN", str(tmp_path))
+    monkeypatch.setattr(mosaic, "_tool", lambda name: str(tool))
+    for on_line in (None, print):
+        with pytest.raises(mosaic.MosaicError, match="pto_gen could not run"):
+            mosaic._run(["pto_gen"], on_line=on_line)
+
+
+def test_the_stitch_takes_every_photo_type_and_refreshes_a_changed_photo(tmp_path, monkeypatch):
+    import os
+
+    from terminus import mosaic
+
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for n in ("a.JPG", "b.png", "c.TIFF", "notes.txt"):
+        (photos / n).write_bytes(b"one")
+    calls = []
+    monkeypatch.setattr(mosaic, "require_hugin", lambda: None)
+    monkeypatch.setattr(mosaic, "_run", lambda cmd, **kw: calls.append(cmd) or "")
+    monkeypatch.setattr(
+        mosaic, "control_point_counts", lambda pto: {"a.JPG": 50, "b.png": 50, "c.TIFF": 50}
+    )
+    monkeypatch.setattr(
+        mosaic, "control_point_links", lambda pto: {"a.JPG": [], "b.png": [], "c.TIFF": []}
+    )
+    work = tmp_path / "work"
+    mosaic.solve(str(photos), str(work))
+    staged = [
+        os.path.basename(a) for a in calls[0] if a.endswith((".JPG", ".png", ".TIFF", ".txt"))
+    ]
+    assert staged == ["a.JPG", "b.png", "c.TIFF"]
+    (work / "stage" / "a.key").write_text("keypoints of the first a.JPG")
+    (photos / "a.JPG").write_bytes(b"a different photo, same name")
+    mosaic.solve(str(photos), str(work))
+    assert (work / "stage" / "a.JPG").read_bytes() == b"a different photo, same name"
+    assert not (work / "stage" / "a.key").exists(), "its stale keypoints are dropped"
+
+
+def test_a_canvas_event_must_be_two_integers(tmp_path):
+    jobs = FakeJobs()
+    jobs.state = {"canvas": None, "frames": [], "active": [], "pairs": [], "compared": 0}
+    for bad in ('{"canvas": [1]}', '{"canvas": [1.5, 2]}', '{"canvas": ["a", "b"]}'):
+        jobs._event(bad)
+        assert jobs.state["canvas"] is None, bad
+    jobs._event('{"canvas": [2880, 1440]}')
+    assert jobs.state["canvas"] == [2880, 1440]
+
+
+def test_the_build_child_says_why_its_stdin_watch_failed():
+    script = (
+        "import sys\n"
+        "class Bad:\n"
+        "    def read(self): raise OSError('stdin is broken')\n"
+        "sys.stdin = Bad()\n"
+        "from terminus.server import sites\n"
+        "sites.exit_on_eof()\n"
+    )
+    p = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "PYTHONPATH": str(ROOT / "src")})  # fmt: skip
+    assert p.returncode == 3 and "stdin is broken" in p.stderr
+
+
+def test_an_unreadable_rotation_is_logged_not_silent(caplog):
+    from terminus.server import views
+
+    assert views.solution({"oriented": True, "yaw": "12.5deg"}) is None
+    assert "rotation is unreadable" in caplog.text
+    caplog.clear()
+    assert views.solution({"oriented": True}) is None, "a scope-only sweep: nothing to say"
+    assert "unreadable" not in caplog.text

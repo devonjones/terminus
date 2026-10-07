@@ -3,8 +3,8 @@
 
 export interface Footprint {
   name: string;
-  box: number[]; // [x, y, width, height] on the panorama, in its pixels
-  alpha: Uint8ClampedArray; // width * height, non-zero where the photo covers
+  box: [number, number, number, number]; // [x, y, width, height] on the panorama, in its pixels
+  alpha: Uint8ClampedArray; // box width * box height, row by row; non-zero where the photo covers
 }
 
 // The photos covering panorama pixel (x, y).
@@ -28,7 +28,11 @@ export function pick(fps: Footprint[], x: number, y: number): string | null {
 }
 
 // A footprint PNG's alpha channel. Needs a real canvas (Electron), not jsdom.
-export async function decode(name: string, box: number[], png: Uint8Array): Promise<Footprint> {
+export async function decode(
+  name: string,
+  box: [number, number, number, number],
+  png: Uint8Array,
+): Promise<Footprint> {
   const bitmap = await createImageBitmap(new Blob([png as BlobPart], { type: "image/png" }));
   const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
   const ctx = canvas.getContext("2d")!;

@@ -37,6 +37,7 @@ import numpy as np
 
 TOOLS = ("pto_gen", "cpfind", "cpclean", "autooptimiser", "nona", "pano_modify")
 MIN_CONTROL_POINTS = 12  # below this a frame's orientation is not determined
+PHOTO_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")  # what the app accepts, any case
 
 
 class MosaicError(RuntimeError):
@@ -82,15 +83,24 @@ def _run(cmd, cwd=None, on_line=None):
         # Never fall back to PATH: the app must run the Hugin it ships.
         raise MosaicError(f"{cmd[0]} is missing from {HUGIN_BIN}")
     cmd = [tool or cmd[0], *cmd[1:]]
-    if on_line is None:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-        if p.returncode != 0:
-            raise MosaicError(f"{cmd[0]} failed: {p.stderr.strip()[:400]}")
-        return p.stdout
+    try:
+        if on_line is None:
+            p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+            if p.returncode != 0:
+                raise MosaicError(f"{cmd[0]} failed: {p.stderr.strip()[:400]}")
+            return p.stdout
+        p = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+    except OSError as e:  # not there, not executable, not permitted
+        raise MosaicError(f"{cmd[0]} could not run: {e.strerror or e}") from e
     lines = []
-    with subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace"
-    ) as p:
+    with p:
         for line in p.stdout:
             lines.append(line)
             on_line(line.rstrip())
@@ -213,7 +223,9 @@ def solve(
     require_hugin()
     os.makedirs(work_dir, exist_ok=True)
     images = sorted(
-        p for p in glob.glob(os.path.join(image_dir, "*.jpg")) if os.path.basename(p) not in exclude
+        os.path.join(image_dir, n)
+        for n in os.listdir(image_dir)
+        if n.lower().endswith(PHOTO_EXTS) and n not in exclude
     )
     if len(images) < 2:
         raise MosaicError(f"need at least 2 images, found {len(images)}")
@@ -228,8 +240,16 @@ def solve(
         stage = os.path.join(work_dir, "stage")
         os.makedirs(stage, exist_ok=True)
         for n in keep:
-            if not os.path.isfile(os.path.join(stage, n)):
-                shutil.copy2(os.path.join(image_dir, n), os.path.join(stage, n))
+            src, dst = os.path.join(image_dir, n), os.path.join(stage, n)
+            s = os.stat(src)
+            if os.path.isfile(dst):
+                d = os.stat(dst)
+                if (d.st_size, d.st_mtime_ns) == (s.st_size, s.st_mtime_ns):
+                    continue  # the same photo: its cached keypoints still hold
+            shutil.copy2(src, dst)  # copy2 keeps the mtime the check above compares
+            key = os.path.splitext(dst)[0] + ".key"
+            if os.path.isfile(key):
+                os.remove(key)  # a different photo under the same name
         pto = os.path.join(stage, "project.pto")
         _run(["pto_gen", "-o", pto] + [os.path.join(stage, n) for n in keep])
         if lens:
@@ -465,6 +485,15 @@ def remap_labels(pto, work_dir, label_for, prefix="label"):
     return sorted(written)
 
 
+def _placed(m, ox, oy, width, height):
+    """A layer's covered pixels, clipped to the canvas: (ys, xs) in the layer and
+    (Y, X) on the canvas, in the same order as `layer[m]`."""
+    ys, xs = np.nonzero(m)
+    Y, X = ys + oy, xs + ox
+    ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
+    return ys[ok], xs[ok], Y[ok], X[ok]
+
+
 def combine_labels(layer_paths, width, height):
     """Majority vote per pixel across the remapped label layers.
 
@@ -480,11 +509,8 @@ def combine_labels(layer_paths, width, height):
     for path in layer_paths:
         rgb, mask, ox, oy = _layer(path)
         lab = rgb[..., 0].astype(int)  # class id stored in every channel
-        h, w = lab.shape
-        ys, xs = np.mgrid[0:h, 0:w]
-        Y, X = ys[mask] + oy, xs[mask] + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
-        Y, X, L = Y[ok], X[ok], lab[mask][ok]
+        ys, xs, Y, X = _placed(mask, ox, oy, width, height)
+        L = lab[ys, xs]
         covered[Y, X] = True
         for cls in np.unique(L):
             box = votes.setdefault(int(cls), np.zeros((height, width), np.int32))
@@ -498,15 +524,18 @@ def combine_labels(layer_paths, width, height):
     return np.where(covered, out, -1)
 
 
-def combine_terrain_biased(label_paths, width, height):
-    """Devon's rule over warped per-frame LABEL layers: a pixel is sky only if a
-    strict majority of the frames covering it say sky; otherwise it is terrain,
-    labelled with its most-voted non-sky class (so a tree stays a tree). Ported
-    exactly from the 2026-10-05 session's combine_terrain_biased.py.
+def combine_terrain_biased(label_paths, width, height, on_start=None, on_frame=None, on_vote=None):
+    """The terrain-biased vote over warped per-frame LABEL layers: a pixel is sky
+    only if a strict majority of the frames covering it say sky; otherwise it is
+    terrain, labelled with its most-voted non-sky class (so a tree stays a tree).
 
     `combine_labels` takes a plain argmax whose ties go to the lowest class id,
     and sky (2) is lower than most terrain classes, so a two-frame disagreement
     resolves to SKY: the unsafe direction. Returns (classes, sky_votes, cover).
+
+    The hooks match `vote_sky`'s: `on_start(path)` before a frame,
+    `on_frame(path, sky)` with its own verdict (the layer's shape), and
+    `on_vote(sky_votes, cover)` with the vote so far after it.
     """
     from .skymask import SKY_CLASS_ADE20K as SKY
 
@@ -514,12 +543,14 @@ def combine_terrain_biased(label_paths, width, height):
     skyv = np.zeros((height, width), np.int32)
     votes = {}  # non-sky class -> counts
     for path in label_paths:
+        if on_start:
+            on_start(path)
         rgb, mask, ox, oy = _layer(path)
         lab = rgb[..., 0].astype(int)
-        ys, xs = np.nonzero(mask)
-        Y, X = ys + oy, xs + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
-        Y, X, L = Y[ok], X[ok], lab[mask][ok]
+        if on_frame:
+            on_frame(path, (lab == SKY) & mask)
+        ys, xs, Y, X = _placed(mask, ox, oy, width, height)
+        L = lab[ys, xs]
         np.add.at(cover, (Y, X), 1)
         s = L == SKY
         np.add.at(skyv, (Y[s], X[s]), 1)
@@ -527,6 +558,8 @@ def combine_terrain_biased(label_paths, width, height):
             sel = L == cls
             box = votes.setdefault(int(cls), np.zeros((height, width), np.int32))
             np.add.at(box, (Y[sel], X[sel]), 1)
+        if on_vote:
+            on_vote(skyv, cover)
     out = np.full((height, width), -1, int)
     if votes:
         labels = sorted(votes)
@@ -588,12 +621,15 @@ def vote_sky(
     judged whole, in its own exposure, rather than through a blend that mixes a
     bright frame's sky into a dim frame's tree.
 
-    `classify(rgb, valid)` takes one frame placed on the full canvas and returns
-    its sky mask. Returns (sky, disagree): `disagree` is the fraction of the
-    covering frames outvoted at each pixel, 0 where they agree or none covers.
-    `on_frame(path, sky, box)`, if given, sees each frame's own verdict, cropped
-    to its box, as soon as it is made. `known(path)` may return a verdict made
-    before (cropped the same way) to skip classifying that frame again.
+    `classify(rgb, valid)` takes one frame (its columns, full height) and returns
+    its sky mask. Returns (sky, disagree), or with `counts` (sky, disagree, votes,
+    cover): `disagree` is the fraction of the covering frames outvoted at each
+    pixel, 0 where they agree or none covers.
+
+    Hooks: `on_start(path)` before a frame is classified; `on_frame(path, sky,
+    (x0, y0))` with its verdict cropped to its box and that box's corner;
+    `known(path)` may return such a crop made before, to skip classifying again;
+    `on_vote(votes, cover)` with the vote so far after each frame.
 
     Each frame is classified on its own columns plus `margin` either side, at
     full height: the columns beyond carry none of its pixels, so cropping them
@@ -603,11 +639,9 @@ def vote_sky(
     cover = np.zeros((height, width), np.int32)
     for path in layer_paths:
         rgb, m, ox, oy = _layer(path)
-        ys, xs = np.nonzero(m)
-        Y, X = ys + oy, xs + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
+        ys, xs, Y, X = _placed(m, ox, oy, width, height)
         valid = np.zeros((height, width), bool)
-        valid[Y[ok], X[ok]] = True
+        valid[Y, X] = True
         y0, y1 = max(0, oy), min(height, oy + m.shape[0])
         x0, x1 = max(0, ox), min(width, ox + m.shape[1])
         mine = np.zeros((height, width), bool)
@@ -617,7 +651,7 @@ def vote_sky(
                 on_start(path)
             c0, c1 = max(0, ox - margin), min(width, ox + m.shape[1] + margin)
             canvas = np.zeros((height, c1 - c0, 3), np.float32)
-            canvas[Y[ok], X[ok] - c0] = rgb[m][ok]
+            canvas[Y, X - c0] = rgb[ys, xs]
             mine[:, c0:c1] = classify(canvas, valid[:, c0:c1])
             mine &= valid
             box = mine[y0:y1, x0:x1]
@@ -654,11 +688,9 @@ def solve_gains(layers, iterations=12):
     prep = []
     cnt = np.zeros(h * w)
     for rgb, m, ox, oy in layers:
-        ys, xs = np.nonzero(m)
-        Y, X = ys + oy, xs + ox
-        ok = (Y >= 0) & (Y < h) & (X >= 0) & (X < w)
-        idx = Y[ok] * w + X[ok]
-        prep.append((idx, rgb[m][ok]))
+        ys, xs, Y, X = _placed(m, ox, oy, w, h)
+        idx = Y * w + X
+        prep.append((idx, rgb[ys, xs]))
         cnt[idx] += 1
     for _ in range(iterations):
         acc = np.zeros((h * w, layers[0][0].shape[-1]))
@@ -702,12 +734,10 @@ def blend(tiffs, width, height, feather=48, gains=None, on_frame=None):
         if on_frame:
             on_frame(path)
         weight = np.minimum(distance_transform_edt(m), feather) / feather
-        ys, xs = np.mgrid[0 : m.shape[0], 0 : m.shape[1]]
-        Y, X = ys[m] + oy, xs[m] + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
-        w = weight[m][ok]
-        acc[Y[ok], X[ok]] += np.clip(rgb[m][ok] * g, 0, 255) * w[:, None]
-        wsum[Y[ok], X[ok]] += w
+        ys, xs, Y, X = _placed(m, ox, oy, width, height)
+        w = weight[ys, xs]
+        acc[Y, X] += np.clip(rgb[ys, xs] * g, 0, 255) * w[:, None]
+        wsum[Y, X] += w
     img = np.where(wsum[..., None] > 0, acc / np.maximum(wsum, 1e-9)[..., None], 0)
     return img.clip(0, 255).astype(np.uint8)
 
@@ -720,11 +750,9 @@ def composite(tiffs, width, height, gains=None):
     acc = np.zeros((height, width, 3))
     cnt = np.zeros((height, width))
     for g, (rgb, m, ox, oy) in zip(gains, layers, strict=False):
-        ys, xs = np.mgrid[0 : m.shape[0], 0 : m.shape[1]]
-        Y, X = ys[m] + oy, xs[m] + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
-        acc[Y[ok], X[ok]] += np.clip(rgb[m][ok] * g, 0, 255)
-        cnt[Y[ok], X[ok]] += 1
+        ys, xs, Y, X = _placed(m, ox, oy, width, height)
+        acc[Y, X] += np.clip(rgb[ys, xs] * g, 0, 255)
+        cnt[Y, X] += 1
     img = np.where(cnt[..., None] > 0, acc / np.maximum(cnt, 1)[..., None], 0)
     return img.clip(0, 255).astype(np.uint8), cnt, gains
 

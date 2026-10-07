@@ -133,7 +133,7 @@ export interface Horizon {
   fit: FitColumn[];
   settled: boolean | null;
   /**
-   * the detector that read the horizon (e.g. "heuristic": no segmentation model ran)
+   * the vote that read the horizon: "segment (per-frame vote)", or "heuristic ..." when the frames were judged by colour
    */
   backend: string | null;
 }

@@ -316,12 +316,13 @@ def upper_envelope(rows, half_deg, px_per_deg):
 # ADE20K classes that behave like vegetation: gappy, seasonal, partly
 # transmissive. Everything else that blocks is treated as opaque structure.
 VEG_CLASSES_ADE20K = (4, 9, 17, 66)  # tree, grass, plant, flower
-TERRAIN_CLASS = 1  # ADE20K "building": terrain whose kind is unknown (a colour vote)
+TERRAIN_CLASS = 255  # terrain of unknown kind (a colour vote): not an ADE20K class
 
 
 def type_name(cls):
-    """ADE20K class -> the mask's vocabulary. -1 means nothing was segmented."""
-    if cls < 0:
+    """ADE20K class -> the mask's vocabulary. -1 (nothing segmented) and
+    TERRAIN_CLASS (terrain, kind unknown) have no type to claim."""
+    if cls < 0 or cls == TERRAIN_CLASS:
         return ""
     return "tree" if cls in VEG_CLASSES_ADE20K else "structure"
 

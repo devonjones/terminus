@@ -122,10 +122,11 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     revoke(v.photo);
     revoke(v.outline);
     revokeFrames();
-    [v.horizon, v.disc, v.frames] = [views[0], views[1], views[4]];
-    v.outline = toUrl(views[6], "image/png");
-    [v.pano, v.photo] = [toUrl(views[2]), toUrl(views[3])];
-    v.disagree = toUrl(views[5], "image/png");
+    const [horizon, disc, pano, photo, frames, disagree, outline] = views;
+    [v.horizon, v.disc, v.frames] = [horizon, disc, frames];
+    [v.pano, v.photo] = [toUrl(pano), toUrl(photo)];
+    v.disagree = toUrl(disagree, "image/png");
+    v.outline = toUrl(outline, "image/png");
     v.pending = new Set(v.frames?.frames.filter((f) => f.off).map((f) => f.name));
     render();
     if (v.frames) await loadPhotos(mine, v.frames);
@@ -209,7 +210,11 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     if (job.outline > b.progressN) {
       const seen = job.outline;
       const url = toUrl(await api.image("progress"), "image/png");
-      if (url) [b.progress, b.progressN] = [(revoke(b.progress), url), seen];
+      if (url) {
+        revoke(b.progress);
+        b.progress = url;
+        b.progressN = seen;
+      }
     }
   }
 
@@ -226,6 +231,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       polling = false;
       try {
         v.st = await api.getState();
+        v.error = ""; // the engine answered: an earlier failed read no longer applies
         if (v.st.job?.status === "running") {
           await fetchBuild();
           return (render(), poll());

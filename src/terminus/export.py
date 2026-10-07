@@ -173,6 +173,24 @@ def load_mask(path):
     return meta, sorted((az, c["alt"], c.get("type", "")) for az, c in cols.items())
 
 
+def load_planning(path):
+    """(meta, [(az, alt, type)], planned): what a planner should treat as blocked.
+
+    A map from `terminus horizon` carries two lines: `alt`, the actual outline
+    (for matching scope edges), and `planning`, raised wherever terrain was seen
+    to move and already buffered where only one frame saw a tree. Planners get
+    the planning line; `planned` says it is there, so callers do not add the tree
+    buffer a second time. A mask without `planning` comes back as `load_mask`.
+    """
+    meta, cols = load_columns(path)
+    planned = any("planning" in c for c in cols.values())
+    rows = sorted(
+        (az, max(c["alt"], c["planning"]) if "planning" in c else c["alt"], c.get("type", ""))
+        for az, c in cols.items()
+    )
+    return meta, rows, planned
+
+
 def parse_pockets(raw):
     """[(alt_hi, alt_lo), ...] from a mask's `pockets`, refusing a malformed one.
 
@@ -504,8 +522,10 @@ def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriente
     # Deliberately does NOT buffer here: the exporters do it themselves, so a
     # caller reaching past this wrapper still gets the margin. Buffering in both
     # places would apply it twice.
-    meta, rows = load_mask(mask_path)
+    meta, rows, planned = load_planning(mask_path)
     require_oriented(meta, allow_unoriented)
+    if planned:
+        tree_buffer = 0.0  # the planning line already carries it
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
         # Forward the override: to_nina_hrz checks again for the benefit of

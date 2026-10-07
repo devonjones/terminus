@@ -9975,3 +9975,18 @@ def test_sky_outline_runs_where_the_open_sky_meets_terrain():
     edge = sky_outline(votes, cover)
     assert edge[7].all(), "the line runs along the last sky row"
     assert not edge[:4].any() and not edge[11:].any(), "nowhere else: not the patch"
+
+
+def test_export_writes_the_planning_line_without_a_second_tree_buffer(tmp_path):
+    from terminus.export import export_all, write_mask
+    from terminus.horizon import Horizon
+
+    mask = tmp_path / "h.yaml"
+    cols = {az: {"alt": 10.0, "planning": 18.0, "type": "tree"} for az in range(0, 360, 10)}
+    write_mask(str(mask), cols, [], {"oriented": True})
+    hrz, txt = export_all(str(mask), str(tmp_path / "out"))
+    alts = {
+        float(line.split()[1]) for line in open(hrz) if line.strip() and not line.startswith("#")
+    }
+    assert alts == {18.0}, "the planning line, already buffered: not 10, not 21"
+    assert Horizon.from_mask(str(mask)).altitude_at(45) == 18.0, "planners get planning too"

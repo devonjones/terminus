@@ -1748,7 +1748,7 @@ The app's build child watches its stdin so it can die with the sidecar. On Windo
 thread sat in `sys.stdin.read()`, and the main thread's first `import scipy.linalg` (loading
 OpenBLAS) then hung forever: py-spy showed exactly two threads, one in the read and one in the
 DLL load. The app showed a build stuck at "blending" with nothing moving. Proven by control, not
-inferred: the same child with the blocking reader hung 30 s every time; with a reader that only
+inferred: the same child with the blocking reader was still stuck at the test's 30 s limit every time; with a reader that only
 polls the pipe (`PeekNamedPipe`), scipy imported in 1.7 s and the child still exited within a
 second of stdin closing. The stage-1 sidecar deadlock (OpenBLAS loading in a worker thread) was
 the same family.

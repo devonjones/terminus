@@ -1,15 +1,13 @@
 """Horizon ACTUAL and horizon PLANNING, in true coordinates, from one reprojection.
 
-Ported from the 2026-10-05 session's reproject_mask.py, the method that drew the
-published maps (~/terminus-out/home2/pipeline; it reproduced east_fit.yaml
-360/360). Inputs are panorama-space class maps from the frames' own vote:
+Inputs are panorama-space class maps from the frames' own vote:
 
 actual    terrain-biased: sky only where a strict majority of covering frames
           say sky, and only sky contiguous with the open sky. No altitude clamp:
           true 0 deg is unknown until the fit. Per column the line is the floor
           of the lowest contiguous sky pixel, so it dips into pockets.
 planning  terrain wherever ANY covering frame saw terrain within
-          SEARCH_ABOVE_DEG above the actual edge (wind), run-guarded so a speck
+          SEARCH_ABOVE_DEG above the highest obstruction (wind), run-guarded so a speck
           cannot lift it; never below actual. Where only one frame saw a tree's
           edge, the fixed tree buffer stands in for the movement nobody measured.
 fuzz      planning - the highest obstruction: how far the edge was seen to move.
@@ -26,7 +24,7 @@ from . import skymask
 from .export import TREE_BUFFER_DEG
 from .orient import rotate_inverse
 
-SEARCH_ABOVE_DEG = 10.0  # how far above the actual line wind-blown terrain is looked for
+SEARCH_ABOVE_DEG = 10.0  # how far above the highest obstruction wind-blown terrain is looked for
 IDENTITY = {"yaw": 0.0, "pitch": 0.0, "tilt_mag": 0.0, "tilt_dir": 0.0}
 
 
@@ -86,5 +84,7 @@ def true_horizon(actual, strict, cover, coverage, solution=None):
             "type": typ,
             "planning": round(plan, 2),
             "fuzz": round(plan - top_alt, 2),
+            # The obstruction runs off the top of the photos: a lower bound.
+            "clipped": bool(a_band["clipped"][x]),
         }
     return mask

@@ -316,7 +316,7 @@ describe("fit", () => {
   });
 });
 
-describe("round-1 review", () => {
+describe("overlapping loads, polling and failures", () => {
   it("an overlapping, stale site load is dropped and its photos released", async () => {
     let release!: () => void;
     let holdNext = false;
@@ -375,6 +375,40 @@ describe("round-1 review", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(root.querySelector('[role="alert"]')).toBeNull();
     expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2); // B's photos are still in use
+  });
+
+  it("a progress read that works again clears the earlier error", async () => {
+    vi.useFakeTimers();
+    const running: Job = {
+      site: "site-a",
+      step: "mosaic",
+      status: "running",
+      log: [],
+      error: null,
+      phase: null,
+      detail: null,
+      outline: 0,
+      canvas: null,
+      frames: [],
+      active: [],
+      pairs: [],
+      compared: 0,
+    };
+    let reads = 0;
+    await mount(
+      root,
+      fakeApi({
+        getState: vi.fn(async () => {
+          reads += 1;
+          if (reads === 2) throw new Error("engine /state: 502");
+          return state({ site, tab: "panorama", job: running });
+        }),
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(root.querySelector("[role=alert]")?.textContent).toContain("502");
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(root.querySelector("[role=alert]")).toBeNull();
   });
 
   it("keeps polling a build after one failed progress read", async () => {
@@ -540,7 +574,7 @@ describe("view details", () => {
   });
 });
 
-describe("round-2 review", () => {
+describe("stale views, focus and spin", () => {
   it("this site's running build shows progress, not 'no panorama yet'", async () => {
     const running: Job = {
       site: "site-a",
@@ -787,6 +821,23 @@ describe("watching a build", () => {
     expect(root.textContent).toContain("3 pairs compared, 1 share points");
   });
 
+  it("a judged photo gets its sky wash, placed at its own box", async () => {
+    const judged = job({
+      phase: "judging",
+      frames: [{ name: "a.jpg", state: "judged", layer: "layer0000.tif", box: [40, 10, 60, 20] }],
+      active: [],
+    });
+    await mount(root, watching(judged));
+    await waitFor(() => expect(root.querySelector(".live .sky")).not.toBeNull(), { timeout: 3000 });
+    const sky = root.querySelector<HTMLElement>(".live .sky")!;
+    expect([sky.style.left, sky.style.top, sky.style.width, sky.style.height]).toEqual([
+      "40%",
+      "20%",
+      "60%",
+      "40%",
+    ]);
+  });
+
   it("draws the horizon so far over the panorama as each photo is judged", async () => {
     const judging = job({
       step: "reblend",
@@ -828,6 +879,15 @@ describe("watching a build", () => {
     expect(root.querySelector(".live img")!.classList.contains("hot")).toBe(true);
     expect(root.querySelectorAll(".live .hl")).toHaveLength(1); // the same wash as hovering
     expect(api.buildImage).toHaveBeenCalledWith("layer", "layer0000.tif");
+    // Placed at its box: x 0/100, y 0/50, 60 by 50 of a 100 x 50 canvas.
+    const img = root.querySelector<HTMLImageElement>(".live img")!;
+    expect([img.style.left, img.style.top, img.style.width, img.style.height]).toEqual([
+      "0%",
+      "0%",
+      "60%",
+      "100%",
+    ]);
+    expect(root.querySelector(".live .sky")).toBeNull(); // not judged yet: no wash
     const rows = root.querySelectorAll(".progress li");
     expect(rows[0].classList.contains("hot")).toBe(true);
     expect(rows[1].classList.contains("hot")).toBe(false);

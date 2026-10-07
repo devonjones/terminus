@@ -3,8 +3,12 @@
 A site is a folder under the sites root that the app owns:
 
     <root>/<slug>/photos/            the user's photographs, copied in
-    <root>/<slug>/equirect.png       `terminus mosaic` output (+ .coverage.npy, ...)
-    <root>/<slug>/photo_mask.yaml    `terminus skymask` output
+    <root>/<slug>/site.json          the user's name for the site
+    <root>/<slug>/curation.json      the photos the user turned off
+    <root>/<slug>/work/              `terminus mosaic`: the stitch, one layer per photo
+    <root>/<slug>/equirect.*         `terminus reblend`: the panoramas and class maps
+    <root>/<slug>/photo_mask.yaml    `terminus skymask`: the native mask, for orienting
+    <root>/<slug>/horizon.yaml       `terminus horizon`: the map (actual + planning)
     <root>/<slug>/oriented.yaml      `terminus orient` output, when there is one
 
 The same files the CLI writes, so the CLI can still open a site. The pipeline
@@ -113,12 +117,15 @@ MAX_NAME = 80
 
 def site_name(d):
     path = os.path.join(d, SITE_FILE)
-    if os.path.isfile(path):
+    try:
         with open(path) as fh:
             name = json.load(fh).get("name")
-        if isinstance(name, str) and name.strip():
-            return name
-    return os.path.basename(d)
+    except FileNotFoundError:
+        name = None
+    except (OSError, ValueError, AttributeError):
+        log.warning("%s is unreadable; the site keeps its folder name", path)
+        name = None
+    return name if isinstance(name, str) and name.strip() else os.path.basename(d)
 
 
 def rename_site(root, slug, name):
@@ -142,7 +149,12 @@ def summary(root, slug):
     """What the site holds, for the UI to decide what it can show."""
     d = site_dir(root, slug)
     photos = os.path.join(d, "photos")
-    changed = max(os.stat(os.path.join(d, f)).st_mtime for f in os.listdir(d) + ["."])
+    changed = os.stat(d).st_mtime
+    for f in os.listdir(d):
+        try:
+            changed = max(changed, os.stat(os.path.join(d, f)).st_mtime)
+        except FileNotFoundError:  # removed while we looked (a build tidying up)
+            pass
     return {
         "slug": slug,
         "name": site_name(d),
@@ -257,10 +269,13 @@ def _poll_until_closed(every_s=1.0):
     import time
 
     handle = msvcrt.get_osfhandle(sys.stdin.fileno())
-    peek = ctypes.windll.kernel32.PeekNamedPipe
+    peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
     avail = ctypes.c_ulong()
     while peek(ctypes.c_void_p(handle), None, 0, None, ctypes.byref(avail), None):
         time.sleep(every_s)  # the pipe is still open (and nothing is ever written)
+    error = ctypes.get_last_error()
+    if error != 109:  # ERROR_BROKEN_PIPE: the writer has gone, which is the point
+        log.warning("stdin is not a pipe we can watch (Windows error %d): stopping", error)
 
 
 def exit_on_eof():
@@ -271,6 +286,11 @@ def exit_on_eof():
             _poll_until_closed()
         else:
             sys.stdin.read()
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()  # into the build log: why the build is stopping
+        raise
     finally:
         # The sidecar may have died without stopping us (killed, crashed), so
         # take the Hugin tool we are running down with us: on POSIX we lead our
@@ -329,6 +349,7 @@ class Jobs:
     def __init__(self, command=None, hugin=None, timeout=JOB_TIMEOUT_S):
         self._command = command or own_command
         self._hugin = hugin
+        self._root = None  # the running site's parent folder, scrubbed from what the page sees
         self._timeout = timeout
         self._lock = threading.Lock()
         self._proc = None
@@ -338,10 +359,14 @@ class Jobs:
     def busy(self):
         return bool(self.state and self.state["status"] == "running")
 
+    def _scrub(self, text):
+        """The sites folder is nobody's business in what the page sees."""
+        return text.replace(self._root, "<sites>") if self._root else text
+
     def _log(self, line):
-        log.info("build: %s", line)
+        log.info("build: %s", line)  # whole, in sidecar.log
         lines = self.state["log"]
-        lines.append(line)
+        lines.append(self._scrub(line))
         del lines[:-MAX_LOG]
 
     def _event(self, text):
@@ -369,8 +394,9 @@ class Jobs:
                 self.state["pairs"].append(
                     {"a": pair[0], "b": pair[1], "matches": event["matches"]}
                 )
-        if isinstance(event.get("canvas"), list):
-            self.state["canvas"] = event["canvas"]
+        canvas = event.get("canvas")
+        if isinstance(canvas, list) and len(canvas) == 2 and all(type(v) is int for v in canvas):
+            self.state["canvas"] = canvas
         if isinstance(event.get("outline"), int):
             self.state["outline"] = event["outline"]
         name = event.get("name")
@@ -383,7 +409,7 @@ class Jobs:
             frame.update({k: event[k] for k in FRAME_FIELDS if k in event})
 
     def _fail(self, error):
-        self.state["error"] = error
+        self.state["error"] = self._scrub(error)
         self.state["status"] = "failed"
 
     def start(self, slug, d, kind="build"):
@@ -392,6 +418,7 @@ class Jobs:
         with self._lock:
             if self._closed:
                 raise SiteError("the engine is shutting down")
+            self._root = os.path.dirname(os.path.abspath(d))
             if self.busy():
                 raise SiteError("a site is already being built")
             self.state = {

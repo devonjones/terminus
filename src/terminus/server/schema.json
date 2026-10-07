@@ -424,7 +424,7 @@
             "string",
             "null"
           ],
-          "description": "the detector that read the horizon (e.g. \"heuristic\": no segmentation model ran)"
+          "description": "the vote that read the horizon: \"segment (per-frame vote)\", or \"heuristic ...\" when the frames were judged by colour"
         }
       },
       "required": [
