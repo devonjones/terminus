@@ -1269,7 +1269,9 @@ describe("telescope columns", () => {
     (await findByRole(root, "button", { name: "3 frames" })).click();
     await findByText(root, /measured 23.09°, predicted 22.69°/);
     await waitFor(() => expect(api.columnFrame).toHaveBeenCalledTimes(3));
-    const captions = [...root.querySelectorAll(".strip figcaption")].map((c) => c.textContent);
+    const captions = [...root.querySelectorAll(".column-strip figcaption")].map(
+      (c) => c.textContent,
+    );
     expect(captions).toEqual([
       "23.25° · 100% sky",
       "23.00° · 45% sky · measured",

@@ -448,32 +448,32 @@ table.columns .tag.on {
   opacity: 1;
   font-weight: 600;
 }
-.strip .tiles {
+.column-strip .tiles {
   display: flex;
   gap: 0.5rem;
   overflow-x: auto;
   padding-bottom: 0.5rem;
 }
-.strip figure {
+.column-strip figure {
   margin: 0;
   flex: none;
 }
-.strip img,
-.strip .loading {
+.column-strip img,
+.column-strip .loading {
   display: block;
   height: 200px;
   aspect-ratio: 9 / 16;
   object-fit: cover;
   background: #8883;
 }
-.strip figure.marked img {
+.column-strip figure.marked img {
   outline: 3px solid var(--warn-text);
 }
-.strip .clickable {
+.column-strip .clickable {
   position: relative;
   cursor: crosshair;
 }
-.strip .dot {
+.column-strip .dot {
   position: absolute;
   width: 8px;
   height: 8px;
@@ -481,13 +481,13 @@ table.columns .tag.on {
   border-radius: 50%;
   pointer-events: none;
 }
-.strip .dot.edge {
+.column-strip .dot.edge {
   background: var(--warn-text);
 }
-.strip .dot.sky {
+.column-strip .dot.sky {
   background: #3b82f6;
 }
-.strip figcaption {
+.column-strip figcaption {
   font-size: 0.8em;
   white-space: nowrap;
 }

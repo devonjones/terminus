@@ -1024,7 +1024,7 @@ function strip(c: TelescopeColumn, p: ColumnsProps): HTMLElement {
   });
   return el(
     "section",
-    { className: "strip" },
+    { className: "column-strip" },
     el("h2", {
       textContent: `az ${c.az.toFixed(0)}: measured ${c.alt.toFixed(2)}°${predicted == null ? "" : `, predicted ${predicted.toFixed(2)}°`}`,
     }),
