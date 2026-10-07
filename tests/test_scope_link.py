@@ -370,3 +370,52 @@ def test_a_park_that_loses_the_pointing_before_the_stow_refuses():
     with pytest.raises(PointingUnreadable, match="before the stow"):
         ptr.park()
     assert sc.parks == 0
+
+
+MORNING = "2026-10-07T14:25:00Z"  # Sun about az 110 alt 14 at the S50 spot
+
+
+class _Mount(FakeMount):
+    """Arrives wherever it is sent, at once, and records each goto."""
+
+    def __init__(self, rd):
+        super().__init__()
+        self.rd, self.gotos = rd, []
+
+    def goto(self, ra, dec):
+        self.gotos.append((ra, dec))
+        self.rd = (ra, dec)
+
+
+def _morning(monkeypatch):
+    from astropy.time import Time
+
+    from terminus import sweep
+
+    monkeypatch.setattr(sweep, "_now", lambda: Time(MORNING))
+    monkeypatch.setattr(sweep.time, "sleep", lambda s: None)
+    return Sky(39.791668, -104.894165)
+
+
+def test_routes_stay_above_the_mounts_floor(monkeypatch):
+    """2026-10-07: the only Sun-safe route west ran the RA axis the long way, through
+    alt -36.6, and Alpaca refused it as below the horizon."""
+    sky = _morning(monkeypatch)
+    ptr = Pointer(_Mount(None), sky, 30.0, 5.0)
+    here = sky.altaz_to_radec(75.8, 1.2)
+    west = sky.altaz_to_radec(260.0, 30.0)
+    ptr.MIN_ALT_DEG = -90.0
+    assert ptr.plan_route(here, west) is not None  # control: below the floor it plans
+    ptr.MIN_ALT_DEG = 0.0
+    assert ptr.plan_route(here, west) is None
+
+
+def test_the_escape_turns_no_lower_than_its_floor(monkeypatch):
+    """The app opened the arm level and east (alt 2.7), inside the Sun cone, and the
+    driver refused a turn that low; the escape now turns at 5 deg or above."""
+    sky = _morning(monkeypatch)
+    mount = _Mount(sky.altaz_to_radec(86.8, 2.7))
+    ptr = Pointer(mount, sky, 30.0, 5.0)
+    ptr.escape()
+    assert mount.gotos
+    assert all(sky.radec_to_altaz(*g)[1] >= 4.9 for g in mount.gotos)

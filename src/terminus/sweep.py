@@ -368,7 +368,11 @@ class Pointer:
             turn = self.escape_turn(az, alt)
             here, turned = az, 0.0
             cleared = True
-            while ang_sep(here, alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:
+            # The Alpaca driver refuses targets a few degrees up as "below horizon"
+            # when its own model is unsolved (2026-10-07: alt 2.7 refused), so a
+            # turn that low could never start.
+            turn_alt = max(alt, self.ESCAPE_TURN_FLOOR_DEG)
+            while ang_sep(here, turn_alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:
                 here = (here + turn * step) % 360.0
                 turned += step
                 # THE TURN OBEYS THE POLE LIMIT LIKE EVERY OTHER MOTION. Every
@@ -382,11 +386,11 @@ class Pointer:
                 # Stalling there strands the tube mid-escape, in the one manoeuvre
                 # whose whole job is guaranteeing an exit, so the turn gives up
                 # and the descent takes over.
-                _, dec = self.sky.altaz_to_radec(here, alt)
+                _, dec = self.sky.altaz_to_radec(here, turn_alt)
                 if abs(dec) > MAX_VIA_DEC or turned > 360.0:
                     cleared = False
                     break
-                self._goto_wait(*self.sky.altaz_to_radec(here, alt), 0.3)
+                self._goto_wait(*self.sky.altaz_to_radec(here, turn_alt), 0.3)
         if not cleared:
             # Descending is the escape that asks the mount for nothing exotic:
             # the ground is never in the way of pointing at the ground. But the
@@ -421,6 +425,7 @@ class Pointer:
     # five-minute job with the scope in hand and it turns this constant into a
     # fact.
     MIN_ALT_DEG = -5.0
+    ESCAPE_TURN_FLOOR_DEG = 5.0
 
     def corridor_alt(self):
         """Depth for a transit that is safe at EVERY azimuth, or None.
@@ -538,6 +543,20 @@ class Pointer:
             a = b
         return worst
 
+    def route_min_alt(self, rd0, waypoints, samples=PATH_SAMPLES):
+        """Lowest altitude along a route, sampled as `route_min_sep` samples it.
+        A route under the mount's floor is one the mount refuses (Alpaca:
+        "below horizon"), so it is no route at all."""
+        lowest, a = 90.0, rd0
+        for b in waypoints:
+            dra = wrap_ra(b[0] - a[0])
+            for i in range(samples + 1):
+                t = i / samples
+                ra, dec = a[0] + dra * t, a[1] + (b[1] - a[1]) * t
+                lowest = min(lowest, self.sky.radec_to_altaz(ra % 24.0, dec)[1])
+            a = b
+        return lowest
+
     @staticmethod
     def route_cost(rd0, waypoints):
         """Total axis travel in degrees. Cheapest safe route wins.
@@ -575,6 +594,7 @@ class Pointer:
             (self.route_cost(rd0, wps), name, wps)
             for name, wps in candidates
             if self.route_min_sep(rd0, wps) >= self.cone
+            and self.route_min_alt(rd0, wps) >= self.MIN_ALT_DEG - 0.5
         ]
         if not safe:
             return None
