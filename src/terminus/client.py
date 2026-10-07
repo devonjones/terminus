@@ -181,6 +181,11 @@ class Seestar:
     def park(self):
         return self.call("scope_park")
 
+    def unpark(self):
+        """Open the arm. The firmware's own move: the tube comes up level, facing
+        about east (az 88 alt 4, 2026-10-05). Over Alpaca, Unpark does not open it."""
+        return self.call("scope_move_to_horizon")
+
     # ---- imaging ---------------------------------------------------------
     def start_view(self, mode="scenery"):
         return self.call("iscope_start_view", {"mode": mode})

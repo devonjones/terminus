@@ -178,3 +178,56 @@ def test_park_is_a_put_to_the_telescope(scope):
     fake, sc = scope
     sc.park()
     assert ("telescope", "park") in [(d, p) for d, p, _ in fake.puts]
+
+
+class _Arm:
+    """A mount whose arm opens on unpark: Dec -90 until then."""
+
+    def __init__(self):
+        self.opened = False
+
+    def unpark(self):
+        self.opened = True
+
+    def equ_coord(self):
+        return (6.0, 10.0) if self.opened else (6.0, -90.0)
+
+
+class _Sky:
+    def __init__(self, sun_alt):
+        self.sun_alt = sun_alt
+
+    def sun(self):
+        return (90.0, self.sun_alt)
+
+    def radec_to_altaz(self, ra, dec):
+        return (88.0, 4.0)
+
+
+@pytest.mark.parametrize("sun_alt", [-2.9, 10.0])
+def test_unpark_is_refused_while_the_sun_is_up(monkeypatch, sun_alt):
+    """The firmware picks the arm's path, so no Pointer guards it: Sun down only."""
+    from terminus import cli
+
+    arm = _Arm()
+    monkeypatch.setattr(cli, "_sky", lambda sc, cfg: _Sky(sun_alt))
+    with pytest.raises(SeestarError, match="Sun is up"):
+        cli.cmd_unpark(arm, {}, None)
+    assert not arm.opened
+
+
+def test_unpark_opens_the_arm_after_dark(monkeypatch, capsys):
+    from terminus import cli
+
+    arm = _Arm()
+    monkeypatch.setattr(cli, "_sky", lambda sc, cfg: _Sky(-20.0))
+    cli.cmd_unpark(arm, {}, None)
+    assert arm.opened and "arm open" in capsys.readouterr().out
+
+
+def test_unpark_over_alpaca_says_to_use_the_app(monkeypatch):
+    from terminus import cli
+
+    monkeypatch.setattr(cli, "_sky", lambda sc, cfg: _Sky(-20.0))
+    with pytest.raises(SeestarError, match="Seestar app"):
+        cli.cmd_unpark(object(), {}, None)

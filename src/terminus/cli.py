@@ -38,6 +38,7 @@ from .sweep import (
     MAX_POINTING_MISSES,
     NIGHT_SUN_ALT,
     SKY_REF_MAX_AGE,
+    SUN_SAFE_ALT,
     Pointer,
     PointingError,
     PointingUnreadable,
@@ -182,6 +183,28 @@ def cmd_park(sc, cfg, args):
             raise SeestarError(f"park did not stow in 90 s; mount reads {sc.equ_coord()}")
         time.sleep(2)
     print("parked: arm closed (Dec -90)")
+
+
+def cmd_unpark(sc, cfg, args):
+    """Open the arm. The firmware picks the path and the landing (level, about
+    east), so no Pointer can guard it: refused unless the Sun is below the
+    altitude at which Pointer itself stops checking."""
+    sky = _sky(sc, cfg)
+    if sky.sun()[1] >= SUN_SAFE_ALT:
+        raise SeestarError(
+            "the Sun is up and opening the arm points the tube level and east: "
+            "open it in the Seestar app with the Sun behind the scope"
+        )
+    if not hasattr(sc, "unpark"):
+        raise SeestarError("Alpaca cannot open the arm: open it in the Seestar app")
+    sc.unpark()
+    deadline = time.time() + 90
+    while is_stowed(sc.equ_coord()):
+        if time.time() > deadline:
+            raise SeestarError("the arm did not open in 90 s")
+        time.sleep(2)
+    az, alt = sky.radec_to_altaz(*sc.equ_coord())
+    print(f"unparked: arm open, pointing az {az:.1f} alt {alt:.1f}")
 
 
 def cmd_classify(sc, cfg, args):
@@ -2335,7 +2358,7 @@ def cmd_horizon(sc, cfg, args):  # sc, cfg unused: offline
     )
 
 
-NEEDS_SCOPE = {"preflight", "point", "classify", "sweep", "park"}
+NEEDS_SCOPE = {"preflight", "point", "classify", "sweep", "park", "unpark"}
 # Offline: no scope, no network, and no config.toml — a user with photographs
 # and no telescope must not be made to write one.
 OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar"}
@@ -2376,6 +2399,7 @@ def main(argv=None):
     pp.add_argument("--dry-run", action="store_true")
     sub.add_parser("classify")
     sub.add_parser("park", help="slew clear and close the arm")
+    sub.add_parser("unpark", help="open the arm (native link, Sun down)")
     sw = sub.add_parser(
         "sweep",
         help="full horizon sweep -> mask YAML (day or night)",
@@ -2664,6 +2688,7 @@ def main(argv=None):
     handlers = {
         "preflight": cmd_preflight,
         "park": cmd_park,
+        "unpark": cmd_unpark,
         "point": cmd_point,
         "classify": cmd_classify,
         "sweep": cmd_sweep,
