@@ -48,6 +48,8 @@ Routes (payload shapes: schema.json beside this file):
   GET  /site/columns      the open site's telescope columns and their fit (204: none)
   POST /site/columns/edit {"az", "included"?, "tags"?}: change one column, refit near the last fit
   POST /site/columns/fit  the full fit over every included column (minutes)
+  POST /site/columns/click {"az", "name", "p1", "p2", "sky"}: the edge clicked in a frame
+                          (two points on it, one in the sky, 0-1 fractions) -> the columns
   GET  /site/column/frame.jpg?az=&name=   one of a column's frames
   GET  /dev/state         state plus recent log lines; exists only with --dev
 """
@@ -286,6 +288,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/scope/frame": lambda: self._frame(body.get("exposure_ms")),
             "/site/columns/edit": lambda: self._edit_column(body),
             "/site/columns/fit": self._fit_columns,
+            "/site/columns/click": lambda: self._click_edge(body),
             "/scope/disconnect": self._disconnect,
         }
         self._dispatch(routes)
@@ -304,6 +307,24 @@ class _Handler(BaseHTTPRequestHandler):
             return float(self._query(key))
         except ValueError:
             raise sites.SiteError(f"?{key}= must be a number") from None
+
+    def _click_edge(self, body):
+        def point(v):
+            ok = isinstance(v, list) and len(v) == 2
+            ok = ok and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+            if not ok or not all(0 <= x <= 1 for x in v):
+                raise sites.SiteError("points are [x, y] in 0-1 image fractions")
+            return (float(v[0]), float(v[1]))
+
+        az, name = body.get("az"), body.get("name")
+        if not isinstance(az, (int, float)) or isinstance(az, bool) or not isinstance(name, str):
+            raise sites.SiteError("az must be a number and name a frame's name")
+        p1, p2, sky = point(body.get("p1")), point(body.get("p2")), point(body.get("sky"))
+        try:
+            out = telescope.click(self.server.site_dir(), float(az), name, p1, p2, sky)
+        except ValueError as e:
+            raise sites.SiteError(str(e)) from None
+        self._send(200, out)
 
     def _fit_columns(self):
         try:

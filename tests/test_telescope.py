@@ -192,3 +192,56 @@ def test_a_site_without_columns(serve, tmp_path):  # noqa: F811
     assert call(s, "GET", "/site/columns")[0] == 204
     code, body = call(s, "POST", "/site/columns/fit", {})
     assert code == 400 and "no telescope columns" in body["error"]
+
+
+def test_sky_fraction_is_measured_in_pixels():
+    assert telescope.sky_fraction((100, 100), (0, 0.25), (1, 0.25), (0.5, 0.1)) == pytest.approx(
+        0.25, abs=0.01
+    )
+    assert telescope.sky_fraction((100, 100), (0, 0.25), (1, 0.25), (0.5, 0.9)) == pytest.approx(
+        0.75, abs=0.01
+    )
+    # The diagonal of a portrait frame halves it whichever way the frame is stretched.
+    assert telescope.sky_fraction((1080, 1920), (0, 0), (1, 1), (0.9, 0.1)) == pytest.approx(
+        0.5, abs=0.01
+    )
+    # A line from one corner to a side's middle: a quarter, in pixels.
+    assert telescope.sky_fraction((1080, 1920), (0, 0), (1, 0.5), (0.9, 0.1)) == pytest.approx(
+        0.25, abs=0.01
+    )
+    with pytest.raises(ValueError, match="off the edge"):
+        telescope.sky_fraction((100, 100), (0, 0.5), (1, 0.5), (0.3, 0.5))
+
+
+def test_a_click_becomes_the_measurement(site, tmp_path, monkeypatch):
+    from PIL import Image
+
+    from terminus.judge import FRAME_DEG
+
+    run = tmp_path / "run"
+    (run / "frames").mkdir(parents=True)
+    Image.new("RGB", (108, 192)).save(run / "frames" / "az040_alt23.00_sky045.jpg")
+    (run / "f.yaml").write_text(yaml.safe_dump({"horizon": {40: {"alt": 22.5}}}))
+    telescope.import_run(str(site), [str(run / "f.yaml")], str(run / "frames"))
+    monkeypatch.setattr(telescope, "refit", lambda *a, **k: None)
+    v = telescope.click(
+        str(site), 40, "az040_alt23.00_sky045.jpg", (0, 0.25), (1, 0.25), (0.5, 0.1)
+    )
+    col = v["columns"][0]
+    assert col["method"] == "clicked"
+    assert col["alt"] == pytest.approx(
+        23.0 + 0.25 * FRAME_DEG, abs=0.02
+    )  # a quarter sky: high in the frame
+    with pytest.raises(ValueError, match="no frame"):
+        telescope.click(str(site), 40, "az040_alt99.00_sky000.jpg", (0, 0.5), (1, 0.5), (0.5, 0.1))
+
+
+@pytest.mark.parametrize(
+    "body", [{"az": 90, "name": "az090_alt05.25_sky040.jpg", "p1": [0, 0.5], "p2": [1, 0.5], "sky": [0.5, 2]},
+             {"az": 90, "name": "az090_alt05.25_sky040.jpg", "p1": [0, 0.5], "p2": [1], "sky": [0.5, 0.1]},
+             {"az": "90", "name": "az090_alt05.25_sky040.jpg", "p1": [0, 0.5], "p2": [1, 0.5], "sky": [0.5, 0.1]},
+             {"az": 90, "name": "nope.jpg", "p1": [0, 0.5], "p2": [1, 0.5], "sky": [0.5, 0.1]}],
+)  # fmt: skip
+def test_a_click_refuses_what_it_cannot_place(opened, body):
+    s, _ = opened
+    assert call(s, "POST", "/site/columns/click", body)[0] == 400

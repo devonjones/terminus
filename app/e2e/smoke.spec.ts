@@ -28,6 +28,7 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
   ).toEqual({
     api: [
       "buildImage",
+      "clickEdge",
       "columnFrame",
       "columns",
       "connectScope",

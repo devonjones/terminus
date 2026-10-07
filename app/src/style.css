@@ -469,6 +469,24 @@ table.columns .tag.on {
 .strip figure.marked img {
   outline: 3px solid var(--warn-text);
 }
+.strip .clickable {
+  position: relative;
+  cursor: crosshair;
+}
+.strip .dot {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.strip .dot.edge {
+  background: var(--warn-text);
+}
+.strip .dot.sky {
+  background: #3b82f6;
+}
 .strip figcaption {
   font-size: 0.8em;
   white-space: nowrap;

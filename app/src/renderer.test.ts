@@ -146,6 +146,7 @@ function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
     editColumn: vi.fn(async () => cols()),
     fitColumns: vi.fn(async () => cols()),
     columnFrame: vi.fn(async () => new Uint8Array([0xff, 0xd8])),
+    clickEdge: vi.fn(async () => cols()),
     ...over,
   };
 }
@@ -1273,6 +1274,36 @@ describe("telescope columns", () => {
       "23.00° · 45% sky · measured",
       "22.75° · 0% sky · predicted",
     ]);
+  });
+
+  it("reads the edge from two clicks on it and one in the sky", async () => {
+    const api = withSite();
+    await openFit(api);
+    (await findByRole(root, "button", { name: "3 frames" })).click();
+    const img = (await findByRole(root, "img", { name: "az 40 alt 23" })) as HTMLImageElement;
+    img.getBoundingClientRect = () => ({ left: 10, top: 20, width: 90, height: 160 }) as DOMRect;
+    const at = (x: number, y: number) =>
+      img.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
+    expect(root.textContent).toContain("Click a point on the edge in a frame.");
+    at(10, 60); // left edge, a quarter down
+    await findByText(root, /Click a second point on the edge/);
+    expect(root.querySelectorAll(".dot.edge")).toHaveLength(1);
+    const img2 = root.querySelector<HTMLImageElement>('img[alt="az 40 alt 23"]')!;
+    img2.getBoundingClientRect = img.getBoundingClientRect;
+    img2.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: 100, clientY: 60 }));
+    await findByText(root, /Click once in the sky/);
+    const img3 = root.querySelector<HTMLImageElement>('img[alt="az 40 alt 23"]')!;
+    img3.getBoundingClientRect = img.getBoundingClientRect;
+    img3.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: 55, clientY: 30 }));
+    await waitFor(() =>
+      expect(api.clickEdge).toHaveBeenCalledWith(
+        40,
+        "az040_alt23.00_sky045.jpg",
+        [0, 0.25],
+        [1, 0.25],
+        [0.5, 0.0625],
+      ),
+    );
   });
 
   it("fits every column on request", async () => {

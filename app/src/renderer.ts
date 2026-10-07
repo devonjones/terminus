@@ -17,6 +17,7 @@ import {
   buildView,
   columnsView,
   connectView,
+  type Clicks,
   el,
   fitView,
   horizonView,
@@ -64,6 +65,7 @@ interface View {
   // The site's telescope columns (Fit tab), the one being looked at, its frames.
   cols: Columns | null;
   selCol: number | null;
+  clicks: Clicks | null;
   colFrames: Map<string, string>;
   colBusy: string;
 }
@@ -105,6 +107,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     preview: null,
     cols: null,
     selCol: null,
+    clicks: null,
     colFrames: new Map(),
     colBusy: "",
   };
@@ -528,6 +531,17 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
           const now = v.cols?.columns.find((c) => c.az === az)?.tags ?? [];
           const tags = on ? [...now, tag] : now.filter((t) => t !== tag);
           void columnsAct(`Tagging az ${az}…`, () => api.editColumn(az, { tags }));
+        },
+        clicks: v.clicks,
+        onFrameClick: (az, name, pt) => {
+          const same = v.clicks && v.clicks.az === az && v.clicks.name === name;
+          const pts = same ? [...v.clicks!.pts, pt] : [pt];
+          if (pts.length < 3) return ((v.clicks = { az, name, pts }), render());
+          v.clicks = null;
+          const [p1, p2, sky] = pts;
+          void columnsAct(`Reading az ${az} at the clicked edge…`, () =>
+            api.clickEdge(az, name, p1, p2, sky),
+          );
         },
         onFitAll: () =>
           void columnsAct("Fitting every included column (this takes minutes)…", () =>

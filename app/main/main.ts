@@ -153,6 +153,17 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
       throw new Error("expected a frame name");
     return view(sc, `/site/column/frame.jpg?az=${az}&name=${encodeURIComponent(name)}`);
   });
+  handle("site:column-click", (az, name, p1, p2, sky) => {
+    if (typeof az !== "number" || !Number.isFinite(az)) throw new Error("az must be a number");
+    if (typeof name !== "string" || !COLUMN_FRAME.test(name))
+      throw new Error("expected a frame name");
+    const pt = (v: unknown) =>
+      Array.isArray(v) &&
+      v.length === 2 &&
+      v.every((x) => typeof x === "number" && x >= 0 && x <= 1);
+    if (!pt(p1) || !pt(p2) || !pt(sky)) throw new Error("points are [x, y] in 0-1 fractions");
+    return request(sc, "/site/columns/click", { az, name, p1, p2, sky }, 120_000);
+  });
   // The file dialog is opened here, not in the page, so the page never chooses paths.
   handle("site:pick", async () => {
     const w = win();

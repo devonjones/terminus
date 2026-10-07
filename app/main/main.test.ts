@@ -216,6 +216,9 @@ describe("site IPC", () => {
     ["site:column-edit", [40, { tags: ["cloud"] }]],
     ["site:column-frame", [40, "../photo_mask.yaml"]],
     ["site:column-frame", ["40", "az040_alt23.00_sky045.jpg"]],
+    ["site:column-click", [40, "az040_alt23.00_sky045.jpg", [0, 0.5], [1, 0.5], [0.5, 2]]],
+    ["site:column-click", [40, "../x.jpg", [0, 0.5], [1, 0.5], [0.5, 0.1]]],
+    ["site:column-click", [40, "az040_alt23.00_sky045.jpg", [0, 0.5], [1], [0.5, 0.1]]],
   ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
     await boot();
     expect(() => call(ch, ...args)).toThrow();
@@ -253,6 +256,7 @@ describe("site IPC", () => {
       "site:column-edit",
       "site:columns-fit",
       "site:column-frame",
+      "site:column-click",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
   });

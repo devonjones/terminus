@@ -16,6 +16,7 @@ import re
 import shutil
 import statistics
 
+import numpy as np
 import yaml
 
 from . import guide, orient
@@ -198,3 +199,39 @@ def frame_path(site, az, name):
         return None
     path = os.path.join(site, FRAMES, f"az{int(az):03d}", name)
     return path if os.path.isfile(path) else None
+
+
+def sky_fraction(size, p1, p2, sky):
+    """Share of a frame on `sky`'s side of the line through p1 and p2.
+
+    Points are (x, y) in 0-1 image fractions; `size` is the image's (w, h) in
+    pixels, so the area is measured in pixels, not in stretched fractions."""
+    w, h = size
+    ys, xs = np.mgrid[0:200, 0:200]
+    px, py = (xs + 0.5) / 200 * w, (ys + 0.5) / 200 * h
+    (x1, y1), (x2, y2), (sx, sy) = ((x * w, y * h) for x, y in (p1, p2, sky))
+    side = lambda x, y: (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)  # noqa: E731
+    if side(sx, sy) == 0 or (x1, y1) == (x2, y2):
+        raise ValueError("the sky point must sit off the edge line")
+    return float((np.sign(side(px, py)) == np.sign(side(sx, sy))).mean())
+
+
+def click(site, az, name, p1, p2, sky):
+    """The edge as clicked in one frame: it becomes the column's measurement."""
+    from PIL import Image
+
+    from .judge import FRAME_DEG
+
+    doc = load(site)
+    c = _column(doc, az)
+    frame = next((f for f in c.get("frames", ()) if os.path.basename(f["file"]) == name), None)
+    if frame is None:
+        raise ValueError(f"az {az:g} has no frame {name}")
+    with Image.open(os.path.join(site, frame["file"])) as im:
+        frac = sky_fraction(im.size, p1, p2, sky)
+    c["alt"] = round(frame["alt"] - (frac - 0.5) * FRAME_DEG, 3)
+    c["method"] = "clicked"
+    last = (doc.get("fit") or {}).get("solution")
+    doc["fit"] = refit(site, doc, near=last) if last else doc.get("fit")
+    save(site, doc)
+    return view(site)

@@ -35,5 +35,7 @@ const api: TerminusApi = {
   editColumn: (az, change) => ipcRenderer.invoke("site:column-edit", az, change),
   fitColumns: () => ipcRenderer.invoke("site:columns-fit"),
   columnFrame: (az, name) => ipcRenderer.invoke("site:column-frame", az, name),
+  clickEdge: (az, name, p1, p2, sky) =>
+    ipcRenderer.invoke("site:column-click", az, name, p1, p2, sky),
 };
 contextBridge.exposeInMainWorld("terminus", api);

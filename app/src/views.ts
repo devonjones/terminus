@@ -871,7 +871,21 @@ export interface ColumnsProps {
   onInclude(az: number, on: boolean): void;
   onTag(az: number, tag: ColumnTag, on: boolean): void;
   onFitAll(): void;
+  clicks: Clicks | null; // an edge being clicked in one frame
+  onFrameClick(az: number, name: string, pt: [number, number]): void;
 }
+
+export interface Clicks {
+  az: number;
+  name: string;
+  pts: [number, number][];
+}
+
+const CLICK_STEPS = [
+  "Click a point on the edge in a frame.",
+  "Click a second point on the edge.",
+  "Click once in the sky.",
+];
 
 const TAGS: ColumnTag[] = ["false edge", "pocket", "near object"];
 const signed = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}°`;
@@ -929,7 +943,7 @@ export function columnsView(p: ColumnsProps): HTMLElement {
   const parts: Node[] = [el("div", { className: "row" }, head, all), table];
   if (p.busy) parts.push(el("p", { className: "busy", textContent: p.busy }));
   const sel = p.cols.columns.find((c) => c.az === p.selected);
-  if (sel) parts.push(strip(sel, p.frames));
+  if (sel) parts.push(strip(sel, p));
   if (p.cols.note) parts.push(el("p", { className: "note", textContent: p.cols.note }));
   return el("div", { className: "columns-view" }, ...parts);
 }
@@ -979,22 +993,22 @@ function columnRow(c: TelescopeColumn, p: ColumnsProps): HTMLTableRowElement {
 
 // A column's frames from the top down, each marked where the measured edge and
 // the fit's prediction fall.
-function strip(c: TelescopeColumn, frames: Map<string, string>): HTMLElement {
+function strip(c: TelescopeColumn, p: ColumnsProps): HTMLElement {
+  const frames = p.frames;
   const sorted = [...c.frames].sort((a, b) => b.alt - a.alt);
   const step = sorted.length > 1 ? Math.abs(sorted[0].alt - sorted[1].alt) : 0.25;
   const predicted = c.residual == null ? null : c.alt + c.residual;
   const near = (alt: number, x: number | null) => x != null && Math.abs(alt - x) <= step / 2;
   const tiles = sorted.map((f) => {
     const url = frames.get(`${c.az}/${f.name}`);
+    const mine = p.clicks && p.clicks.az === c.az && p.clicks.name === f.name ? p.clicks.pts : [];
     const marks = [near(f.alt, c.alt) ? "measured" : "", near(f.alt, predicted) ? "predicted" : ""]
       .filter(Boolean)
       .join(" · ");
     return el(
       "figure",
       { className: marks ? "frame marked" : "frame" },
-      url
-        ? el("img", { src: url, alt: `az ${c.az} alt ${f.alt}` })
-        : el("div", { className: "loading" }),
+      url ? clickable(url, c.az, f, mine, p) : el("div", { className: "loading" }),
       el("figcaption", {
         textContent: `${f.alt.toFixed(2)}° · ${Math.round(f.sky * 100)}% sky${marks ? ` · ${marks}` : ""}`,
       }),
@@ -1006,6 +1020,37 @@ function strip(c: TelescopeColumn, frames: Map<string, string>): HTMLElement {
     el("h2", {
       textContent: `az ${c.az.toFixed(0)}: measured ${c.alt.toFixed(2)}°${predicted == null ? "" : `, predicted ${predicted.toFixed(2)}°`}`,
     }),
+    el("p", {
+      className: "hint",
+      textContent:
+        CLICK_STEPS[Math.min(p.clicks?.pts.length ?? 0, 2)] +
+        " The edge's altitude comes from how much of the frame lies on the sky side.",
+    }),
     el("div", { className: "tiles" }, ...tiles),
   );
+}
+
+// A frame that takes clicks: points in 0-1 fractions of the image, shown as dots.
+function clickable(
+  url: string,
+  az: number,
+  f: { alt: number; name: string },
+  pts: [number, number][],
+  p: ColumnsProps,
+): HTMLElement {
+  const img = el("img", { src: url, alt: `az ${az} alt ${f.alt}` });
+  img.addEventListener("click", (e) => {
+    const r = img.getBoundingClientRect();
+    if (!r.width || !r.height || p.busy) return;
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    p.onFrameClick(az, f.name, [x, y]);
+  });
+  const dots = pts.map(([x, y], i) => {
+    const d = el("span", { className: i < 2 ? "dot edge" : "dot sky" });
+    d.style.left = `${(x * 100).toFixed(1)}%`;
+    d.style.top = `${(y * 100).toFixed(1)}%`;
+    return d;
+  });
+  return el("div", { className: "clickable" }, img, ...dots);
 }
