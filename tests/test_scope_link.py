@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 
+import numpy as np
 import pytest
 from test_server import call, conforms, serve  # noqa: F401 (serve is a fixture)
 
@@ -424,3 +425,100 @@ def test_the_escape_turns_no_lower_than_its_floor(monkeypatch):
 def test_the_app_link_keeps_routes_above_alpacas_horizon():
     link = scopes.AlpacaScope("h", connect=FakeMount)
     assert link.ptr.MIN_ALT_DEG == 0.0
+
+
+class FrameLink(FakeLink):
+    def __init__(self, host):
+        super().__init__(host)
+        self.points, self.exposures = [], []
+
+    def point(self, az, alt):
+        self.points.append((az, alt))
+
+    def frame(self, exposure_s):
+        self.exposures.append(exposure_s)
+        return {"exposure_ms": exposure_s * 1000, "median": 19360.0, "saturated": 0.0}
+
+    def preview_jpeg(self):
+        return scopes.preview_jpeg(np.full((4, 4), 1000, np.uint16)) if self.exposures else None
+
+
+@pytest.fixture
+def framed(serve, monkeypatch):  # noqa: F811
+    made = []
+    monkeypatch.setattr(
+        scopes, "AlpacaScope", lambda host: made.append(FrameLink(host)) or made[-1]
+    )
+    s = serve()
+    call(s, "POST", "/scope/connect", {"host": "10.5.2.65"})
+    return s, made
+
+
+def test_point_goes_to_the_link_and_answers_with_status(framed):
+    s, made = framed
+    code, st = call(s, "POST", "/scope/point", {"az": 260, "alt": 30.5})
+    assert code == 200 and made[0].points == [(260.0, 30.5)]
+    conforms("ScopeStatus", st)
+
+
+@pytest.mark.parametrize(
+    "body", [{"az": 360, "alt": 30}, {"az": -1, "alt": 30}, {"az": 10, "alt": -6},
+             {"az": 10, "alt": 91}, {"az": "10", "alt": 30}, {"az": True, "alt": 30}, {}],
+)  # fmt: skip
+def test_point_refuses_a_bad_target(framed, body):
+    s, made = framed
+    assert call(s, "POST", "/scope/point", body)[0] == 400 and made[0].points == []
+
+
+def test_a_sun_refusal_on_point_says_why(framed):
+    s, made = framed
+
+    def refuse(az, alt):
+        raise SunGuard("(110,15) is 3.0 deg from Sun (< 30.0)")
+
+    made[0].point = refuse
+    code, body = call(s, "POST", "/scope/point", {"az": 110, "alt": 15})
+    assert code == 502 and "from Sun" in body["error"]
+
+
+def test_a_frame_and_its_preview(framed):
+    s, made = framed
+    assert call(s, "GET", "/scope/frame.jpg")[0] == 204  # nothing taken yet
+    code, f = call(s, "POST", "/scope/frame", {"exposure_ms": 2})
+    assert code == 200 and made[0].exposures == [0.002]
+    conforms("ScopeFrame", f)
+    code, jpg = call(s, "GET", "/scope/frame.jpg")
+    assert code == 200 and jpg[:2] == b"\xff\xd8"
+
+
+@pytest.mark.parametrize("ms", [0, 0.01, 20_000, "2", None])
+def test_a_frame_refuses_a_bad_exposure(framed, ms):
+    s, made = framed
+    assert call(s, "POST", "/scope/frame", {"exposure_ms": ms})[0] == 400 and not made[0].exposures
+
+
+def test_nothing_linked_means_no_point_and_no_frame(serve):  # noqa: F811
+    s = serve()
+    assert call(s, "POST", "/scope/point", {"az": 260, "alt": 30})[0] == 502
+    assert call(s, "POST", "/scope/frame", {"exposure_ms": 2})[0] == 502
+    assert call(s, "GET", "/scope/frame.jpg")[0] == 204
+
+
+def test_the_preview_is_in_colour_red_where_grbg_puts_it():
+    """GRBG: red at [0,1], blue at [1,0]. A frame bright only on the red sites is red."""
+    import io
+
+    from PIL import Image
+
+    raw = np.zeros((8, 8), np.uint16)
+    raw[0::2, 1::2] = 40000
+    px = np.asarray(Image.open(io.BytesIO(scopes.preview_jpeg(raw))).convert("RGB")).mean((0, 1))
+    assert px[0] > 200 and px[1] < 60 and px[2] < 60
+
+
+def test_the_link_frame_keeps_the_raw_for_the_preview():
+    link = scopes.AlpacaScope("h", connect=FakeMount)
+    link.sc.capture_raw16 = lambda s: np.full((4, 4), 65504, np.uint16)
+    f = link.frame(0.002)
+    assert f == {"exposure_ms": 2.0, "median": 65504.0, "saturated": 1.0}
+    assert link.preview_jpeg()[:2] == b"\xff\xd8"

@@ -6881,6 +6881,7 @@ def test_the_cheapest_safe_route_wins_and_an_unsafe_one_is_never_chosen():
 
     sky = Sky(39.7917, -104.894, 1600)
     ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    ptr.route_min_alt = lambda *a, **k: 90.0  # this test is about the Sun, not the floor
     rd0, rd1 = (2.0, 10.0), (8.0, 40.0)
     all_routes = ptr.routes(rd0, rd1)
 

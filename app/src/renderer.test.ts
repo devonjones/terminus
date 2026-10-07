@@ -100,6 +100,9 @@ function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
     ),
     parkScope: vi.fn(async () => linked({ stowed: true })),
     disconnectScope: vi.fn(async () => (st = { ...st, scope: { link: "none", host: null } })),
+    pointScope: vi.fn(async (az: number, alt: number) => linked({ az, alt })),
+    takeFrame: vi.fn(async (ms: number) => ({ exposure_ms: ms, median: 19360, saturated: 0 })),
+    framePreview: vi.fn(async () => new Uint8Array([0xff, 0xd8])),
     ...over,
   };
 }
@@ -1106,6 +1109,57 @@ describe("connect", () => {
     expect(
       (getByRole(root, "button", { name: "Park and disconnect" }) as HTMLButtonElement).disabled,
     ).toBe(false);
+  });
+
+  it("points where it is told and shows a frame", async () => {
+    const api = fakeApi();
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    const az = (await findByRole(root, "spinbutton", { name: "Azimuth" })) as HTMLInputElement;
+    const alt = getByRole(root, "spinbutton", { name: "Altitude" }) as HTMLInputElement;
+    az.value = "260";
+    alt.value = "24.2";
+    getByRole(root, "button", { name: "Go" }).click();
+    await findByText(root, "az 260.0° alt 24.2°");
+    expect(api.pointScope).toHaveBeenCalledWith(260, 24.2);
+    const ms = getByRole(root, "spinbutton", { name: "Exposure (ms)" }) as HTMLInputElement;
+    ms.value = "0.5";
+    getByRole(root, "button", { name: "Take a frame" }).click();
+    await findByText(root, "0.5 ms: median 19360, 0.0% saturated");
+    expect(api.takeFrame).toHaveBeenCalledWith(0.5);
+    expect(root.querySelector<HTMLImageElement>("img.frame")!.src).toBe("blob:fake");
+  });
+
+  it("offers no aiming while the arm is closed", async () => {
+    const api = fakeApi();
+    const connect = api.connectScope;
+    let on = false;
+    api.scopeStatus = vi.fn(async () =>
+      on ? linked({ stowed: true }) : { link: "none" as const },
+    );
+    api.connectScope = vi.fn(async (host: string) => ((on = true), connect(host)));
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    await findByText(root, /Open it in the Seestar app/);
+    expect(root.querySelector('[data-focus="scope-go"]')).toBeNull();
+    expect(root.querySelector('[data-focus="scope-frame"]')).toBeNull();
+  });
+
+  it("shows a Sun refusal on a slew", async () => {
+    const api = fakeApi({
+      pointScope: vi.fn(async () => {
+        throw new Error("engine /scope/point: 502 (110,15) is 3.0 deg from Sun (< 30.0)");
+      }),
+    });
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    ((await findByRole(root, "spinbutton", { name: "Azimuth" })) as HTMLInputElement).value = "110";
+    (getByRole(root, "spinbutton", { name: "Altitude" }) as HTMLInputElement).value = "15";
+    getByRole(root, "button", { name: "Go" }).click();
+    expect((await findByRole(root, "alert")).textContent).toContain("from Sun");
   });
 
   it("parks and disconnects", async () => {

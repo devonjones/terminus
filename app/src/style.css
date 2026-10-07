@@ -414,6 +414,15 @@ header .site-name {
   font: inherit;
   padding: 0.3rem 0.7rem;
 }
+.connect input[type="number"] {
+  width: 6rem;
+}
+.connect img.frame {
+  display: block;
+  max-width: min(100%, 640px);
+  max-height: calc(100vh - 360px);
+  margin-top: 0.5rem;
+}
 dl.scope {
   display: grid;
   grid-template-columns: max-content auto;

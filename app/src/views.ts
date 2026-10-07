@@ -6,6 +6,7 @@ import type {
   Frames,
   Horizon,
   Job,
+  ScopeFrame,
   ScopeList,
   ScopeStatus,
   SiteSummary,
@@ -318,6 +319,10 @@ export interface ConnectProps {
   status: ScopeStatus | null; // null until first read
   found: ScopeList["scopes"] | null; // null until a search has run
   busy: string; // what is in progress, in words; "" when idle
+  frame: ScopeFrame | null; // the last frame taken
+  preview: string | null; // blob: URL of that frame in colour
+  onPoint(az: number, alt: number): void;
+  onFrame(exposureMs: number): void;
   onFind(): void;
   onConnect(host: string): void;
   onPark(): void;
@@ -408,14 +413,53 @@ export function connectView(p: ConnectProps): HTMLElement {
     notes.push(
       el("p", { className: "banner warn", textContent: "Switch the mount to EQ mode in the app." }),
     );
+  const aim: Node[] = st.stowed ? [] : [aimRow(p), frameRow(p)];
+  if (p.frame)
+    aim.push(
+      el("p", {
+        className: "frame-stats",
+        textContent: `${p.frame.exposure_ms} ms: median ${Math.round(p.frame.median)}, ${(
+          p.frame.saturated * 100
+        ).toFixed(1)}% saturated`,
+      }),
+    );
+  if (p.preview) aim.push(el("img", { src: p.preview, className: "frame", alt: "Last frame" }));
   return el(
     "div",
     { className: "connect" },
     table,
     ...notes,
     el("div", { className: "row" }, park, leave),
+    ...aim,
     busy,
   );
+}
+
+function numberBox(label: string, value: string, focus: string): HTMLInputElement {
+  const box = el("input", { type: "number", value, step: "any" });
+  box.setAttribute("aria-label", label);
+  box.dataset.focus = focus;
+  return box;
+}
+
+// Where to point: the engine checks the target and the path against the Sun.
+function aimRow(p: ConnectProps): HTMLElement {
+  const az = numberBox("Azimuth", "", "scope-az");
+  const alt = numberBox("Altitude", "", "scope-alt");
+  const go = el("button", { textContent: "Go", disabled: !!p.busy });
+  go.dataset.focus = "scope-go";
+  go.addEventListener("click", () => {
+    if (az.value !== "" && alt.value !== "") p.onPoint(Number(az.value), Number(alt.value));
+  });
+  return el("div", { className: "row" }, "Go to az ", az, " alt ", alt, go);
+}
+
+function frameRow(p: ConnectProps): HTMLElement {
+  const ms = numberBox("Exposure (ms)", String(p.frame?.exposure_ms ?? 2), "scope-ms");
+  const take = el("button", { textContent: "Take a frame", disabled: !!p.busy });
+  take.dataset.focus = "scope-frame";
+  take.addEventListener("click", () => ms.value !== "" && p.onFrame(Number(ms.value)));
+  return el("div", { className: "row" }, ms, " ms ", take);
 }
 
 export interface CurateProps {

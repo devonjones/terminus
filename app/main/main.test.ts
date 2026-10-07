@@ -207,6 +207,10 @@ describe("site IPC", () => {
     ["scope:connect", ["http://10.5.2.65"]],
     ["scope:connect", ["10.5.2.65:32323"]],
     ["scope:connect", ["10.5.2.65/api"]],
+    ["scope:point", ["260", 30]],
+    ["scope:point", [260, Number.NaN]],
+    ["scope:frame", ["2"]],
+    ["scope:frame", [Number.POSITIVE_INFINITY]],
   ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
     await boot();
     expect(() => call(ch, ...args)).toThrow();
@@ -237,6 +241,9 @@ describe("site IPC", () => {
       "scope:connect",
       "scope:park",
       "scope:disconnect",
+      "scope:point",
+      "scope:frame",
+      "scope:frame-preview",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
   });
@@ -249,9 +256,15 @@ describe("site IPC", () => {
     });
     expect(await call("scope:status")).toEqual({ p: "/scope/status" });
     expect(await call("scope:discover")).toEqual({ p: "/scope/discover" });
+    expect(await call("scope:frame", 2)).toEqual({ p: "/scope/frame", body: { exposure_ms: 2 } });
+    expect(await call("scope:frame-preview")).toEqual({ view: "/scope/frame.jpg" });
     h.request.mockClear();
     expect(await call("scope:park")).toEqual({ p: "/scope/park", body: {} });
     expect(await call("scope:disconnect")).toEqual({ p: "/scope/disconnect", body: {} });
+    expect(await call("scope:point", 260, 30)).toEqual({
+      p: "/scope/point",
+      body: { az: 260, alt: 30 },
+    });
     for (const c of h.request.mock.calls) expect((c as unknown[])[3]).toBe(5 * 60_000);
   });
 

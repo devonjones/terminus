@@ -3,6 +3,7 @@ import type {
   Disc,
   Frames,
   Horizon,
+  ScopeFrame,
   ScopeList,
   ScopeStatus,
   SiteSummary,
@@ -55,6 +56,8 @@ interface View {
   scope: ScopeStatus | null;
   found: ScopeList["scopes"] | null;
   scopeBusy: string;
+  frame: ScopeFrame | null;
+  preview: string | null; // blob: URL
 }
 
 const SCOPE_POLL_MS = 3000;
@@ -90,6 +93,8 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     scope: null,
     found: null,
     scopeBusy: "",
+    frame: null,
+    preview: null,
   };
   let polling = false;
   let generation = 0;
@@ -310,6 +315,18 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     status: v.scope,
     found: v.found,
     busy: v.scopeBusy,
+    frame: v.frame,
+    preview: v.preview,
+    onPoint: (az: number, alt: number) =>
+      scopeAct(`Slewing to az ${az} alt ${alt}, clear of the Sun…`, async () => {
+        v.scope = await api.pointScope(az, alt);
+      }),
+    onFrame: (ms: number) =>
+      scopeAct(`Exposing ${ms} ms…`, async () => {
+        v.frame = await api.takeFrame(ms);
+        revoke(v.preview);
+        v.preview = toUrl(await api.framePreview());
+      }),
     onFind: () =>
       scopeAct("Looking for telescopes…", async () => {
         v.found = (await api.discoverScopes()).scopes;

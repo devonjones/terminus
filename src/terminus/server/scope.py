@@ -5,10 +5,13 @@ engine and every route (dev ones included) passes through it. The UI only shows
 what this reports.
 """
 
+import io
 import json
 import logging
 import socket
 import time
+
+import numpy as np
 
 from ..alpaca import PORT, Alpaca
 from ..client import SeestarError
@@ -50,6 +53,22 @@ def _broadcast(timeout, to):
     return [{"host": h, "port": p} for h, p in sorted(found.items())]
 
 
+SATURATED = 65000  # raw counts: the S50's 12-bit data, scaled by 16, tops out at 65504
+
+
+def preview_jpeg(raw):
+    """A raw GRBG frame (red at [0,1], blue at [1,0]) as a colour JPEG at half size."""
+    from PIL import Image
+
+    a = raw.astype(np.float32)
+    rgb = np.stack([a[0::2, 1::2], (a[0::2, 0::2] + a[1::2, 1::2]) / 2, a[1::2, 0::2]], -1)
+    top = max(float(np.percentile(rgb, 99.5)), 1.0)
+    out = (np.clip(rgb / top, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
 class NoScope:
     """No telescope linked."""
 
@@ -61,6 +80,15 @@ class NoScope:
 
     def park(self):
         log.info("park: no scope linked, nothing to park")
+
+    def point(self, az, alt):
+        raise SeestarError("no telescope is linked")
+
+    def frame(self, exposure_s):
+        raise SeestarError("no telescope is linked")
+
+    def preview_jpeg(self):
+        return None
 
     def close(self):
         pass
@@ -77,6 +105,7 @@ class AlpacaScope:
         sw = SWEEP_DEFAULTS
         self.ptr = Pointer(self.sc, self.sky, sw["sun_cone_deg"], sw["slew_step_deg"])
         self.ptr.MIN_ALT_DEG = ALPACA_FLOOR_DEG
+        self.last = None
 
     def status(self):
         rd = self.sc.equ_coord()
@@ -99,6 +128,25 @@ class AlpacaScope:
 
     def park(self):
         self.ptr.park()
+
+    def point(self, az, alt):
+        """Slew to (az, alt): Pointer's Sun-checked route, every waypoint."""
+        self.ptr.point_to(az, alt)
+
+    def frame(self, exposure_s):
+        """One raw frame where the scope points; kept for the preview."""
+        self.last = self.sc.capture_raw16(exposure_s)
+        return {
+            "exposure_ms": round(exposure_s * 1000.0, 3),
+            "median": float(np.median(self.last)),
+            "saturated": round(float((self.last >= SATURATED).mean()), 4),
+        }
+
+    def preview_jpeg(self):
+        """The last frame in colour (GRBG Bayer, half size), or None."""
+        if self.last is None:
+            return None
+        return preview_jpeg(self.last)
 
     def close(self):
         self.sc.close()

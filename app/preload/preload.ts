@@ -28,5 +28,8 @@ const api: TerminusApi = {
   scopeStatus: () => ipcRenderer.invoke("scope:status"),
   parkScope: () => ipcRenderer.invoke("scope:park"),
   disconnectScope: () => ipcRenderer.invoke("scope:disconnect"),
+  pointScope: (az, alt) => ipcRenderer.invoke("scope:point", az, alt),
+  takeFrame: (exposureMs) => ipcRenderer.invoke("scope:frame", exposureMs),
+  framePreview: () => ipcRenderer.invoke("scope:frame-preview"),
 };
 contextBridge.exposeInMainWorld("terminus", api);

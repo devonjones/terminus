@@ -5,6 +5,7 @@ import type {
   Disc,
   Frames,
   Horizon,
+  ScopeFrame,
   ScopeList,
   ScopeStatus,
   SiteList,
@@ -48,6 +49,11 @@ export interface TerminusApi {
   parkScope(): Promise<ScopeStatus>;
   // Parks first; the link stays if the park fails.
   disconnectScope(): Promise<AppState>;
+  // A Sun-guarded slew; the engine refuses a target or path near the Sun.
+  pointScope(az: number, alt: number): Promise<ScopeStatus>;
+  takeFrame(exposureMs: number): Promise<ScopeFrame>;
+  // The last frame in colour; null before the first.
+  framePreview(): Promise<Uint8Array | null>;
 }
 
 declare global {

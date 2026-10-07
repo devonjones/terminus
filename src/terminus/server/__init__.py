@@ -42,6 +42,9 @@ Routes (payload shapes: schema.json beside this file):
   POST /scope/connect     {"host": name}: link a Seestar over Alpaca -> the new state
   POST /scope/park        Sun-guarded park; the scope's status after it
   POST /scope/disconnect  park, then unlink -> the new state
+  POST /scope/point       {"az", "alt"}: Sun-guarded slew -> the scope's status
+  POST /scope/frame       {"exposure_ms"}: one raw frame -> {exposure_ms, median, saturated}
+  GET  /scope/frame.jpg   that frame in colour (204 before the first)
   GET  /dev/state         state plus recent log lines; exists only with --dev
 """
 
@@ -246,6 +249,7 @@ class _Handler(BaseHTTPRequestHandler):
             ),
             "/scope/discover": lambda: self._send(200, {"scopes": scopes.discover()}),
             "/scope/status": lambda: self._send(200, sv.scope.status()),
+            "/scope/frame.jpg": self._preview,
         }
         if sv.dev:
             routes["/dev/state"] = lambda: self._send(
@@ -270,6 +274,8 @@ class _Handler(BaseHTTPRequestHandler):
             "/site/delete": lambda: self._delete(body.get("slug")),
             "/scope/connect": lambda: self._connect(body.get("host")),
             "/scope/park": self._park,
+            "/scope/point": lambda: self._point(body.get("az"), body.get("alt")),
+            "/scope/frame": lambda: self._frame(body.get("exposure_ms")),
             "/scope/disconnect": self._disconnect,
         }
         self._dispatch(routes)
@@ -316,6 +322,29 @@ class _Handler(BaseHTTPRequestHandler):
             sv.scope = scopes.AlpacaScope(host)
         log.info("scope linked: %s", host)
         self._send(200, sv.snapshot())
+
+    def _point(self, az, alt):
+        ok = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (az, alt))
+        if not ok or not (0 <= az < 360 and -5 <= alt <= 90):
+            return self._send(400, {"error": "az must be 0-360 and alt -5 to 90 degrees"})
+        with self.server.linking:
+            self.server.scope.point(float(az), float(alt))
+        self._send(200, self.server.scope.status())
+
+    def _frame(self, exposure_ms):
+        ok = isinstance(exposure_ms, (int, float)) and not isinstance(exposure_ms, bool)
+        if not ok or not 0.05 <= exposure_ms <= 10_000:
+            return self._send(400, {"error": "exposure_ms must be 0.05 to 10000"})
+        with self.server.linking:
+            self._send(200, self.server.scope.frame(exposure_ms / 1000.0))
+
+    def _preview(self):
+        jpg = self.server.scope.preview_jpeg()
+        if jpg is None:
+            self.send_response(204)
+            self.end_headers()
+            return
+        self._send_bytes(jpg, "image/jpeg")
 
     def _park(self):
         with self.server.linking:

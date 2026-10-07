@@ -27,6 +27,9 @@
     },
     "scopes": {
       "$ref": "#/$defs/ScopeList"
+    },
+    "scope_frame": {
+      "$ref": "#/$defs/ScopeFrame"
     }
   },
   "additionalProperties": false,
@@ -781,6 +784,29 @@
       },
       "required": [
         "scopes"
+      ],
+      "additionalProperties": false
+    },
+    "ScopeFrame": {
+      "description": "One raw frame from the linked telescope.",
+      "type": "object",
+      "properties": {
+        "exposure_ms": {
+          "type": "number"
+        },
+        "median": {
+          "type": "number",
+          "description": "raw counts, 0-65504"
+        },
+        "saturated": {
+          "type": "number",
+          "description": "fraction of pixels at the top of the range"
+        }
+      },
+      "required": [
+        "exposure_ms",
+        "median",
+        "saturated"
       ],
       "additionalProperties": false
     }

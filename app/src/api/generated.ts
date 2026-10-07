@@ -18,6 +18,7 @@ export interface Api {
   frames?: Frames;
   scope_status?: ScopeStatus;
   scopes?: ScopeList;
+  scope_frame?: ScopeFrame;
 }
 export interface Health {
   ok: true;
@@ -243,4 +244,18 @@ export interface ScopeList {
     host: string;
     port: number;
   }[];
+}
+/**
+ * One raw frame from the linked telescope.
+ */
+export interface ScopeFrame {
+  exposure_ms: number;
+  /**
+   * raw counts, 0-65504
+   */
+  median: number;
+  /**
+   * fraction of pixels at the top of the range
+   */
+  saturated: number;
 }

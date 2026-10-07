@@ -114,6 +114,17 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
   });
   handle("scope:park", () => request(sc, "/scope/park", {}, SCOPE_MOTION_MS));
   handle("scope:disconnect", () => request<AppState>(sc, "/scope/disconnect", {}, SCOPE_MOTION_MS));
+  handle("scope:point", (az, alt) => {
+    const num = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+    if (!num(az) || !num(alt)) throw new Error("az and alt must be numbers");
+    return request(sc, "/scope/point", { az, alt }, SCOPE_MOTION_MS);
+  });
+  handle("scope:frame", (ms) => {
+    if (typeof ms !== "number" || !Number.isFinite(ms))
+      throw new Error("exposure must be a number");
+    return request(sc, "/scope/frame", { exposure_ms: ms }, 120_000);
+  });
+  handle("scope:frame-preview", () => view(sc, "/scope/frame.jpg"));
   // The file dialog is opened here, not in the page, so the page never chooses paths.
   handle("site:pick", async () => {
     const w = win();
