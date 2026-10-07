@@ -39,6 +39,9 @@ const PHOTO_EXTENSIONS = ["jpg", "jpeg", "png", "tif", "tiff"];
 const isName = (n: unknown): n is string =>
   typeof n === "string" && n.length > 0 && n.length < 256 && !/[\\/]/.test(n);
 
+// The sidecar's own rule (server.HOST): a bare name or address, no scheme, port or path.
+const HOST = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
+
 // Every renderer call is checked here: the sender must be our page, and each
 // argument must have the shape the sidecar expects before it is forwarded.
 function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
@@ -99,6 +102,16 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
     if (typeof restitch !== "boolean") throw new Error("restitch must be a boolean");
     return request<AppState>(sc, "/site/frames", { off, restitch });
   });
+  // A park walks the tube clear of the Sun and then stows: minutes, not seconds.
+  const SCOPE_MOTION_MS = 5 * 60_000;
+  handle("scope:discover", () => request(sc, "/scope/discover"));
+  handle("scope:status", () => request(sc, "/scope/status", undefined, 120_000));
+  handle("scope:connect", (host) => {
+    if (typeof host !== "string" || !HOST.test(host)) throw new Error("expected a host name or IP");
+    return request<AppState>(sc, "/scope/connect", { host }, 120_000);
+  });
+  handle("scope:park", () => request(sc, "/scope/park", {}, SCOPE_MOTION_MS));
+  handle("scope:disconnect", () => request<AppState>(sc, "/scope/disconnect", {}, SCOPE_MOTION_MS));
   // The file dialog is opened here, not in the page, so the page never chooses paths.
   handle("site:pick", async () => {
     const w = win();

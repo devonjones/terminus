@@ -592,11 +592,8 @@ class Pointer:
         return worst
 
     def _moving(self):
-        if hasattr(self.sc, "moving"):  # the Alpaca link
-            return self.sc.moving()
         try:
-            m = self.sc.call("get_device_state").get("result", {}).get("mount", {})
-            return m.get("move_type") not in (None, "none")
+            return bool(self.sc.moving())
         except Exception:
             return False
 
@@ -837,6 +834,28 @@ class Pointer:
                 )
         rd = self.sc.equ_coord()
         return self.sky.radec_to_altaz(*rd) if rd else (az, alt)
+
+    PARK_VIA = (0.0, 25.0)  # due north: the Sun never gets near it at mid-latitudes
+    PARK_TIMEOUT_S = 90
+
+    def park(self):
+        """Close the arm: Sun-guarded to PARK_VIA, then park, which stows to Dec
+        -90 in about 25 s. The route verified on 2026-10-05 (native) and
+        2026-10-06 (Alpaca)."""
+        self.point_to(*self.PARK_VIA)
+        if self.dry:
+            return
+        self.sc.park()
+        deadline = time.time() + self.PARK_TIMEOUT_S
+        while True:
+            rd = self.sc.equ_coord()
+            if rd is not None and abs(abs(float(rd[1])) - 90.0) < 0.5:
+                return
+            if time.time() > deadline:
+                raise PointingError(
+                    f"park did not stow in {self.PARK_TIMEOUT_S} s; mount reads {rd}"
+                )
+            time.sleep(2)
 
 
 # ---- horizon search -------------------------------------------------------

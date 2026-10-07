@@ -1,6 +1,14 @@
 // The sidecar's payloads are generated from src/terminus/server/schema.json
 // (`npm run gen:api`); only the preload's own API is written here.
-import type { AppState, Disc, Frames, Horizon, SiteList } from "./generated";
+import type {
+  AppState,
+  Disc,
+  Frames,
+  Horizon,
+  ScopeList,
+  ScopeStatus,
+  SiteList,
+} from "./generated";
 
 export type * from "./generated";
 
@@ -33,6 +41,13 @@ export interface TerminusApi {
   buildImage(kind: BuildImage, layer: string): Promise<Uint8Array | null>;
   // Rebuild without the `off` photos: re-blend the stitched ones, or stitch afresh.
   curate(off: string[], restitch: boolean): Promise<AppState>;
+  // The telescope, over Alpaca. Every motion is Sun-guarded in the engine.
+  discoverScopes(): Promise<ScopeList>;
+  connectScope(host: string): Promise<AppState>;
+  scopeStatus(): Promise<ScopeStatus>;
+  parkScope(): Promise<ScopeStatus>;
+  // Parks first; the link stays if the park fails.
+  disconnectScope(): Promise<AppState>;
 }
 
 declare global {

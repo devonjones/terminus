@@ -98,6 +98,20 @@ if it exists, and otherwise the sidecar falls back to PATH.
 Known limit: quitting while a site is building leaves it half-built; nothing
 resumes it yet (terminus-82).
 
+## Telescope
+
+The Connect tab links a Seestar over ASCOM Alpaca, with no interop key. Turn
+on Alpaca in the Seestar app, with the scope on your Wi-Fi in EQ mode. "Find
+telescopes" broadcasts Alpaca discovery (UDP 32227); an address can also be
+typed. Discovery does not cross WSL's NAT, so from WSL type the address.
+
+The sidecar holds the link (`server/scope.py`). Every motion goes through
+`sweep.Pointer`, Sun-checked at each waypoint. Park first slews to az 0 alt 25
+and then stows. Disconnecting parks first, and a park that fails keeps the
+link. Pointing is read from RA/Dec: in EQ mode the mount's own alt/az is not
+trusted. Alpaca cannot open the arm, so the tab says to open it in the
+Seestar app.
+
 ## Develop
 
 ```sh

@@ -1,8 +1,18 @@
-import type { AppState, Disc, Frames, Horizon, SiteSummary, TerminusApi } from "./api/types";
+import type {
+  AppState,
+  Disc,
+  Frames,
+  Horizon,
+  ScopeList,
+  ScopeStatus,
+  SiteSummary,
+  TerminusApi,
+} from "./api/types";
 import { decode, pick, type Footprint } from "./frames";
 import {
   buildTitle,
   buildView,
+  connectView,
   el,
   fitView,
   horizonView,
@@ -18,7 +28,6 @@ const title = (s: string) => s[0].toUpperCase() + s.slice(1);
 const PHOTO = /\.(jpe?g|png|tiff?)$/i;
 const PHOTO_LOADS = 4; // photos fetched at once for the curation strip
 const LATER: Record<string, string> = {
-  connect: "Connecting the telescope arrives with the Alpaca driver.",
   orient: "Orienting against the telescope arrives in a later stage.",
   export: "Exporting to planning programs arrives next.",
 };
@@ -43,7 +52,12 @@ interface View {
   showDisagree: boolean;
   build: BuildImages; // what a running build has produced so far
   managing: boolean; // the site list is showing instead of the tab
+  scope: ScopeStatus | null;
+  found: ScopeList["scopes"] | null;
+  scopeBusy: string;
 }
+
+const SCOPE_POLL_MS = 3000;
 
 // Render the app: a site picker, the tab bar, the active tab and a status line.
 // Every number and pixel comes from the sidecar; this file only arranges them.
@@ -73,6 +87,9 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       progressN: 0,
     },
     managing: false,
+    scope: null,
+    found: null,
+    scopeBusy: "",
   };
   let polling = false;
   let generation = 0;
@@ -254,6 +271,64 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     poll();
   }
 
+  // The Connect tab: the telescope's status, refreshed while the tab is open.
+  let scopePolling = false;
+  async function readScope() {
+    v.scope = await api.scopeStatus();
+  }
+  function pollScope() {
+    if (scopePolling || v.st.tab !== "connect" || v.st.scope.link === "none") return;
+    scopePolling = true;
+    setTimeout(async () => {
+      scopePolling = false;
+      if (v.st.tab !== "connect" || v.st.scope.link === "none") return;
+      try {
+        await readScope();
+        render();
+      } catch (e) {
+        fail(e as Error);
+      }
+      pollScope();
+    }, SCOPE_POLL_MS);
+  }
+  // One scope request at a time, with what it is doing on screen.
+  async function scopeAct(doing: string, act: () => Promise<void>) {
+    v.scopeBusy = doing;
+    render();
+    try {
+      await act();
+      v.error = "";
+    } catch (e) {
+      v.error = (e as Error).message;
+    }
+    v.scopeBusy = "";
+    render();
+    pollScope();
+  }
+  const scopeProps = () => ({
+    status: v.scope,
+    found: v.found,
+    busy: v.scopeBusy,
+    onFind: () =>
+      scopeAct("Looking for telescopes…", async () => {
+        v.found = (await api.discoverScopes()).scopes;
+      }),
+    onConnect: (host: string) =>
+      scopeAct(`Connecting to ${host}…`, async () => {
+        v.st = await api.connectScope(host);
+        await readScope();
+      }),
+    onPark: () =>
+      scopeAct("Parking: clearing the Sun, then closing the arm…", async () => {
+        v.scope = await api.parkScope();
+      }),
+    onDisconnect: () =>
+      scopeAct("Parking, then disconnecting…", async () => {
+        v.st = await api.disconnectScope();
+        await readScope();
+      }),
+  });
+
   const newSite = () => {
     startBuild();
     return api.pickPhotos().then(adopt).catch(fail);
@@ -304,7 +379,13 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         b.addEventListener("click", () => {
           api
             .setTab(t)
-            .then((next) => ((v.st = next), (v.error = ""), render()))
+            .then(async (next) => {
+              v.st = next;
+              v.error = "";
+              if (t === "connect") await readScope();
+              render();
+              pollScope();
+            })
             .catch(fail);
         });
         return b;
@@ -369,6 +450,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         },
         v.st.site?.panorama ? () => curate([], false) : null,
       );
+    if (tab === "connect") return connectView(scopeProps());
     if (tab === "fit") return fitView(v.horizon);
     if (tab === "horizon") {
       if (!v.st.site) return el("p", { textContent: "Choose or create a site first." });
@@ -439,6 +521,8 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     api.createSite(files).then(adopt).catch(fail);
   });
 
+  if (v.st.tab === "connect") await readScope().catch(fail);
   await loadSite();
   poll();
+  pollScope();
 }

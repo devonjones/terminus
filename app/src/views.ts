@@ -6,6 +6,8 @@ import type {
   Frames,
   Horizon,
   Job,
+  ScopeList,
+  ScopeStatus,
   SiteSummary,
 } from "./api/types";
 import { dragSpin } from "./spin";
@@ -309,6 +311,102 @@ export function manageView(
     ...["Name", "Photos", "Horizon", "Last changed", ""].map((h) => el("th", { textContent: h })),
   );
   return el("table", { className: "sites" }, el("thead", {}, head), el("tbody", {}, ...rows));
+}
+
+export interface ConnectProps {
+  status: ScopeStatus | null; // null until first read
+  found: ScopeList["scopes"] | null; // null until a search has run
+  busy: string; // what is in progress, in words; "" when idle
+  onFind(): void;
+  onConnect(host: string): void;
+  onPark(): void;
+  onDisconnect(): void;
+}
+
+const deg = (n: number) => `${n.toFixed(1)}°`;
+
+// The telescope: find it, link it, see where it points and where the Sun is.
+// Every motion is decided and Sun-checked by the engine; these are requests.
+export function connectView(p: ConnectProps): HTMLElement {
+  const busy = p.busy ? el("p", { textContent: p.busy, className: "busy" }) : "";
+  const st = p.status;
+  if (!st || st.link === "none") {
+    const find = el("button", { textContent: "Find telescopes", disabled: !!p.busy });
+    find.dataset.focus = "scope-find";
+    find.addEventListener("click", p.onFind);
+    const host = el("input", { type: "text", placeholder: "10.0.0.20" });
+    host.setAttribute("aria-label", "Telescope address");
+    host.dataset.focus = "scope-host";
+    const go = el("button", { textContent: "Connect", disabled: !!p.busy });
+    go.dataset.focus = "scope-connect";
+    go.addEventListener("click", () => host.value.trim() && p.onConnect(host.value.trim()));
+    host.addEventListener("keydown", (e) => e.key === "Enter" && go.click());
+    const list =
+      p.found === null
+        ? ""
+        : p.found.length === 0
+          ? el("p", { textContent: "No telescopes answered. Is Alpaca on in the Seestar app?" })
+          : el(
+              "ul",
+              { className: "found" },
+              ...p.found.map((f) => {
+                const b = el("button", { textContent: `Connect to ${f.host}`, disabled: !!p.busy });
+                b.addEventListener("click", () => p.onConnect(f.host));
+                return el("li", {}, b);
+              }),
+            );
+    return el(
+      "div",
+      { className: "connect" },
+      el("p", {
+        textContent:
+          "Turn on Alpaca in the Seestar app (Settings), with the scope on your Wi-Fi in EQ mode.",
+      }),
+      el("div", { className: "row" }, find, host, go),
+      list,
+      busy,
+    );
+  }
+  const rows: [string, string][] = [
+    ["Telescope", st.host ?? ""],
+    ["Mount", st.eq ? "EQ mode" : "not in EQ mode: terminus needs EQ mode"],
+    ["Arm", st.stowed ? "closed" : "open"],
+    ["Pointing", st.stowed ? "stowed" : `az ${deg(st.az!)} alt ${deg(st.alt!)}`],
+    ["Sun", `az ${deg(st.sun!.az)} alt ${deg(st.sun!.alt)}`],
+    ["Keeps clear of the Sun by", deg(st.cone!)],
+  ];
+  if (st.moving) rows.push(["Now", "moving"]);
+  const table = el(
+    "dl",
+    { className: "scope" },
+    ...rows.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]),
+  );
+  const park = el("button", { textContent: "Park", disabled: !!p.busy || !!st.stowed });
+  park.dataset.focus = "scope-park";
+  park.addEventListener("click", p.onPark);
+  const leave = el("button", { textContent: "Park and disconnect", disabled: !!p.busy });
+  leave.dataset.focus = "scope-disconnect";
+  leave.addEventListener("click", p.onDisconnect);
+  const notes: Node[] = [];
+  if (st.stowed)
+    notes.push(
+      el("p", {
+        className: "banner",
+        textContent: "The arm is closed. Open it in the Seestar app, then close the app.",
+      }),
+    );
+  if (!st.eq)
+    notes.push(
+      el("p", { className: "banner warn", textContent: "Switch the mount to EQ mode in the app." }),
+    );
+  return el(
+    "div",
+    { className: "connect" },
+    table,
+    ...notes,
+    el("div", { className: "row" }, park, leave),
+    busy,
+  );
 }
 
 export interface CurateProps {

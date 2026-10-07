@@ -12,7 +12,7 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
   const app = await electron.launch({ args: [appDir] });
   const win = await app.firstWindow();
   await expect(win.locator("footer")).toHaveText(
-    "engine 0.2.0 · site: none · scope: none · sun mode: SUN",
+    "engine 0.3.0 · site: none · scope: none · sun mode: SUN",
   );
   await win.getByRole("tab", { name: "Horizon" }).click();
   await expect(win.locator("h1")).toHaveText("Horizon");
@@ -28,10 +28,13 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
   ).toEqual({
     api: [
       "buildImage",
+      "connectScope",
       "createSite",
       "curate",
       "deleteSite",
       "disc",
+      "disconnectScope",
+      "discoverScopes",
       "frameImage",
       "frames",
       "getState",
@@ -39,8 +42,10 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
       "image",
       "listSites",
       "openSite",
+      "parkScope",
       "pickPhotos",
       "renameSite",
+      "scopeStatus",
       "setSpin",
       "setTab",
     ],

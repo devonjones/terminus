@@ -21,6 +21,12 @@
     },
     "frames": {
       "$ref": "#/$defs/Frames"
+    },
+    "scope_status": {
+      "$ref": "#/$defs/ScopeStatus"
+    },
+    "scopes": {
+      "$ref": "#/$defs/ScopeList"
     }
   },
   "additionalProperties": false,
@@ -70,11 +76,21 @@
           "type": "object",
           "properties": {
             "link": {
-              "type": "string"
+              "enum": [
+                "none",
+                "alpaca"
+              ]
+            },
+            "host": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "link"
+            "link",
+            "host"
           ],
           "additionalProperties": false
         },
@@ -682,6 +698,89 @@
         "a",
         "b",
         "matches"
+      ],
+      "additionalProperties": false
+    },
+    "ScopeStatus": {
+      "description": "The linked telescope, or {link: none}. Pointing comes from RA/Dec (EQ mode's own alt/az is unreliable).",
+      "type": "object",
+      "properties": {
+        "link": {
+          "enum": [
+            "none",
+            "alpaca"
+          ]
+        },
+        "host": {
+          "type": "string"
+        },
+        "eq": {
+          "type": "boolean"
+        },
+        "az": {
+          "type": "number"
+        },
+        "alt": {
+          "type": "number"
+        },
+        "stowed": {
+          "type": "boolean",
+          "description": "arm closed (Dec -90)"
+        },
+        "moving": {
+          "type": "boolean"
+        },
+        "sun": {
+          "type": "object",
+          "properties": {
+            "az": {
+              "type": "number"
+            },
+            "alt": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "az",
+            "alt"
+          ],
+          "additionalProperties": false
+        },
+        "cone": {
+          "type": "number",
+          "description": "degrees from the Sun no slew may come within"
+        }
+      },
+      "required": [
+        "link"
+      ],
+      "additionalProperties": false
+    },
+    "ScopeList": {
+      "type": "object",
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "host",
+              "port"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "scopes"
       ],
       "additionalProperties": false
     }

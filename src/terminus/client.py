@@ -169,6 +169,10 @@ class Seestar:
     def mount_state(self):
         return self.call("get_device_state", {"keys": ["mount"]}).get("result", {}).get("mount", {})
 
+    def moving(self):
+        m = self.call("get_device_state").get("result", {}).get("mount", {})
+        return m.get("move_type") not in (None, "none")
+
     def location(self):
         """Scope's stored (lon, lat) or None."""
         r = self.call("get_device_state", {"keys": ["location_lon_lat"]}).get("result", {})

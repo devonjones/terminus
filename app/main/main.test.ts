@@ -202,6 +202,11 @@ describe("site IPC", () => {
     ["site:build-image", ["verdict", "label0003.tif"]],
     ["site:rename", ["site-a", 3]],
     ["site:rename", ["site-a", "x".repeat(201)]],
+    ["scope:connect", [3]],
+    ["scope:connect", [""]],
+    ["scope:connect", ["http://10.5.2.65"]],
+    ["scope:connect", ["10.5.2.65:32323"]],
+    ["scope:connect", ["10.5.2.65/api"]],
   ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
     await boot();
     expect(() => call(ch, ...args)).toThrow();
@@ -227,8 +232,27 @@ describe("site IPC", () => {
       "site:rename",
       "site:delete",
       "site:build-image",
+      "scope:discover",
+      "scope:status",
+      "scope:connect",
+      "scope:park",
+      "scope:disconnect",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
+  });
+
+  it("the scope channels reach their routes; motion gets minutes, not 10 s", async () => {
+    await boot();
+    expect(await call("scope:connect", "10.5.2.65")).toEqual({
+      p: "/scope/connect",
+      body: { host: "10.5.2.65" },
+    });
+    expect(await call("scope:status")).toEqual({ p: "/scope/status" });
+    expect(await call("scope:discover")).toEqual({ p: "/scope/discover" });
+    h.request.mockClear();
+    expect(await call("scope:park")).toEqual({ p: "/scope/park", body: {} });
+    expect(await call("scope:disconnect")).toEqual({ p: "/scope/disconnect", body: {} });
+    for (const c of h.request.mock.calls) expect((c as unknown[])[3]).toBe(5 * 60_000);
   });
 
   it("copying a drop gets a long timeout, not the ordinary 10 s", async () => {

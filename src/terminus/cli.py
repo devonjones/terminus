@@ -172,16 +172,10 @@ def cmd_point(sc, cfg, args):
 
 
 def cmd_park(sc, cfg, args):
-    """Close the arm: Sun-guarded to az 0 alt 25 first, the route verified on
-    2026-10-05, then park, which stows to Dec -90 in about 25 s."""
-    sky = _sky(sc, cfg)
-    _pointer(sc, sky, cfg["sweep"], False).point_to(0.0, 25.0)
-    sc.park()
-    deadline = time.time() + 90
-    while not is_stowed(sc.equ_coord()):
-        if time.time() > deadline:
-            raise SeestarError(f"park did not stow in 90 s; mount reads {sc.equ_coord()}")
-        time.sleep(2)
+    try:
+        _pointer(sc, _sky(sc, cfg), cfg["sweep"], False).park()
+    except (SunGuard, PointingError) as e:
+        raise SeestarError(f"park: {e}") from e
     print("parked: arm closed (Dec -90)")
 
 

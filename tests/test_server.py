@@ -137,7 +137,7 @@ def test_state_defaults(serve):
         "site": None,
         "tab": "connect",
         "tabs": list(TABS),
-        "scope": {"link": "none"},
+        "scope": {"link": "none", "host": None},
         "sun_mode": "sun",
         "spin": 0.0,
         "job": None,
@@ -942,7 +942,7 @@ def test_shutdown_parks_first_and_every_step_survives_a_failure(failing):
         return run
 
     server = types.SimpleNamespace(
-        scope=types.SimpleNamespace(park=step("park")),
+        scope=types.SimpleNamespace(park=step("park"), close=step("unlink")),
         jobs=types.SimpleNamespace(stop=step("stop")),
         server_close=step("close"),
     )
@@ -951,7 +951,7 @@ def test_shutdown_parks_first_and_every_step_survives_a_failure(failing):
             server_module._shutdown(server)
     else:
         server_module._shutdown(server)
-    assert calls == ["park", "stop", "close"]
+    assert calls == ["park", "unlink", "stop", "close"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
