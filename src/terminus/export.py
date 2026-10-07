@@ -523,20 +523,17 @@ def require_oriented(meta, allow_unoriented=False):
 
 
 def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=False):
-    # Deliberately does NOT buffer here: the exporters do it themselves, so a
-    # caller reaching past this wrapper still gets the margin. Buffering in both
-    # places would apply it twice.
-    meta, rows = load_planning(mask_path, tree_buffer)  # final: no further buffer
+    # load_planning applies the buffer; the exporters below must add none.
+    meta, rows = load_planning(mask_path, tree_buffer)
     require_oriented(meta, allow_unoriented)
-    tree_buffer = 0.0
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
         # Forward the override: to_nina_hrz checks again for the benefit of
         # direct callers, and without this an explicit allow_unoriented would be
         # granted here and then refused one line later.
-        f.write(to_nina_hrz(rows, meta, tree_buffer, allow_unoriented=True))
+        f.write(to_nina_hrz(rows, meta, 0.0, allow_unoriented=True))
     with open(txt, "w") as f:
-        f.write(to_stellarium_txt(rows, meta, tree_buffer, allow_unoriented=True))
+        f.write(to_stellarium_txt(rows, meta, 0.0, allow_unoriented=True))
     return hrz, txt
 
 

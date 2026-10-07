@@ -72,6 +72,32 @@ def test_export_all_applies_the_buffer_exactly_once(tmp_path):
     hrz, _ = export_all(str(p), str(tmp_path / "out"))
     body = [ln for ln in open(hrz).read().splitlines() if not ln.startswith("#")]
     assert body[0] == "0 15", f"expected one 3 deg buffer, got {body[0]}"
+    hrz, _ = export_all(str(p), str(tmp_path / "out5"), tree_buffer=5.0)
+    body = [ln for ln in open(hrz).read().splitlines() if not ln.startswith("#")]
+    assert body[0] == "0 17", f"expected the 5 deg override once, got {body[0]}"
+
+
+def test_horizon_from_a_mask_adds_no_tree_buffer(tmp_path):
+    """Planners read the measured line; the margin is the exporters' business."""
+    p = tmp_path / "m.yaml"
+    write_mask(str(p), {0: (12.0, "tree"), 180: (12.0, "tree")}, [], {"lat": 40, "lon": -105})
+    assert Horizon.from_mask(str(p)).altitude_at(0) == 12.0
+
+
+def test_fresh_labels_ignores_frames_that_are_not_kept(tmp_path):
+    """An off frame, or one nona left off the canvas, must not force the colour vote."""
+    from terminus import reblend
+
+    for f in ("layer0000.tif", "label0000.tif", "layer0001.tif", "layer0002.tif"):
+        (tmp_path / f).write_bytes(b"")
+    os.utime(tmp_path / "label0000.tif", ns=(2, 2))
+    for f in ("layer0000.tif", "layer0001.tif", "layer0002.tif"):
+        os.utime(tmp_path / f, ns=(1, 1))
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    a, b = str(tmp_path / "layer0000.tif"), str(tmp_path / "layer0001.tif")
+    layers = {"a.jpg": a, "b.jpg": b, "c.jpg": str(tmp_path / "layer0002.tif"), "d.jpg": None}
+    got = reblend.fresh_labels(str(tmp_path), names, layers, [a])
+    assert got == {a: str(tmp_path / "label0000.tif")}
 
 
 def test_stellarium_txt_has_no_comments():
@@ -10001,3 +10027,31 @@ def test_a_mixed_mask_buffers_the_trees_that_have_no_planning_line(tmp_path):
     write_mask(str(mask), cols, [], {"oriented": True})
     _meta, rows = load_planning(str(mask))
     assert {az: alt for az, alt, _ in rows} == {0: 7.0, 90: 5.0, 180: 5.0 + TREE_BUFFER_DEG}
+
+
+def test_export_pictures_apply_the_buffer_exactly_once(tmp_path, monkeypatch):
+    """The CLI's Sky Safari and landscape paths read the buffered planning line,
+    so the exporters must add nothing more."""
+    from terminus import cli, export, landscape
+
+    seen = {}
+
+    def record(kind):
+        def fake(*a, **kw):
+            rows = a[0] if kind == "skysafari" else a[1]
+            seen[kind] = rows[0][1] + kw["tree_buffer"]
+            return str(tmp_path / kind)
+
+        return fake
+
+    monkeypatch.setattr(landscape, "to_skysafari_png", record("skysafari"))
+    monkeypatch.setattr(landscape, "write_landscape", record("landscape"))
+    monkeypatch.setattr(
+        export,
+        "to_pvsyst_hor",
+        lambda rows, meta, buf, **kw: seen.setdefault("pvsyst", rows[0][1] + buf) and "",
+    )
+    p = tmp_path / "m.yaml"
+    write_mask(str(p), {0: (12.0, "tree")}, [], {"lat": 40, "lon": -105, "oriented": True})
+    cli.main(["export", str(p), "--skysafari", "--landscape", "--pvsyst"])
+    assert seen == {"skysafari": 15.0, "landscape": 15.0, "pvsyst": 15.0}

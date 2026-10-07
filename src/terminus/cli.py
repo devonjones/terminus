@@ -842,18 +842,17 @@ def _export(args, base, allow):
     from .landscape import to_skysafari_png, write_landscape
 
     meta, rows = load_planning(args.mask)  # final: no further buffer
-    buffer = {"tree_buffer": 0.0}
     texture, coverage = _texture(args)
     if args.skysafari:
         png = to_skysafari_png(
             rows, base + ".skysafari.png", meta, texture=texture, coverage=coverage,
-            allow_unoriented=allow, **buffer,
+            allow_unoriented=allow, tree_buffer=0.0,
         )  # fmt: skip
         print(f"wrote {png} (Settings -> Horizon & Sky -> Panoramic Image)")
     if args.landscape:
         d = write_landscape(
             base + "_landscape", rows, meta, name=os.path.basename(base),
-            texture=texture, coverage=coverage, allow_unoriented=allow, **buffer,
+            texture=texture, coverage=coverage, allow_unoriented=allow, tree_buffer=0.0,
         )  # fmt: skip
         kind = "spherical" if texture is not None else "polygonal"
         print(f"wrote {d}/ ({kind}); copy it into Stellarium's landscapes/ folder")
