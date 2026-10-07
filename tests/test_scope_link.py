@@ -551,3 +551,20 @@ def test_an_escape_gains_separation_at_every_step(monkeypatch):
     seps = [ang_sep(*sky.radec_to_altaz(*g), saz, salt) for g in mount.gotos]
     assert mount.gotos and min(seps) >= start
     assert seps == sorted(seps)
+
+
+def test_an_escape_turn_stops_at_the_first_step_clear_at_the_altitude_it_flies(monkeypatch):
+    """The turn is judged where it flies (the floor), not where the tube started:
+    judged at the start, nearer the Sun, it would turn on past the point it was clear."""
+    from terminus.sweep import ang_sep
+
+    sky = _morning(monkeypatch, "2026-10-07T13:00:00Z")
+    saz, salt = sky.sun()
+    mount = _Mount(sky.altaz_to_radec(saz - 9.5, 1.0))  # one step lands between the two
+    ptr = Pointer(mount, sky, 30.0, 1.0)
+    ptr.escape()
+    turn = [sky.radec_to_altaz(*g) for g in mount.gotos]
+    clear = ptr.cone + ptr.ESCAPE_MARGIN_DEG
+    seps = [ang_sep(az, alt, saz, salt) for az, alt in turn]
+    assert all(abs(alt - 5.0) < 0.1 for _, alt in turn)
+    assert seps[-1] >= clear and all(s < clear for s in seps[:-1])

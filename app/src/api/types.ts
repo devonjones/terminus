@@ -60,7 +60,7 @@ export interface TerminusApi {
   framePreview(): Promise<Uint8Array | null>;
   // The open site's telescope columns and their fit; null when it has none.
   columns(): Promise<Columns | null>;
-  // Include or exclude a column, or set its tags; the engine refits near the last fit.
+  // Include or exclude a column, or set its tags; the engine refits near the last fit, if any.
   editColumn(az: number, change: { included?: boolean; tags?: ColumnTag[] }): Promise<Columns>;
   // The full fit over every included column: minutes.
   fitColumns(): Promise<Columns>;
