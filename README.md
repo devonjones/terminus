@@ -375,11 +375,11 @@ terminus park                      # Sun-guarded to alt 25 toward the up pole, t
 terminus unpark                    # open the arm: native link only, Sun down only
 ```
 
-A uniform overcast under
-suburban light pollution makes the sky a bright, even backdrop, but drifting
-broken cloud does not: on 2026-10-06 it read 3 of 4 known columns wrong
-(terminus-84). At the shipped `az_step = 5` a full circle is 72 columns
-(`az_step = 10` halves it, more coarsely). Let the Sun set first: the Sun
+A full circle takes hours: at the shipped `az_step = 5` it is 72 columns
+(`az_step = 10` halves it, more coarsely). A uniform overcast under suburban
+light pollution makes the sky a bright, even backdrop, but drifting broken
+cloud does not: on 2026-10-06 it read 3 of 4 known columns wrong
+(terminus-84). Let the Sun set first: the Sun
 guard refuses any slew whose path passes near it, so daytime columns toward
 the Sun are skipped rather than measured. When the Sun crosses −12° mid-run,
 `sweep` switches to the night channel on its own, so a dusk-into-dark circle

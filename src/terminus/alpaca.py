@@ -66,6 +66,14 @@ def parse_imagebytes(blob):
     return np.frombuffer(blob, dtype=dtype, offset=start, count=d1 * d2).reshape(d1, d2).T
 
 
+def _reason(e):
+    """The body of an HTTP error: the driver's own words, if it can be read."""
+    try:
+        return e.read().decode(errors="replace")[:200]
+    except (OSError, http.client.HTTPException):
+        return ""
+
+
 def _check(d, what):
     """An Alpaca reply, or the scope's own error raised."""
     if d.get("ErrorNumber"):
@@ -93,15 +101,11 @@ class Alpaca:
                     return json.loads(body)
             except urllib.error.HTTPError as e:
                 if e.code >= 500:  # the server's trouble, not the request's: retry
-                    last = e
+                    last = f"{e.code} {_reason(e)}"
                     time.sleep(1 + attempt)
                     continue
                 # The server answered and refused: retrying repeats the refusal.
-                try:
-                    reason = e.read().decode(errors="replace")[:200]
-                except (OSError, http.client.HTTPException):
-                    reason = ""
-                raise SeestarError(f"Alpaca refused {req.full_url}: {e.code} {reason}") from e
+                raise SeestarError(f"Alpaca refused {req.full_url}: {e.code} {_reason(e)}") from e
             except ValueError as e:  # not JSON
                 raise SeestarError(f"Alpaca sent an unreadable reply to {req.full_url}") from e
             except (urllib.error.URLError, OSError, http.client.HTTPException) as e:

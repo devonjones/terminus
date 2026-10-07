@@ -366,3 +366,35 @@ def test_an_image_that_never_arrives_says_so(scope, monkeypatch):
     monkeypatch.setattr(alpaca.time, "time", lambda: next(clock))
     with pytest.raises(SeestarError, match="no image"):
         sc.capture_raw16(2.0)
+
+
+def test_a_server_error_that_persists_keeps_the_drivers_reason(scope):
+    fake, sc = scope
+
+    def always_500(req, method):
+        body = b"Driver exception: target below horizon limit"
+        req.send_response(500)
+        req.send_header("Content-Length", str(len(body)))
+        req.end_headers()
+        req.wfile.write(body)
+        return None
+
+    fake.handle = always_500
+    with pytest.raises(SeestarError, match="500 Driver exception: target below horizon"):
+        sc.is_eq_mode()
+
+
+def test_a_refusal_whose_body_breaks_off_is_still_a_scope_error(scope):
+    fake, sc = scope
+
+    def truncated(req, method):
+        req.send_response(400)
+        req.send_header("Content-Length", "100")
+        req.end_headers()
+        req.wfile.write(b"Dec")
+        req.close_connection = True
+        return None
+
+    fake.handle = truncated
+    with pytest.raises(SeestarError, match="400"):
+        sc.is_eq_mode()
