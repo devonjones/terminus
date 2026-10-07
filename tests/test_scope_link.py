@@ -10,7 +10,7 @@ from test_server import call, conforms, serve  # noqa: F401 (serve is a fixture)
 
 from terminus.client import SeestarError
 from terminus.server import scope as scopes
-from terminus.sweep import Pointer, PointingError, Sky, SunGuard
+from terminus.sweep import Pointer, PointingError, PointingUnreadable, Sky, SunGuard
 
 
 class FakeMount:
@@ -334,3 +334,39 @@ def test_cli_park_reports_a_sun_refusal_plainly(monkeypatch):
     cfg = {"sweep": {"sun_cone_deg": 30.0, "slew_step_deg": 5.0}}
     with pytest.raises(SeestarError, match="park: the stow would pass"):
         cli.cmd_park(FakeMount(), cfg, None)
+
+
+def test_a_dec_that_rounds_past_the_pole_still_converts():
+    """Interpolating a path to Dec -90 lands on -90.00000000000001 for about a fifth
+    of northern daytime parks; astropy refused it and the stow-leg check crashed."""
+    az, alt = Sky(39.79, -104.89).radec_to_altaz(6.0407, -90.00000000000001)
+    assert abs(alt + 39.79) < 0.1  # the south pole, below a northern horizon
+
+
+def test_only_the_south_pole_is_stowed():
+    """The stow is Dec -90; a scope near the north pole is pointing, not parked."""
+    from terminus.sweep import is_stowed
+
+    assert is_stowed((4.0, -90.0)) and is_stowed((4.0, -89.85))
+    assert not is_stowed((4.0, 89.8)) and not is_stowed(None)
+
+
+def test_an_unreadable_pointing_is_not_taken_for_the_zenith():
+    sc = FakeMount()
+    sc.rd = None
+    ptr = Pointer(sc, Sky(39.79, -104.89), 30, 5)
+    with pytest.raises(PointingUnreadable):
+        ptr.current_azalt()
+
+
+def test_a_park_that_loses_the_pointing_before_the_stow_refuses():
+    sc = FakeMount()
+    ptr = _Ptr(sc)
+
+    def lose_it(az, alt):
+        sc.rd = None
+
+    ptr.point_to = lose_it
+    with pytest.raises(PointingUnreadable, match="before the stow"):
+        ptr.park()
+    assert sc.parks == 0

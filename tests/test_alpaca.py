@@ -336,3 +336,33 @@ def test_a_scope_error_on_a_read_is_raised(scope):
     )
     with pytest.raises(SeestarError, match="1031"):
         sc.is_eq_mode()
+
+
+def test_a_server_error_is_retried(scope):
+    """A 503 is the server's trouble; one of them must not end a night's sweep."""
+    fake, sc = scope
+    orig, failed = fake.handle, []
+
+    def busy_once(req, method):
+        if not failed:
+            failed.append(1)
+            req.send_response(503)
+            req.send_header("Content-Length", "0")
+            req.end_headers()
+            return None
+        return orig(req, method)
+
+    fake.handle = busy_once
+    assert sc.is_eq_mode() is False and failed
+
+
+def test_an_image_that_never_arrives_says_so(scope, monkeypatch):
+    fake, sc = scope
+    orig = fake.handle
+    fake.handle = lambda req, m: (
+        {"Value": False, "ErrorNumber": 0} if "imageready" in req.path else orig(req, m)
+    )
+    clock = iter(range(0, 10_000, 30))
+    monkeypatch.setattr(alpaca.time, "time", lambda: next(clock))
+    with pytest.raises(SeestarError, match="no image"):
+        sc.capture_raw16(2.0)

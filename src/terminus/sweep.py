@@ -107,6 +107,7 @@ class Sky:
         return c.ra.hourangle, c.dec.deg
 
     def radec_to_altaz(self, ra_h, dec_d, when=None):
+        dec_d = np.clip(dec_d, -90.0, 90.0)  # a path interpolated to a pole can overshoot by 1e-14
         aa = SkyCoord(ra=ra_h * u.hourangle, dec=dec_d * u.deg).transform_to(
             AltAz(obstime=when or _now(), location=self.loc)
         )
@@ -203,20 +204,13 @@ def wrap_ra(d_hours):
 
 
 def is_stowed(rd):
-    """Is the mount parked with its arm closed?
+    """Is the mount parked with its arm closed? The stow is Dec -90, so this
+    reads from the pointing alone. Only -90: the north pole is a real pointing.
 
-    Devon: Dec -90 tells you it is stowed. The stow position IS the south
-    celestial pole, so this is readable from the pointing alone — no second call,
-    and true whatever the firmware chooses to report elsewhere.
-
-    Worth checking because the failure it causes is so misleading. A stowed mount
-    answers every query happily and simply never moves, so each goto waits out
-    GOTO_TIMEOUT and reports "did not arrive; mount may be closed, parked, or not
-    tracking". Three of those in a row trip MAX_POINTING_MISSES and abandon the
-    run. On 2026-08-05 that reading cost a session, and this morning it cost ten
-    minutes before the Dec was noticed.
+    Worth checking because a stowed mount answers every query and never moves,
+    so each goto times out as "did not arrive", which looks like a pointing bug.
     """
-    return rd is not None and abs(abs(float(rd[1])) - 90.0) < 0.5
+    return rd is not None and float(rd[1]) < -89.5
 
 
 class Pointer:
@@ -243,7 +237,9 @@ class Pointer:
 
     def current_azalt(self):
         rd = self.sc.equ_coord()
-        return self.sky.radec_to_altaz(*rd) if rd else (0.0, 90.0)
+        if rd is None:
+            raise PointingUnreadable("cannot read the current pointing")
+        return self.sky.radec_to_altaz(*rd)
 
     def _sun_check(self, az, alt):
         saz, salt = self.sky.sun()

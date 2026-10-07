@@ -1067,18 +1067,26 @@ describe("connect", () => {
     expect(root.querySelector('[data-focus="scope-find"]')).toBeNull();
   });
 
-  it("refreshes the status every few seconds while the tab is open", async () => {
+  it("refreshes the status every few seconds while the tab is open, and stops after", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
+    let az = 180;
     const api = fakeApi();
+    const read = api.scopeStatus;
+    api.scopeStatus = vi.fn(async () => {
+      const st = await read();
+      return st.link === "none" ? st : { ...st, az };
+    });
     await mount(root, api);
     getByRole(root, "button", { name: "Find telescopes" }).click();
     (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
     await findByText(root, "az 180.0° alt 30.0°");
-    const before = vi.mocked(api.scopeStatus).mock.calls.length;
+    az = 200; // the scope moved
     await vi.advanceTimersByTimeAsync(3100);
-    await vi.waitFor(() =>
-      expect(vi.mocked(api.scopeStatus).mock.calls.length).toBeGreaterThan(before),
-    );
+    await findByText(root, "az 200.0° alt 30.0°");
+    await openTab("Panorama");
+    const reads = vi.mocked(api.scopeStatus).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(vi.mocked(api.scopeStatus).mock.calls.length).toBe(reads);
   });
 
   it("disables the controls while a park runs", async () => {

@@ -371,11 +371,11 @@ terminus point 75 45               # slew to az 75 / alt 45 (Sun-guarded), verif
 terminus point 75 20 --expose 2    # ...then take a 2 s raw frame (--save f.npy keeps it)
 terminus classify                  # sky / vegetation / structure at current pointing
 terminus sweep                     # full sweep -> horizon_mask.yaml + .hrz + .txt
-terminus park                      # Sun-guarded to the up pole, then close the arm
+terminus park                      # Sun-guarded to alt 25 toward the up pole, then close the arm
 terminus unpark                    # open the arm: native link only, Sun down only
 ```
 
-Run it **after dark**: a full circle takes hours. A uniform overcast under
+A uniform overcast under
 suburban light pollution makes the sky a bright, even backdrop, but drifting
 broken cloud does not: on 2026-10-06 it read 3 of 4 known columns wrong
 (terminus-84). At the shipped `az_step = 5` a full circle is 72 columns

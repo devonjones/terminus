@@ -92,8 +92,15 @@ class Alpaca:
                         return body
                     return json.loads(body)
             except urllib.error.HTTPError as e:
+                if e.code >= 500:  # the server's trouble, not the request's: retry
+                    last = e
+                    time.sleep(1 + attempt)
+                    continue
                 # The server answered and refused: retrying repeats the refusal.
-                reason = e.read().decode(errors="replace")[:200]
+                try:
+                    reason = e.read().decode(errors="replace")[:200]
+                except (OSError, http.client.HTTPException):
+                    reason = ""
                 raise SeestarError(f"Alpaca refused {req.full_url}: {e.code} {reason}") from e
             except ValueError as e:  # not JSON
                 raise SeestarError(f"Alpaca sent an unreadable reply to {req.full_url}") from e
@@ -123,9 +130,8 @@ class Alpaca:
         native link's contract, which Pointer and the sweep turn into a skipped
         column rather than a lost run."""
         try:
-            ra, dec = self._get("telescope", "rightascension"), self._get(
-                "telescope", "declination"
-            )
+            ra = self._get("telescope", "rightascension")
+            dec = self._get("telescope", "declination")
         except SeestarError as e:
             log.warning("could not read the pointing: %s", e)
             return None
@@ -187,6 +193,7 @@ class Alpaca:
         return float(np.median(self.capture_raw16(exposure_s)))
 
     def capture_rgb(self, *a, **k):
+        """Refused: daytime frames over Alpaca are not built (see lock_exposure)."""
         self.lock_exposure()
 
     def lock_exposure(self, exp_ms=None, gain=None):
