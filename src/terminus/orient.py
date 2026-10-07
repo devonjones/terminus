@@ -574,6 +574,10 @@ def _record(f, used, residual, reason):
     }
 
 
+NEAR_YAW_DEG = 10.0
+NEAR_TILT_DEG = 3.0
+
+
 def fit(
     fids,
     sample,
@@ -584,6 +588,7 @@ def fit(
     robust=True,
     delta=4.0,
     min_headroom=None,
+    near=None,
 ):
     """Solve yaw, pitch and tilt against the fiducials.
 
@@ -593,6 +598,10 @@ def fit(
 
     min_headroom, if given, drops exact fiducials whose result sits closer than
     that to their own ceiling — the signature of a manufactured edge.
+
+    near, a previous solution, searches only around it (yaw within NEAR_YAW_DEG,
+    tilt within NEAR_TILT_DEG): a refit after one column changed, fast enough to
+    run on every edit. The full grid takes minutes.
     """
     # WHY EACH COLUMN WAS OR WAS NOT USED, recorded alongside the answer. The
     # published fit used 16 of 30 available columns and nothing on disk records
@@ -623,9 +632,14 @@ def fit(
     def cost(y, p, tm, td):
         return cost_from(predict(used, sample, y, tm, td), p)
 
+    yaws = np.arange(0.0, 360.0, yaw_step)
+    tilts = np.arange(0.0, tilt_max + 1e-9, tilt_step)
+    if near is not None:
+        yaws = (near["yaw"] + np.arange(-NEAR_YAW_DEG, NEAR_YAW_DEG + 1e-9, yaw_step)) % 360.0
+        tilts = tilts[np.abs(tilts - near["tilt_mag"]) <= NEAR_TILT_DEG]
     best = None
-    for y in np.arange(0.0, 360.0, yaw_step):
-        for tm in np.arange(0.0, tilt_max + 1e-9, tilt_step):
+    for y in yaws:
+        for tm in tilts:
             dirs = [0.0] if tm == 0 else np.arange(0.0, 360.0, 30.0)
             for td in dirs:
                 # The rotation is the expensive part and pitch is a pure offset,

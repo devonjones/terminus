@@ -1,0 +1,131 @@
+"""A site's telescope columns: the measured edges the orientation is fitted to.
+
+    <site>/scope/columns.json   the columns, each with how it was measured
+    <site>/scope/frames/        the frames each column was read from
+
+A column is {az, alt, uncertainty, method, included, tags, frames, note}:
+`method` is how `alt` was measured (focused, coarse, frame or clicked) and
+`frames` are [{alt, sky, file}] down that column. `refit` solves the rotation
+from every included column at once, never a guided subset.
+"""
+
+import glob
+import json
+import os
+import re
+import shutil
+import statistics
+
+import yaml
+
+from . import guide, orient
+from .export import load_columns, load_mask
+
+COLUMNS = os.path.join("scope", "columns.json")
+FRAMES = os.path.join("scope", "frames")
+PHOTO_MASK = "photo_mask.yaml"
+DEFAULT_UNCERTAINTY = 0.5
+FRAME_NAME = re.compile(r"az(\d{3})_alt([\d.]+)_sky(\d{3})\.(jpe?g|png)$")
+
+
+def load(site):
+    path = os.path.join(site, COLUMNS)
+    if not os.path.isfile(path):
+        return {"note": "", "columns": []}
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def save(site, doc):
+    path = os.path.join(site, COLUMNS)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def _frames_for(site, az, frames_dir):
+    """Copy a column's frames (focus_refine names: az020_alt29.50_sky000.jpg) in."""
+    out = []
+    for src in sorted(glob.glob(os.path.join(frames_dir, f"az{az:03d}_alt*"))):
+        m = FRAME_NAME.search(os.path.basename(src))
+        if not m:
+            continue
+        rel = os.path.join(FRAMES, f"az{az:03d}", os.path.basename(src))
+        os.makedirs(os.path.join(site, os.path.dirname(rel)), exist_ok=True)
+        shutil.copyfile(src, os.path.join(site, rel))
+        out.append({"alt": float(m.group(2)), "sky": int(m.group(3)) / 100.0, "file": rel})
+    return out
+
+
+def import_run(site, fiducial_files, frames_dir=None, note=""):
+    """Columns from CLI fiducial masks, merged first-wins (as `orient --fiducials`),
+    with each column's frames copied in. A column with frames was focused."""
+    columns = {}
+    for path in fiducial_files:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh) or {}
+        for az, e in (doc.get("horizon") or {}).items():
+            if int(az) in columns or not isinstance(e, dict) or e.get("alt") is None:
+                continue
+            columns[int(az)] = {
+                "az": float(az),
+                "alt": float(e["alt"]),
+                "uncertainty": float(e.get("uncertainty") or DEFAULT_UNCERTAINTY),
+                "included": not e.get("exclude"),
+                "tags": [],
+                "note": str(e.get("exclude") or ""),
+            }
+    for az, col in columns.items():
+        col["frames"] = _frames_for(site, az, frames_dir) if frames_dir else []
+        col["method"] = "focused" if col["frames"] else "coarse"
+    doc = {"note": note, "columns": [columns[az] for az in sorted(columns)]}
+    save(site, doc)
+    return doc
+
+
+def fiducials(doc):
+    return [
+        orient.Fiducial(c["az"], c["alt"], sigma=c.get("uncertainty") or DEFAULT_UNCERTAINTY)
+        for c in doc["columns"]
+        if c.get("included") and c.get("alt") is not None
+    ]
+
+
+def refit(site, doc=None, near=None):
+    """Solve the rotation from every included column against the site's photo mask.
+
+    `near`, a previous solution, makes it a quick local refit (orient.fit).
+    Returns {"solution", "yaw_pm", "columns", "summary"}, or None with fewer than
+    four included columns (the fit's own minimum)."""
+    doc = doc if doc is not None else load(site)
+    fids = fiducials(doc)
+    if len(fids) < 4:
+        return None
+    mask = os.path.join(site, PHOTO_MASK)
+    _, rows = load_mask(mask)
+    pockets = {az: c["pockets"] for az, c in load_columns(mask)[1].items() if c.get("pockets")}
+    sample = guide.photo_sample(rows, pockets)
+    sol = orient.fit(fids, sample, near=near)
+    half = orient.yaw_uncertainty(fids, sample, sol, step=2.0)
+    res = sol["residuals"]
+    cols = [
+        {**{k: c[k] for k in ("az", "alt", "method", "included")}, "residual": res.get(c["az"])}
+        for c in doc["columns"]
+    ]
+    r = [abs(v) for v in res.values()]
+    summary = {
+        "n": len(r),
+        "rms": sol["rms"],
+        "median": statistics.median(r) if r else None,
+        "max": max(r) if r else None,
+        "within_2": sum(1 for v in r if v <= 2.0),
+    }
+    keys = ("yaw", "pitch", "tilt_mag", "tilt_dir")
+    return {
+        "solution": {k: sol[k] for k in keys},
+        "yaw_pm": half,
+        "columns": cols,
+        "summary": summary,
+    }
