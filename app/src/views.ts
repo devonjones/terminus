@@ -871,6 +871,7 @@ export interface ColumnsProps {
   onInclude(az: number, on: boolean): void;
   onTag(az: number, tag: ColumnTag, on: boolean): void;
   onFitAll(): void;
+  onApply(): void;
   clicks: Clicks | null; // an edge being clicked in one frame
   onFrameClick(az: number, name: string, pt: [number, number]): void;
 }
@@ -940,7 +941,14 @@ export function columnsView(p: ColumnsProps): HTMLElement {
       ),
     );
   }
-  const parts: Node[] = [el("div", { className: "row" }, head, all), table];
+  const apply = el("button", {
+    textContent: "Apply this orientation",
+    disabled: !!p.busy || !fit,
+    title: fit ? "Re-read the site's horizon with this rotation" : "Fit the columns first",
+  });
+  apply.dataset.focus = "apply-orientation";
+  apply.addEventListener("click", p.onApply);
+  const parts: Node[] = [el("div", { className: "row" }, head, all, apply), table];
   if (p.busy) parts.push(el("p", { className: "busy", textContent: p.busy }));
   const sel = p.cols.columns.find((c) => c.az === p.selected);
   if (sel) parts.push(strip(sel, p));

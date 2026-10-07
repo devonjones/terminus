@@ -147,6 +147,7 @@ function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
     fitColumns: vi.fn(async () => cols()),
     columnFrame: vi.fn(async () => new Uint8Array([0xff, 0xd8])),
     clickEdge: vi.fn(async () => cols()),
+    applyOrientation: vi.fn(async () => st),
     ...over,
   };
 }
@@ -1304,6 +1305,21 @@ describe("telescope columns", () => {
         [0.5, 0.0625],
       ),
     );
+  });
+
+  it("applies the fit as the site's orientation", async () => {
+    const api = withSite();
+    await openFit(api);
+    (await findByRole(root, "button", { name: "Apply this orientation" })).click();
+    await waitFor(() => expect(api.applyOrientation).toHaveBeenCalledOnce());
+  });
+
+  it("offers no apply before a fit", async () => {
+    await openFit(withSite({ columns: vi.fn(async () => cols({ fit: null })) }));
+    const b = (await findByRole(root, "button", {
+      name: "Apply this orientation",
+    })) as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
   });
 
   it("fits every column on request", async () => {

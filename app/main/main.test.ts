@@ -257,6 +257,7 @@ describe("site IPC", () => {
       "site:columns-fit",
       "site:column-frame",
       "site:column-click",
+      "site:columns-apply",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
   });
@@ -284,6 +285,7 @@ describe("site IPC", () => {
   it("the column channels reach their routes", async () => {
     await boot();
     expect(await call("site:columns")).toEqual({ view: "/site/columns" });
+    expect(await call("site:columns-apply")).toEqual({ p: "/site/columns/apply", body: {} });
     expect(await call("site:column-edit", 40, { included: false, tags: ["pocket"] })).toEqual({
       p: "/site/columns/edit",
       body: { az: 40, included: false, tags: ["pocket"] },

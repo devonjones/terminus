@@ -235,3 +235,28 @@ def click(site, az, name, p1, p2, sky):
     doc["fit"] = refit(site, doc, near=last) if last else doc.get("fit")
     save(site, doc)
     return view(site)
+
+
+def write_orientation(site, path):
+    """The stored fit as a mask meta `terminus horizon --solution` reads, with the
+    columns it used so the disc can draw them."""
+    doc = load(site)
+    fit = doc.get("fit")
+    if not fit:
+        raise ValueError("fit the columns before applying an orientation")
+    res = {c["az"]: c["residual"] for c in fit["columns"]}
+    meta = {
+        **fit["solution"],
+        "oriented": True,
+        "fit_settled": True,
+        "fit_fiducials": [
+            {"az": c["az"], "alt": c["alt"], "used": c["included"], "residual": res.get(c["az"]),
+             **({} if c["included"] else {"reason": c.get("note") or "excluded"})}
+            for c in doc["columns"]
+        ],  # fmt: skip
+        "note": f"telescope fit applied in the app; {doc.get('note', '')}".strip("; "),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        yaml.safe_dump({"meta": meta}, fh, sort_keys=False)
+    os.replace(tmp, path)

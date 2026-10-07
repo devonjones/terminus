@@ -245,3 +245,55 @@ def test_a_click_becomes_the_measurement(site, tmp_path, monkeypatch):
 def test_a_click_refuses_what_it_cannot_place(opened, body):
     s, _ = opened
     assert call(s, "POST", "/site/columns/click", body)[0] == 400
+
+
+def test_an_applied_orientation_rereads_only_the_horizon(tmp_path):
+    from terminus.server import sites
+
+    d = tmp_path
+    assert sites.pipeline(str(d), "orient") == [
+        ("horizon", ["horizon", str(d / "equirect"), "--out", str(d / sites.HORIZON)])
+    ]
+    (d / sites.ORIENTATION).write_text("meta: {}\n")
+    steps = sites.pipeline(str(d), "orient")
+    assert [s for s, _ in steps] == ["horizon"] and steps[0][1][-2:] == [
+        "--solution",
+        str(d / sites.ORIENTATION),
+    ]
+    # A rebuild keeps the applied orientation too.
+    assert sites.pipeline(str(d), "reblend")[-1][1][-2:] == [
+        "--solution",
+        str(d / sites.ORIENTATION),
+    ]
+
+
+def test_the_orientation_carries_the_fit_and_its_columns(opened, tmp_path):
+    s, _ = opened
+    call(s, "POST", "/site/columns/fit", {})
+    call(s, "POST", "/site/columns/edit", {"az": 250, "included": False})
+    site = next(p for p in tmp_path.iterdir() if (p / telescope.COLUMNS).exists())
+    out = tmp_path / "o.yaml"
+    telescope.write_orientation(str(site), str(out))
+    meta = yaml.safe_load(out.read_text())["meta"]
+    assert meta["oriented"] is True and meta["yaw"] == FAKE_FIT["solution"]["yaw"]
+    rec = {f["az"]: f for f in meta["fit_fiducials"]}
+    assert rec[90.0]["used"] is True and rec[250.0]["used"] is False and "reason" in rec[250.0]
+
+
+def test_apply_needs_a_fit_and_a_quiet_site(opened):
+    s, _ = opened
+    code, body = call(s, "POST", "/site/columns/apply", {})
+    assert code == 400 and "fit the columns" in body["error"]
+
+
+def test_apply_writes_the_orientation_and_starts_the_reread(opened, monkeypatch):
+    from terminus.server import sites
+
+    s, _ = opened
+    started = []
+    monkeypatch.setattr(s.jobs, "start", lambda slug, d, kind: started.append((d, kind)))
+    call(s, "POST", "/site/columns/fit", {})
+    code, st = call(s, "POST", "/site/columns/apply", {})
+    assert code == 200 and [k for _, k in started] == ["orient"]
+    assert os.path.isfile(os.path.join(started[0][0], sites.ORIENTATION))
+    conforms("AppState", st)

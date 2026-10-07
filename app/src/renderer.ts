@@ -532,6 +532,10 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
           const tags = on ? [...now, tag] : now.filter((t) => t !== tag);
           void columnsAct(`Tagging az ${az}…`, () => api.editColumn(az, { tags }));
         },
+        onApply: () => {
+          startBuild();
+          api.applyOrientation().then(adopt).catch(fail);
+        },
         clicks: v.clicks,
         onFrameClick: (az, name, pt) => {
           const same = v.clicks && v.clicks.az === az && v.clicks.name === name;

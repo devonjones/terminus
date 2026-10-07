@@ -67,6 +67,8 @@ export interface TerminusApi {
   // The edge clicked in a frame: two points on it and one in the sky, each [x, y]
   // in 0-1 image fractions. It becomes the column's measurement.
   clickEdge(az: number, name: string, p1: Pt, p2: Pt, sky: Pt): Promise<Columns>;
+  // Make the fit the site's orientation and re-read its horizon with it (a job).
+  applyOrientation(): Promise<AppState>;
 }
 
 declare global {

@@ -179,7 +179,10 @@ def mask_path(d):
 
 
 CURATION = "curation.json"  # the frames the user turned off: {"off": [name, ...]}
-KINDS = ("build", "reblend")  # stitch from the photos, or re-blend the stitched frames
+# Stitch from the photos, re-blend the stitched frames, or only re-read the horizon
+# with a new orientation.
+KINDS = ("build", "reblend", "orient")
+ORIENTATION = "orientation.yaml"  # the applied telescope fit (telescope.write_orientation)
 
 
 def frames_off(d):
@@ -217,6 +220,12 @@ def pipeline(d, kind="build"):
     """
     off = frames_off(d)
     eq, work = os.path.join(d, "equirect"), os.path.join(d, "work")
+    orient = os.path.join(d, ORIENTATION)
+    horizon = ["horizon", eq, "--out", os.path.join(d, HORIZON)]
+    if os.path.isfile(orient):
+        horizon += ["--solution", orient]
+    if kind == "orient":
+        return [("horizon", horizon)]
     steps = []
     if kind == "build":
         exclude = [a for n in off for a in ("--exclude", n)]
@@ -235,7 +244,7 @@ def pipeline(d, kind="build"):
                               os.path.join(d, "photo_mask.yaml")]))  # fmt: skip
     # The map the app shows and exports; photo_mask.yaml is the native mask the
     # orientation fit reads.
-    steps.append(("horizon", ["horizon", eq, "--out", os.path.join(d, HORIZON)]))
+    steps.append(("horizon", horizon))
     return steps
 
 

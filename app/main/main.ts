@@ -147,6 +147,7 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
   });
   // The full fit searches every yaw and tilt: minutes on a slow machine.
   handle("site:columns-fit", () => request(sc, "/site/columns/fit", {}, 15 * 60_000));
+  handle("site:columns-apply", () => request<AppState>(sc, "/site/columns/apply", {}));
   handle("site:column-frame", (az, name) => {
     if (typeof az !== "number" || !Number.isFinite(az)) throw new Error("az must be a number");
     if (typeof name !== "string" || !COLUMN_FRAME.test(name))

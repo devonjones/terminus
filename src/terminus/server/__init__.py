@@ -48,6 +48,7 @@ Routes (payload shapes: schema.json beside this file):
   GET  /site/columns      the open site's telescope columns and their fit (204: none)
   POST /site/columns/edit {"az", "included"?, "tags"?}: change one column, refit near the last fit
   POST /site/columns/fit  the full fit over every included column (minutes)
+  POST /site/columns/apply  write the fit as the site's orientation, re-read the horizon
   POST /site/columns/click {"az", "name", "p1", "p2", "sky"}: the edge clicked in a frame
                           (two points on it, one in the sky, 0-1 fractions) -> the columns
   GET  /site/column/frame.jpg?az=&name=   one of a column's frames
@@ -289,6 +290,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/site/columns/edit": lambda: self._edit_column(body),
             "/site/columns/fit": self._fit_columns,
             "/site/columns/click": lambda: self._click_edge(body),
+            "/site/columns/apply": self._apply_orientation,
             "/scope/disconnect": self._disconnect,
         }
         self._dispatch(routes)
@@ -325,6 +327,20 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             raise sites.SiteError(str(e)) from None
         self._send(200, out)
+
+    def _apply_orientation(self):
+        """Write the fit as the site's orientation and re-read the horizon with it."""
+        sv = self.server
+        d = sv.site_dir()
+        if sv.jobs.busy():
+            raise sites.SiteError("a site is already being built")
+        try:
+            telescope.write_orientation(d, os.path.join(d, sites.ORIENTATION))
+        except ValueError as e:
+            raise sites.SiteError(str(e)) from None
+        log.info("site %s: orientation applied, re-reading the horizon", sv.slug)
+        sv.jobs.start(sv.slug, d, "orient")
+        self._send(200, sv.snapshot())
 
     def _fit_columns(self):
         try:
