@@ -419,3 +419,8 @@ def test_the_escape_turns_no_lower_than_its_floor(monkeypatch):
     ptr.escape()
     assert mount.gotos
     assert all(sky.radec_to_altaz(*g)[1] >= 4.9 for g in mount.gotos)
+
+
+def test_the_app_link_keeps_routes_above_alpacas_horizon():
+    link = scopes.AlpacaScope("h", connect=FakeMount)
+    assert link.ptr.MIN_ALT_DEG == 0.0

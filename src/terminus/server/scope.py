@@ -16,6 +16,9 @@ from ..config import SWEEP_DEFAULTS
 from ..sweep import Pointer, Sky, is_stowed
 
 log = logging.getLogger("terminus.server")
+# Alpaca refuses any target below its horizon ("below horizon", 2026-10-07), so
+# Pointer's routes and escapes must stay above it.
+ALPACA_FLOOR_DEG = 0.0
 DISCOVERY_PORT = 32227
 DISCOVERY_S = 2.0
 
@@ -73,6 +76,7 @@ class AlpacaScope:
         self.sky = Sky(lat, lon)
         sw = SWEEP_DEFAULTS
         self.ptr = Pointer(self.sc, self.sky, sw["sun_cone_deg"], sw["slew_step_deg"])
+        self.ptr.MIN_ALT_DEG = ALPACA_FLOOR_DEG
 
     def status(self):
         rd = self.sc.equ_coord()
