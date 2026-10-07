@@ -26,3 +26,8 @@ build/
 # measured horizon captures (large; kept on disk, not in git)
 captures/
 scratch/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
