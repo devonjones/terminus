@@ -2,12 +2,15 @@
 // (`npm run gen:api`); only the preload's own API is written here.
 import type {
   AppState,
+  Columns,
   Disc,
   Frames,
   Horizon,
+  ScopeFrame,
   ScopeList,
   ScopeStatus,
   SiteList,
+  TelescopeColumn,
 } from "./generated";
 
 export type * from "./generated";
@@ -15,6 +18,8 @@ export type * from "./generated";
 export type ImageName = "panorama" | "disc" | "disagree" | "outline" | "progress";
 export type FrameImage = "footprint" | "thumb";
 export type BuildImage = "layer" | "verdict";
+export type ColumnTag = TelescopeColumn["tags"][number];
+export type Pt = [number, number];
 
 // What the preload exposes on window.terminus. Keep it narrow: named calls only.
 export interface TerminusApi {
@@ -48,6 +53,23 @@ export interface TerminusApi {
   parkScope(): Promise<ScopeStatus>;
   // Parks first; the link stays if the park fails.
   disconnectScope(): Promise<AppState>;
+  // A Sun-guarded slew; the engine refuses a target or path near the Sun.
+  pointScope(az: number, alt: number): Promise<ScopeStatus>;
+  takeFrame(exposureMs: number): Promise<ScopeFrame>;
+  // The last frame in colour; null before the first.
+  framePreview(): Promise<Uint8Array | null>;
+  // The open site's telescope columns and their fit; null when it has none.
+  columns(): Promise<Columns | null>;
+  // Include or exclude a column, or set its tags; the engine refits near the last fit, if any.
+  editColumn(az: number, change: { included?: boolean; tags?: ColumnTag[] }): Promise<Columns>;
+  // The full fit over every included column: minutes.
+  fitColumns(): Promise<Columns>;
+  columnFrame(az: number, name: string): Promise<Uint8Array | null>;
+  // The edge clicked in a frame: two points on it and one in the sky, each [x, y]
+  // in 0-1 image fractions. It becomes the column's measurement.
+  clickEdge(az: number, name: string, p1: Pt, p2: Pt, sky: Pt): Promise<Columns>;
+  // Make the fit the site's orientation and re-read its horizon with it (a job).
+  applyOrientation(): Promise<AppState>;
 }
 
 declare global {

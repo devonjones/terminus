@@ -6881,6 +6881,7 @@ def test_the_cheapest_safe_route_wins_and_an_unsafe_one_is_never_chosen():
 
     sky = Sky(39.7917, -104.894, 1600)
     ptr = Pointer(MagicMock(), sky, 30, 5, True)
+    ptr.route_min_alt = lambda *a, **k: 90.0  # this test is about the Sun, not the floor
     rd0, rd1 = (2.0, 10.0), (8.0, 40.0)
     all_routes = ptr.routes(rd0, rd1)
 
@@ -10061,3 +10062,12 @@ def test_export_pictures_apply_the_buffer_exactly_once(tmp_path, monkeypatch):
     write_mask(str(p), {0: (12.0, "tree")}, [], {"lat": 40, "lon": -105, "oriented": True})
     cli.main(["export", str(p), "--skysafari", "--landscape", "--pvsyst"])
     assert seen == {"skysafari": 15.0, "landscape": 15.0, "pvsyst": 15.0}
+
+
+def test_a_route_between_two_high_points_is_as_low_as_its_lowest_leg():
+    """Both ends clear the floor; the leg between them passes under the pole."""
+    ptr, sky = _pointer_with_sun(0, -30)
+    ra0, _ = sky.altaz_to_radec(0.0, 90.0)  # the meridian
+    start, end = ((ra0 + 6.1) % 24, 30.0), ((ra0 - 6.1) % 24, 30.0)
+    assert min(sky.radec_to_altaz(*start)[1], sky.radec_to_altaz(*end)[1]) > 10
+    assert ptr.route_min_alt(start, [end]) < -10

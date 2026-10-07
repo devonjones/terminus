@@ -49,6 +49,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `M-22` Calibrate a control's rate before using it, and do not hill-climb on a drifting signal
 - `M-23` At night the edge is a persistent, unrecovered drop — and only negative steps are roughness
 - `M-24` Overhead wires read as sky through the segmentation — and the unguarded number is `top`, not the skyline
+- `M-25` Judge the edge inside one exposure: the sky between exposures is not the same sky
 
 **Fitting and validation**
 
@@ -154,6 +155,8 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `D-14` After the second refuted hypothesis, stop theorising and go look
 - `D-15` A file at a canonical path is not evidence that it is current
 - `D-16` Checkpoint attempts, not successes — and re-judge saved profiles on load
+- `D-17` A tree's horizon is the top of its canopy, when the frames can see it
+- `D-18` In shade the Sun cone shrinks to about 10 deg; it is never lifted
 
 ---
 
@@ -610,6 +613,21 @@ Where the exposure actually lives, found by trying to break it:
 produce the mask, filter thin runs by proximity-to-mass before `horizon_band` — not by
 thinness alone. And any future guard on `top` gets its mutation test against `top`, not
 `first`; the two are protected by different rules and only one of them currently has one.
+
+### M-25 — Judge the edge inside one exposure: the sky between exposures is not the same sky
+
+Measured 2026-10-06, overcast, over Alpaca: the night detector read 3 of 4 known columns
+wrong (az 90 as 23.8 against 10.3, 165 as 41.9 against 14.5). Lit cloud drifted, and the sky
+changed by up to 30% between pointings minutes apart, so a cloud dip passed every rule a
+sequence of exposures can apply, persistence included. Inside one exposure, though, sky and
+terrain share the instant: the same frames showed the edge as a crisp step. Six frames at
+one pointing held terrain at exactly 560 while the sky drifted 12%.
+
+So the judge (terminus.judge) reads the edge within a frame: the best straight split at any
+angle, the side nearer the column's own sky called sky. By day brightness alone fails
+(sunlit terrain saturates while sky reads 22k at 2 ms, and skylit shaded siding matches the
+sky in both brightness and colour), so it uses colour as well. Compare each frame with the
+nearest sky above it, not one reference: sky brightens and whitens toward the horizon.
 
 ## Fitting and validation
 
@@ -1967,3 +1985,27 @@ On resume, the stored VERDICT is what an old judge thought; the stored PROFILE i
 did. Re-judging profiles with the current detector turned two wrong verdicts into right ones with
 zero re-observation minutes. Judge is code; data is data. The `--replay` feature is the same
 principle wearing a different hat.
+
+### D-17 — A tree's horizon is the top of its canopy, when the frames can see it
+
+Devon, 2026-10-06. Light through gaps in the leaves is not open sky for planning: the
+horizon is where the canopy starts, read top-down as the first frame that is not all sky.
+The leafy band below it is what the second horizon is for (planning versus actual, with the
+fuzz between). An under-canopy reading (the lowest 50% crossing, under the leaves: 6.39 at az
+330 against a canopy top near 17.5) is a different quantity, not a better one.
+
+### D-18 — In shade the Sun cone shrinks to about 10 deg; it is never lifted
+
+Decided, not yet built: the engine keeps the 30-degree cone in both modes until the
+switch is wired. Devon, 2026-10-07, after a morning in which the 30-degree cone and the mount's horizon
+floor together left no route out of the east. The in-sun / in-shade switch is set only
+by the human, in the app, and resets to IN SUN whenever the app starts. In shade the
+cone shrinks to about 10 degrees rather than disappearing: shade is partial and it moves,
+so pointing at the Sun or right beside it stays refused. Not chosen: lifting the guard
+entirely, and an in-shade setting that expires on a timer.
+
+After twilight the guard is removed entirely (Devon: "when you can confirm that it's after
+twilight, you may remove the sun guard entirely"). The engine already does this, and a
+little earlier: below SUN_SAFE_ALT (-3 deg) every Sun check passes and every path counts
+as clear. The confirmation is the Sun's computed altitude for now, from the position the scope
+reports; it is never a setting.

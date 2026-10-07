@@ -43,6 +43,10 @@ const isName = (n: unknown): n is string =>
 // The quit waits as long, since the sidecar parks on its way out.
 const SCOPE_MOTION_MS = 5 * 60_000;
 
+const TAGS: unknown[] = ["false edge", "pocket", "near object"];
+// telescope.FRAME_NAME: az020_alt29.50_sky000.jpg
+const COLUMN_FRAME = /^az\d{3}_alt[\d.]+_sky\d{3}\.(jpe?g|png)$/;
+
 // The sidecar's own rule (server.HOST): a bare name or address, no scheme, port or path.
 const HOST = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
 
@@ -114,6 +118,53 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
   });
   handle("scope:park", () => request(sc, "/scope/park", {}, SCOPE_MOTION_MS));
   handle("scope:disconnect", () => request<AppState>(sc, "/scope/disconnect", {}, SCOPE_MOTION_MS));
+  handle("scope:point", (az, alt) => {
+    const num = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+    if (!num(az) || !num(alt)) throw new Error("az and alt must be numbers");
+    return request(sc, "/scope/point", { az, alt }, SCOPE_MOTION_MS);
+  });
+  handle("scope:frame", (ms) => {
+    if (typeof ms !== "number" || !Number.isFinite(ms))
+      throw new Error("exposure must be a number");
+    return request(sc, "/scope/frame", { exposure_ms: ms }, 120_000);
+  });
+  handle("scope:frame-preview", () => view(sc, "/scope/frame.jpg"));
+  handle("site:columns", () => view(sc, "/site/columns"));
+  handle("site:column-edit", (az, change) => {
+    if (typeof az !== "number" || !Number.isFinite(az)) throw new Error("az must be a number");
+    const c = (change ?? {}) as { included?: unknown; tags?: unknown };
+    const body: { az: number; included?: boolean; tags?: string[] } = { az };
+    if (c.included !== undefined) {
+      if (typeof c.included !== "boolean") throw new Error("included must be true or false");
+      body.included = c.included;
+    }
+    if (c.tags !== undefined) {
+      if (!Array.isArray(c.tags) || !c.tags.every((t) => TAGS.includes(t)))
+        throw new Error("unknown tag");
+      body.tags = c.tags;
+    }
+    return request(sc, "/site/columns/edit", body, 120_000);
+  });
+  // The full fit searches every yaw and tilt: minutes on a slow machine.
+  handle("site:columns-fit", () => request(sc, "/site/columns/fit", {}, 15 * 60_000));
+  handle("site:columns-apply", () => request<AppState>(sc, "/site/columns/apply", {}));
+  handle("site:column-frame", (az, name) => {
+    if (typeof az !== "number" || !Number.isFinite(az)) throw new Error("az must be a number");
+    if (typeof name !== "string" || !COLUMN_FRAME.test(name))
+      throw new Error("expected a frame name");
+    return view(sc, `/site/column/frame.jpg?az=${az}&name=${encodeURIComponent(name)}`);
+  });
+  handle("site:column-click", (az, name, p1, p2, sky) => {
+    if (typeof az !== "number" || !Number.isFinite(az)) throw new Error("az must be a number");
+    if (typeof name !== "string" || !COLUMN_FRAME.test(name))
+      throw new Error("expected a frame name");
+    const pt = (v: unknown) =>
+      Array.isArray(v) &&
+      v.length === 2 &&
+      v.every((x) => typeof x === "number" && x >= 0 && x <= 1);
+    if (!pt(p1) || !pt(p2) || !pt(sky)) throw new Error("points are [x, y] in 0-1 fractions");
+    return request(sc, "/site/columns/click", { az, name, p1, p2, sky }, 120_000);
+  });
   // The file dialog is opened here, not in the page, so the page never chooses paths.
   handle("site:pick", async () => {
     const w = win();

@@ -414,6 +414,15 @@ header .site-name {
   font: inherit;
   padding: 0.3rem 0.7rem;
 }
+.connect input[type="number"] {
+  width: 6rem;
+}
+.connect img.frame {
+  display: block;
+  max-width: min(100%, 640px);
+  max-height: calc(100vh - 360px);
+  margin-top: 0.5rem;
+}
 dl.scope {
   display: grid;
   grid-template-columns: max-content auto;
@@ -425,6 +434,66 @@ dl.scope dt {
 }
 dl.scope dd {
   margin: 0;
+}
+table.columns tr.selected td {
+  background: #8882;
+}
+table.columns .tag {
+  font-size: 0.8em;
+  padding: 0.1rem 0.4rem;
+  margin-right: 0.2rem;
+  opacity: 0.55;
+}
+table.columns .tag.on {
+  opacity: 1;
+  font-weight: 600;
+}
+.column-strip .tiles {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+}
+.column-strip figure {
+  margin: 0;
+  flex: none;
+}
+/* Never cropped or stretched: a click is read as a fraction of the box, and the
+   engine takes it as a fraction of the whole image. */
+.column-strip img {
+  display: block;
+  height: 200px;
+  width: auto;
+}
+.column-strip .loading {
+  height: 200px;
+  aspect-ratio: 9 / 16;
+  background: #8883;
+}
+.column-strip figure.marked img {
+  outline: 3px solid var(--warn-text);
+}
+.column-strip .clickable {
+  position: relative;
+  cursor: crosshair;
+}
+.column-strip .dot {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.column-strip .dot.edge {
+  background: var(--warn-text);
+}
+.column-strip .dot.sky {
+  background: #3b82f6;
+}
+.column-strip figcaption {
+  font-size: 0.8em;
+  white-space: nowrap;
 }
 table.sites {
   border-collapse: collapse;

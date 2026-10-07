@@ -35,6 +35,9 @@ from astropy.time import Time  # noqa: E402
 SETTLE = 1.5
 log = logging.getLogger(__name__)
 GOTO_TIMEOUT = 90
+# Routes are sampled between waypoints; a sample may land a little under the
+# floor on a leg whose ends are on it, and the mount is given the same allowance.
+ROUTE_FLOOR_SLACK_DEG = 0.5
 SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
 ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
 PROGRESS_DEG = 0.5  # a closing of at least this much counts as progress
@@ -229,6 +232,14 @@ class Pointer:
 
     def __init__(self, sc, sky, cone, slew_step, dry=False):
         self.sc, self.sky, self.cone, self.slew_step, self.dry = sc, sky, cone, slew_step, dry
+        # A link that knows its mount's limits declares them (alpaca.Alpaca).
+        for attr, key in (
+            ("MIN_ALT_DEG", "min_alt_deg"),
+            ("ESCAPE_TURN_FLOOR_DEG", "escape_floor_deg"),
+        ):
+            v = getattr(sc, key, None)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                setattr(self, attr, float(v))
         # Consecutive never-moved gotos reclassified as the mount's own solar
         # protection. Reset by any observed motion; capped, because the same
         # motionless signature belongs to a stowed or jammed arm, and near
@@ -342,6 +353,24 @@ class Pointer:
         # is a guard against a sky we do not have, not a case we expect.
         return az, -self.safe_depth()
 
+    def _escape_turn_alt(self, az, alt, here_sep):
+        """The altitude to turn at: the tube's own, or the floor above it. The turn
+        is safe because every step at one altitude gains separation; the climb to
+        the floor has no such promise, so it is taken only if no point on it is
+        nearer the Sun than the tube already is."""
+        floor = self.ESCAPE_TURN_FLOOR_DEG
+        if floor is None or alt >= floor:
+            return alt
+        saz, salt = self.sky.sun()
+        climb = np.linspace(alt, floor, 11)
+        if min(ang_sep(az, a, saz, salt) for a in climb) < here_sep:
+            raise SunGuard(
+                f"cannot get clear: this mount will not turn below {floor:g} deg, and "
+                f"climbing there from {alt:.1f} brings the tube nearer the Sun. "
+                "Cover the aperture and move it by hand."
+            )
+        return floor
+
     def escape(self):
         """Get the tube out of the cone. Returns the pointing it reached.
 
@@ -365,10 +394,11 @@ class Pointer:
         step = max(1.0, float(self.slew_step))
         cleared = False
         if abs(target_alt - alt) < 1e-9:
-            turn = self.escape_turn(az, alt)
+            turn_alt = self._escape_turn_alt(az, alt, here_sep)
+            turn = self.escape_turn(az, turn_alt)
             here, turned = az, 0.0
             cleared = True
-            while ang_sep(here, alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:
+            while ang_sep(here, turn_alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:
                 here = (here + turn * step) % 360.0
                 turned += step
                 # THE TURN OBEYS THE POLE LIMIT LIKE EVERY OTHER MOTION. Every
@@ -382,11 +412,11 @@ class Pointer:
                 # Stalling there strands the tube mid-escape, in the one manoeuvre
                 # whose whole job is guaranteeing an exit, so the turn gives up
                 # and the descent takes over.
-                _, dec = self.sky.altaz_to_radec(here, alt)
+                _, dec = self.sky.altaz_to_radec(here, turn_alt)
                 if abs(dec) > MAX_VIA_DEC or turned > 360.0:
                     cleared = False
                     break
-                self._goto_wait(*self.sky.altaz_to_radec(here, alt), 0.3)
+                self._goto_wait(*self.sky.altaz_to_radec(here, turn_alt), 0.3)
         if not cleared:
             # Descending is the escape that asks the mount for nothing exotic:
             # the ground is never in the way of pointing at the ground. But the
@@ -412,7 +442,8 @@ class Pointer:
             )
         return out
 
-    # HOW FAR BELOW THE HORIZON THIS MOUNT CAN POINT IS NOT KNOWN. It was
+    # HOW FAR BELOW THE HORIZON THE NATIVE LINK CAN POINT IS NOT KNOWN (a link
+    # that knows its floor declares it: alpaca.Alpaca.min_alt_deg). It was
     # observed at -1.1 degrees on 2026-08-05, which proves only that below the
     # horizon is reachable at all. The corridor below needs more than that when
     # the Sun is low, so this is a configurable floor rather than an assumption,
@@ -421,6 +452,11 @@ class Pointer:
     # five-minute job with the scope in hand and it turns this constant into a
     # fact.
     MIN_ALT_DEG = -5.0
+    # The lowest altitude an escape may turn at, or None. The Alpaca driver refuses
+    # targets a few degrees up as "below horizon" when its own model is unsolved
+    # (2026-10-07: alt 2.7 refused), so its link sets 5; the native link turns
+    # wherever the tube is.
+    ESCAPE_TURN_FLOOR_DEG = None
 
     def corridor_alt(self):
         """Depth for a transit that is safe at EVERY azimuth, or None.
@@ -538,6 +574,20 @@ class Pointer:
             a = b
         return worst
 
+    def route_min_alt(self, rd0, waypoints, samples=PATH_SAMPLES):
+        """Lowest altitude along a route, sampled as `route_min_sep` samples it.
+        A route under the mount's floor is one the mount refuses (Alpaca:
+        "below horizon"), so it is no route at all."""
+        lowest, a = 90.0, rd0
+        for b in waypoints:
+            dra = wrap_ra(b[0] - a[0])
+            for i in range(samples + 1):
+                t = i / samples
+                ra, dec = a[0] + dra * t, a[1] + (b[1] - a[1]) * t
+                lowest = min(lowest, self.sky.radec_to_altaz(ra % 24.0, dec)[1])
+            a = b
+        return lowest
+
     @staticmethod
     def route_cost(rd0, waypoints):
         """Total axis travel in degrees. Cheapest safe route wins.
@@ -556,7 +606,8 @@ class Pointer:
     def plan_route(self, rd0, rd1):
         """Cheapest route that never approaches the Sun. None if there is none.
 
-        Plan every shape, discard the ones that come inside the cone, take the
+        Plan every shape, discard the ones that come inside the cone or dip
+        under the mount's floor (route_min_alt), take the
         shortest of what is left — rather than requiring that ALL shapes be safe,
         which is a test no route has to pass once we are the one driving.
         """
@@ -575,6 +626,7 @@ class Pointer:
             (self.route_cost(rd0, wps), name, wps)
             for name, wps in candidates
             if self.route_min_sep(rd0, wps) >= self.cone
+            and self.route_min_alt(rd0, wps) >= self.MIN_ALT_DEG - ROUTE_FLOOR_SLACK_DEG
         ]
         if not safe:
             return None

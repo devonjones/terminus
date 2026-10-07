@@ -207,6 +207,18 @@ describe("site IPC", () => {
     ["scope:connect", ["http://10.5.2.65"]],
     ["scope:connect", ["10.5.2.65:32323"]],
     ["scope:connect", ["10.5.2.65/api"]],
+    ["scope:point", ["260", 30]],
+    ["scope:point", [260, Number.NaN]],
+    ["scope:frame", ["2"]],
+    ["scope:frame", [Number.POSITIVE_INFINITY]],
+    ["site:column-edit", ["40", {}]],
+    ["site:column-edit", [40, { included: "no" }]],
+    ["site:column-edit", [40, { tags: ["cloud"] }]],
+    ["site:column-frame", [40, "../photo_mask.yaml"]],
+    ["site:column-frame", ["40", "az040_alt23.00_sky045.jpg"]],
+    ["site:column-click", [40, "az040_alt23.00_sky045.jpg", [0, 0.5], [1, 0.5], [0.5, 2]]],
+    ["site:column-click", [40, "../x.jpg", [0, 0.5], [1, 0.5], [0.5, 0.1]]],
+    ["site:column-click", [40, "az040_alt23.00_sky045.jpg", [0, 0.5], [1], [0.5, 0.1]]],
   ])("%s refuses %j before it reaches the sidecar", async (ch, args) => {
     await boot();
     expect(() => call(ch, ...args)).toThrow();
@@ -237,6 +249,15 @@ describe("site IPC", () => {
       "scope:connect",
       "scope:park",
       "scope:disconnect",
+      "scope:point",
+      "scope:frame",
+      "scope:frame-preview",
+      "site:columns",
+      "site:column-edit",
+      "site:columns-fit",
+      "site:column-frame",
+      "site:column-click",
+      "site:columns-apply",
     ])
       expect(() => h.handlers.get(ch)!(evil, "x"), ch).toThrow("unexpected frame");
   });
@@ -249,10 +270,32 @@ describe("site IPC", () => {
     });
     expect(await call("scope:status")).toEqual({ p: "/scope/status" });
     expect(await call("scope:discover")).toEqual({ p: "/scope/discover" });
+    expect(await call("scope:frame", 2)).toEqual({ p: "/scope/frame", body: { exposure_ms: 2 } });
+    expect(await call("scope:frame-preview")).toEqual({ view: "/scope/frame.jpg" });
     h.request.mockClear();
     expect(await call("scope:park")).toEqual({ p: "/scope/park", body: {} });
     expect(await call("scope:disconnect")).toEqual({ p: "/scope/disconnect", body: {} });
+    expect(await call("scope:point", 260, 30)).toEqual({
+      p: "/scope/point",
+      body: { az: 260, alt: 30 },
+    });
     for (const c of h.request.mock.calls) expect((c as unknown[])[3]).toBe(5 * 60_000);
+  });
+
+  it("the column channels reach their routes", async () => {
+    await boot();
+    expect(await call("site:columns")).toEqual({ view: "/site/columns" });
+    expect(await call("site:columns-apply")).toEqual({ p: "/site/columns/apply", body: {} });
+    expect(await call("site:column-edit", 40, { included: false, tags: ["pocket"] })).toEqual({
+      p: "/site/columns/edit",
+      body: { az: 40, included: false, tags: ["pocket"] },
+    });
+    expect(await call("site:column-frame", 40, "az040_alt23.00_sky045.jpg")).toEqual({
+      view: "/site/column/frame.jpg?az=40&name=az040_alt23.00_sky045.jpg",
+    });
+    h.request.mockClear();
+    expect(await call("site:columns-fit")).toEqual({ p: "/site/columns/fit", body: {} });
+    expect((h.request.mock.calls[0] as unknown[])[3]).toBe(15 * 60_000);
   });
 
   it("copying a drop gets a long timeout, not the ordinary 10 s", async () => {

@@ -185,6 +185,27 @@ def cmd_unpark(sc, cfg, args):
     print(f"unparked: arm open, pointing az {az:.1f} alt {alt:.1f}")
 
 
+def cmd_columns(sc, cfg, args):
+    """A site's telescope columns: import a CLI run's, then fit them all."""
+    from . import telescope
+
+    if args.import_:
+        doc = telescope.import_run(args.site, args.import_, args.frames, args.note or "")
+        n = sum(1 for c in doc["columns"] if c["frames"])
+        print(f"{len(doc['columns'])} columns into {args.site} ({n} with frames)")
+    if args.fit:
+        try:
+            f = telescope.fit_all(args.site)["fit"]
+        except telescope.ColumnError as e:
+            raise MaskError(str(e)) from e
+        s, m = f["solution"], f["summary"]
+        print(
+            f"yaw {s['yaw']:.2f} pitch {s['pitch']:.2f} tilt {s['tilt_mag']:.2f} toward "
+            f"{s['tilt_dir']:.0f}  rms {m['rms']:.2f} over {m['n']} columns, "
+            f"{m['within_2']} within 2 deg"
+        )
+
+
 def cmd_classify(sc, cfg, args):
     sc.stop_view()
     time.sleep(1)
@@ -2339,7 +2360,7 @@ def cmd_horizon(sc, cfg, args):  # sc, cfg unused: offline
 NEEDS_SCOPE = {"preflight", "point", "classify", "sweep", "park", "unpark"}
 # Offline: no scope, no network, and no config.toml — a user with photographs
 # and no telescope must not be made to write one.
-OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar"}
+OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar", "columns"}
 
 
 def _is_offline(args):
@@ -2376,6 +2397,13 @@ def main(argv=None):
     pp.add_argument("--save", help="save that frame (.npy)")
     pp.add_argument("--dry-run", action="store_true")
     sub.add_parser("classify")
+    co = sub.add_parser("columns", help="a site's telescope columns: import a CLI run, fit them")
+    co.add_argument("site", help="the site folder")
+    co.add_argument("--import", dest="import_", action="append", metavar="MASK",
+                    help="a fiducial mask from orient or focus_refine; repeatable, first wins")  # fmt: skip
+    co.add_argument("--frames", help="the run's frames (az020_alt29.50_sky000.jpg names)")
+    co.add_argument("--note", help="recorded with the columns, e.g. how they were measured")
+    co.add_argument("--fit", action="store_true", help="then fit every included column (minutes)")
     sub.add_parser("park", help="slew clear and close the arm")
     sub.add_parser("unpark", help="open the arm (native link, Sun down)")
     sw = sub.add_parser(
@@ -2666,6 +2694,7 @@ def main(argv=None):
     handlers = {
         "preflight": cmd_preflight,
         "park": cmd_park,
+        "columns": cmd_columns,
         "unpark": cmd_unpark,
         "point": cmd_point,
         "classify": cmd_classify,
