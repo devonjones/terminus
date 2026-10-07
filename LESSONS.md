@@ -2002,3 +2002,9 @@ by the human, in the app, and resets to IN SUN whenever the app starts. In shade
 cone shrinks to about 10 degrees rather than disappearing: shade is partial and it moves,
 so pointing at the Sun or right beside it stays refused. Not chosen: lifting the guard
 entirely, and an in-shade setting that expires on a timer.
+
+After twilight the guard is removed entirely (Devon: "when you can confirm that it's after
+twilight, you may remove the sun guard entirely"). The engine already does this, and a
+little earlier: below SUN_SAFE_ALT (-3 deg) every Sun check passes and every path counts
+as clear. The confirmation is the Sun's computed altitude for now, from the site's own
+position; it is never a setting.
