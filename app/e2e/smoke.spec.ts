@@ -128,3 +128,34 @@ test("stage 1: open a built site, see its panorama and disc, spin it, read the f
     rmSync(site, { recursive: true, force: true });
   }
 });
+
+test("stage 3: the Fit tab edits telescope columns and shows their frames", async () => {
+  const app = await electron.launch({ args: [appDir] });
+  const sites = path.join(await app.evaluate(({ app }) => app.getPath("userData")), "sites");
+  const site = path.join(sites, "site-fixture");
+  rmSync(site, { recursive: true, force: true });
+  cpSync(path.join(__dirname, "fixtures", "site-fixture"), site, { recursive: true });
+  cpSync(path.join(__dirname, "fixtures", "scope-columns"), path.join(site, "scope"), {
+    recursive: true,
+  });
+  try {
+    const win = await app.firstWindow();
+    await win.reload();
+    await win.getByLabel("Site").selectOption("site-fixture");
+    await win.getByRole("tab", { name: "Fit" }).click();
+    await expect(win.locator("table.columns tbody tr")).toHaveCount(6);
+    await expect(win.getByText(/yaw 29.75°/)).toBeVisible();
+    await expect(win.locator("table.columns tfoot")).toContainText("6 fitted");
+
+    // A real local refit, through the sidecar.
+    await win.getByRole("checkbox", { name: "Use az 320 in the fit" }).click();
+    await expect(win.locator("table.columns tfoot")).toContainText("5 fitted");
+
+    await win.getByRole("button", { name: "3 frames" }).click();
+    await expect(win.locator(".column-strip img")).toHaveCount(3);
+    await expect(win.locator(".column-strip figcaption").first()).toContainText("100% sky");
+  } finally {
+    await app.close();
+    rmSync(site, { recursive: true, force: true });
+  }
+});

@@ -142,7 +142,8 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
             api.frames(),
             api.image("disagree"),
             api.image("outline"),
-            api.columns(),
+            // Its own failure: an unreadable columns file costs the Fit tab, not the site.
+            api.columns().catch((e: Error) => (fail(e), null)),
           ])
         : ([null, null, null, null, null, null, null, null] as const);
     } catch (e) {
@@ -153,6 +154,8 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       revoke(v.outline);
       revokeFrames();
       v.horizon = v.disc = v.pano = v.photo = v.outline = v.frames = null;
+      for (const url of v.colFrames.values()) revoke(url);
+      [v.cols, v.selCol, v.colFrames] = [null, null, new Map()];
       throw e;
     }
     if (mine !== generation) return;
@@ -195,8 +198,12 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     for (const f of col?.frames ?? []) {
       const key = `${az}/${f.name}`;
       if (v.colFrames.has(key)) continue;
-      const url = toUrl(await api.columnFrame(az, f.name));
-      if (url) v.colFrames.set(key, url);
+      try {
+        const url = toUrl(await api.columnFrame(az, f.name));
+        if (url) v.colFrames.set(key, url);
+      } catch (e) {
+        fail(e as Error); // one frame that will not load: say so, and load the rest
+      }
       if (v.selCol === az) render();
     }
   }
@@ -540,7 +547,10 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         onFrameClick: (az, name, pt) => {
           const same = v.clicks && v.clicks.az === az && v.clicks.name === name;
           const pts = same ? [...v.clicks!.pts, pt] : [pt];
-          if (pts.length < 3) return ((v.clicks = { az, name, pts }), render());
+          if (pts.length < 3) {
+            v.clicks = { az, name, pts };
+            return render();
+          }
           v.clicks = null;
           const [p1, p2, sky] = pts;
           void columnsAct(`Reading az ${az} at the clicked edge…`, () =>

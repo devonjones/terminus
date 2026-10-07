@@ -458,12 +458,16 @@ table.columns .tag.on {
   margin: 0;
   flex: none;
 }
-.column-strip img,
-.column-strip .loading {
+/* Never cropped or stretched: a click is read as a fraction of the box, and the
+   engine takes it as a fraction of the whole image. */
+.column-strip img {
   display: block;
   height: 200px;
+  width: auto;
+}
+.column-strip .loading {
+  height: 200px;
   aspect-ratio: 9 / 16;
-  object-fit: cover;
   background: #8883;
 }
 .column-strip figure.marked img {

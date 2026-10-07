@@ -83,6 +83,8 @@ const cols = (over: Partial<Columns> = {}): Columns => ({
       method: "focused",
       included: true,
       note: "",
+      bound: false,
+      usable: true,
       tags: [],
       residual: -0.4,
       frames: [
@@ -98,6 +100,8 @@ const cols = (over: Partial<Columns> = {}): Columns => ({
       method: "coarse",
       included: false,
       note: "dawn",
+      bound: false,
+      usable: true,
       tags: ["false edge"],
       residual: null,
       frames: [],
@@ -1084,6 +1088,25 @@ describe("connect", () => {
     expect((getByRole(root, "button", { name: "Park" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("says to work in shade while the Sun is up, and not at night", async () => {
+    let on = false;
+    let sunAlt = 20;
+    const api = fakeApi({
+      scopeStatus: vi.fn(async () =>
+        on ? linked({ sun: { az: 120, alt: sunAlt } }) : { link: "none" as const },
+      ),
+    });
+    const connect = api.connectScope;
+    api.connectScope = vi.fn(async (host: string) => ((on = true), connect(host)));
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    await findByText(root, /The Sun is up. Run with the scope in shade/);
+    sunAlt = -20;
+    getByRole(root, "button", { name: "Park" }).click();
+    await waitFor(() => expect(root.textContent).not.toContain("The Sun is up"));
+  });
+
   it("warns when the mount is not in EQ mode", async () => {
     let on = false;
     const api = fakeApi({
@@ -1137,7 +1160,7 @@ describe("connect", () => {
     expect(vi.mocked(api.scopeStatus).mock.calls.length).toBe(reads);
   });
 
-  it("disables the controls while a park runs", async () => {
+  it("holds the controls while a park runs, without taking focus from them", async () => {
     let finish: (st: ScopeStatus) => void = () => {};
     const api = fakeApi({
       parkScope: vi.fn(() => new Promise<ScopeStatus>((r) => (finish = r))),
@@ -1148,11 +1171,13 @@ describe("connect", () => {
     (await findByRole(root, "button", { name: "Park" })).click();
     await findByText(root, /Parking: clearing the Sun/);
     for (const name of ["Park", "Park and disconnect"])
-      expect((getByRole(root, "button", { name }) as HTMLButtonElement).disabled, name).toBe(true);
+      expect(getByRole(root, "button", { name }).getAttribute("aria-disabled"), name).toBe("true");
+    getByRole(root, "button", { name: "Park" }).click(); // ignored while busy
+    expect(api.parkScope).toHaveBeenCalledOnce();
     finish(linked({ stowed: true }));
     await findByText(root, /Open it in the Seestar app/);
     expect(
-      (getByRole(root, "button", { name: "Park and disconnect" }) as HTMLButtonElement).disabled,
+      getByRole(root, "button", { name: "Park and disconnect" }).hasAttribute("aria-disabled"),
     ).toBe(false);
   });
 
@@ -1250,6 +1275,24 @@ describe("telescope columns", () => {
     })) as HTMLInputElement;
     box.click();
     await waitFor(() => expect(api.editColumn).toHaveBeenCalledWith(40, { included: false }));
+  });
+
+  it("keeps focus on the control that was used, through the refit", async () => {
+    const api = withSite();
+    await openFit(api);
+    const box = (await findByRole(root, "checkbox", {
+      name: "Use az 40 in the fit",
+    })) as HTMLInputElement;
+    box.focus();
+    box.click();
+    await waitFor(() => expect(api.editColumn).toHaveBeenCalled());
+    await waitFor(() =>
+      expect((document.activeElement as HTMLElement).dataset.focus).toBe("include:40"),
+    );
+    getByRole(root, "button", { name: "3 frames" }).focus();
+    getByRole(root, "button", { name: "3 frames" }).click();
+    await findByText(root, /measured 23.09°/);
+    expect((document.activeElement as HTMLElement).dataset.focus).toBe("frames:40");
   });
 
   it("tags a column and untags it", async () => {
@@ -1352,6 +1395,46 @@ describe("telescope columns", () => {
     });
     await openFit(api);
     await findByText(root, /yaw 186.20°/);
+  });
+
+  it("says when a frame will not load, and loads the rest", async () => {
+    let n = 0;
+    const api = withSite({
+      columnFrame: vi.fn(async () => {
+        if (n++ === 0) throw new Error("engine /site/column/frame.jpg: 422 could not be read");
+        return new Uint8Array([0xff, 0xd8]);
+      }),
+    });
+    await openFit(api);
+    (await findByRole(root, "button", { name: "3 frames" })).click();
+    expect((await findByRole(root, "alert")).textContent).toContain("could not be read");
+    await waitFor(() => expect(api.columnFrame).toHaveBeenCalledTimes(3));
+  });
+
+  it("a site that will not load takes its columns with it", async () => {
+    const api = withSite();
+    await openFit(api);
+    await findByText(root, /yaw 186.20°/);
+    api.horizon = vi.fn(async () => {
+      throw new Error("engine /site/horizon: 422 could not be read");
+    });
+    const pick = root.querySelector("select")!;
+    pick.value = site.slug;
+    pick.dispatchEvent(new Event("change"));
+    await findByRole(root, "alert");
+    expect(root.querySelector("table.columns")).toBeNull();
+  });
+
+  it("an unreadable columns file costs the Fit tab, not the site", async () => {
+    const api = withSite({
+      columns: vi.fn(async () => {
+        throw new Error("engine /site/columns: 422 could not be read (JSONDecodeError)");
+      }),
+    });
+    api.getState = vi.fn(async () => state({ site, tab: "horizon" }));
+    await mount(root, api);
+    expect((await findByRole(root, "alert")).textContent).toContain("/site/columns");
+    expect(root.textContent).not.toContain("This site has no horizon yet");
   });
 
   it("falls back to the oriented mask's record without columns", async () => {

@@ -841,7 +841,11 @@
           "type": "number"
         },
         "alt": {
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "null: the import found no measurement"
         },
         "uncertainty": {
           "type": "number"
@@ -882,6 +886,14 @@
           "items": {
             "$ref": "#/$defs/ColumnFrame"
           }
+        },
+        "bound": {
+          "type": "boolean",
+          "description": "one-sided: the horizon is at least alt (the scan's ceiling)"
+        },
+        "usable": {
+          "type": "boolean",
+          "description": "false: not a measurement the fit can use (note says why) until an edge is clicked"
         }
       },
       "required": [
@@ -893,7 +905,9 @@
         "note",
         "tags",
         "residual",
-        "frames"
+        "frames",
+        "bound",
+        "usable"
       ],
       "additionalProperties": false
     },

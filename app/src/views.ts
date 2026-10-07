@@ -34,6 +34,14 @@ function svg(tag: string, attrs: Record<string, string | number> = {}, ...childr
   return e;
 }
 
+// A control that waits on the engine stays focusable, so a redraw can hand focus
+// back to it; while busy it is marked unavailable and its action does nothing.
+function waitable<T extends HTMLElement>(e: T, busy: string, act: () => void): T {
+  if (busy) e.setAttribute("aria-disabled", "true");
+  e.addEventListener("click", () => !busy && act());
+  return e;
+}
+
 const points = (xy: number[][]) => xy.map(([x, y]) => `${x},${y}`).join(" ");
 
 export function jobPanel(job: Job): HTMLElement {
@@ -340,15 +348,15 @@ export function connectView(p: ConnectProps): HTMLElement {
   const busy = p.busy ? el("p", { textContent: p.busy, className: "busy" }) : "";
   const st = p.status;
   if (!p.linked) {
-    const find = el("button", { textContent: "Find telescopes", disabled: !!p.busy });
+    const find = waitable(el("button", { textContent: "Find telescopes" }), p.busy, p.onFind);
     find.dataset.focus = "scope-find";
-    find.addEventListener("click", p.onFind);
     const host = el("input", { type: "text", placeholder: "10.0.0.20" });
     host.setAttribute("aria-label", "Telescope address");
     host.dataset.focus = "scope-host";
-    const go = el("button", { textContent: "Connect", disabled: !!p.busy });
+    const go = waitable(el("button", { textContent: "Connect" }), p.busy, () => {
+      if (host.value.trim()) p.onConnect(host.value.trim());
+    });
     go.dataset.focus = "scope-connect";
-    go.addEventListener("click", () => host.value.trim() && p.onConnect(host.value.trim()));
     host.addEventListener("keydown", (e) => e.key === "Enter" && go.click());
     const list =
       p.found === null
@@ -359,8 +367,12 @@ export function connectView(p: ConnectProps): HTMLElement {
               "ul",
               { className: "found" },
               ...p.found.map((f) => {
-                const b = el("button", { textContent: `Connect to ${f.host}`, disabled: !!p.busy });
-                b.addEventListener("click", () => p.onConnect(f.host));
+                const b = waitable(
+                  el("button", { textContent: `Connect to ${f.host}` }),
+                  p.busy,
+                  () => p.onConnect(f.host),
+                );
+                b.dataset.focus = `scope-host:${f.host}`;
                 return el("li", {}, b);
               }),
             );
@@ -376,9 +388,12 @@ export function connectView(p: ConnectProps): HTMLElement {
       busy,
     );
   }
-  const leave = el("button", { textContent: "Park and disconnect", disabled: !!p.busy });
+  const leave = waitable(
+    el("button", { textContent: "Park and disconnect" }),
+    p.busy,
+    p.onDisconnect,
+  );
   leave.dataset.focus = "scope-disconnect";
-  leave.addEventListener("click", p.onDisconnect);
   if (!st || st.link === "none")
     return el(
       "div",
@@ -401,9 +416,12 @@ export function connectView(p: ConnectProps): HTMLElement {
     { className: "scope" },
     ...rows.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]),
   );
-  const park = el("button", { textContent: "Park", disabled: !!p.busy || !!st.stowed });
+  const park = waitable(
+    el("button", { textContent: "Park", disabled: !!st.stowed }),
+    p.busy,
+    p.onPark,
+  );
   park.dataset.focus = "scope-park";
-  park.addEventListener("click", p.onPark);
   const notes: Node[] = [];
   if (st.stowed)
     notes.push(
@@ -415,6 +433,15 @@ export function connectView(p: ConnectProps): HTMLElement {
   if (!st.eq)
     notes.push(
       el("p", { className: "banner warn", textContent: "Switch the mount to EQ mode in the app." }),
+    );
+  if (!st.stowed && st.sun && st.sun.alt > 0)
+    notes.push(
+      el("p", {
+        className: "banner warn",
+        textContent:
+          "The Sun is up. Run with the scope in shade and a solar-safe cap to hand, and aim away " +
+          `from the Sun's part of the sky: every slew is kept ${st.cone ?? 30}° clear of it, but shade is what protects the camera.`,
+      }),
     );
   const aim: Node[] = st.stowed ? [] : [aimRow(p), frameRow(p)];
   if (p.frame)
@@ -449,19 +476,19 @@ function numberBox(label: string, value: string, focus: string): HTMLInputElemen
 function aimRow(p: ConnectProps): HTMLElement {
   const az = numberBox("Azimuth", "", "scope-az");
   const alt = numberBox("Altitude", "", "scope-alt");
-  const go = el("button", { textContent: "Go", disabled: !!p.busy });
-  go.dataset.focus = "scope-go";
-  go.addEventListener("click", () => {
+  const go = waitable(el("button", { textContent: "Go" }), p.busy, () => {
     if (az.value !== "" && alt.value !== "") p.onPoint(Number(az.value), Number(alt.value));
   });
+  go.dataset.focus = "scope-go";
   return el("div", { className: "row" }, "Go to az ", az, " alt ", alt, go);
 }
 
 function frameRow(p: ConnectProps): HTMLElement {
   const ms = numberBox("Exposure (ms)", String(p.frame?.exposure_ms ?? 2), "scope-ms");
-  const take = el("button", { textContent: "Take a frame", disabled: !!p.busy });
+  const take = waitable(el("button", { textContent: "Take a frame" }), p.busy, () => {
+    if (ms.value !== "") p.onFrame(Number(ms.value));
+  });
   take.dataset.focus = "scope-frame";
-  take.addEventListener("click", () => ms.value !== "" && p.onFrame(Number(ms.value)));
   return el("div", { className: "row" }, ms, " ms ", take);
 }
 
@@ -895,9 +922,8 @@ const signed = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}°`;
 // frames. Every change refits in the engine; the numbers here are its answer.
 export function columnsView(p: ColumnsProps): HTMLElement {
   const fit = p.cols.fit;
-  const all = el("button", { textContent: "Fit all columns", disabled: !!p.busy });
+  const all = waitable(el("button", { textContent: "Fit all columns" }), p.busy, p.onFitAll);
   all.dataset.focus = "fit-all";
-  all.addEventListener("click", p.onFitAll);
   const head = fit
     ? el(
         "p",
@@ -941,13 +967,16 @@ export function columnsView(p: ColumnsProps): HTMLElement {
       ),
     );
   }
-  const apply = el("button", {
-    textContent: "Apply this orientation",
-    disabled: !!p.busy || !fit,
-    title: fit ? "Re-read the site's horizon with this rotation" : "Fit the columns first",
-  });
+  const apply = waitable(
+    el("button", {
+      textContent: "Apply this orientation",
+      disabled: !fit,
+      title: fit ? "Re-read the site's horizon with this rotation" : "Fit the columns first",
+    }),
+    p.busy,
+    p.onApply,
+  );
   apply.dataset.focus = "apply-orientation";
-  apply.addEventListener("click", p.onApply);
   const parts: Node[] = [el("div", { className: "row" }, head, all, apply), table];
   if (p.busy) parts.push(el("p", { className: "busy", textContent: p.busy }));
   const sel = p.cols.columns.find((c) => c.az === p.selected);
@@ -957,22 +986,28 @@ export function columnsView(p: ColumnsProps): HTMLElement {
 }
 
 function columnRow(c: TelescopeColumn, p: ColumnsProps): HTMLTableRowElement {
-  const inc = el("input", { type: "checkbox", checked: c.included, disabled: !!p.busy });
+  const inc = el("input", { type: "checkbox", checked: c.included, disabled: !c.usable });
   inc.setAttribute("aria-label", `Use az ${c.az} in the fit`);
+  if (!c.usable) inc.title = c.note;
+  if (p.busy) inc.setAttribute("aria-disabled", "true");
   inc.dataset.focus = `include:${c.az}`;
-  inc.addEventListener("change", () => p.onInclude(c.az, inc.checked));
+  inc.addEventListener("change", () => {
+    if (p.busy)
+      inc.checked = c.included; // waiting on the engine: undo the tick
+    else p.onInclude(c.az, inc.checked);
+  });
   const tags = el(
     "span",
     { className: "tags" },
     ...TAGS.map((t) => {
       const on = c.tags.includes(t);
-      const b = el("button", {
-        textContent: t,
-        className: on ? "tag on" : "tag",
-        disabled: !!p.busy,
-      });
+      const b = waitable(
+        el("button", { textContent: t, className: on ? "tag on" : "tag" }),
+        p.busy,
+        () => p.onTag(c.az, t, !on),
+      );
       b.setAttribute("aria-pressed", String(on));
-      b.addEventListener("click", () => p.onTag(c.az, t, !on));
+      b.dataset.focus = `tag:${c.az}:${t}`;
       return b;
     }),
   );
@@ -981,6 +1016,7 @@ function columnRow(c: TelescopeColumn, p: ColumnsProps): HTMLTableRowElement {
     disabled: !c.frames.length,
   });
   look.addEventListener("click", () => p.onSelect(c.az));
+  look.dataset.focus = `frames:${c.az}`;
   const tr = el(
     "tr",
     {
@@ -989,7 +1025,7 @@ function columnRow(c: TelescopeColumn, p: ColumnsProps): HTMLTableRowElement {
         .trim(),
     },
     el("td", { textContent: c.az.toFixed(0) }),
-    el("td", { textContent: `${c.alt.toFixed(2)}°` }),
+    el("td", { textContent: c.alt == null ? "—" : `${c.bound ? "≥ " : ""}${c.alt.toFixed(2)}°` }),
     el("td", { textContent: c.method }),
     el("td", { textContent: c.residual == null ? "—" : signed(c.residual) }),
     el("td", {}, inc),
@@ -1005,7 +1041,7 @@ function strip(c: TelescopeColumn, p: ColumnsProps): HTMLElement {
   const frames = p.frames;
   const sorted = [...c.frames].sort((a, b) => b.alt - a.alt);
   const step = sorted.length > 1 ? Math.abs(sorted[0].alt - sorted[1].alt) : 0.25;
-  const predicted = c.residual == null ? null : c.alt + c.residual;
+  const predicted = c.residual == null || c.alt == null ? null : c.alt + c.residual;
   const near = (alt: number, x: number | null) => x != null && Math.abs(alt - x) <= step / 2;
   const tiles = sorted.map((f) => {
     const url = frames.get(`${c.az}/${f.name}`);
@@ -1026,7 +1062,10 @@ function strip(c: TelescopeColumn, p: ColumnsProps): HTMLElement {
     "section",
     { className: "column-strip" },
     el("h2", {
-      textContent: `az ${c.az.toFixed(0)}: measured ${c.alt.toFixed(2)}°${predicted == null ? "" : `, predicted ${predicted.toFixed(2)}°`}`,
+      textContent:
+        `az ${c.az.toFixed(0)}: ` +
+        (c.alt == null ? `no measurement (${c.note})` : `measured ${c.alt.toFixed(2)}°`) +
+        (predicted == null ? "" : `, predicted ${predicted.toFixed(2)}°`),
     }),
     el("p", {
       className: "hint",

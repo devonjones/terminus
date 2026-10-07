@@ -10,6 +10,7 @@ import type {
   ScopeList,
   ScopeStatus,
   SiteList,
+  TelescopeColumn,
 } from "./generated";
 
 export type * from "./generated";
@@ -17,7 +18,7 @@ export type * from "./generated";
 export type ImageName = "panorama" | "disc" | "disagree" | "outline" | "progress";
 export type FrameImage = "footprint" | "thumb";
 export type BuildImage = "layer" | "verdict";
-export type ColumnTag = "false edge" | "pocket" | "near object";
+export type ColumnTag = TelescopeColumn["tags"][number];
 export type Pt = [number, number];
 
 // What the preload exposes on window.terminus. Keep it narrow: named calls only.

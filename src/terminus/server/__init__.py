@@ -46,7 +46,7 @@ Routes (payload shapes: schema.json beside this file):
   POST /scope/frame       {"exposure_ms"}: one raw frame -> {exposure_ms, median, saturated}
   GET  /scope/frame.jpg   that frame in colour (204 before the first)
   GET  /site/columns      the open site's telescope columns and their fit (204: none)
-  POST /site/columns/edit {"az", "included"?, "tags"?}: change one column, refit near the last fit
+  POST /site/columns/edit {"az", "included"?, "tags"?}: change one column, refit near the last fit if any
   POST /site/columns/fit  the full fit over every included column (minutes)
   POST /site/columns/apply  write the fit as the site's orientation, re-read the horizon
   POST /site/columns/click {"az", "name", "p1", "p2", "sky"}: the edge clicked in a frame
@@ -60,6 +60,7 @@ import collections
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -306,25 +307,28 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _num_query(self, key):
         try:
-            return float(self._query(key))
+            v = float(self._query(key))
         except ValueError:
-            raise sites.SiteError(f"?{key}= must be a number") from None
+            v = math.nan
+        if not math.isfinite(v):
+            raise sites.SiteError(f"?{key}= must be a number")
+        return v
 
     def _click_edge(self, body):
         def point(v):
             ok = isinstance(v, list) and len(v) == 2
-            ok = ok and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+            ok = ok and all(_is_num(x) for x in v)
             if not ok or not all(0 <= x <= 1 for x in v):
                 raise sites.SiteError("points are [x, y] in 0-1 image fractions")
             return (float(v[0]), float(v[1]))
 
         az, name = body.get("az"), body.get("name")
-        if not isinstance(az, (int, float)) or isinstance(az, bool) or not isinstance(name, str):
+        if not _is_num(az) or not isinstance(name, str):
             raise sites.SiteError("az must be a number and name a frame's name")
         p1, p2, sky = point(body.get("p1")), point(body.get("p2")), point(body.get("sky"))
         try:
             out = telescope.click(self.server.site_dir(), float(az), name, p1, p2, sky)
-        except ValueError as e:
+        except telescope.ColumnError as e:
             raise sites.SiteError(str(e)) from None
         self._send(200, out)
 
@@ -336,7 +340,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise sites.SiteError("a site is already being built")
         try:
             telescope.write_orientation(d, os.path.join(d, sites.ORIENTATION))
-        except ValueError as e:
+        except telescope.ColumnError as e:
             raise sites.SiteError(str(e)) from None
         log.info("site %s: orientation applied, re-reading the horizon", sv.slug)
         sv.jobs.start(sv.slug, d, "orient")
@@ -345,12 +349,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _fit_columns(self):
         try:
             self._send(200, telescope.fit_all(self.server.site_dir()))
-        except ValueError as e:
+        except telescope.ColumnError as e:
             raise sites.SiteError(str(e)) from None
 
     def _edit_column(self, body):
         az, included, tags = body.get("az"), body.get("included"), body.get("tags")
-        if not isinstance(az, (int, float)) or isinstance(az, bool):
+        if not _is_num(az):
             raise sites.SiteError("az must be a number")
         if included is not None and not isinstance(included, bool):
             raise sites.SiteError("included must be true or false")
@@ -360,7 +364,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise sites.SiteError("tags must be a list of names")
         try:
             out = telescope.edit(self.server.site_dir(), float(az), included, tags)
-        except ValueError as e:
+        except telescope.ColumnError as e:
             raise sites.SiteError(str(e)) from None
         self._send(200, out)
 
@@ -399,7 +403,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, sv.snapshot())
 
     def _point(self, az, alt):
-        ok = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (az, alt))
+        ok = _is_num(az) and _is_num(alt)
         if not ok or not (0 <= az < 360 and -5 <= alt <= 90):
             return self._send(400, {"error": "az must be 0-360 and alt -5 to 90 degrees"})
         with self.server.linking:
@@ -407,7 +411,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, self.server.scope.status())
 
     def _frame(self, exposure_ms):
-        ok = isinstance(exposure_ms, (int, float)) and not isinstance(exposure_ms, bool)
+        ok = _is_num(exposure_ms)
         if not ok or not 0.05 <= exposure_ms <= 10_000:
             return self._send(400, {"error": "exposure_ms must be 0.05 to 10000"})
         with self.server.linking:
@@ -555,6 +559,11 @@ def main(argv=None):
         server.serve_forever()
     finally:
         _shutdown(server)
+
+
+def _is_num(v):
+    """A finite JSON number: bool is an int in Python, and NaN fails every range."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _read(path):

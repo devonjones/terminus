@@ -82,6 +82,13 @@ def _check(d, what):
 
 
 class Alpaca:
+    # The mount's limits, read by sweep.Pointer. The driver refuses any target it
+    # places below its horizon ("1279 below horizon", 2026-10-07), so routes stay
+    # at 0 or above. With its model unsolved it refused alt 2.7, so an escape turns
+    # no lower than 5.
+    min_alt_deg = 0.0
+    escape_floor_deg = 5.0
+
     def __init__(self, host, port=PORT):
         self.base = f"http://{host}:{port}/api/v1"
         self.img = None  # the native client's imaging socket; nothing to close here

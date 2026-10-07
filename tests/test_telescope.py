@@ -119,9 +119,14 @@ def opened(serve, tmp_path, monkeypatch):  # noqa: F811
     d = _site(tmp_path)
     run = tmp_path / "run"
     (run / "frames").mkdir(parents=True)
-    (run / "frames" / "az090_alt05.25_sky040.jpg").write_bytes(b"\xff\xd8 a frame")
-    (run / "f.yaml").write_text(yaml.safe_dump({"horizon": {90: {"alt": 5.4}, 200: {"alt": 40.0},
-                                                              250: {"alt": 12.0}}}))  # fmt: skip
+    from PIL import Image
+
+    Image.new("RGB", (108, 192)).save(run / "frames" / "az090_alt05.25_sky040.jpg")
+    horizon = {
+        az: {"alt": alt}
+        for az, alt in ((90, 5.4), (120, 9.0), (200, 40.0), (250, 12.0), (300, 7.0))
+    }
+    (run / "f.yaml").write_text(yaml.safe_dump({"horizon": horizon}))
     telescope.import_run(str(d), [str(run / "f.yaml")], str(run / "frames"))
     calls = []
 
@@ -140,7 +145,11 @@ def opened(serve, tmp_path, monkeypatch):  # noqa: F811
 def test_columns_route_lists_them_without_paths(opened):
     s, _ = opened
     code, v = call(s, "GET", "/site/columns")
-    assert code == 200 and v["fit"] is None and [c["az"] for c in v["columns"]] == [90, 200, 250]
+    assert (
+        code == 200
+        and v["fit"] is None
+        and [c["az"] for c in v["columns"]] == [90, 120, 200, 250, 300]
+    )
     conforms("Columns", v)
     assert v["columns"][0]["frames"] == [
         {"alt": 5.25, "sky": 0.4, "name": "az090_alt05.25_sky040.jpg"}
@@ -179,7 +188,7 @@ def test_an_edit_refuses_what_it_cannot_apply(opened, body):
 def test_a_frame_by_name_and_nothing_else(opened):
     s, _ = opened
     code, img = call(s, "GET", "/site/column/frame.jpg?az=90&name=az090_alt05.25_sky040.jpg")
-    assert code == 200 and img.startswith(b"\xff\xd8")
+    assert code == 200 and img[:2] == b"\xff\xd8"
     for q in ("az=90&name=../../../photo_mask.yaml", "az=90&name=az090_alt09.99_sky000.jpg",
               "az=x&name=az090_alt05.25_sky040.jpg"):  # fmt: skip
         assert call(s, "GET", f"/site/column/frame.jpg?{q}")[0] in (204, 400)
@@ -297,3 +306,130 @@ def test_apply_writes_the_orientation_and_starts_the_reread(opened, monkeypatch)
     assert code == 200 and [k for _, k in started] == ["orient"]
     assert os.path.isfile(os.path.join(started[0][0], sites.ORIENTATION))
     conforms("AppState", st)
+
+
+def test_import_reads_masks_as_the_fit_does(site, tmp_path):
+    """Open, failed and missing columns are not edges, and a bound is one-sided:
+    the import keeps every distinction orient.from_mask keeps."""
+    run = tmp_path / "run"
+    run.mkdir()
+    mask = {
+        "meta": {"alt_search": [0, 60]},
+        "horizon": {
+            10: {"alt": 22.0, "type": "tree"},
+            20: {"alt": 0.0, "type": "open"},
+            30: {"alt": 41.0, "type": "tree", "bound": True},
+            40: {"alt": 31.0, "type": "unknown"},
+            50: {"alt": 60.0, "type": "tree"},  # sits on the 60 deg ceiling
+            60: {"type": "tree"},  # no altitude
+        },
+    }
+    (run / "m.yaml").write_text(yaml.safe_dump(mask))
+    doc = telescope.import_run(str(site), [str(run / "m.yaml")])
+    col = {int(c["az"]): c for c in doc["columns"]}
+    assert col[10]["usable"] and not col[10]["bound"]
+    assert col[30]["bound"] and col[50]["bound"] and col[50]["ceiling"] == 60.0
+    for az, why in ((20, "open"), (40, "failed"), (60, "no altitude")):
+        assert not col[az]["usable"] and not col[az]["included"] and why in col[az]["note"]
+    fids = {int(f.az): f for f in telescope.fiducials(doc)}
+    assert sorted(fids) == [10, 30, 50] and fids[30].bound and not fids[10].bound
+    with pytest.raises(ValueError, match="not a measurement"):
+        telescope.edit(str(site), 20.0, included=True)
+    v = telescope.view(str(site))
+    assert next(c for c in v["columns"] if c["az"] == 60)["alt"] is None
+
+
+def test_an_edit_that_would_leave_under_four_is_refused_and_not_saved(opened):
+    s, _ = opened
+    call(s, "POST", "/site/columns/fit", {})
+    assert call(s, "POST", "/site/columns/edit", {"az": 90, "included": False})[0] == 200  # 4 left
+    code, body = call(s, "POST", "/site/columns/edit", {"az": 120, "included": False})
+    assert code == 400 and "four" in body["error"]
+    v = call(s, "GET", "/site/columns")[1]
+    assert next(c for c in v["columns"] if c["az"] == 120)["included"] is True
+    assert v["fit"] is not None
+
+
+def test_a_corrupt_columns_file_is_logged_not_blamed_on_the_request(opened, tmp_path):
+    s, _ = opened
+    site = next(p for p in tmp_path.iterdir() if (p / telescope.COLUMNS).exists())
+    (site / telescope.COLUMNS).write_text("{ truncated")
+    code, _ = call(s, "POST", "/site/columns/edit", {"az": 90, "included": False})
+    assert code == 422  # _dispatch's file-error arm, which logs the traceback
+
+
+def test_a_click_survives_a_refit_that_fails(site, tmp_path, monkeypatch):
+    from PIL import Image
+
+    run = tmp_path / "run"
+    (run / "frames").mkdir(parents=True)
+    Image.new("RGB", (108, 192)).save(run / "frames" / "az040_alt23.00_sky045.jpg")
+    horizon = {az: {"alt": 20.0} for az in (40, 80, 120, 160, 200)}
+    (run / "f.yaml").write_text(yaml.safe_dump({"horizon": horizon}))
+    telescope.import_run(str(site), [str(run / "f.yaml")], str(run / "frames"))
+    doc = telescope.load(str(site))
+    doc["fit"] = FAKE_FIT
+    telescope.save(str(site), doc)
+
+    def broken(*a, **k):
+        raise FileNotFoundError("photo_mask.yaml")
+
+    monkeypatch.setattr(telescope, "refit", broken)
+    with pytest.raises(FileNotFoundError):
+        telescope.click(
+            str(site), 40, "az040_alt23.00_sky045.jpg", (0, 0.25), (1, 0.25), (0.5, 0.1)
+        )
+    col = next(c for c in telescope.load(str(site))["columns"] if c["az"] == 40)
+    assert col["method"] == "clicked"
+
+
+def test_apply_waits_for_a_build_to_finish(opened, monkeypatch):
+    from terminus.server import sites
+
+    s, _ = opened
+    call(s, "POST", "/site/columns/fit", {})
+    started = []
+    monkeypatch.setattr(s.jobs, "busy", lambda: True)
+    monkeypatch.setattr(s.jobs, "start", lambda *a: started.append(a))
+    code, body = call(s, "POST", "/site/columns/apply", {})
+    assert code == 400 and "being built" in body["error"] and not started
+    site = s.site_dir()
+    assert not os.path.isfile(os.path.join(site, sites.ORIENTATION))
+
+
+def test_a_click_through_the_route(opened):
+    from terminus.judge import FRAME_DEG
+
+    s, _ = opened
+    body = {
+        "az": 90,
+        "name": "az090_alt05.25_sky040.jpg",
+        "p1": [0, 0.25],
+        "p2": [1, 0.25],
+        "sky": [0.5, 0.1],
+    }
+    code, v = call(s, "POST", "/site/columns/click", body)
+    assert code == 200
+    conforms("Columns", v)
+    col = next(c for c in v["columns"] if c["az"] == 90)
+    assert col["method"] == "clicked" and col["alt"] == pytest.approx(
+        5.25 + 0.25 * FRAME_DEG, abs=0.02
+    )
+
+
+def test_without_a_fit_an_edit_does_not_search_and_with_one_it_stays_near(opened):
+    s, calls = opened
+    call(s, "POST", "/site/columns/edit", {"az": 90, "tags": ["pocket"]})
+    assert calls == []  # no stored fit: no refit, least of all the minutes-long full one
+    call(s, "POST", "/site/columns/fit", {})
+    call(s, "POST", "/site/columns/edit", {"az": 90, "tags": []})
+    assert calls[-1] == FAKE_FIT["solution"]
+
+
+def test_a_near_fit_refines_out_of_a_poor_tilt_seed(site):
+    """The near window bounds the starting grid, for speed; the refinement after it
+    is free, so a seed 10 deg off in tilt still lands on the truth."""
+    azs = [10, 40, 75, 110, 150, 200, 250, 290, 330]
+    seed = {**NEAR, "tilt_mag": 12.0}  # the truth is 2.0
+    fit = telescope.refit(str(site), columns(site, measured(site, azs)), near=seed)
+    assert abs(fit["solution"]["tilt_mag"] - TRUE["tilt_mag"]) < 0.5

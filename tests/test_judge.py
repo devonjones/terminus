@@ -46,8 +46,10 @@ def sky(f):
 )
 def test_the_edge_is_read_inside_the_frames(name, truth, tol):
     night = name.startswith("night")
-    edge, _ = judge.judge_feature_column(column(name), night)
-    assert edge is not None and abs(edge - truth) <= tol, edge
+    rows = column(name)
+    top = max(rows, key=lambda r: r[0])[1]  # every one of these scans starts in open sky
+    edge, _ = judge.judge_feature_column(rows, sky(top), night)
+    assert edge.status == "edge" and abs(edge.alt - truth) <= tol, edge
 
 
 def test_low_sky_is_judged_against_the_sky_just_above_it():
@@ -56,7 +58,7 @@ def test_low_sky_is_judged_against_the_sky_just_above_it():
     rows = column("day270col")
     top = sky(dict(rows)[45.0])
     assert judge.judge_features(dict(rows)[20.0], top).kind == "terrain"  # the old failure
-    _, verdicts = judge.judge_feature_column(rows)
+    _, verdicts = judge.judge_feature_column(rows, top)
     assert all(v.kind == "sky" for _, v in verdicts)
 
 
@@ -90,11 +92,24 @@ def test_the_last_upward_crossing_skips_a_pocket():
         (25.0, Verdict("sky", 1.0)),  # a pocket
         (22.5, Verdict("terrain", 0.0)),
     ]
-    assert column_edge(v) == 28.75
+    assert column_edge(v) == judge.Edge(28.75, "edge")
 
 
 def test_an_edge_frame_places_the_edge_by_its_sky_fraction():
     v = [(20.0, Verdict("sky", 1.0)), (18.0, Verdict("edge", 0.75))]
-    assert column_edge(v) == pytest.approx(18.0 - 0.25 * judge.FRAME_DEG)
-    assert column_edge([(18.0, Verdict("terrain", 0.0))]) is None  # never saw sky
-    assert column_edge([(18.0, Verdict("sky", 1.0))]) is None  # never saw terrain
+    e = column_edge(v)
+    assert e.status == "edge" and e.alt == pytest.approx(18.0 - 0.25 * judge.FRAME_DEG)
+
+
+def test_blocked_above_and_open_below_are_never_the_same_answer():
+    """The two opposite non-results: blocked from the top frame up (the horizon is
+    at least there) and open down to the lowest frame (it is under it)."""
+    blocked = [(40.0, Verdict("terrain", 0.0)), (38.0, Verdict("terrain", 0.0))]
+    open_ = [(40.0, Verdict("sky", 1.0)), (38.0, Verdict("sky", 1.0))]
+    assert column_edge(blocked) == judge.Edge(40.0, "above")
+    assert column_edge(open_) == judge.Edge(38.0, "below")
+
+
+def test_an_unknown_verdict_is_refused_not_read_as_terrain():
+    with pytest.raises(ValueError, match="unknown verdict"):
+        column_edge([(30.0, Verdict("sky", 1.0)), (20.0, Verdict("Edge", 0.4))])

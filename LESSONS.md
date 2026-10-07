@@ -1991,12 +1991,13 @@ principle wearing a different hat.
 Devon, 2026-10-06. Light through gaps in the leaves is not open sky for planning: the
 horizon is where the canopy starts, read top-down as the first frame that is not all sky.
 The leafy band below it is what the second horizon is for (planning versus actual, with the
-fuzz between). An under-canopy reading (the last 50% crossing below the leaves, 6.39 at az
+fuzz between). An under-canopy reading (the lowest 50% crossing, under the leaves: 6.39 at az
 330 against a canopy top near 17.5) is a different quantity, not a better one.
 
 ### D-18 — In shade the Sun cone shrinks to about 10 deg; it is never lifted
 
-Devon, 2026-10-07, after a morning in which the 30-degree cone and the mount's horizon
+Decided, not yet built: the engine keeps the 30-degree cone in both modes until the
+switch is wired. Devon, 2026-10-07, after a morning in which the 30-degree cone and the mount's horizon
 floor together left no route out of the east. The in-sun / in-shade switch is set only
 by the human, in the app, and resets to IN SUN whenever the app starts. In shade the
 cone shrinks to about 10 degrees rather than disappearing: shade is partial and it moves,
@@ -2006,5 +2007,5 @@ entirely, and an in-shade setting that expires on a timer.
 After twilight the guard is removed entirely (Devon: "when you can confirm that it's after
 twilight, you may remove the sun guard entirely"). The engine already does this, and a
 little earlier: below SUN_SAFE_ALT (-3 deg) every Sun check passes and every path counts
-as clear. The confirmation is the Sun's computed altitude for now, from the site's own
-position; it is never a setting.
+as clear. The confirmation is the Sun's computed altitude for now, from the position the scope
+reports; it is never a setting.

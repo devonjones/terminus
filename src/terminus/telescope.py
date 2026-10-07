@@ -5,7 +5,8 @@
 
 A column is {az, alt, uncertainty, method, included, tags, frames, note}:
 `method` is how `alt` was measured (focused, coarse, frame or clicked) and
-`frames` are [{alt, sky, file}] down that column. `refit` solves the rotation
+`frames` are [{alt, sky, file}] down that column. ("frame", a reading by the
+judge, is for stage 4's scans.) `refit` solves the rotation
 from every included column at once, never a guided subset.
 """
 
@@ -26,6 +27,12 @@ COLUMNS = os.path.join("scope", "columns.json")
 FRAMES = os.path.join("scope", "frames")
 PHOTO_MASK = "photo_mask.yaml"
 DEFAULT_UNCERTAINTY = 0.5
+
+
+class ColumnError(ValueError):
+    """A request about the columns that cannot be done, said in the user's terms."""
+
+
 FRAME_NAME = re.compile(r"az(\d{3})_alt([\d.]+)_sky(\d{3})\.(jpe?g|png)$")
 
 
@@ -61,22 +68,40 @@ def _frames_for(site, az, frames_dir):
 
 
 def import_run(site, fiducial_files, frames_dir=None, note=""):
-    """Columns from CLI fiducial masks, merged first-wins (as `orient --fiducials`),
-    with each column's frames copied in. A column with frames was focused."""
+    """Columns from CLI fiducial masks, read exactly as `orient --fiducials` reads
+    them (orient.from_mask, each file's search ceiling), merged first-wins, with
+    each column's frames copied in. A column with frames was focused.
+
+    What from_mask will not fit (open to the floor, a failed measurement, no
+    altitude) comes in as not usable, with its reason; a bound keeps its bound."""
     columns = {}
     for path in fiducial_files:
         with open(path) as fh:
             doc = yaml.safe_load(fh) or {}
-        for az, e in (doc.get("horizon") or {}).items():
-            if int(az) in columns or not isinstance(e, dict) or e.get("alt") is None:
+        horizon = doc.get("horizon") or {}
+        search = (doc.get("meta") or {}).get("alt_search") or []
+        reasons = {}
+        fids = {
+            int(f.az): f
+            for f in orient.from_mask(
+                horizon, ceiling=float(search[1]) if len(search) > 1 else None, excluded=reasons
+            )
+        }
+        for az, e in horizon.items():
+            az = int(az)
+            if az in columns or not isinstance(e, dict):
                 continue
-            columns[int(az)] = {
+            f = fids.get(az)
+            columns[az] = {
                 "az": float(az),
-                "alt": float(e["alt"]),
+                "alt": f.alt if f else (float(e["alt"]) if e.get("alt") is not None else None),
+                "bound": bool(f and f.bound),
+                "ceiling": f.ceiling if f else None,
                 "uncertainty": float(e.get("uncertainty") or DEFAULT_UNCERTAINTY),
-                "included": not e.get("exclude"),
+                "usable": f is not None,
+                "included": f is not None,
                 "tags": [],
-                "note": str(e.get("exclude") or ""),
+                "note": "" if f else reasons.get(az, "not a measurement the fit can use"),
             }
     for az, col in columns.items():
         col["frames"] = _frames_for(site, az, frames_dir) if frames_dir else []
@@ -88,9 +113,12 @@ def import_run(site, fiducial_files, frames_dir=None, note=""):
 
 def fiducials(doc):
     return [
-        orient.Fiducial(c["az"], c["alt"], sigma=c.get("uncertainty") or DEFAULT_UNCERTAINTY)
+        orient.Fiducial(
+            c["az"], c["alt"], c.get("ceiling"), bound=c.get("bound", False),
+            sigma=c.get("uncertainty") or DEFAULT_UNCERTAINTY,
+        )  # fmt: skip
         for c in doc["columns"]
-        if c.get("included") and c.get("alt") is not None
+        if c.get("included") and c.get("usable", True) and c.get("alt") is not None
     ]
 
 
@@ -146,6 +174,8 @@ def view(site):
     cols = [
         {
             **{k: c.get(k) for k in ("az", "alt", "uncertainty", "method", "included", "note")},
+            "bound": bool(c.get("bound")),
+            "usable": c.get("usable", True),
             "tags": list(c.get("tags") or []),
             "residual": res.get(c["az"]),
             "frames": [
@@ -155,7 +185,7 @@ def view(site):
         }
         for c in doc["columns"]
     ]
-    out = {k: v for k, v in (fit or {}).items() if k != "columns"} if fit else None
+    out = {k: v for k, v in fit.items() if k != "columns"} if fit else None
     return {"note": doc.get("note", ""), "columns": cols, "fit": out}
 
 
@@ -163,32 +193,47 @@ def _column(doc, az):
     for c in doc["columns"]:
         if c["az"] == az:
             return c
-    raise ValueError(f"no telescope column at az {az:g}")
+    raise ColumnError(f"no telescope column at az {az:g}")
+
+
+def _refit_near_last(site, doc):
+    """Keep the change, then refit near the last fit, if there is one. A change
+    that would leave the fit under its four columns is refused, not saved."""
+    if doc.get("fit") and len(fiducials(doc)) < 4:
+        raise ColumnError("that leaves fewer than four columns in the fit; it needs four")
+    save(site, doc)  # the measurement survives a refit that fails
+    last = (doc.get("fit") or {}).get("solution")
+    if last:
+        doc["fit"] = refit(site, doc, near=last)
+        save(site, doc)
+    return view(site)
 
 
 def edit(site, az, included=None, tags=None):
-    """Include or exclude a column, or tag it, then refit near the last fit."""
+    """Include or exclude a column, or tag it, then refit near the last fit, if any."""
     doc = load(site)
     c = _column(doc, az)
+    if included and not c.get("usable", True):
+        raise ColumnError(f"az {az:g} is not a measurement the fit can use: {c.get('note')}")
     if included is not None:
         c["included"] = bool(included)
     if tags is not None:
         bad = [t for t in tags if t not in TAGS]
         if bad:
-            raise ValueError(f"unknown tags {bad}; known: {', '.join(TAGS)}")
+            raise ColumnError(f"unknown tags {bad}; known: {', '.join(TAGS)}")
         c["tags"] = list(tags)
-    last = (doc.get("fit") or {}).get("solution")
-    doc["fit"] = refit(site, doc, near=last) if last else doc.get("fit")
-    save(site, doc)
-    return view(site)
+    return _refit_near_last(site, doc)
 
 
 def fit_all(site):
     """The full search: after an import, or when a local refit may be lost. Minutes."""
     doc = load(site)
     if not doc["columns"]:
-        raise ValueError("this site has no telescope columns to fit")
-    doc["fit"] = refit(site, doc)
+        raise ColumnError("this site has no telescope columns to fit")
+    fit = refit(site, doc)
+    if fit is None:
+        raise ColumnError("fewer than four columns are included; the fit needs four")
+    doc["fit"] = fit
     save(site, doc)
     return view(site)
 
@@ -212,7 +257,7 @@ def sky_fraction(size, p1, p2, sky):
     (x1, y1), (x2, y2), (sx, sy) = ((x * w, y * h) for x, y in (p1, p2, sky))
     side = lambda x, y: (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)  # noqa: E731
     if side(sx, sy) == 0 or (x1, y1) == (x2, y2):
-        raise ValueError("the sky point must sit off the edge line")
+        raise ColumnError("the sky point must sit off the edge line")
     return float((np.sign(side(px, py)) == np.sign(side(sx, sy))).mean())
 
 
@@ -226,15 +271,27 @@ def click(site, az, name, p1, p2, sky):
     c = _column(doc, az)
     frame = next((f for f in c.get("frames", ()) if os.path.basename(f["file"]) == name), None)
     if frame is None:
-        raise ValueError(f"az {az:g} has no frame {name}")
+        raise ColumnError(f"az {az:g} has no frame {name}")
     with Image.open(os.path.join(site, frame["file"])) as im:
         frac = sky_fraction(im.size, p1, p2, sky)
     c["alt"] = round(frame["alt"] - (frac - 0.5) * FRAME_DEG, 3)
-    c["method"] = "clicked"
-    last = (doc.get("fit") or {}).get("solution")
-    doc["fit"] = refit(site, doc, near=last) if last else doc.get("fit")
-    save(site, doc)
-    return view(site)
+    c.update(method="clicked", bound=False, ceiling=None, usable=True, note="")
+    return _refit_near_last(site, doc)
+
+
+def _record(c, residual):
+    """A column as the fit's record, with no None in it: the mask writes meta by
+    repr, and a None would land as the string 'None' (E-06)."""
+    r = {"az": c["az"], "used": c["included"]}
+    if c.get("alt") is not None:
+        r["alt"] = c["alt"]
+    if residual is not None:
+        r["residual"] = residual
+    if c.get("bound"):
+        r["bound"] = True
+    if not c["included"]:
+        r["reason"] = c.get("note") or "excluded"
+    return r
 
 
 def write_orientation(site, path):
@@ -243,17 +300,13 @@ def write_orientation(site, path):
     doc = load(site)
     fit = doc.get("fit")
     if not fit:
-        raise ValueError("fit the columns before applying an orientation")
+        raise ColumnError("fit the columns before applying an orientation")
     res = {c["az"]: c["residual"] for c in fit["columns"]}
     meta = {
         **fit["solution"],
         "oriented": True,
         "fit_settled": True,
-        "fit_fiducials": [
-            {"az": c["az"], "alt": c["alt"], "used": c["included"], "residual": res.get(c["az"]),
-             **({} if c["included"] else {"reason": c.get("note") or "excluded"})}
-            for c in doc["columns"]
-        ],  # fmt: skip
+        "fit_fiducials": [_record(c, res.get(c["az"])) for c in doc["columns"]],
         "note": f"telescope fit applied in the app; {doc.get('note', '')}".strip("; "),
     }
     tmp = path + ".tmp"

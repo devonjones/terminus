@@ -377,7 +377,10 @@ MORNING = "2026-10-07T14:25:00Z"  # Sun about az 110 alt 14 at the S50 spot
 
 
 class _Mount(FakeMount):
-    """Arrives wherever it is sent, at once, and records each goto."""
+    """Arrives wherever it is sent, at once, and records each goto. Declares
+    Alpaca's floors."""
+
+    min_alt_deg, escape_floor_deg = 0.0, 5.0
 
     def __init__(self, rd):
         super().__init__()
@@ -388,12 +391,12 @@ class _Mount(FakeMount):
         self.rd = (ra, dec)
 
 
-def _morning(monkeypatch):
+def _morning(monkeypatch, when=MORNING):
     from astropy.time import Time
 
     from terminus import sweep
 
-    monkeypatch.setattr(sweep, "_now", lambda: Time(MORNING))
+    monkeypatch.setattr(sweep, "_now", lambda: Time(when))
     monkeypatch.setattr(sweep.time, "sleep", lambda s: None)
     return Sky(39.791668, -104.894165)
 
@@ -411,20 +414,20 @@ def test_routes_stay_above_the_mounts_floor(monkeypatch):
     assert ptr.plan_route(here, west) is None
 
 
-def test_the_escape_turns_no_lower_than_its_floor(monkeypatch):
-    """The app opened the arm level and east (alt 2.7), inside the Sun cone, and the
-    driver refused a turn that low; the escape now turns at 5 deg or above."""
-    sky = _morning(monkeypatch)
-    mount = _Mount(sky.altaz_to_radec(86.8, 2.7))
-    ptr = Pointer(mount, sky, 30.0, 5.0)
-    ptr.escape()
-    assert mount.gotos
-    assert all(sky.radec_to_altaz(*g)[1] >= 4.9 for g in mount.gotos)
+def test_a_link_declares_its_mounts_floors():
+    from unittest.mock import MagicMock
 
+    from terminus.alpaca import Alpaca
 
-def test_the_app_link_keeps_routes_above_alpacas_horizon():
-    link = scopes.AlpacaScope("h", connect=FakeMount)
-    assert link.ptr.MIN_ALT_DEG == 0.0
+    assert (Alpaca.min_alt_deg, Alpaca.escape_floor_deg) == (0.0, 5.0)
+
+    class AlpacaLike(FakeMount):
+        min_alt_deg, escape_floor_deg = Alpaca.min_alt_deg, Alpaca.escape_floor_deg
+
+    link = scopes.AlpacaScope("h", connect=AlpacaLike)
+    assert (link.ptr.MIN_ALT_DEG, link.ptr.ESCAPE_TURN_FLOOR_DEG) == (0.0, 5.0)
+    plain = Pointer(MagicMock(), Sky(39.8, -104.9), 30, 5)  # the native link declares nothing
+    assert (plain.MIN_ALT_DEG, plain.ESCAPE_TURN_FLOOR_DEG) == (-5.0, None)
 
 
 class FrameLink(FakeLink):
@@ -522,3 +525,29 @@ def test_the_link_frame_keeps_the_raw_for_the_preview():
     f = link.frame(0.002)
     assert f == {"exposure_ms": 2.0, "median": 65504.0, "saturated": 1.0}
     assert link.preview_jpeg()[:2] == b"\xff\xd8"
+
+
+def test_an_escape_never_climbs_toward_the_sun(monkeypatch):
+    """The floor's climb has no promise of gaining separation, unlike the turn: from
+    alt 2.7 under a Sun at alt 14 it would close in, so the escape refuses."""
+    sky = _morning(monkeypatch)
+    mount = _Mount(sky.altaz_to_radec(86.8, 2.7))
+    with pytest.raises(SunGuard, match="nearer the Sun"):
+        Pointer(mount, sky, 30.0, 5.0).escape()
+    assert mount.gotos == []
+
+
+def test_an_escape_gains_separation_at_every_step(monkeypatch):
+    """With the Sun just above the horizon and below the floor, the climb moves
+    away from it, and every step after does too."""
+    from terminus.sweep import ang_sep
+
+    sky = _morning(monkeypatch, "2026-10-07T13:00:00Z")  # Sun about 1 deg below the horizon
+    saz, salt = sky.sun()
+    assert -3.0 < salt < 1.0
+    mount = _Mount(sky.altaz_to_radec(saz - 10.0, 1.0))
+    start = ang_sep(saz - 10.0, 1.0, saz, salt)
+    Pointer(mount, sky, 30.0, 5.0).escape()
+    seps = [ang_sep(*sky.radec_to_altaz(*g), saz, salt) for g in mount.gotos]
+    assert mount.gotos and min(seps) >= start
+    assert seps == sorted(seps)

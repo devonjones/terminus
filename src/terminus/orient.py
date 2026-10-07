@@ -599,9 +599,10 @@ def fit(
     min_headroom, if given, drops exact fiducials whose result sits closer than
     that to their own ceiling — the signature of a manufactured edge.
 
-    near, a previous solution, searches only around it (yaw within NEAR_YAW_DEG,
-    tilt within NEAR_TILT_DEG): a refit after one column changed, fast enough to
-    run on every edit. The full grid takes minutes.
+    near, a previous solution, starts the grid only around it (yaw within
+    NEAR_YAW_DEG, tilt within NEAR_TILT_DEG): a refit after one column changed,
+    fast enough to run on every edit (the full grid takes minutes). The window
+    bounds the grid, not the answer: the refinement after it may walk out.
     """
     # WHY EACH COLUMN WAS OR WAS NOT USED, recorded alongside the answer. The
     # published fit used 16 of 30 available columns and nothing on disk records

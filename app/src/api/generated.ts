@@ -267,7 +267,10 @@ export interface Columns {
 }
 export interface TelescopeColumn {
   az: number;
-  alt: number;
+  /**
+   * null: the import found no measurement
+   */
+  alt: number | null;
   uncertainty: number;
   method: "focused" | "coarse" | "frame" | "clicked";
   included: boolean;
@@ -278,6 +281,14 @@ export interface TelescopeColumn {
    */
   residual: number | null;
   frames: ColumnFrame[];
+  /**
+   * one-sided: the horizon is at least alt (the scan's ceiling)
+   */
+  bound: boolean;
+  /**
+   * false: not a measurement the fit can use (note says why) until an edge is clicked
+   */
+  usable: boolean;
 }
 export interface ColumnFrame {
   alt: number;

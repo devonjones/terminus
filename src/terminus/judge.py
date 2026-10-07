@@ -12,15 +12,18 @@ frame   The best straight split of the frame (any angle: EQ frames rotate
         the frame is all sky or all terrain, by the same comparison. Brightness
         alone fails by day (sunlit terrain outshines the sky, shaded siding
         matches it), so the comparison uses colour as well.
-column  The edge is the last upward crossing of 50% sky. A straight edge
-        through a frame splits its area evenly at any rotation, so the
-        crossing needs no "up" in the image (m110, terminus-77).
+column  The edge is the last upward crossing of 50% sky. A line that halves a
+        frame passes through its centre at any rotation, so that crossing needs
+        no "up" in the image (m110, terminus-77). Inside an edge frame the sky
+        fraction becomes altitude assuming the frame's long side runs along
+        altitude (FRAME_DEG), which holds to 0.1-0.3 deg on the S50's frames.
 
 Raw frames are the S50's GRBG Bayer (red at [0,1], blue at [1,0]).
 """
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -91,8 +94,8 @@ def _like_sky(side, ref, night):
 
 @dataclass
 class Verdict:
-    kind: str  # "sky", "terrain" or "edge"
-    sky: float  # fraction of the frame that is sky
+    kind: Literal["sky", "terrain", "edge"]
+    sky: float  # fraction of the frame that is sky: 1 or 0 unless an edge
 
 
 def judge_frame(raw, ref, night=False):
@@ -101,6 +104,8 @@ def judge_frame(raw, ref, night=False):
 
 
 def judge_features(f, ref, night=False):
+    """One frame, reduced by `features`, against its column's open-sky `ref`.
+    At night the colour ratios are noise, so only brightness decides."""
     s = best_split(f)
     if s.contrast(night):
         # The side nearer the column's sky is sky, if it looks like sky at all:
@@ -109,35 +114,34 @@ def judge_features(f, ref, night=False):
         db = np.abs(s.b - ref)[: 1 if night else 2].sum()
         near, frac = (s.a, s.frac_a) if da < db else (s.b, 1.0 - s.frac_a)
         return Verdict("edge", frac) if _like_sky(near, ref, night) else Verdict("terrain", 0.0)
-    whole = f.reshape(-1, 3).mean(0)
+    whole = _mean(f)
     return Verdict("sky", 1.0) if _like_sky(whole, ref, night) else Verdict("terrain", 0.0)
 
 
 def sky_reference(raw):
     """A column's open-sky features: the mean of a frame known to be sky."""
-    return features(raw).reshape(-1, 3).mean(0)
+    return _mean(features(raw))
 
 
 def _mean(f):
     return f.reshape(-1, 3).mean(0)
 
 
-def judge_column(frames, night=False, ref=None):
-    """[(alt, raw)] down one column -> (horizon alt or None, [(alt, Verdict)]).
+def judge_column(frames, ref, night=False):
+    """[(alt, raw)] down one column, judged against `ref` (sky_reference of a frame
+    known to be open sky) -> (Edge, [(alt, Verdict)]).
 
-    Judged from the top down, each frame against the nearest sky above it: sky
-    brightens and whitens toward the horizon, so one reference taken high up
-    calls low sky terrain. With no `ref`, the top frame is taken as open sky (a
-    scan starts above the horizon)."""
-    return judge_feature_column([(alt, features(raw)) for alt, raw in frames], night, ref)
+    From the top down, each frame against the nearest sky above it: sky brightens
+    and whitens toward the horizon, so one reference taken high up calls low sky
+    terrain. The reference is never guessed from the top frame: a column blocked
+    above it would then read sky all the way down."""
+    return judge_feature_column([(alt, features(raw)) for alt, raw in frames], ref, night)
 
 
-def judge_feature_column(frames, night=False, ref=None):
+def judge_feature_column(frames, ref, night=False):
     """`judge_column` on frames already reduced by `features`."""
     out = []
     for alt, f in sorted(frames, key=lambda r: r[0], reverse=True):
-        if ref is None:
-            ref = _mean(f)
         v = judge_features(f, ref, night)
         if v.kind == "sky":
             ref = _mean(f)
@@ -145,8 +149,18 @@ def judge_feature_column(frames, night=False, ref=None):
     return column_edge(out), out
 
 
+@dataclass
+class Edge:
+    """A column's horizon: `alt` with `status` "edge"; "above" when the top frame
+    is already blocked (the horizon is at least `alt`, that frame's altitude);
+    "below" when every frame is sky (it is under the lowest frame, `alt`)."""
+
+    alt: float | None
+    status: Literal["edge", "above", "below"]
+
+
 def column_edge(verdicts):
-    """The horizon in one column from [(alt, Verdict)], or None if no frame shows it.
+    """The horizon in one column from [(alt, Verdict)], as an Edge.
 
     Walking down from the top, the first frame that is not all sky: an edge frame
     places the horizon inside it, a terrain frame puts it halfway to the sky
@@ -154,10 +168,14 @@ def column_edge(verdicts):
     lower down (under eaves, between branches) is never taken for the horizon.
     """
     rows = sorted(verdicts, key=lambda r: r[0], reverse=True)
+    if not rows:
+        raise ValueError("no frames to judge")
     for k, (alt, v) in enumerate(rows):
         if v.kind == "sky":
             continue
         if v.kind == "edge":
-            return alt - (v.sky - 0.5) * FRAME_DEG
-        return (alt + rows[k - 1][0]) / 2 if k else None
-    return None
+            return Edge(alt - (v.sky - 0.5) * FRAME_DEG, "edge")
+        if v.kind != "terrain":
+            raise ValueError(f"unknown verdict kind {v.kind!r}")
+        return Edge((alt + rows[k - 1][0]) / 2, "edge") if k else Edge(alt, "above")
+    return Edge(rows[-1][0], "below")
