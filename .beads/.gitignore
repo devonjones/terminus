@@ -71,3 +71,8 @@ bd.db
 # They would override fork protection in .git/info/exclude.
 # Config files (metadata.json, config.yaml) are tracked by git by default
 # since no pattern above ignores them.
+
+# bd 1.0.3 no longer ignores these by default
+beads.left.jsonl*
+.migration-hint-ts
+.jsonl.lock
