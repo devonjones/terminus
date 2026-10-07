@@ -1,7 +1,16 @@
 // @vitest-environment jsdom
 import { findByRole, findByText, getByRole, waitFor } from "@testing-library/dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AppState, Disc, Frame, Frames, Horizon, Job, TerminusApi } from "./api/types";
+import type {
+  AppState,
+  Disc,
+  Frame,
+  Frames,
+  Horizon,
+  Job,
+  ScopeStatus,
+  TerminusApi,
+} from "./api/types";
 import { mount } from "./renderer";
 
 const site = {
@@ -17,7 +26,7 @@ const state = (over: Partial<AppState> = {}): AppState => ({
   site: null,
   tab: "connect",
   tabs: ["connect", "panorama", "horizon", "orient", "fit", "export"],
-  scope: { link: "none" },
+  scope: { link: "none", host: null },
   sun_mode: "sun",
   spin: 0,
   job: null,
@@ -50,6 +59,19 @@ const disc: Disc = {
   fiducials: [{ az: 90, alt: 10, bound: false, xy: [850, 600] }],
 };
 
+const linked = (over: Partial<ScopeStatus> = {}): ScopeStatus => ({
+  link: "alpaca",
+  host: "10.5.2.65",
+  eq: true,
+  az: 180,
+  alt: 30,
+  stowed: false,
+  moving: false,
+  sun: { az: 290, alt: -30 },
+  cone: 30,
+  ...over,
+});
+
 function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
   let st = state();
   return {
@@ -69,6 +91,15 @@ function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
     frameImage: vi.fn(async () => null),
     buildImage: vi.fn(async () => null),
     curate: vi.fn(async () => st),
+    discoverScopes: vi.fn(async () => ({ scopes: [{ host: "10.5.2.65", port: 32323 }] })),
+    connectScope: vi.fn(
+      async (host: string) => (st = { ...st, scope: { link: "alpaca" as const, host } }),
+    ),
+    scopeStatus: vi.fn(async () =>
+      st.scope.link === "none" ? { link: "none" as const } : linked(),
+    ),
+    parkScope: vi.fn(async () => linked({ stowed: true })),
+    disconnectScope: vi.fn(async () => (st = { ...st, scope: { link: "none", host: null } })),
     ...over,
   };
 }
@@ -950,5 +981,140 @@ describe("managing sites", () => {
     expect(
       (getByRole(root, "button", { name: "Delete site-a" }) as HTMLButtonElement).disabled,
     ).toBe(true);
+  });
+});
+
+describe("connect", () => {
+  it("finds a telescope on the network and links it", async () => {
+    const api = fakeApi();
+    await mount(root, api);
+    (await findByRole(root, "button", { name: "Find telescopes" })).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    await findByText(root, "az 180.0° alt 30.0°");
+    expect(api.connectScope).toHaveBeenCalledWith("10.5.2.65");
+    expect(root.textContent).toContain("EQ mode");
+    expect(root.querySelector("footer")!.textContent).toContain("scope: alpaca");
+  });
+
+  it("links a typed address", async () => {
+    const api = fakeApi();
+    await mount(root, api);
+    const host = getByRole(root, "textbox", { name: "Telescope address" }) as HTMLInputElement;
+    host.value = " 10.0.0.20 ";
+    getByRole(root, "button", { name: "Connect" }).click();
+    await waitFor(() => expect(api.connectScope).toHaveBeenCalledWith("10.0.0.20"));
+  });
+
+  it("says when nothing answered", async () => {
+    await mount(root, fakeApi({ discoverScopes: vi.fn(async () => ({ scopes: [] })) }));
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    await findByText(root, /No telescopes answered/);
+  });
+
+  it("parks, then says the arm is closed and how to open it", async () => {
+    const api = fakeApi();
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    (await findByRole(root, "button", { name: "Park" })).click();
+    await findByText(root, /Open it in the Seestar app/);
+    expect(api.parkScope).toHaveBeenCalledOnce();
+    expect((getByRole(root, "button", { name: "Park" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("shows a refused park and keeps the controls", async () => {
+    const api = fakeApi({
+      parkScope: vi.fn(async () => {
+        throw new Error("engine /scope/park: 502 no Sun-safe path to (0,25)");
+      }),
+    });
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    (await findByRole(root, "button", { name: "Park" })).click();
+    expect((await findByRole(root, "alert")).textContent).toContain("Sun-safe");
+    expect((getByRole(root, "button", { name: "Park" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("warns when the mount is not in EQ mode", async () => {
+    let on = false;
+    const api = fakeApi({
+      scopeStatus: vi.fn(async () => (on ? linked({ eq: false }) : { link: "none" as const })),
+    });
+    const connect = api.connectScope;
+    api.connectScope = vi.fn(async (host: string) => ((on = true), connect(host)));
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    await findByText(root, "Switch the mount to EQ mode in the app.");
+  });
+
+  it("keeps the way out when the first status read fails", async () => {
+    let on = false;
+    const api = fakeApi({
+      scopeStatus: vi.fn(async () => {
+        if (on) throw new Error("engine /scope/status: 502 the telescope did not report");
+        return { link: "none" as const };
+      }),
+    });
+    const connect = api.connectScope;
+    api.connectScope = vi.fn(async (host: string) => ((on = true), connect(host)));
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    expect((await findByRole(root, "alert")).textContent).toContain("did not report");
+    expect(getByRole(root, "button", { name: "Park and disconnect" })).toBeTruthy();
+    expect(root.querySelector('[data-focus="scope-find"]')).toBeNull();
+  });
+
+  it("refreshes the status every few seconds while the tab is open, and stops after", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let az = 180;
+    const api = fakeApi();
+    const read = api.scopeStatus;
+    api.scopeStatus = vi.fn(async () => {
+      const st = await read();
+      return st.link === "none" ? st : { ...st, az };
+    });
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    await findByText(root, "az 180.0° alt 30.0°");
+    az = 200; // the scope moved
+    await vi.advanceTimersByTimeAsync(3100);
+    await findByText(root, "az 200.0° alt 30.0°");
+    await openTab("Panorama");
+    const reads = vi.mocked(api.scopeStatus).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(vi.mocked(api.scopeStatus).mock.calls.length).toBe(reads);
+  });
+
+  it("disables the controls while a park runs", async () => {
+    let finish: (st: ScopeStatus) => void = () => {};
+    const api = fakeApi({
+      parkScope: vi.fn(() => new Promise<ScopeStatus>((r) => (finish = r))),
+    });
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    (await findByRole(root, "button", { name: "Park" })).click();
+    await findByText(root, /Parking: clearing the Sun/);
+    for (const name of ["Park", "Park and disconnect"])
+      expect((getByRole(root, "button", { name }) as HTMLButtonElement).disabled, name).toBe(true);
+    finish(linked({ stowed: true }));
+    await findByText(root, /Open it in the Seestar app/);
+    expect(
+      (getByRole(root, "button", { name: "Park and disconnect" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it("parks and disconnects", async () => {
+    const api = fakeApi();
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    (await findByRole(root, "button", { name: "Park and disconnect" })).click();
+    await findByRole(root, "button", { name: "Find telescopes" });
+    expect(api.disconnectScope).toHaveBeenCalledOnce();
   });
 });

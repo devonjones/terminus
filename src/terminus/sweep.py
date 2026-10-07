@@ -16,6 +16,7 @@ across the Sun between two safe positions.
 
 import datetime
 import json
+import logging
 import math
 import os
 import sys
@@ -32,6 +33,7 @@ from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun  # noqa:
 from astropy.time import Time  # noqa: E402
 
 SETTLE = 1.5
+log = logging.getLogger(__name__)
 GOTO_TIMEOUT = 90
 SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
 ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
@@ -105,6 +107,7 @@ class Sky:
         return c.ra.hourangle, c.dec.deg
 
     def radec_to_altaz(self, ra_h, dec_d, when=None):
+        dec_d = np.clip(dec_d, -90.0, 90.0)  # a path interpolated to a pole can overshoot by 1e-14
         aa = SkyCoord(ra=ra_h * u.hourangle, dec=dec_d * u.deg).transform_to(
             AltAz(obstime=when or _now(), location=self.loc)
         )
@@ -200,6 +203,16 @@ def wrap_ra(d_hours):
     return (d_hours + 12.0) % 24.0 - 12.0
 
 
+def is_stowed(rd):
+    """Is the mount parked with its arm closed? The stow is Dec -90, so this
+    reads from the pointing alone. Only -90: the north pole is a real pointing.
+
+    Worth checking because a stowed mount answers every query and never moves,
+    so each goto times out as "did not arrive", which looks like a pointing bug.
+    """
+    return rd is not None and float(rd[1]) < -89.5
+
+
 class Pointer:
     """Points the scope by RA/Dec goto, refusing any slew whose PATH approaches
     the Sun.
@@ -224,7 +237,9 @@ class Pointer:
 
     def current_azalt(self):
         rd = self.sc.equ_coord()
-        return self.sky.radec_to_altaz(*rd) if rd else (0.0, 90.0)
+        if rd is None:
+            raise PointingUnreadable("cannot read the current pointing")
+        return self.sky.radec_to_altaz(*rd)
 
     def _sun_check(self, az, alt):
         saz, salt = self.sky.sun()
@@ -593,9 +608,10 @@ class Pointer:
 
     def _moving(self):
         try:
-            m = self.sc.call("get_device_state").get("result", {}).get("mount", {})
-            return m.get("move_type") not in (None, "none")
-        except Exception:
+            return bool(self.sc.moving())
+        except Exception as e:
+            # Unknown counts as still: the goto then gives up on its stall rule.
+            log.warning("could not read whether the mount is moving: %s", e)
             return False
 
     def _goto_wait(self, ra, dec, settle):
@@ -634,7 +650,7 @@ class Pointer:
             # look like it had moved, because `best` starts at infinity so the
             # first reading always beat it — and the failure then blamed a
             # convergence problem for a closed arm. A stowed mount answers every
-            # query and reports move_type "none"; one that is genuinely slewing
+            # query and reports no motion; one that is genuinely slewing
             # and failing to converge reports motion the whole time. That is the
             # difference between opening the arm and hunting a pointing bug.
             is_moving = self._moving()
@@ -835,6 +851,44 @@ class Pointer:
                 )
         rd = self.sc.equ_coord()
         return self.sky.radec_to_altaz(*rd) if rd else (az, alt)
+
+    PARK_VIA_ALT = 25.0
+    PARK_TIMEOUT_S = 90
+
+    def park(self):
+        """Close the arm: Sun-guarded to the up pole's azimuth at PARK_VIA_ALT,
+        then park, which stows to Dec -90 in about 25 s. Verified 2026-10-05
+        (native) and 2026-10-06 (Alpaca), in the northern hemisphere.
+
+        The stow is the firmware's own move, so its path is checked here as a
+        Dec-only leg from the waypoint to the stow, the shape `path_min_sep`
+        already models, and refused if it passes the Sun."""
+        if is_stowed(self.sc.equ_coord()):
+            return
+        north = self.sky.loc.lat.deg >= 0
+        self.point_to(0.0 if north else 180.0, self.PARK_VIA_ALT)
+        if self.dry:
+            return
+        here = self.sc.equ_coord()
+        if here is None:
+            raise PointingUnreadable("cannot read the pointing before the stow; not parking")
+        sep = self.path_min_sep(here, (here[0], -90.0))
+        if sep < self.cone:
+            raise SunGuard(
+                f"the stow would pass {sep:.1f} deg from the Sun; not parking. "
+                "Cover the aperture, or park later."
+            )
+        self.sc.park()
+        deadline = time.time() + self.PARK_TIMEOUT_S
+        while True:
+            rd = self.sc.equ_coord()
+            if is_stowed(rd):
+                return
+            if time.time() > deadline:
+                raise PointingError(
+                    f"park did not stow in {self.PARK_TIMEOUT_S} s; mount reads {rd}"
+                )
+            time.sleep(2)
 
 
 # ---- horizon search -------------------------------------------------------

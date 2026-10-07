@@ -23,5 +23,10 @@ const api: TerminusApi = {
   frameImage: (kind, name) => ipcRenderer.invoke("site:frame-image", kind, name),
   buildImage: (kind, layer) => ipcRenderer.invoke("site:build-image", kind, layer),
   curate: (off, restitch) => ipcRenderer.invoke("site:curate", off, restitch),
+  discoverScopes: () => ipcRenderer.invoke("scope:discover"),
+  connectScope: (host) => ipcRenderer.invoke("scope:connect", host),
+  scopeStatus: () => ipcRenderer.invoke("scope:status"),
+  parkScope: () => ipcRenderer.invoke("scope:park"),
+  disconnectScope: () => ipcRenderer.invoke("scope:disconnect"),
 };
 contextBridge.exposeInMainWorld("terminus", api);

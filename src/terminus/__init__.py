@@ -84,7 +84,7 @@ from .plan import (
 )
 from .sweep import Pointer, Sky, SunGuard, ang_sep, classify, obstruction_type, run_sweep
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     # measuring, with the scope
     "Seestar",

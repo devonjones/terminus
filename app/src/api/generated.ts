@@ -16,6 +16,8 @@ export interface Api {
   horizon?: Horizon;
   disc?: Disc;
   frames?: Frames;
+  scope_status?: ScopeStatus;
+  scopes?: ScopeList;
 }
 export interface Health {
   ok: true;
@@ -27,7 +29,8 @@ export interface AppState {
   tab: string;
   tabs: string[];
   scope: {
-    link: string;
+    link: "none" | "alpaca";
+    host: string | null;
   };
   sun_mode: "sun" | "shade";
   /**
@@ -211,4 +214,33 @@ export interface Frame {
    * left out by the stitch: too few control points
    */
   dropped: boolean;
+}
+/**
+ * The linked telescope, or {link: none}. Pointing comes from RA/Dec (EQ mode's own alt/az is unreliable).
+ */
+export interface ScopeStatus {
+  link: "none" | "alpaca";
+  host?: string;
+  eq?: boolean;
+  az?: number;
+  alt?: number;
+  /**
+   * arm closed (Dec -90)
+   */
+  stowed?: boolean;
+  moving?: boolean;
+  sun?: {
+    az: number;
+    alt: number;
+  };
+  /**
+   * degrees from the Sun no slew may come within
+   */
+  cone?: number;
+}
+export interface ScopeList {
+  scopes: {
+    host: string;
+    port: number;
+  }[];
 }

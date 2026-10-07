@@ -169,6 +169,10 @@ class Seestar:
     def mount_state(self):
         return self.call("get_device_state", {"keys": ["mount"]}).get("result", {}).get("mount", {})
 
+    def moving(self):
+        m = self.call("get_device_state").get("result", {}).get("mount", {})
+        return m.get("move_type") not in (None, "none")
+
     def location(self):
         """Scope's stored (lon, lat) or None."""
         r = self.call("get_device_state", {"keys": ["location_lon_lat"]}).get("result", {})
@@ -177,6 +181,14 @@ class Seestar:
 
     def goto(self, ra_hours, dec_deg):
         return self.call("scope_goto", [ra_hours, dec_deg])
+
+    def park(self):
+        return self.call("scope_park")
+
+    def unpark(self):
+        """Open the arm. The firmware's own move: the tube comes up level, facing
+        about east (az 88 alt 4, 2026-10-05). Over Alpaca, Unpark does not open it."""
+        return self.call("scope_move_to_horizon")
 
     # ---- imaging ---------------------------------------------------------
     def start_view(self, mode="scenery"):

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from terminus import Horizon, ang_sep, classify, to_nina_hrz, to_stellarium_txt
+from terminus.client import Seestar
 from terminus.export import _ascending_pairs, export_all, load_mask, write_mask
 from terminus.sweep import find_edge, obstruction_type, sky_reference, wrap180, wrap_ra
 
@@ -904,6 +905,7 @@ def test_a_goto_that_doglegs_is_not_reported_failed_while_the_mount_still_moves(
                 "result": {"mount": {"move_type": ("goto" if moving_at(clock.t) else "none")}}
             }
         )
+        sc.moving = lambda: Seestar.moving(sc)
         return Pointer(sc, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
 
     # Dogleg: closes for 10 s, pauses 35 s (still moving), then closes and
@@ -962,6 +964,7 @@ def test_a_mount_that_refuses_a_sun_adjacent_goto_is_sun_blocked_not_broken():
         sc = MagicMock()
         sc.equ_coord = MagicMock(return_value=(8.0, 30.0))  # never changes
         sc.call = MagicMock(return_value={"result": {"mount": {"move_type": "none"}}})
+        sc.moving = lambda: Seestar.moving(sc)
         return Pointer(sc, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
 
     clock = FakeTime()
@@ -1006,6 +1009,7 @@ def test_a_mount_that_refuses_a_sun_adjacent_goto_is_sun_blocked_not_broken():
                 "result": {"mount": {"move_type": ("goto" if moving["on"] else "none")}}
             }
         )
+        arriving.moving = lambda: Seestar.moving(arriving)
         ptr = Pointer(arriving, Sky(39.79, -104.89, 1600), 30, 5, dry=False)
         near = ptr.sky.altaz_to_radec(259.0, 25.0)
         for _ in range(2):
@@ -8520,6 +8524,7 @@ def test_a_goto_that_moves_without_arriving_gives_up_instead_of_extending_foreve
     # Dec arrives; RA never does — exactly what the mount did.
     sc.equ_coord.return_value = (4.551, 60.43)
     sc.call.return_value = {"result": {"mount": {"move_type": "ScopeGoto"}}}
+    sc.moving = lambda: Seestar.moving(sc)
     ptr = Pointer(sc, sky, 30, 5)
 
     with patch.object(sweep_mod, "time", clock):
@@ -8549,6 +8554,7 @@ def test_a_mount_that_never_moves_is_reported_differently():
     sc = MagicMock()
     sc.equ_coord.return_value = (5.759, -90.0)  # parked at the pole, stowed
     sc.call.return_value = {"result": {"mount": {"move_type": "none"}}}
+    sc.moving = lambda: Seestar.moving(sc)
     ptr = Pointer(sc, Sky(39.7917, -104.894, 1600), 30, 5)
 
     with pytest.raises(PointingError, match="never moved toward it at all"):

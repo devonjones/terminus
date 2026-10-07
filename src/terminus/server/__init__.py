@@ -37,6 +37,11 @@ Routes (payload shapes: schema.json beside this file):
   POST /site/delete       {"slug": name}: remove the site (not while it is building)
   POST /site/frames       {"off": [name, ...], "restitch": bool}: rebuild without those
                           photos, re-blending the stitched ones or stitching afresh
+  GET  /scope/discover    {"scopes": [{"host", "port"}, ...]}: Alpaca servers on the network
+  GET  /scope/status      the linked telescope: pointing (from RA/Dec), arm, Sun
+  POST /scope/connect     {"host": name}: link a Seestar over Alpaca -> the new state
+  POST /scope/park        Sun-guarded park; the scope's status after it
+  POST /scope/disconnect  park, then unlink -> the new state
   GET  /dev/state         state plus recent log lines; exists only with --dev
 """
 
@@ -46,6 +51,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -57,7 +63,10 @@ from urllib.parse import parse_qs, urlsplit
 import yaml
 
 from .. import __version__
+from ..client import SeestarError
 from ..export import MaskError
+from ..sweep import PointingError, SunGuard
+from . import scope as scopes
 from . import sites, views
 
 log = logging.getLogger("terminus.server")
@@ -65,15 +74,7 @@ log.setLevel(logging.INFO)
 
 TABS = ("connect", "panorama", "horizon", "orient", "fit", "export")
 MAX_BODY = 256 * 1024  # a drop of a few hundred photo paths
-
-
-class NoScope:
-    """The scope link before one exists. Stage 4 replaces it with the Alpaca driver."""
-
-    link = "none"
-
-    def park(self):
-        log.info("park: no scope linked, nothing to park")
+HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")  # no scheme, port or path
 
 
 class _RecentLog(logging.Handler):
@@ -103,7 +104,8 @@ class Sidecar(ThreadingHTTPServer):
         self.sites_root = sites_root
         self.jobs = jobs or sites.Jobs()
         self.token = token or secrets.token_hex(32)
-        self.scope = scope or NoScope()
+        self.scope = scope or scopes.NoScope()
+        self.linking = threading.Lock()  # connect, disconnect and park take turns
         self.recent = _RecentLog()
         log.addHandler(self.recent)
         self.state = {
@@ -111,7 +113,6 @@ class Sidecar(ThreadingHTTPServer):
             "site": None,
             "tab": TABS[0],
             "tabs": list(TABS),
-            "scope": {"link": self.scope.link},
             # The in-sun / in-shade switch. Defaults to SUN (the cautious answer)
             # and only the human sets it; no route here changes it.
             "sun_mode": "sun",
@@ -129,7 +130,8 @@ class Sidecar(ThreadingHTTPServer):
             except sites.SiteError:
                 log.warning("site %s is gone from disk; closing it", self.slug)
                 self.slug = None
-        return {**self.state, "site": site, "job": self.jobs.state}
+        scope = {"link": self.scope.link, "host": self.scope.host}
+        return {**self.state, "scope": scope, "site": site, "job": self.jobs.state}
 
     def site_dir(self):
         if self.slug is None:
@@ -242,6 +244,8 @@ class _Handler(BaseHTTPRequestHandler):
             "/site/frame/verdict.png": lambda: self._site_view(
                 lambda d: views.verdict_png(d, self._query("layer"))
             ),
+            "/scope/discover": lambda: self._send(200, {"scopes": scopes.discover()}),
+            "/scope/status": lambda: self._send(200, sv.scope.status()),
         }
         if sv.dev:
             routes["/dev/state"] = lambda: self._send(
@@ -264,6 +268,9 @@ class _Handler(BaseHTTPRequestHandler):
             "/site/frames": lambda: self._curate(body.get("off"), body.get("restitch", False)),
             "/site/rename": lambda: self._rename(body.get("slug"), body.get("name")),
             "/site/delete": lambda: self._delete(body.get("slug")),
+            "/scope/connect": lambda: self._connect(body.get("host")),
+            "/scope/park": self._park,
+            "/scope/disconnect": self._disconnect,
         }
         self._dispatch(routes)
 
@@ -284,6 +291,10 @@ class _Handler(BaseHTTPRequestHandler):
             route()
         except sites.SiteError as e:
             self._send(400, {"error": str(e)})
+        except (SeestarError, SunGuard, PointingError) as e:
+            # The scope said no, or could not be reached: the reason is the message.
+            log.warning("%s: %s", self.path, e)
+            self._send(502, {"error": str(e)})
         except MaskError as e:
             # The mask is the app's own file, but its path is nobody's business
             # in an error; the reason is.
@@ -294,6 +305,33 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             log.exception("%s failed", self.path)
             self._send(500, {"error": "internal error; see sidecar.log"})
+
+    def _connect(self, host):
+        if not isinstance(host, str) or not HOST.fullmatch(host):
+            return self._send(400, {"error": "host must be an IP address or host name"})
+        sv = self.server
+        with sv.linking:
+            if sv.scope.link != "none":
+                return self._send(409, {"error": "a telescope is already linked; disconnect first"})
+            sv.scope = scopes.AlpacaScope(host)
+        log.info("scope linked: %s", host)
+        self._send(200, sv.snapshot())
+
+    def _park(self):
+        with self.server.linking:
+            self.server.scope.park()
+        self._send(200, self.server.scope.status())
+
+    def _disconnect(self):
+        """Park, then let go. A park that fails keeps the link: dropping it would
+        leave the scope open with nothing able to close it."""
+        sv = self.server
+        with sv.linking:
+            sv.scope.park()
+            sv.scope.close()
+            sv.scope = scopes.NoScope()
+        log.info("scope unlinked")
+        self._send(200, sv.snapshot())
 
     def _set_tab(self, tab):
         if tab not in TABS:
@@ -419,7 +457,12 @@ def _shutdown(server):
     """Park first: the telescope outranks a half-done build. Each later step
     still runs if the one before it fails."""
     try:
-        server.scope.park()
+        # After any park or disconnect already under way: never two at once.
+        with server.linking:
+            try:
+                server.scope.park()
+            finally:
+                server.scope.close()
     finally:
         try:
             server.jobs.stop()
