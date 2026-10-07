@@ -57,6 +57,10 @@ from .sweep import (
 
 
 def _connect(cfg):
+    if cfg.get("link") == "alpaca":
+        from .alpaca import Alpaca
+
+        return Alpaca(cfg["host"])
     sc = Seestar(cfg["host"], cfg["pem"])
     if not sc.authenticate():
         raise SeestarError("authentication failed — check the interop key path")
@@ -152,11 +156,32 @@ def cmd_point(sc, cfg, args):
     try:
         faz, falt = ptr.point_to(args.az, args.alt)
         print(f"target ({args.az},{args.alt}) -> landed az {faz:.1f} alt {falt:.1f}")
+        if args.expose:
+            import numpy as np
+
+            frame = sc.capture_raw16(args.expose)
+            print(f"{args.expose} s frame {frame.shape}: median {float(np.median(frame)):.1f}")
+            if args.save:
+                np.save(args.save, frame)
     except SunGuard as e:
         print("SUN GUARD:", e)
     except PointingError as e:
         print("POINTING FAILED:", e)
         sys.exit(2)
+
+
+def cmd_park(sc, cfg, args):
+    """Close the arm: Sun-guarded to az 0 alt 25 first, the route verified on
+    2026-10-05, then park, which stows to Dec -90 in about 25 s."""
+    sky = _sky(sc, cfg)
+    _pointer(sc, sky, cfg["sweep"], False).point_to(0.0, 25.0)
+    sc.park()
+    deadline = time.time() + 90
+    while not is_stowed(sc.equ_coord()):
+        if time.time() > deadline:
+            raise SeestarError(f"park did not stow in 90 s; mount reads {sc.equ_coord()}")
+        time.sleep(2)
+    print("parked: arm closed (Dec -90)")
 
 
 def cmd_classify(sc, cfg, args):
@@ -2310,7 +2335,7 @@ def cmd_horizon(sc, cfg, args):  # sc, cfg unused: offline
     )
 
 
-NEEDS_SCOPE = {"preflight", "point", "classify", "sweep"}
+NEEDS_SCOPE = {"preflight", "point", "classify", "sweep", "park"}
 # Offline: no scope, no network, and no config.toml — a user with photographs
 # and no telescope must not be made to write one.
 OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar"}
@@ -2346,8 +2371,11 @@ def main(argv=None):
     pp = sub.add_parser("point")
     pp.add_argument("az", type=float)
     pp.add_argument("alt", type=float)
+    pp.add_argument("--expose", type=float, help="then take a raw frame this many seconds long")
+    pp.add_argument("--save", help="save that frame (.npy)")
     pp.add_argument("--dry-run", action="store_true")
     sub.add_parser("classify")
+    sub.add_parser("park", help="slew clear and close the arm")
     sw = sub.add_parser(
         "sweep",
         help="full horizon sweep -> mask YAML (day or night)",
@@ -2635,6 +2663,7 @@ def main(argv=None):
 
     handlers = {
         "preflight": cmd_preflight,
+        "park": cmd_park,
         "point": cmd_point,
         "classify": cmd_classify,
         "sweep": cmd_sweep,

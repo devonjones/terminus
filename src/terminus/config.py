@@ -1,7 +1,8 @@
 """Load terminus configuration from a TOML file (see config.example.toml).
 
-Only [scope] is required; [site] may be omitted and read from the scope, and
-[sweep] falls back to the defaults below. Keeping every runtime value in a file
+Only [scope] is required: its host, plus the interop key (pem) for the native
+link; without a pem the scope is driven over ASCOM Alpaca. [site] may be
+omitted and read from the scope, and [sweep] falls back to the defaults below. Keeping every runtime value in a file
 (not code) is what lets the same checkout run on a laptop or a Raspberry Pi.
 """
 
@@ -39,14 +40,18 @@ def load_config(path):
         raise ConfigError(f"bad TOML in {path}: {e}") from e
 
     scope = doc.get("scope") or {}
-    if not scope.get("host") or not scope.get("pem"):
-        raise ConfigError("[scope] needs both 'host' and 'pem'")
+    link = scope.get("link", "native" if scope.get("pem") else "alpaca")
+    if link not in ("alpaca", "native"):
+        raise ConfigError(f"[scope] link must be 'alpaca' or 'native', not {link!r}")
+    if not scope.get("host") or (link == "native" and not scope.get("pem")):
+        raise ConfigError("[scope] needs 'host', and 'pem' for the native link")
 
     sweep = dict(SWEEP_DEFAULTS)
     sweep.update(doc.get("sweep") or {})
     return {
         "host": scope["host"],
-        "pem": scope["pem"],
+        "pem": scope.get("pem"),
+        "link": link,
         "site": doc.get("site") or {},  # optional lat/lon/elev_m; else from scope
         "sweep": sweep,
     }

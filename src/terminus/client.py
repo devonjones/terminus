@@ -178,6 +178,9 @@ class Seestar:
     def goto(self, ra_hours, dec_deg):
         return self.call("scope_goto", [ra_hours, dec_deg])
 
+    def park(self):
+        return self.call("scope_park")
+
     # ---- imaging ---------------------------------------------------------
     def start_view(self, mode="scenery"):
         return self.call("iscope_start_view", {"mode": mode})

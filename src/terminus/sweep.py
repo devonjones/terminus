@@ -592,6 +592,8 @@ class Pointer:
         return worst
 
     def _moving(self):
+        if hasattr(self.sc, "moving"):  # the Alpaca link
+            return self.sc.moving()
         try:
             m = self.sc.call("get_device_state").get("result", {}).get("mount", {})
             return m.get("move_type") not in (None, "none")

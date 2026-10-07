@@ -3,7 +3,9 @@
 
 [scope]
 host = "192.168.1.50"                         # your Seestar's IP (a static lease helps)
-pem  = "~/.seestar/seestar_client_key.pem"   # interop key; see README (never commit this)
+# link = "alpaca"                           # default without a pem: ASCOM Alpaca (enable it
+                                             # in the Seestar app); night measurement only so far
+pem  = "~/.seestar/seestar_client_key.pem"   # native link's interop key; see README (never commit this)
 
 [site]                       # optional — omit to use the location stored on the scope
 # lat = 31.9583              # degrees north            (example: Kitt Peak)
