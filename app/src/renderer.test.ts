@@ -1049,6 +1049,57 @@ describe("connect", () => {
     await findByText(root, "Switch the mount to EQ mode in the app.");
   });
 
+  it("keeps the way out when the first status read fails", async () => {
+    let on = false;
+    const api = fakeApi({
+      scopeStatus: vi.fn(async () => {
+        if (on) throw new Error("engine /scope/status: 502 the telescope did not report");
+        return { link: "none" as const };
+      }),
+    });
+    const connect = api.connectScope;
+    api.connectScope = vi.fn(async (host: string) => ((on = true), connect(host)));
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    expect((await findByRole(root, "alert")).textContent).toContain("did not report");
+    expect(getByRole(root, "button", { name: "Park and disconnect" })).toBeTruthy();
+    expect(root.querySelector('[data-focus="scope-find"]')).toBeNull();
+  });
+
+  it("refreshes the status every few seconds while the tab is open", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fakeApi();
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    await findByText(root, "az 180.0° alt 30.0°");
+    const before = vi.mocked(api.scopeStatus).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3100);
+    await vi.waitFor(() =>
+      expect(vi.mocked(api.scopeStatus).mock.calls.length).toBeGreaterThan(before),
+    );
+  });
+
+  it("disables the controls while a park runs", async () => {
+    let finish: (st: ScopeStatus) => void = () => {};
+    const api = fakeApi({
+      parkScope: vi.fn(() => new Promise<ScopeStatus>((r) => (finish = r))),
+    });
+    await mount(root, api);
+    getByRole(root, "button", { name: "Find telescopes" }).click();
+    (await findByRole(root, "button", { name: "Connect to 10.5.2.65" })).click();
+    (await findByRole(root, "button", { name: "Park" })).click();
+    await findByText(root, /Parking: clearing the Sun/);
+    for (const name of ["Park", "Park and disconnect"])
+      expect((getByRole(root, "button", { name }) as HTMLButtonElement).disabled, name).toBe(true);
+    finish(linked({ stowed: true }));
+    await findByText(root, /Open it in the Seestar app/);
+    expect(
+      (getByRole(root, "button", { name: "Park and disconnect" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
   it("parks and disconnects", async () => {
     const api = fakeApi();
     await mount(root, api);

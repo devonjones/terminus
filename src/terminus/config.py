@@ -2,8 +2,9 @@
 
 Only [scope] is required: its host, plus the interop key (pem) for the native
 link; without a pem the scope is driven over ASCOM Alpaca. [site] may be
-omitted and read from the scope, and [sweep] falls back to the defaults below. Keeping every runtime value in a file
-(not code) is what lets the same checkout run on a laptop or a Raspberry Pi.
+omitted and read from the scope, and [sweep] falls back to the defaults below.
+Keeping every runtime value in a file (not code) is what lets the same checkout
+run on a laptop or a Raspberry Pi.
 """
 
 import os

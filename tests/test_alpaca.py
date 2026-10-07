@@ -140,7 +140,14 @@ def test_a_scope_that_never_answers_says_so(scope):
     fake, sc = scope
     fake.drop = alpaca.RETRIES
     with pytest.raises(SeestarError, match="after 3 tries"):
-        sc.equ_coord()
+        sc.is_eq_mode()
+
+
+def test_an_unreadable_pointing_is_none_like_the_native_link(scope):
+    """Pointer and the sweep skip a column on None; an exception lost the run."""
+    fake, sc = scope
+    fake.drop = alpaca.RETRIES
+    assert sc.equ_coord() is None
 
 
 def test_a_frame_comes_back_row_major(scope):
@@ -231,3 +238,101 @@ def test_unpark_over_alpaca_says_to_use_the_app(monkeypatch):
     monkeypatch.setattr(cli, "_sky", lambda sc, cfg: _Sky(-20.0))
     with pytest.raises(SeestarError, match="Seestar app"):
         cli.cmd_unpark(object(), {}, None)
+
+
+def test_a_refusal_is_not_retried_and_keeps_its_reason(scope):
+    fake, sc = scope
+    seen = []
+    orig = fake.handle
+
+    def refuse(req, method):
+        seen.append(method)
+        if method == "PUT":
+            req.send_response(400)
+            body = b"Declination out of range"
+            req.send_header("Content-Length", str(len(body)))
+            req.end_headers()
+            req.wfile.write(body)
+            return None
+        return orig(req, method)
+
+    fake.handle = refuse
+    with pytest.raises(SeestarError, match="400 Declination out of range"):
+        sc._put("telescope", "abortslew")
+    assert seen.count("PUT") == 1
+
+
+def test_an_unreadable_reply_is_a_scope_error(scope):
+    fake, sc = scope
+
+    def garbled(req, method):
+        req.send_response(200)
+        req.send_header("Content-Length", "3")
+        req.end_headers()
+        req.wfile.write(b"<?>")
+        return None
+
+    fake.handle = garbled
+    with pytest.raises(SeestarError, match="unreadable"):
+        sc.is_eq_mode()
+
+
+def test_classify_over_alpaca_says_daytime_is_not_built(scope):
+    _, sc = scope
+    with pytest.raises(SeestarError, match="daytime"):
+        sc.capture_rgb()
+
+
+def test_a_frame_is_not_taken_before_its_exposure_ends(scope, monkeypatch):
+    """A "ready" left over from the last frame would be the last pointing's sky."""
+    fake, sc = scope
+    waits = []
+    monkeypatch.setattr(alpaca.time, "sleep", waits.append)
+    sc.capture_raw16(2.0)
+    assert waits and waits[0] == 2.0
+
+
+def test_a_json_image_array_comes_back_row_major(scope):
+    """Some servers ignore Accept and send ImageArray as JSON, x-major."""
+    fake, sc = scope
+    orig = fake.handle
+
+    def json_image(req, method):
+        if "imagearray" in req.path:
+            return {"Value": fake.frame.T.tolist(), "ErrorNumber": 0}
+        return orig(req, method)
+
+    fake.handle = json_image
+    assert np.array_equal(sc.capture_raw16(0.1), fake.frame)
+
+
+def test_an_unknown_link_is_refused(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('[scope]\nhost = "h"\nlink = "bluetooth"\n')
+    with pytest.raises(ConfigError, match="link must be"):
+        load_config(str(p))
+
+
+def test_the_frame_conversion_reproduces_the_scope_on_2026_10_06():
+    """Measured: the scope read JNow (3.314722 h, 4.150833 deg) and its own az/alt
+    as 86.808/2.655 at once. Read as JNow it reproduces them; swapped it is 0.3 deg off."""
+    from astropy.time import Time
+
+    from terminus.sweep import Sky
+
+    when = Time("2026-10-07T03:15:18.29Z")
+    sky = Sky(39.791458, -104.894089)
+    az, alt = sky.radec_to_altaz(*jnow_to_icrs(3.314722, 4.150833, when), when)
+    assert abs(az - 86.808) < 0.05 and abs(alt - 2.655) < 0.05, (az, alt)
+
+
+def test_a_scope_error_on_a_read_is_raised(scope):
+    fake, sc = scope
+    orig = fake.handle
+    fake.handle = lambda req, m: (
+        {"ErrorNumber": 1031, "ErrorMessage": "not connected"}
+        if "alignmentmode" in req.path
+        else orig(req, m)
+    )
+    with pytest.raises(SeestarError, match="1031"):
+        sc.is_eq_mode()

@@ -457,10 +457,12 @@ def _shutdown(server):
     """Park first: the telescope outranks a half-done build. Each later step
     still runs if the one before it fails."""
     try:
-        try:
-            server.scope.park()
-        finally:
-            server.scope.close()
+        # After any park or disconnect already under way: never two at once.
+        with server.linking:
+            try:
+                server.scope.park()
+            finally:
+                server.scope.close()
     finally:
         try:
             server.jobs.stop()

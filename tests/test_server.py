@@ -942,6 +942,7 @@ def test_shutdown_parks_first_and_every_step_survives_a_failure(failing):
         return run
 
     server = types.SimpleNamespace(
+        linking=threading.Lock(),
         scope=types.SimpleNamespace(park=step("park"), close=step("unlink")),
         jobs=types.SimpleNamespace(stop=step("stop")),
         server_close=step("close"),

@@ -306,6 +306,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     pollScope();
   }
   const scopeProps = () => ({
+    linked: v.st.scope.link !== "none",
     status: v.scope,
     found: v.found,
     busy: v.scopeBusy,

@@ -314,6 +314,7 @@ export function manageView(
 }
 
 export interface ConnectProps {
+  linked: boolean; // the sidecar holds a link, whether or not a status read worked
   status: ScopeStatus | null; // null until first read
   found: ScopeList["scopes"] | null; // null until a search has run
   busy: string; // what is in progress, in words; "" when idle
@@ -330,7 +331,7 @@ const deg = (n: number) => `${n.toFixed(1)}°`;
 export function connectView(p: ConnectProps): HTMLElement {
   const busy = p.busy ? el("p", { textContent: p.busy, className: "busy" }) : "";
   const st = p.status;
-  if (!st || st.link === "none") {
+  if (!p.linked) {
     const find = el("button", { textContent: "Find telescopes", disabled: !!p.busy });
     find.dataset.focus = "scope-find";
     find.addEventListener("click", p.onFind);
@@ -367,6 +368,17 @@ export function connectView(p: ConnectProps): HTMLElement {
       busy,
     );
   }
+  const leave = el("button", { textContent: "Park and disconnect", disabled: !!p.busy });
+  leave.dataset.focus = "scope-disconnect";
+  leave.addEventListener("click", p.onDisconnect);
+  if (!st || st.link === "none")
+    return el(
+      "div",
+      { className: "connect" },
+      el("p", { textContent: "Linked. Reading the telescope…" }),
+      el("div", { className: "row" }, leave),
+      busy,
+    );
   const rows: [string, string][] = [
     ["Telescope", st.host ?? ""],
     ["Mount", st.eq ? "EQ mode" : "not in EQ mode: terminus needs EQ mode"],
@@ -384,9 +396,6 @@ export function connectView(p: ConnectProps): HTMLElement {
   const park = el("button", { textContent: "Park", disabled: !!p.busy || !!st.stowed });
   park.dataset.focus = "scope-park";
   park.addEventListener("click", p.onPark);
-  const leave = el("button", { textContent: "Park and disconnect", disabled: !!p.busy });
-  leave.dataset.focus = "scope-disconnect";
-  leave.addEventListener("click", p.onDisconnect);
   const notes: Node[] = [];
   if (st.stowed)
     notes.push(

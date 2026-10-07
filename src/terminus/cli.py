@@ -47,6 +47,7 @@ from .sweep import (
     below_day_floor,
     classify,
     column_touches_sun,
+    is_stowed,
     night_find_edge,
     obstruction_type,
     run_sweep,
@@ -87,23 +88,6 @@ def _start_locked(sc, sw):
     day-only entry point the CLI commands share.
     """
     set_channel(sc, night=False, sw=sw)
-
-
-def is_stowed(rd):
-    """Is the mount parked with its arm closed?
-
-    Devon: Dec -90 tells you it is stowed. The stow position IS the south
-    celestial pole, so this is readable from the pointing alone — no second call,
-    and true whatever the firmware chooses to report elsewhere.
-
-    Worth checking because the failure it causes is so misleading. A stowed mount
-    answers every query happily and simply never moves, so each goto waits out
-    GOTO_TIMEOUT and reports "did not arrive; mount may be closed, parked, or not
-    tracking". Three of those in a row trip MAX_POINTING_MISSES and abandon the
-    run. On 2026-08-05 that reading cost a session, and this morning it cost ten
-    minutes before the Dec was noticed.
-    """
-    return rd is not None and abs(abs(float(rd[1])) - 90.0) < 0.5
 
 
 def _pointer(sc, sky, sw, dry):

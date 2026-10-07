@@ -333,7 +333,8 @@ describe("lifecycle", () => {
     const e = { preventDefault: vi.fn() };
     h.app.emit("will-quit", e);
     expect(e.preventDefault).toHaveBeenCalled();
-    expect(h.stopSidecar).toHaveBeenCalledWith(proc);
+    // Long enough for the park the sidecar runs on its way out, not the 5 s default.
+    expect(h.stopSidecar).toHaveBeenCalledWith(proc, 5 * 60_000);
     await vi.waitFor(() => expect(h.app.quit).toHaveBeenCalled());
   });
 

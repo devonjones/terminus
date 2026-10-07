@@ -10,7 +10,7 @@ from test_server import call, conforms, serve  # noqa: F401 (serve is a fixture)
 
 from terminus.client import SeestarError
 from terminus.server import scope as scopes
-from terminus.sweep import Pointer, PointingError, SunGuard
+from terminus.sweep import Pointer, PointingError, Sky, SunGuard
 
 
 class FakeMount:
@@ -105,12 +105,20 @@ def test_park_route_parks_the_linked_scope(linked):
     conforms("ScopeStatus", st)
 
 
-def test_a_refused_park_says_why(linked):
+@pytest.mark.parametrize(
+    "fail, why",
+    [
+        (SunGuard("no Sun-safe path to (0,25)"), "Sun-safe"),
+        (PointingError("park did not stow in 90 s"), "did not stow"),
+        (SeestarError("Alpaca request failed after 3 tries"), "3 tries"),
+    ],
+)
+def test_a_refused_park_says_why(linked, fail, why):
     s, made = linked
     call(s, "POST", "/scope/connect", {"host": "10.5.2.65"})
-    made[0].fail = SunGuard("no Sun-safe path to (0,25)")
+    made[0].fail = fail
     code, body = call(s, "POST", "/scope/park", {})
-    assert code == 502 and "Sun-safe" in body["error"]
+    assert code == 502 and why in body["error"]
 
 
 def test_disconnect_parks_then_unlinks(linked):
@@ -167,18 +175,51 @@ def test_discover_finds_an_alpaca_reply_and_ignores_noise():
 
 
 class _Ptr(Pointer):
-    def __init__(self, sc):
-        self.sc, self.dry, self.route = sc, False, []
+    """Pointer with the slew recorded and the stow's Sun separation chosen."""
+
+    def __init__(self, sc, lat=39.8, stow_sep=180.0):
+        self.sc, self.dry, self.cone, self.route = sc, False, 30.0, []
+        self.sky = Sky(lat, -104.9)
+        self.stow_sep = stow_sep
 
     def point_to(self, az, alt):
         self.route.append((az, alt))
 
+    def path_min_sep(self, rd0, rd1):
+        assert rd1[1] == -90.0, "the stow leg runs to Dec -90"
+        return self.stow_sep
 
-def test_park_goes_north_first_then_stows():
+
+def test_park_goes_via_the_up_pole_then_stows():
     sc = FakeMount()
     ptr = _Ptr(sc)
     ptr.park()
-    assert ptr.route == [Pointer.PARK_VIA] and sc.parks == 1
+    assert ptr.route == [(0.0, Pointer.PARK_VIA_ALT)] and sc.parks == 1
+
+
+def test_a_southern_park_goes_via_south():
+    """Due north is where the southern midday Sun is."""
+    sc = FakeMount()
+    ptr = _Ptr(sc, lat=-33.9)
+    ptr.park()
+    assert ptr.route == [(180.0, Pointer.PARK_VIA_ALT)]
+
+
+def test_a_stow_that_would_pass_the_sun_is_refused():
+    """The firmware picks the stow's path; it is checked like any slew."""
+    sc = FakeMount()
+    with pytest.raises(SunGuard, match="stow would pass"):
+        _Ptr(sc, stow_sep=5.0).park()
+    assert sc.parks == 0
+
+
+def test_parking_a_stowed_scope_does_nothing():
+    """Park and disconnect must work on a closed scope."""
+    sc = FakeMount()
+    sc.rd = (4.0, -90.0)
+    ptr = _Ptr(sc)
+    ptr.park()
+    assert ptr.route == [] and sc.parks == 0
 
 
 def test_a_park_that_never_stows_says_so(monkeypatch):
@@ -188,3 +229,108 @@ def test_a_park_that_never_stows_says_so(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     with pytest.raises(PointingError, match="did not stow"):
         _Ptr(sc).park()
+
+
+def test_shutdown_waits_for_a_park_already_under_way():
+    """Two parks driving the mount at once is what the lock prevents."""
+    import types
+
+    import terminus.server as server_module
+
+    running, most = [0], [0]
+
+    def park():
+        running[0] += 1
+        most[0] = max(most[0], running[0])
+        time.sleep(0.2)
+        running[0] -= 1
+
+    server = types.SimpleNamespace(
+        linking=threading.Lock(),
+        scope=types.SimpleNamespace(park=park, close=lambda: None),
+        jobs=types.SimpleNamespace(stop=lambda: None),
+        server_close=lambda: None,
+    )
+
+    def route_park():
+        with server.linking:
+            park()
+
+    t = threading.Thread(target=route_park)
+    t.start()
+    time.sleep(0.05)
+    server_module._shutdown(server)
+    t.join()
+    assert most[0] == 1
+
+
+def test_a_failed_search_is_a_scope_error_not_a_site_error(linked, monkeypatch):
+    s, _ = linked
+
+    def no_network(*a, **k):
+        raise OSError("Network is unreachable")
+
+    monkeypatch.setattr(scopes, "_broadcast", no_network)
+    code, body = call(s, "GET", "/scope/discover")
+    assert code == 502 and "search for telescopes" in body["error"]
+
+
+@pytest.mark.parametrize("path", ["/scope/discover", "/scope/status"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"token": False},
+        {"headers": {"Host": "evil.example"}},
+        {"headers": {"Origin": "https://evil.example"}},
+    ],
+)
+def test_scope_reads_refuse_strangers(linked, monkeypatch, path, bad):
+    s, _ = linked
+    monkeypatch.setattr(scopes, "_broadcast", lambda *a: pytest.fail("searched for a stranger"))
+    assert call(s, "GET", path, **bad)[0] in (401, 403)
+
+
+def test_discover_through_the_sidecar(linked, monkeypatch):
+    s, _ = linked
+    monkeypatch.setattr(scopes, "_broadcast", lambda *a: [{"host": "10.5.2.65", "port": 32323}])
+    code, body = call(s, "GET", "/scope/discover")
+    assert code == 200 and body == {"scopes": [{"host": "10.5.2.65", "port": 32323}]}
+    conforms("ScopeList", body)
+
+
+def test_a_failed_connect_leaves_nothing_linked(serve, monkeypatch):  # noqa: F811
+    def unreachable(host):
+        raise SeestarError("Alpaca request failed after 3 tries")
+
+    monkeypatch.setattr(scopes, "AlpacaScope", unreachable)
+    s = serve()
+    code, body = call(s, "POST", "/scope/connect", {"host": "10.5.2.65"})
+    assert code == 502 and "3 tries" in body["error"]
+    assert call(s, "GET", "/state")[1]["scope"] == {"link": "none", "host": None}
+
+
+def test_status_says_so_when_the_pointing_cannot_be_read():
+    link = scopes.AlpacaScope("h", connect=FakeMount)
+    link.sc.rd = None
+    with pytest.raises(SeestarError, match="where it is pointing"):
+        link.status()
+
+
+def test_the_cli_links_over_alpaca_without_a_key(monkeypatch):
+    from terminus import alpaca, cli
+
+    monkeypatch.setattr(alpaca, "Alpaca", lambda host: ("alpaca", host))
+    assert cli._connect({"link": "alpaca", "host": "10.5.2.65"}) == ("alpaca", "10.5.2.65")
+
+
+def test_cli_park_reports_a_sun_refusal_plainly(monkeypatch):
+    from terminus import cli
+
+    def refuse(self):
+        raise SunGuard("the stow would pass 5.0 deg from the Sun")
+
+    monkeypatch.setattr(cli, "_sky", lambda sc, cfg: Sky(39.8, -104.9))
+    monkeypatch.setattr(Pointer, "park", refuse)
+    cfg = {"sweep": {"sun_cone_deg": 30.0, "slew_step_deg": 5.0}}
+    with pytest.raises(SeestarError, match="park: the stow would pass"):
+        cli.cmd_park(FakeMount(), cfg, None)

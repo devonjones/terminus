@@ -11,8 +11,9 @@ import socket
 import time
 
 from ..alpaca import PORT, Alpaca
+from ..client import SeestarError
 from ..config import SWEEP_DEFAULTS
-from ..sweep import Pointer, Sky
+from ..sweep import Pointer, Sky, is_stowed
 
 log = logging.getLogger("terminus.server")
 DISCOVERY_PORT = 32227
@@ -21,6 +22,13 @@ DISCOVERY_S = 2.0
 
 def discover(timeout=DISCOVERY_S, to=("255.255.255.255", DISCOVERY_PORT)):
     """Alpaca servers answering a broadcast on this network: [{"host", "port"}]."""
+    try:
+        return _broadcast(timeout, to)
+    except OSError as e:  # no network, or broadcast refused
+        raise SeestarError(f"could not search for telescopes: {e}") from e
+
+
+def _broadcast(timeout, to):
     found = {}
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -67,7 +75,10 @@ class AlpacaScope:
         self.ptr = Pointer(self.sc, self.sky, sw["sun_cone_deg"], sw["slew_step_deg"])
 
     def status(self):
-        ra, dec = self.sc.equ_coord()
+        rd = self.sc.equ_coord()
+        if rd is None:
+            raise SeestarError("the telescope did not report where it is pointing")
+        ra, dec = rd
         az, alt = self.sky.radec_to_altaz(ra, dec)  # never the mount's own alt/az in EQ
         saz, salt = self.sky.sun()
         return {
@@ -76,7 +87,7 @@ class AlpacaScope:
             "eq": self.sc.is_eq_mode(),
             "az": round(float(az), 2),
             "alt": round(float(alt), 2),
-            "stowed": abs(abs(float(dec)) - 90.0) < 0.5,
+            "stowed": is_stowed((ra, dec)),
             "moving": self.sc.moving(),
             "sun": {"az": round(saz, 1), "alt": round(salt, 1)},
             "cone": self.ptr.cone,

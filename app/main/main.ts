@@ -39,6 +39,10 @@ const PHOTO_EXTENSIONS = ["jpg", "jpeg", "png", "tif", "tiff"];
 const isName = (n: unknown): n is string =>
   typeof n === "string" && n.length > 0 && n.length < 256 && !/[\\/]/.test(n);
 
+// A park walks the tube clear of the Sun and then stows: minutes, not seconds.
+// The quit waits as long, since the sidecar parks on its way out.
+const SCOPE_MOTION_MS = 5 * 60_000;
+
 // The sidecar's own rule (server.HOST): a bare name or address, no scheme, port or path.
 const HOST = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
 
@@ -102,8 +106,6 @@ function registerIpc(sc: Sidecar, win: () => BrowserWindow | undefined) {
     if (typeof restitch !== "boolean") throw new Error("restitch must be a boolean");
     return request<AppState>(sc, "/site/frames", { off, restitch });
   });
-  // A park walks the tube clear of the Sun and then stows: minutes, not seconds.
-  const SCOPE_MOTION_MS = 5 * 60_000;
   handle("scope:discover", () => request(sc, "/scope/discover"));
   handle("scope:status", () => request(sc, "/scope/status", undefined, 120_000));
   handle("scope:connect", (host) => {
@@ -238,5 +240,5 @@ app.on("will-quit", (e) => {
   const proc = sidecar?.proc;
   if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
   e.preventDefault();
-  stopSidecar(proc).finally(() => app.quit());
+  stopSidecar(proc, SCOPE_MOTION_MS).finally(() => app.quit());
 });

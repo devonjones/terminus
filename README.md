@@ -78,7 +78,9 @@ is not the horizon you get in January.
   (terminus points by RA/Dec goto; in EQ mode the scope's alt/az readout is not
   trustworthy but its RA/Dec pointing is).
 - Python ≥ 3.11 and **ffmpeg** on `PATH` (the scenery preview arrives over RTSP).
-- The **interop key** (see below).
+- **Alpaca turned on** in the Seestar app. terminus drives the scope over ASCOM
+  Alpaca with no key. Opening the arm and daytime measurement need the native
+  link and its **interop key** (see below) for now.
 
 **Optional, for the photo pipeline:**
 
@@ -95,9 +97,10 @@ Runs headless — a Raspberry Pi is a fine host, same as
 (numpy, pillow, cryptography, astropy, pyyaml) ship ARM wheels; `apt install
 ffmpeg`. The segmentation stack is heavier and may not be practical on a Pi.
 
-## The interop key
+## The interop key (optional: the native link)
 
-Firmware 7.18+ requires a signed challenge/response before it will accept
+Only the native link needs it; without one, terminus uses Alpaca. Firmware
+7.18+ requires a signed challenge/response before it will accept
 commands. The signing key is an RSA private key ZWO ships **in the clear** inside
 the Android app. terminus does **not** include it, and does not document how to
 get it out — you extract it once, yourself, from the app you already own, using
@@ -127,7 +130,7 @@ sudo apt install ffmpeg hugin-tools        # macOS: brew install ffmpeg hugin
 uv sync --extra segment    # pip users: pip install -e '.[segment]' --extra-index-url
                            #   https://download.pytorch.org/whl/cpu
 
-cp config.example.toml config.toml   # edit scope host + pem path
+cp config.example.toml config.toml   # edit scope host (and pem path for the native link)
 ```
 
 Only the commands that talk to the scope need `config.toml`: `terminus mosaic`,
@@ -365,14 +368,17 @@ that type column as a hint, not a measurement.
 ```bash
 terminus preflight                 # connect, show Sun + which azimuths it blocks
 terminus point 75 45               # slew to az 75 / alt 45 (Sun-guarded), verify
+terminus point 75 20 --expose 2    # ...then take a 2 s raw frame (--save f.npy keeps it)
 terminus classify                  # sky / vegetation / structure at current pointing
 terminus sweep                     # full sweep -> horizon_mask.yaml + .hrz + .txt
+terminus park                      # Sun-guarded to the up pole, then close the arm
+terminus unpark                    # open the arm: native link only, Sun down only
 ```
 
-Run it **on a clouded-out night** — a full circle takes hours, and overcast
-under suburban light pollution is actually the *easier* case, because the sweep
-finds the horizon by brightness and cloud makes the sky a bright, even
-backdrop. At the shipped `az_step = 5` a full circle is 72 columns
+Run it **after dark**: a full circle takes hours. A uniform overcast under
+suburban light pollution makes the sky a bright, even backdrop, but drifting
+broken cloud does not: on 2026-10-06 it read 3 of 4 known columns wrong
+(terminus-84). At the shipped `az_step = 5` a full circle is 72 columns
 (`az_step = 10` halves it, more coarsely). Let the Sun set first: the Sun
 guard refuses any slew whose path passes near it, so daytime columns toward
 the Sun are skipped rather than measured. When the Sun crosses −12° mid-run,
