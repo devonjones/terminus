@@ -2,6 +2,7 @@
 // (`npm run gen:api`); only the preload's own API is written here.
 import type {
   AppState,
+  Columns,
   Disc,
   Frames,
   Horizon,
@@ -16,6 +17,7 @@ export type * from "./generated";
 export type ImageName = "panorama" | "disc" | "disagree" | "outline" | "progress";
 export type FrameImage = "footprint" | "thumb";
 export type BuildImage = "layer" | "verdict";
+export type ColumnTag = "false edge" | "pocket" | "near object";
 
 // What the preload exposes on window.terminus. Keep it narrow: named calls only.
 export interface TerminusApi {
@@ -54,6 +56,13 @@ export interface TerminusApi {
   takeFrame(exposureMs: number): Promise<ScopeFrame>;
   // The last frame in colour; null before the first.
   framePreview(): Promise<Uint8Array | null>;
+  // The open site's telescope columns and their fit; null when it has none.
+  columns(): Promise<Columns | null>;
+  // Include or exclude a column, or set its tags; the engine refits near the last fit.
+  editColumn(az: number, change: { included?: boolean; tags?: ColumnTag[] }): Promise<Columns>;
+  // The full fit over every included column: minutes.
+  fitColumns(): Promise<Columns>;
+  columnFrame(az: number, name: string): Promise<Uint8Array | null>;
 }
 
 declare global {

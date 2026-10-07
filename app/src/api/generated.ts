@@ -19,6 +19,7 @@ export interface Api {
   scope_status?: ScopeStatus;
   scopes?: ScopeList;
   scope_frame?: ScopeFrame;
+  columns?: Columns;
 }
 export interface Health {
   ok: true;
@@ -258,4 +259,47 @@ export interface ScopeFrame {
    * fraction of pixels at the top of the range
    */
   saturated: number;
+}
+export interface Columns {
+  note: string;
+  columns: TelescopeColumn[];
+  fit: ColumnFit | null;
+}
+export interface TelescopeColumn {
+  az: number;
+  alt: number;
+  uncertainty: number;
+  method: "focused" | "coarse" | "frame" | "clicked";
+  included: boolean;
+  note: string;
+  tags: ("false edge" | "pocket" | "near object")[];
+  /**
+   * photo minus measured, deg, from the last fit; null when not fitted
+   */
+  residual: number | null;
+  frames: ColumnFrame[];
+}
+export interface ColumnFrame {
+  alt: number;
+  /**
+   * fraction of the frame that is sky, as judged when taken
+   */
+  sky: number;
+  name: string;
+}
+export interface ColumnFit {
+  solution: {
+    yaw: number;
+    pitch: number;
+    tilt_mag: number;
+    tilt_dir: number;
+  };
+  yaw_pm: number | null;
+  summary: {
+    n: number;
+    rms: number;
+    median: number | null;
+    max: number | null;
+    within_2: number;
+  };
 }

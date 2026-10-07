@@ -3,6 +3,7 @@ import { findByRole, findByText, getByRole, waitFor } from "@testing-library/dom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AppState,
+  Columns,
   Disc,
   Frame,
   Frames,
@@ -72,6 +73,44 @@ const linked = (over: Partial<ScopeStatus> = {}): ScopeStatus => ({
   ...over,
 });
 
+const cols = (over: Partial<Columns> = {}): Columns => ({
+  note: "native link: 0.3 deg JNow bias (terminus-85)",
+  columns: [
+    {
+      az: 40,
+      alt: 23.09,
+      uncertainty: 0.5,
+      method: "focused",
+      included: true,
+      note: "",
+      tags: [],
+      residual: -0.4,
+      frames: [
+        { alt: 23.25, sky: 1, name: "az040_alt23.25_sky100.jpg" },
+        { alt: 23.0, sky: 0.45, name: "az040_alt23.00_sky045.jpg" },
+        { alt: 22.75, sky: 0, name: "az040_alt22.75_sky000.jpg" },
+      ],
+    },
+    {
+      az: 270,
+      alt: 19.41,
+      uncertainty: 0.5,
+      method: "coarse",
+      included: false,
+      note: "dawn",
+      tags: ["false edge"],
+      residual: null,
+      frames: [],
+    },
+  ],
+  fit: {
+    solution: { yaw: 186.2, pitch: -1.5, tilt_mag: 7.1, tilt_dir: 300 },
+    yaw_pm: 4,
+    summary: { n: 9, rms: 0.62, median: 0.4, max: 1.3, within_2: 9 },
+  },
+  ...over,
+});
+
 function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
   let st = state();
   return {
@@ -103,6 +142,10 @@ function fakeApi(over: Partial<TerminusApi> = {}): TerminusApi {
     pointScope: vi.fn(async (az: number, alt: number) => linked({ az, alt })),
     takeFrame: vi.fn(async (ms: number) => ({ exposure_ms: ms, median: 19360, saturated: 0 })),
     framePreview: vi.fn(async () => new Uint8Array([0xff, 0xd8])),
+    columns: vi.fn(async () => null),
+    editColumn: vi.fn(async () => cols()),
+    fitColumns: vi.fn(async () => cols()),
+    columnFrame: vi.fn(async () => new Uint8Array([0xff, 0xd8])),
     ...over,
   };
 }
@@ -1170,5 +1213,77 @@ describe("connect", () => {
     (await findByRole(root, "button", { name: "Park and disconnect" })).click();
     await findByRole(root, "button", { name: "Find telescopes" });
     expect(api.disconnectScope).toHaveBeenCalledOnce();
+  });
+});
+
+describe("telescope columns", () => {
+  const openFit = async (api: TerminusApi) => {
+    await mount(root, api);
+    await openTab("Fit");
+  };
+  const withSite = (over: Partial<TerminusApi> = {}) => {
+    const api = fakeApi({ columns: vi.fn(async () => cols()), ...over });
+    api.getState = vi.fn(async () => state({ site }));
+    return api;
+  };
+
+  it("lists the columns, the solution and the summary", async () => {
+    await openFit(withSite());
+    await findByText(root, /yaw 186.20° ± 4°/);
+    const rows = [...root.querySelectorAll("table.columns tbody tr")].map((r) => r.textContent);
+    expect(rows[0]).toContain("23.09°");
+    expect(rows[0]).toContain("-0.40°");
+    expect(rows[1]).toContain("—"); // excluded: no residual
+    expect(root.querySelector("table.columns tfoot")!.textContent).toBe(
+      "9 fitted · rms 0.62° · median 0.40° · max 1.30° · 9 within 2°",
+    );
+    expect(root.textContent).toContain("0.3 deg JNow bias");
+  });
+
+  it("excluding a column refits in the engine", async () => {
+    const api = withSite();
+    await openFit(api);
+    const box = (await findByRole(root, "checkbox", {
+      name: "Use az 40 in the fit",
+    })) as HTMLInputElement;
+    box.click();
+    await waitFor(() => expect(api.editColumn).toHaveBeenCalledWith(40, { included: false }));
+  });
+
+  it("tags a column and untags it", async () => {
+    const api = withSite();
+    await openFit(api);
+    const row = (await findByText(root, "23.09°")).closest("tr")!;
+    getByRole(row as HTMLElement, "button", { name: "pocket" }).click();
+    await waitFor(() => expect(api.editColumn).toHaveBeenCalledWith(40, { tags: ["pocket"] }));
+    const other = (await findByText(root, "19.41°")).closest("tr")!;
+    getByRole(other as HTMLElement, "button", { name: "false edge" }).click();
+    await waitFor(() => expect(api.editColumn).toHaveBeenCalledWith(270, { tags: [] }));
+  });
+
+  it("shows a column's frames, marked where the edge was measured and predicted", async () => {
+    const api = withSite();
+    await openFit(api);
+    (await findByRole(root, "button", { name: "3 frames" })).click();
+    await findByText(root, /measured 23.09°, predicted 22.69°/);
+    await waitFor(() => expect(api.columnFrame).toHaveBeenCalledTimes(3));
+    const captions = [...root.querySelectorAll(".strip figcaption")].map((c) => c.textContent);
+    expect(captions).toEqual([
+      "23.25° · 100% sky",
+      "23.00° · 45% sky · measured",
+      "22.75° · 0% sky · predicted",
+    ]);
+  });
+
+  it("fits every column on request", async () => {
+    const api = withSite();
+    await openFit(api);
+    (await findByRole(root, "button", { name: "Fit all columns" })).click();
+    await waitFor(() => expect(api.fitColumns).toHaveBeenCalledOnce());
+  });
+
+  it("falls back to the oriented mask's record without columns", async () => {
+    await openFit(fakeApi());
+    await findByText(root, /No telescope fit for this site yet/);
   });
 });

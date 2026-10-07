@@ -1,5 +1,8 @@
 import type {
   AppState,
+  ColumnTag,
+  Columns,
+  TelescopeColumn,
   BuildFrame,
   Disc,
   FitColumn,
@@ -857,4 +860,152 @@ export function fitView(h: Horizon | null): HTMLElement {
     ),
   );
   return el("div", {}, ...parts);
+}
+
+export interface ColumnsProps {
+  cols: Columns;
+  selected: number | null; // az of the column whose frames are shown
+  frames: Map<string, string>; // "az/name" -> blob: URL
+  busy: string;
+  onSelect(az: number): void;
+  onInclude(az: number, on: boolean): void;
+  onTag(az: number, tag: ColumnTag, on: boolean): void;
+  onFitAll(): void;
+}
+
+const TAGS: ColumnTag[] = ["false edge", "pocket", "near object"];
+const signed = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}°`;
+
+// The telescope columns, editable: include or exclude, tag, and see each one's
+// frames. Every change refits in the engine; the numbers here are its answer.
+export function columnsView(p: ColumnsProps): HTMLElement {
+  const fit = p.cols.fit;
+  const all = el("button", { textContent: "Fit all columns", disabled: !!p.busy });
+  all.dataset.focus = "fit-all";
+  all.addEventListener("click", p.onFitAll);
+  const head = fit
+    ? el(
+        "p",
+        { className: "solution" },
+        `yaw ${fit.solution.yaw.toFixed(2)}°${fit.yaw_pm != null ? ` ± ${fit.yaw_pm.toFixed(0)}°` : " (not bounded)"}` +
+          ` · pitch ${fit.solution.pitch.toFixed(2)}° · tilt ${fit.solution.tilt_mag.toFixed(2)}° toward ${fit.solution.tilt_dir.toFixed(0)}°`,
+      )
+    : el("p", { textContent: "Not fitted yet." });
+  const rows = [...p.cols.columns].sort((a, b) => a.az - b.az).map((c) => columnRow(c, p));
+  const table = el(
+    "table",
+    { className: "fit columns" },
+    el(
+      "thead",
+      {},
+      el(
+        "tr",
+        {},
+        ...["az", "measured", "how", "residual", "in fit", "tags", ""].map((h) =>
+          el("th", { textContent: h }),
+        ),
+      ),
+    ),
+    el("tbody", {}, ...rows),
+  );
+  if (fit) {
+    const m = fit.summary;
+    const f = (n: number | null | undefined) => (n == null ? "—" : `${n.toFixed(2)}°`);
+    table.append(
+      el(
+        "tfoot",
+        {},
+        el(
+          "tr",
+          {},
+          el("td", {
+            colSpan: 7,
+            textContent: `${m.n} fitted · rms ${f(m.rms)} · median ${f(m.median)} · max ${f(m.max)} · ${m.within_2} within 2°`,
+          }),
+        ),
+      ),
+    );
+  }
+  const parts: Node[] = [el("div", { className: "row" }, head, all), table];
+  if (p.busy) parts.push(el("p", { className: "busy", textContent: p.busy }));
+  const sel = p.cols.columns.find((c) => c.az === p.selected);
+  if (sel) parts.push(strip(sel, p.frames));
+  if (p.cols.note) parts.push(el("p", { className: "note", textContent: p.cols.note }));
+  return el("div", { className: "columns-view" }, ...parts);
+}
+
+function columnRow(c: TelescopeColumn, p: ColumnsProps): HTMLTableRowElement {
+  const inc = el("input", { type: "checkbox", checked: c.included, disabled: !!p.busy });
+  inc.setAttribute("aria-label", `Use az ${c.az} in the fit`);
+  inc.dataset.focus = `include:${c.az}`;
+  inc.addEventListener("change", () => p.onInclude(c.az, inc.checked));
+  const tags = el(
+    "span",
+    { className: "tags" },
+    ...TAGS.map((t) => {
+      const on = c.tags.includes(t);
+      const b = el("button", {
+        textContent: t,
+        className: on ? "tag on" : "tag",
+        disabled: !!p.busy,
+      });
+      b.setAttribute("aria-pressed", String(on));
+      b.addEventListener("click", () => p.onTag(c.az, t, !on));
+      return b;
+    }),
+  );
+  const look = el("button", {
+    textContent: c.frames.length ? `${c.frames.length} frames` : "no frames",
+    disabled: !c.frames.length,
+  });
+  look.addEventListener("click", () => p.onSelect(c.az));
+  const tr = el(
+    "tr",
+    {
+      className: [c.included ? "" : "unused", c.az === p.selected ? "selected" : ""]
+        .join(" ")
+        .trim(),
+    },
+    el("td", { textContent: c.az.toFixed(0) }),
+    el("td", { textContent: `${c.alt.toFixed(2)}°` }),
+    el("td", { textContent: c.method }),
+    el("td", { textContent: c.residual == null ? "—" : signed(c.residual) }),
+    el("td", {}, inc),
+    el("td", {}, tags),
+    el("td", {}, look),
+  );
+  return tr;
+}
+
+// A column's frames from the top down, each marked where the measured edge and
+// the fit's prediction fall.
+function strip(c: TelescopeColumn, frames: Map<string, string>): HTMLElement {
+  const sorted = [...c.frames].sort((a, b) => b.alt - a.alt);
+  const step = sorted.length > 1 ? Math.abs(sorted[0].alt - sorted[1].alt) : 0.25;
+  const predicted = c.residual == null ? null : c.alt + c.residual;
+  const near = (alt: number, x: number | null) => x != null && Math.abs(alt - x) <= step / 2;
+  const tiles = sorted.map((f) => {
+    const url = frames.get(`${c.az}/${f.name}`);
+    const marks = [near(f.alt, c.alt) ? "measured" : "", near(f.alt, predicted) ? "predicted" : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return el(
+      "figure",
+      { className: marks ? "frame marked" : "frame" },
+      url
+        ? el("img", { src: url, alt: `az ${c.az} alt ${f.alt}` })
+        : el("div", { className: "loading" }),
+      el("figcaption", {
+        textContent: `${f.alt.toFixed(2)}° · ${Math.round(f.sky * 100)}% sky${marks ? ` · ${marks}` : ""}`,
+      }),
+    );
+  });
+  return el(
+    "section",
+    { className: "strip" },
+    el("h2", {
+      textContent: `az ${c.az.toFixed(0)}: measured ${c.alt.toFixed(2)}°${predicted == null ? "" : `, predicted ${predicted.toFixed(2)}°`}`,
+    }),
+    el("div", { className: "tiles" }, ...tiles),
+  );
 }

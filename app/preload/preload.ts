@@ -31,5 +31,9 @@ const api: TerminusApi = {
   pointScope: (az, alt) => ipcRenderer.invoke("scope:point", az, alt),
   takeFrame: (exposureMs) => ipcRenderer.invoke("scope:frame", exposureMs),
   framePreview: () => ipcRenderer.invoke("scope:frame-preview"),
+  columns: () => ipcRenderer.invoke("site:columns"),
+  editColumn: (az, change) => ipcRenderer.invoke("site:column-edit", az, change),
+  fitColumns: () => ipcRenderer.invoke("site:columns-fit"),
+  columnFrame: (az, name) => ipcRenderer.invoke("site:column-frame", az, name),
 };
 contextBridge.exposeInMainWorld("terminus", api);

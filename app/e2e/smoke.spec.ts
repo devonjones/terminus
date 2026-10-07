@@ -28,6 +28,8 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
   ).toEqual({
     api: [
       "buildImage",
+      "columnFrame",
+      "columns",
       "connectScope",
       "createSite",
       "curate",
@@ -35,6 +37,8 @@ test("shows the sidecar's state, changes tab, and parks the sidecar on quit", as
       "disc",
       "disconnectScope",
       "discoverScopes",
+      "editColumn",
+      "fitColumns",
       "frameImage",
       "framePreview",
       "frames",

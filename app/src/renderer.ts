@@ -1,5 +1,7 @@
 import type {
   AppState,
+  ColumnTag,
+  Columns,
   Disc,
   Frames,
   Horizon,
@@ -13,6 +15,7 @@ import { decode, pick, type Footprint } from "./frames";
 import {
   buildTitle,
   buildView,
+  columnsView,
   connectView,
   el,
   fitView,
@@ -58,6 +61,11 @@ interface View {
   scopeBusy: string;
   frame: ScopeFrame | null;
   preview: string | null; // blob: URL
+  // The site's telescope columns (Fit tab), the one being looked at, its frames.
+  cols: Columns | null;
+  selCol: number | null;
+  colFrames: Map<string, string>;
+  colBusy: string;
 }
 
 const SCOPE_POLL_MS = 3000;
@@ -95,6 +103,10 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     scopeBusy: "",
     frame: null,
     preview: null,
+    cols: null,
+    selCol: null,
+    colFrames: new Map(),
+    colBusy: "",
   };
   let polling = false;
   let generation = 0;
@@ -152,6 +164,38 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     v.pending = new Set(v.frames?.frames.filter((f) => f.off).map((f) => f.name));
     render();
     if (v.frames) await loadPhotos(mine, v.frames);
+    const cols = v.st.site ? await api.columns() : null;
+    if (mine !== generation) return;
+    for (const url of v.colFrames.values()) revoke(url);
+    [v.cols, v.selCol, v.colFrames] = [cols, null, new Map()];
+    render();
+  }
+
+  // Each edit refits in the engine; the table shows its answer, never a guess.
+  async function columnsAct(doing: string, act: () => Promise<Columns>) {
+    v.colBusy = doing;
+    render();
+    try {
+      v.cols = await act();
+      v.error = "";
+    } catch (e) {
+      v.error = (e as Error).message;
+    }
+    v.colBusy = "";
+    render();
+  }
+
+  async function showColumn(az: number) {
+    v.selCol = az;
+    render();
+    const col = v.cols?.columns.find((c) => c.az === az);
+    for (const f of col?.frames ?? []) {
+      const key = `${az}/${f.name}`;
+      if (v.colFrames.has(key)) continue;
+      const url = toUrl(await api.columnFrame(az, f.name));
+      if (url) v.colFrames.set(key, url);
+      if (v.selCol === az) render();
+    }
   }
 
   // The strip's thumbnails and the hover footprints: one small picture per photo,
@@ -469,6 +513,27 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
         v.st.site?.panorama ? () => curate([], false) : null,
       );
     if (tab === "connect") return connectView(scopeProps());
+    if (tab === "fit" && v.cols)
+      return columnsView({
+        cols: v.cols,
+        selected: v.selCol,
+        frames: v.colFrames,
+        busy: v.colBusy,
+        onSelect: (az) => void showColumn(az),
+        onInclude: (az, on) =>
+          void columnsAct(`Refitting ${on ? "with" : "without"} az ${az}…`, () =>
+            api.editColumn(az, { included: on }),
+          ),
+        onTag: (az, tag: ColumnTag, on) => {
+          const now = v.cols?.columns.find((c) => c.az === az)?.tags ?? [];
+          const tags = on ? [...now, tag] : now.filter((t) => t !== tag);
+          void columnsAct(`Tagging az ${az}…`, () => api.editColumn(az, { tags }));
+        },
+        onFitAll: () =>
+          void columnsAct("Fitting every included column (this takes minutes)…", () =>
+            api.fitColumns(),
+          ),
+      });
     if (tab === "fit") return fitView(v.horizon);
     if (tab === "horizon") {
       if (!v.st.site) return el("p", { textContent: "Choose or create a site first." });

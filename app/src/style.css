@@ -435,6 +435,44 @@ dl.scope dt {
 dl.scope dd {
   margin: 0;
 }
+table.columns tr.selected td {
+  background: #8882;
+}
+table.columns .tag {
+  font-size: 0.8em;
+  padding: 0.1rem 0.4rem;
+  margin-right: 0.2rem;
+  opacity: 0.55;
+}
+table.columns .tag.on {
+  opacity: 1;
+  font-weight: 600;
+}
+.strip .tiles {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+}
+.strip figure {
+  margin: 0;
+  flex: none;
+}
+.strip img,
+.strip .loading {
+  display: block;
+  height: 200px;
+  aspect-ratio: 9 / 16;
+  object-fit: cover;
+  background: #8883;
+}
+.strip figure.marked img {
+  outline: 3px solid var(--warn-text);
+}
+.strip figcaption {
+  font-size: 0.8em;
+  white-space: nowrap;
+}
 table.sites {
   border-collapse: collapse;
   width: 100%;
