@@ -1329,6 +1329,29 @@ describe("telescope columns", () => {
     await waitFor(() => expect(api.fitColumns).toHaveBeenCalledOnce());
   });
 
+  it("shows the columns even when a photo will not load", async () => {
+    const api = withSite({
+      frames: vi.fn(async (): Promise<Frames> => ({
+        width: 72,
+        height: 36,
+        frames: [
+          {
+            name: "a.jpg",
+            layer: "layer0000.tif",
+            box: [0, 0, 36, 36],
+            off: false,
+            dropped: false,
+          },
+        ],
+      })),
+      frameImage: vi.fn(async () => {
+        throw new Error("engine /site/frame/thumb.jpg: 422 this site's files could not be read");
+      }),
+    });
+    await openFit(api);
+    await findByText(root, /yaw 186.20°/);
+  });
+
   it("falls back to the oriented mask's record without columns", async () => {
     await openFit(fakeApi());
     await findByText(root, /No telescope fit for this site yet/);

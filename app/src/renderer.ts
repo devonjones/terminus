@@ -142,8 +142,9 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
             api.frames(),
             api.image("disagree"),
             api.image("outline"),
+            api.columns(),
           ])
-        : ([null, null, null, null, null, null, null] as const);
+        : ([null, null, null, null, null, null, null, null] as const);
     } catch (e) {
       if (mine !== generation) return; // a newer load owns the screen
       // Never leave the previous site's views up under the new site's name.
@@ -159,7 +160,11 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     revoke(v.photo);
     revoke(v.outline);
     revokeFrames();
-    const [horizon, disc, pano, photo, frames, disagree, outline] = views;
+    const [horizon, disc, pano, photo, frames, disagree, outline, cols] = views;
+    // The columns do not wait for the photos: a photo that will not load must not
+    // take the Fit tab with it.
+    for (const url of v.colFrames.values()) revoke(url);
+    [v.cols, v.selCol, v.colFrames] = [cols, null, new Map()];
     [v.horizon, v.disc, v.frames] = [horizon, disc, frames];
     [v.pano, v.photo] = [toUrl(pano), toUrl(photo)];
     v.disagree = toUrl(disagree, "image/png");
@@ -167,11 +172,6 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
     v.pending = new Set(v.frames?.frames.filter((f) => f.off).map((f) => f.name));
     render();
     if (v.frames) await loadPhotos(mine, v.frames);
-    const cols = v.st.site ? await api.columns() : null;
-    if (mine !== generation) return;
-    for (const url of v.colFrames.values()) revoke(url);
-    [v.cols, v.selCol, v.colFrames] = [cols, null, new Map()];
-    render();
   }
 
   // Each edit refits in the engine; the table shows its answer, never a guess.
@@ -623,7 +623,7 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
   });
 
   if (v.st.tab === "connect") await readScope().catch(fail);
-  await loadSite();
+  await loadSite().catch(fail); // a site that will not fully load still shows what it can
   poll();
   pollScope();
 }
