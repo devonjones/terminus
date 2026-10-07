@@ -1,9 +1,10 @@
 # terminus desktop app
 
 An Electron window over the Python engine, plus a dev mode an agent can drive.
-Stage 1 (terminus-71.1): drop in the photographs of a site, and the app stitches
-them, reads the horizon, and shows the panorama and the polar disc, with a
-rough spin for a site the telescope has not oriented yet.
+Drop in the photographs of a site, and the app stitches them while you watch,
+lets you turn photos off and re-blend, reads the horizon (actual and planning),
+and shows the panorama and the polar disc, with a rough spin for a site the
+telescope has not oriented yet.
 
 ## Layout
 
@@ -44,11 +45,38 @@ Every payload is defined once, in `src/terminus/server/schema.json`.
 
 A site is a folder the app owns, under `<userData>/sites/<slug>/`. A new site
 copies the dropped (or chosen) photos into `photos/`. Then the sidecar starts a
-child process of its own executable (`--pipeline <site>`), which runs
-`terminus mosaic` and `terminus skymask`. These are the same code and the same
-files as the CLI (`equirect.png`, `equirect.coverage.npy`, `photo_mask.yaml`),
-but no `terminus` command or Python install is needed. A site that
-`terminus orient` has written an `oriented.yaml` into shows that mask instead.
+child process of its own executable (`--pipeline <site> --kind build`), which
+runs the CLI's own commands, so no `terminus` command or Python install is
+needed:
+
+1. `terminus mosaic --layers-only --events [--segment]`: Hugin registers the
+   photos and remaps each to its own layer in `work/`, one photo at a time.
+   With the `segment` extra installed it also labels each photo (SegFormer) and
+   warps the labels through the same solve.
+2. `terminus reblend --events`: the measurement blend (`equirect.png`), a
+   colour-matched, feathered blend for the eye (`equirect.display.jpg`), and the
+   per-photo sky vote: sky only where a strict majority of the covering photos
+   say so, ties to terrain. It writes the class maps the horizon is read from
+   (`equirect.terrain.classes.npy`, `.strict.classes.npy`, `.cover.npy`).
+   Without segmentation the vote is the colour heuristic, which reads white
+   siding as sky.
+3. `terminus skymask --sky`: the native photo mask (`photo_mask.yaml`), which
+   only the orientation fit reads.
+4. `terminus horizon`: the map (`horizon.yaml`), actual and planning horizons
+   from one reprojection of the class maps (`terminus.reproject`, the method of
+   the 2026-10-05 maps). The disc draws the actual horizon as the outline of
+   the contiguous sky (`polar.sky_layers`) and the planning line from the map.
+
+A site that `terminus orient` has written an `oriented.yaml` into shows that
+mask instead. Each photo's sky verdict is cached beside its layer and the gains in
+`work/cache.json`, so turning photos off and re-blending (`--kind reblend`) takes
+seconds; a set that includes a photo not in the cache re-solves the gains.
+
+The pipeline prints `@step` and `@event` lines, which the sidecar folds into
+the job state the page polls: each photo's progress, the photo being worked on
+(outlined in yellow), cpfind's matched pairs, and the horizon so far. The
+Panorama tab draws all of it as it happens. A site's display name lives in
+`site.json`; the folder keeps its slug.
 
 The build runs in a child, not in the sidecar, because the sidecar will hold the
 telescope: a hang or native crash while stitching must not take down the
@@ -73,12 +101,19 @@ resumes it yet (terminus-82).
 ## Develop
 
 ```sh
-uv sync --dev            # repo root: the sidecar's .venv
+uv sync --dev --extra segment   # repo root: the sidecar's .venv (segment: torch, CPU)
 cd app && npm ci
 npm run dev              # build and launch with --dev
 npm run lint && npm run typecheck && npm run format:check && npm test
 npm run e2e              # launches Electron; needs a display (CI uses xvfb-run)
 ```
+
+`win-dev.sh` installs only the base package on Windows. For segmentation there,
+add CPU torch by hand in `%LOCALAPPDATA%\terminus\src`:
+`.venv\Scripts\python -m pip install torch torchvision --index-url
+https://download.pytorch.org/whl/cpu` and then `... pip install transformers`.
+Whether a release ships torch and the (non-commercial) SegFormer weights is
+terminus-71.6.
 
 ## Dev mode
 

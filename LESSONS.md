@@ -134,6 +134,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `E-16` When two instruments write one record, merge field by field
 - `E-17` Validate operator input before the instrument moves, and pin it clock-independently
 - `E-18` Prose asserts causes the data cannot support, and reviewers catch it late
+- `E-19` On Windows, never park a thread in a blocking stdin read
 
 **Decisions**
 
@@ -1740,6 +1741,24 @@ collected", the harness read any non-zero exit as a kill, and a fix with zero co
 counted as proven. The claim "every fix mutation-checked" was made on that evidence. A harness
 must fail loudly when its selector matches nothing, or it converts absent tests into passing
 ones — the same absent-versus-refuted confusion this project already refuses in its data (E-06).
+
+### E-19 — On Windows, never park a thread in a blocking stdin read
+
+The app's build child watches its stdin so it can die with the sidecar. On Windows the watcher
+thread sat in `sys.stdin.read()`, and the main thread's first `import scipy.linalg` (loading
+OpenBLAS) then hung forever: py-spy showed exactly two threads, one in the read and one in the
+DLL load. The app showed a build stuck at "blending" with nothing moving. Proven by control, not
+inferred: the same child with the blocking reader was still stuck at the test's 30 s limit every time; with a reader that only
+polls the pipe (`PeekNamedPipe`), scipy imported in 1.7 s and the child still exited within a
+second of stdin closing. The stage-1 sidecar deadlock (OpenBLAS loading in a worker thread) was
+the same family.
+
+So on Windows, a thread that waits on a pipe must poll it, never block in ReadFile, whenever
+another thread may load native code. The same day it struck twice: first the build child, then
+the sidecar itself, whose own stdin watcher wedged a request thread drawing the horizon outline
+(the first scipy use in that process) and, behind it, every other request. Fix every watcher, not
+the one that hung. Any native import can be the first one to trip it, so
+"import scipy early" is not a fix, only a delay.
 
 ---
 

@@ -173,6 +173,28 @@ def load_mask(path):
     return meta, sorted((az, c["alt"], c.get("type", "")) for az, c in cols.items())
 
 
+def load_planning(path, tree_buffer=None):
+    """(meta, [(az, alt, type)]): what a planner should treat as blocked, final.
+
+    A map from `terminus horizon` carries two lines per column: `alt`, the
+    actual outline (for matching scope edges), and `planning`, raised wherever
+    terrain was seen to move and already buffered where only one frame saw a
+    tree. A column with `planning` exports that; a column without it gets the
+    tree buffer here (TREE_BUFFER_DEG unless given). Callers pass these rows on
+    with no buffer of their own.
+    """
+    tree_buffer = TREE_BUFFER_DEG if tree_buffer is None else tree_buffer
+    meta, cols = load_columns(path)
+    rows = []
+    for az, c in cols.items():
+        if "planning" in c:
+            alt = max(c["alt"], c["planning"])
+        else:
+            alt = apply_tree_buffer([(az, c["alt"], c.get("type", ""))], tree_buffer)[0][1]
+        rows.append((az, alt, c.get("type", "")))
+    return meta, sorted(rows)
+
+
 def parse_pockets(raw):
     """[(alt_hi, alt_lo), ...] from a mask's `pockets`, refusing a malformed one.
 
@@ -501,19 +523,17 @@ def require_oriented(meta, allow_unoriented=False):
 
 
 def export_all(mask_path, base_out, tree_buffer=TREE_BUFFER_DEG, allow_unoriented=False):
-    # Deliberately does NOT buffer here: the exporters do it themselves, so a
-    # caller reaching past this wrapper still gets the margin. Buffering in both
-    # places would apply it twice.
-    meta, rows = load_mask(mask_path)
+    # load_planning applies the buffer; the exporters below must add none.
+    meta, rows = load_planning(mask_path, tree_buffer)
     require_oriented(meta, allow_unoriented)
     hrz, txt = base_out + ".hrz", base_out + ".stellarium.txt"
     with open(hrz, "w") as f:
         # Forward the override: to_nina_hrz checks again for the benefit of
         # direct callers, and without this an explicit allow_unoriented would be
         # granted here and then refused one line later.
-        f.write(to_nina_hrz(rows, meta, tree_buffer, allow_unoriented=True))
+        f.write(to_nina_hrz(rows, meta, 0.0, allow_unoriented=True))
     with open(txt, "w") as f:
-        f.write(to_stellarium_txt(rows, meta, tree_buffer, allow_unoriented=True))
+        f.write(to_stellarium_txt(rows, meta, 0.0, allow_unoriented=True))
     return hrz, txt
 
 

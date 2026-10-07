@@ -28,9 +28,9 @@ class Horizon:
 
     @classmethod
     def from_mask(cls, path):
-        from .export import load_mask
+        from .export import load_planning
 
-        meta, rows = load_mask(path)
+        meta, rows = load_planning(path, tree_buffer=0.0)  # the planning line, as measured
         return cls([(az, alt) for az, alt, _ in rows], meta)
 
     def altitude_at(self, az):

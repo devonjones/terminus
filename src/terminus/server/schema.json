@@ -18,6 +18,9 @@
     },
     "disc": {
       "$ref": "#/$defs/Disc"
+    },
+    "frames": {
+      "$ref": "#/$defs/Frames"
     }
   },
   "additionalProperties": false,
@@ -131,13 +134,23 @@
         },
         "mask": {
           "type": "boolean"
+        },
+        "name": {
+          "type": "string",
+          "description": "the user's name for the site (the slug until renamed)"
+        },
+        "updated": {
+          "type": "string",
+          "description": "when anything in the site last changed (local time, ISO 8601, minutes)"
         }
       },
       "required": [
         "slug",
         "photos",
         "panorama",
-        "mask"
+        "mask",
+        "name",
+        "updated"
       ],
       "additionalProperties": false
     },
@@ -165,7 +178,9 @@
         "step": {
           "enum": [
             "mosaic",
+            "reblend",
             "skymask",
+            "horizon",
             null
           ]
         },
@@ -187,6 +202,69 @@
             "string",
             "null"
           ]
+        },
+        "phase": {
+          "enum": [
+            "matching",
+            "solving",
+            "placing",
+            "segmenting",
+            "blending",
+            "judging",
+            null
+          ],
+          "description": "what the current step is doing"
+        },
+        "canvas": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "[width, height] of the panorama being built"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frames": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BuildFrame"
+          }
+        },
+        "active": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "the photos being worked on right now"
+        },
+        "pairs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Pair"
+          },
+          "description": "photo pairs found to share matches, as cpfind reports them"
+        },
+        "compared": {
+          "type": "integer",
+          "description": "photo pairs compared so far"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "what the phase is doing right now, in words (e.g. cpfind's own stages)"
+        },
+        "outline": {
+          "type": "integer",
+          "description": "times the horizon so far has been redrawn (fetch /site/progress.png when it changes)"
         }
       },
       "required": [
@@ -194,7 +272,15 @@
         "step",
         "status",
         "log",
-        "error"
+        "error",
+        "phase",
+        "canvas",
+        "frames",
+        "active",
+        "pairs",
+        "compared",
+        "detail",
+        "outline"
       ],
       "additionalProperties": false
     },
@@ -338,7 +424,7 @@
             "string",
             "null"
           ],
-          "description": "the detector that read the horizon (e.g. \"heuristic\": no segmentation model ran)"
+          "description": "the vote that read the horizon, e.g. \"segment (per-frame vote)\"; a value starting \"heuristic\" means the frames were judged by colour"
         }
       },
       "required": [
@@ -411,27 +497,10 @@
             "additionalProperties": false
           }
         },
-        "actual": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/XY"
-          }
-        },
         "planning": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/XY"
-          }
-        },
-        "pockets": {
-          "type": "array",
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/XY"
-            },
-            "minItems": 2,
-            "maxItems": 2
           }
         },
         "fiducials": {
@@ -468,10 +537,151 @@
         "centre",
         "rings",
         "cardinals",
-        "actual",
         "planning",
-        "pockets",
         "fiducials"
+      ],
+      "additionalProperties": false
+    },
+    "Frame": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "layer": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "its remapped layer in work/; null when the last stitch left it out"
+        },
+        "box": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 4,
+              "maxItems": 4,
+              "description": "[x, y, width, height] on the panorama, in its pixels"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "off": {
+          "type": "boolean",
+          "description": "turned off by the user"
+        },
+        "dropped": {
+          "type": "boolean",
+          "description": "left out by the stitch: too few control points"
+        }
+      },
+      "required": [
+        "name",
+        "layer",
+        "box",
+        "off",
+        "dropped"
+      ],
+      "additionalProperties": false
+    },
+    "Frames": {
+      "type": "object",
+      "description": "The photos of a curatable site.",
+      "properties": {
+        "width": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "frames": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Frame"
+          }
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "frames"
+      ],
+      "additionalProperties": false
+    },
+    "BuildFrame": {
+      "type": "object",
+      "description": "One photo's progress through a build.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "listed",
+            "matched",
+            "dropped",
+            "placed",
+            "off",
+            "judged"
+          ]
+        },
+        "points": {
+          "type": "integer",
+          "description": "control points tying it to the others"
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "the photos it shares control points with"
+        },
+        "reason": {
+          "type": "string",
+          "description": "why the stitch dropped it"
+        },
+        "layer": {
+          "type": "string",
+          "description": "its remapped layer in work/"
+        },
+        "box": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 4,
+          "maxItems": 4,
+          "description": "[x, y, width, height] on the panorama"
+        }
+      },
+      "required": [
+        "name",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    "Pair": {
+      "type": "object",
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "matches": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "a",
+        "b",
+        "matches"
       ],
       "additionalProperties": false
     }

@@ -37,6 +37,7 @@ import numpy as np
 
 TOOLS = ("pto_gen", "cpfind", "cpclean", "autooptimiser", "nona", "pano_modify")
 MIN_CONTROL_POINTS = 12  # below this a frame's orientation is not determined
+PHOTO_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")  # what the app accepts, any case
 
 
 class MosaicError(RuntimeError):
@@ -74,16 +75,74 @@ def require_hugin():
         )
 
 
-def _run(cmd, cwd=None):
+def _run(cmd, cwd=None, on_line=None):
+    """Run a Hugin tool. `on_line`, if given, sees each line of its output as it
+    is printed (stderr folded in), so a watcher can follow a long cpfind."""
     tool = _tool(cmd[0])
     if tool is None and HUGIN_BIN is not None:
         # Never fall back to PATH: the app must run the Hugin it ships.
         raise MosaicError(f"{cmd[0]} is missing from {HUGIN_BIN}")
     cmd = [tool or cmd[0], *cmd[1:]]
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    try:
+        if on_line is None:
+            p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+            if p.returncode != 0:
+                raise MosaicError(f"{cmd[0]} failed: {p.stderr.strip()[:400]}")
+            return p.stdout
+        p = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+    except OSError as e:  # not there, not executable, not permitted
+        raise MosaicError(f"{cmd[0]} could not run: {e.strerror or e}") from e
+    lines = []
+    with p:
+        for line in p.stdout:
+            lines.append(line)
+            on_line(line.rstrip())
     if p.returncode != 0:
-        raise MosaicError(f"{cmd[0]} failed: {p.stderr.strip()[:400]}")
-    return p.stdout
+        raise MosaicError(f"{cmd[0]} failed: {''.join(lines[-10:]).strip()[:400]}")
+    return "".join(lines)
+
+
+ANALYZING = re.compile(r"^i(\d+) : Analyzing image")
+CACHED = re.compile(r"^i(\d+) : Caching keypoints")
+PAIR = re.compile(r"^i(\d+) <> i(\d+) : Found (\d+) matches")
+# cpfind's own stages, as it announces them ("--- Analyze Images ---"), in words.
+CPFIND_STAGES = {
+    "Analyze Images": "finding features in each photo",
+    "Cache keyfiles to disc": "saving each photo's features",
+    "Find matches": "comparing neighbouring photos",
+    "Find matches in images groups": "comparing photos across rows",
+    "Find pair-wise matches": "comparing the remaining pairs",
+    "Write Project output": "writing the matches",
+}
+STAGE = re.compile(r"^--- (.+?) ---$")
+
+
+def _follow_cpfind(names):
+    """cpfind's progress as events: which photos it is analysing, then each pair
+    it compares and how many matches it found (only reported once compared)."""
+    busy = set()
+
+    def on_line(line):
+        if (m := STAGE.match(line)) and m.group(1) in CPFIND_STAGES:
+            _emit(detail=CPFIND_STAGES[m.group(1)])
+        elif m := ANALYZING.match(line):
+            busy.add(names[int(m.group(1))])
+            _emit(working=sorted(busy))
+        elif m := CACHED.match(line):
+            busy.discard(names[int(m.group(1))])
+            _emit(working=sorted(busy))
+        elif m := PAIR.match(line):
+            a, b = names[int(m.group(1))], names[int(m.group(2))]
+            _emit(pair=[a, b], matches=int(m.group(3)), working=[a, b])
+
+    return on_line
 
 
 def _set_lens(pto, entries):
@@ -104,17 +163,44 @@ def _set_lens(pto, entries):
         fh.writelines(out)
 
 
-def control_point_counts(pto):
-    counts = {}
-    names = []
+# Progress for a watcher (the app): called with one dict per event when set.
+EVENTS = None
+
+
+def _emit(**event):
+    if EVENTS:
+        EVENTS(event)
+
+
+def _control_points(pto):
+    names, pairs = [], []
     for line in open(pto):
         if line.startswith("i "):
             names.append(os.path.basename(re.search(r'n"([^"]+)"', line).group(1)))
         elif line.startswith("c "):
             m = re.match(r"c n(\d+) N(\d+)", line)
-            for i in (int(m.group(1)), int(m.group(2))):
-                counts[i] = counts.get(i, 0) + 1
+            pairs.append((int(m.group(1)), int(m.group(2))))
+    return names, pairs
+
+
+def control_point_counts(pto):
+    names, pairs = _control_points(pto)
+    counts = {}
+    for pair in pairs:
+        for i in pair:
+            counts[i] = counts.get(i, 0) + 1
     return {names[i]: counts.get(i, 0) for i in range(len(names))}
+
+
+def control_point_links(pto):
+    """Each image's neighbours: the images it shares control points with."""
+    names, pairs = _control_points(pto)
+    links = {n: set() for n in names}
+    for a, b in pairs:
+        if a != b:
+            links[names[a]].add(names[b])
+            links[names[b]].add(names[a])
+    return {n: sorted(v) for n, v in links.items()}
 
 
 def solve(
@@ -124,38 +210,53 @@ def solve(
     min_points=MIN_CONTROL_POINTS,
     celeste=True,
     log=print,
+    exclude=(),
 ):
     """Register every image in image_dir. Returns (pto_path, dropped_names).
+
+    `exclude` names images the user turned off: they are left out of the solve
+    entirely, so they cannot pull the others' registration.
 
     Iterates: find control points, clean, drop under-constrained frames, repeat.
     Dropping is always logged — a silently discarded frame is silently missing sky.
     """
     require_hugin()
     os.makedirs(work_dir, exist_ok=True)
-    images = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
+    images = sorted(
+        os.path.join(image_dir, n)
+        for n in os.listdir(image_dir)
+        if n.lower().endswith(PHOTO_EXTS) and n not in exclude
+    )
     if len(images) < 2:
         raise MosaicError(f"need at least 2 images, found {len(images)}")
     dropped = []
     keep = [os.path.basename(p) for p in images]
+    for n in keep:
+        _emit(name=n, state="listed")
+    _emit(phase="matching")
+    stage = _stage(image_dir, work_dir, keep)
     for _attempt in range(6):
-        stage = os.path.join(work_dir, "stage")
-        shutil.rmtree(stage, ignore_errors=True)
-        os.makedirs(stage)
-        for n in keep:
-            shutil.copy2(os.path.join(image_dir, n), os.path.join(stage, n))
         pto = os.path.join(stage, "project.pto")
         _run(["pto_gen", "-o", pto] + [os.path.join(stage, n) for n in keep])
         if lens:
             _set_lens(pto, lens)
         cp = os.path.join(stage, "cp.pto")
-        cmd = ["cpfind", "--multirow"]
+        cmd = ["cpfind", "--multirow", "--cache"]
         if celeste:
             cmd.append("--celeste")  # masks cloud before feature detection
-        _run(cmd + ["-o", cp, pto])
+        _run(cmd + ["-o", cp, pto], on_line=_follow_cpfind(keep))
         clean = os.path.join(stage, "clean.pto")
+        _emit(detail="throwing out matches that disagree", working=[])
         _run(["cpclean", "-o", clean, cp])
         counts = control_point_counts(clean)
+        links = control_point_links(clean)
         weak = [n for n, c in counts.items() if c < min_points]
+        for n, c in counts.items():
+            if n in weak:
+                _emit(name=n, state="dropped", points=c, links=links[n],
+                      reason=f"{c} control points (needs {min_points})")  # fmt: skip
+            else:
+                _emit(name=n, state="matched", points=c, links=links[n])
         if not weak:
             log(f"all {len(keep)} frames constrained (min {min(counts.values())} points)")
             break
@@ -163,24 +264,61 @@ def solve(
             log(f"dropping {n}: {counts[n]} control points (< {min_points})")
         dropped += weak
         keep = [n for n in keep if n not in weak]
+        _emit(detail=f"matching again without the {len(weak)} that would not match")
         if len(keep) < 3:
             raise MosaicError("too few constrained frames remain")
     else:
         raise MosaicError("frame rejection did not converge")
     solved = os.path.join(work_dir, "solved.pto")
+    _emit(phase="solving")
     _run(["autooptimiser", "-a", "-l", "-s", "-o", solved, clean])
     return solved, dropped
 
 
-def _nona_render(pto, work_dir, prefix):
+def _stage(image_dir, work_dir, names):
+    """Copy the photos into work/stage, which is kept between runs: cpfind caches
+    each photo's keypoints beside it (`--cache`), so a re-stitch does not find
+    them all over again. A photo that differs from its staged copy (size or
+    mtime) is copied afresh and its stale keypoints dropped."""
+    stage = os.path.join(work_dir, "stage")
+    os.makedirs(stage, exist_ok=True)
+    for n in names:
+        src, dst = os.path.join(image_dir, n), os.path.join(stage, n)
+        s = os.stat(src)
+        if os.path.isfile(dst):
+            d = os.stat(dst)
+            if (d.st_size, d.st_mtime_ns) == (s.st_size, s.st_mtime_ns):
+                continue  # the same photo: its cached keypoints still hold
+        shutil.copy2(src, dst)  # copy2 keeps the mtime the check above compares
+        key = os.path.splitext(dst)[0] + ".key"
+        if os.path.isfile(key):
+            os.remove(key)  # a different photo under the same name
+    return stage
+
+
+def _nona_render(pto, work_dir, prefix, one_by_one=False):
     # Clear the prefix's stale layers, remap, return the fresh set - the shared
     # tail of both renders. The stale-file sweep matters: a frame count that
     # shrank between runs would otherwise leave orphan layers that composite
     # happily averages in.
+    #
+    # `one_by_one` remaps one image per nona run, so a watcher sees each frame
+    # land as it is placed.
     out = os.path.join(work_dir, prefix)
     for old in glob.glob(out + "*.tif"):
         os.remove(old)
-    _run(["nona", "-m", "TIFF_m", "-o", out, pto])
+    if not one_by_one:
+        _run(["nona", "-m", "TIFF_m", "-o", out, pto])
+        return sorted(glob.glob(out + "*.tif"))
+    _emit(phase="placing", canvas=list(canvas_size(pto)))
+    for i, name in enumerate(source_images(pto)):
+        _emit(working=[os.path.basename(name)])
+        _run(["nona", "-m", "TIFF_m", "-o", out, "-i", str(i), pto])
+        path = f"{out}{i:04d}.tif"
+        if os.path.isfile(path):  # nona writes nothing for a frame off the canvas
+            box, _mask = footprint(path)
+            _emit(name=os.path.basename(name), state="placed",
+                  layer=os.path.basename(path), box=list(box))  # fmt: skip
     return sorted(glob.glob(out + "*.tif"))
 
 
@@ -208,7 +346,7 @@ def render(pto, work_dir, width=2880, height=1440, prefix="layer"):
             pto,
         ]
     )
-    return _nona_render(final, work_dir, prefix), final
+    return _nona_render(final, work_dir, prefix, one_by_one=True), final
 
 
 def render_photometric(final_pto, work_dir, prefix="figure"):
@@ -354,6 +492,15 @@ def remap_labels(pto, work_dir, label_for, prefix="label"):
     return sorted(written)
 
 
+def _placed(m, ox, oy, width, height):
+    """A layer's covered pixels, clipped to the canvas: (ys, xs) in the layer and
+    (Y, X) on the canvas, in the same order as `layer[m]`."""
+    ys, xs = np.nonzero(m)
+    Y, X = ys + oy, xs + ox
+    ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
+    return ys[ok], xs[ok], Y[ok], X[ok]
+
+
 def combine_labels(layer_paths, width, height):
     """Majority vote per pixel across the remapped label layers.
 
@@ -369,11 +516,8 @@ def combine_labels(layer_paths, width, height):
     for path in layer_paths:
         rgb, mask, ox, oy = _layer(path)
         lab = rgb[..., 0].astype(int)  # class id stored in every channel
-        h, w = lab.shape
-        ys, xs = np.mgrid[0:h, 0:w]
-        Y, X = ys[mask] + oy, xs[mask] + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
-        Y, X, L = Y[ok], X[ok], lab[mask][ok]
+        ys, xs, Y, X = _placed(mask, ox, oy, width, height)
+        L = lab[ys, xs]
         covered[Y, X] = True
         for cls in np.unique(L):
             box = votes.setdefault(int(cls), np.zeros((height, width), np.int32))
@@ -385,6 +529,51 @@ def combine_labels(layer_paths, width, height):
     stack = np.stack([votes[c] for c in labels], axis=0)
     out = np.asarray(labels, dtype=int)[np.argmax(stack, axis=0)]
     return np.where(covered, out, -1)
+
+
+def combine_terrain_biased(label_paths, width, height, on_start=None, on_frame=None, on_vote=None):
+    """The terrain-biased vote over warped per-frame LABEL layers: a pixel is sky
+    only if a strict majority of the frames covering it say sky; otherwise it is
+    terrain, labelled with its most-voted non-sky class (so a tree stays a tree).
+
+    `combine_labels` takes a plain argmax whose ties go to the lowest class id,
+    and sky (2) is lower than most terrain classes, so a two-frame disagreement
+    resolves to SKY: the unsafe direction. Returns (classes, sky_votes, cover).
+
+    The hooks match `vote_sky`'s: `on_start(path)` before a frame,
+    `on_frame(path, sky)` with its own verdict (the layer's shape), and
+    `on_vote(sky_votes, cover)` with the vote so far after it.
+    """
+    from .skymask import SKY_CLASS_ADE20K as SKY
+
+    cover = np.zeros((height, width), np.int32)
+    skyv = np.zeros((height, width), np.int32)
+    votes = {}  # non-sky class -> counts
+    for path in label_paths:
+        if on_start:
+            on_start(path)
+        rgb, mask, ox, oy = _layer(path)
+        lab = rgb[..., 0].astype(int)
+        if on_frame:
+            on_frame(path, (lab == SKY) & mask)
+        ys, xs, Y, X = _placed(mask, ox, oy, width, height)
+        L = lab[ys, xs]
+        np.add.at(cover, (Y, X), 1)
+        s = L == SKY
+        np.add.at(skyv, (Y[s], X[s]), 1)
+        for cls in np.unique(L[~s]):
+            sel = L == cls
+            box = votes.setdefault(int(cls), np.zeros((height, width), np.int32))
+            np.add.at(box, (Y[sel], X[sel]), 1)
+        if on_vote:
+            on_vote(skyv, cover)
+    out = np.full((height, width), -1, int)
+    if votes:
+        labels = sorted(votes)
+        best = np.asarray(labels)[np.argmax(np.stack([votes[c] for c in labels]), axis=0)]
+        out = np.where(cover > 0, best, -1)
+    out[(cover > 0) & (2 * skyv > cover)] = SKY  # strict majority of covering frames
+    return out, skyv, cover
 
 
 def _layer(path):
@@ -402,6 +591,93 @@ def _layer(path):
     return a[..., :3], a[..., 3] > 0, ox, oy
 
 
+def canvas_size(pto):
+    """The (width, height) a rendered project's layers are placed on."""
+    with open(pto) as fh:
+        for line in fh:
+            if line.startswith("p "):
+                w, h = re.search(r"\bw(\d+)", line), re.search(r"\bh(\d+)", line)
+                if w and h:
+                    return int(w.group(1)), int(h.group(1))
+    raise MosaicError(f"{pto} has no canvas size")
+
+
+def footprint(path):
+    """A layer's (x, y, width, height) box on the canvas, and its coverage mask."""
+    _rgb, mask, ox, oy = _layer(path)
+    return (ox, oy, mask.shape[1], mask.shape[0]), mask
+
+
+def vote_sky(
+    layer_paths,
+    width,
+    height,
+    classify,
+    on_frame=None,
+    margin=0,
+    known=None,
+    on_start=None,
+    counts=False,
+    on_vote=None,
+):
+    """Sky by majority of the frames, each classified on its own.
+
+    A pixel is sky only if a STRICT majority of the frames covering it say so:
+    a tie is terrain, because a horizon placed too high costs a planner a
+    target, and one placed too low sends the scope into a roof. Each frame is
+    judged whole, in its own exposure, rather than through a blend that mixes a
+    bright frame's sky into a dim frame's tree.
+
+    `classify(rgb, valid)` takes one frame (its columns, full height) and returns
+    its sky mask. Returns (sky, disagree), or with `counts` (sky, disagree, votes,
+    cover): `disagree` is the fraction of the covering frames outvoted at each
+    pixel, 0 where they agree or none covers.
+
+    Hooks: `on_start(path)` before a frame is classified; `on_frame(path, sky,
+    (x0, y0))` with its verdict cropped to its box and that box's corner;
+    `known(path)` may return such a crop made before, to skip classifying again;
+    `on_vote(votes, cover)` with the vote so far after each frame.
+
+    Each frame is classified on its own columns plus `margin` either side, at
+    full height: the columns beyond carry none of its pixels, so cropping them
+    away changes nothing as long as `margin` covers the classifier's reach.
+    """
+    votes = np.zeros((height, width), np.int32)
+    cover = np.zeros((height, width), np.int32)
+    for path in layer_paths:
+        rgb, m, ox, oy = _layer(path)
+        ys, xs, Y, X = _placed(m, ox, oy, width, height)
+        valid = np.zeros((height, width), bool)
+        valid[Y, X] = True
+        y0, y1 = max(0, oy), min(height, oy + m.shape[0])
+        x0, x1 = max(0, ox), min(width, ox + m.shape[1])
+        mine = np.zeros((height, width), bool)
+        box = known(path) if known else None
+        if box is None:
+            if on_start:
+                on_start(path)
+            c0, c1 = max(0, ox - margin), min(width, ox + m.shape[1] + margin)
+            canvas = np.zeros((height, c1 - c0, 3), np.float32)
+            canvas[Y, X - c0] = rgb[ys, xs]
+            mine[:, c0:c1] = classify(canvas, valid[:, c0:c1])
+            mine &= valid
+            box = mine[y0:y1, x0:x1]
+            if on_frame:
+                on_frame(path, box, (x0, y0))
+        else:
+            mine[y0:y1, x0:x1] = box & valid[y0:y1, x0:x1]
+        votes += mine
+        cover += valid
+        if on_vote:
+            on_vote(votes, cover)  # the vote so far, after this frame
+    sky = votes * 2 > cover
+    outvoted = np.where(sky, cover - votes, votes)
+    disagree = np.where(cover > 0, outvoted / np.maximum(cover, 1), 0.0)
+    # `counts`: also the sky votes and the covering-frame count per pixel, which
+    # the planning horizon reads (sky every frame agreed on is votes == cover).
+    return (sky, disagree, votes, cover) if counts else (sky, disagree)
+
+
 def solve_gains(layers, iterations=12):
     """Per-layer brightness gains that make overlaps agree.
 
@@ -415,30 +691,62 @@ def solve_gains(layers, iterations=12):
     for _rgb, m, ox, oy in layers:
         h = max(h or 0, oy + m.shape[0])
         w = max(w or 0, ox + m.shape[1])
+    # Each layer's covered pixels as flat canvas indices, found once.
+    prep = []
+    cnt = np.zeros(h * w)
+    for rgb, m, ox, oy in layers:
+        ys, xs, Y, X = _placed(m, ox, oy, w, h)
+        idx = Y * w + X
+        prep.append((idx, rgb[ys, xs]))
+        cnt[idx] += 1
     for _ in range(iterations):
-        acc = np.zeros((h, w, 3))
-        cnt = np.zeros((h, w))
-        for g, (rgb, m, ox, oy) in zip(gains, layers, strict=False):
-            ys, xs = np.mgrid[0 : m.shape[0], 0 : m.shape[1]]
-            Y, X = ys[m] + oy, xs[m] + ox
-            ok = (Y >= 0) & (Y < h) & (X >= 0) & (X < w)
-            acc[Y[ok], X[ok]] += rgb[m][ok] * g
-            cnt[Y[ok], X[ok]] += 1
-        ref = np.where(cnt[..., None] > 0, acc / np.maximum(cnt, 1)[..., None], 0)
+        acc = np.zeros((h * w, layers[0][0].shape[-1]))
+        for g, (idx, vals) in zip(gains, prep, strict=True):
+            acc[idx] += vals * g  # a layer covers each pixel once: no repeats in idx
+        ref = acc / np.maximum(cnt, 1)[:, None]
         new = []
-        for g, (rgb, m, ox, oy) in zip(gains, layers, strict=False):
-            ys, xs = np.mgrid[0 : m.shape[0], 0 : m.shape[1]]
-            Y, X = ys[m] + oy, xs[m] + ox
-            ok = (Y >= 0) & (Y < h) & (X >= 0) & (X < w)
-            mine = rgb[m][ok].mean()
-            theirs = ref[Y[ok], X[ok]].mean()
-            new.append(g * (theirs / max(mine * g, 1e-6)) ** 0.5)
+        for g, (idx, vals) in zip(gains, prep, strict=True):
+            new.append(g * (ref[idx].mean() / max(vals.mean() * g, 1e-6)) ** 0.5)
         new = np.array(new)
         new /= np.exp(np.log(new).mean())
         if np.allclose(new, gains, atol=1e-4):
             return new
         gains = new
     return gains
+
+
+def channel_gains(layers):
+    """`solve_gains` for each colour channel: shape (n, 3)."""
+    return np.stack(
+        [
+            solve_gains([(rgb[..., c : c + 1], m, ox, oy) for rgb, m, ox, oy in layers])
+            for c in range(3)
+        ],
+        axis=1,
+    )
+
+
+def blend(tiffs, width, height, feather=48, gains=None, on_frame=None):
+    """A panorama for the eye: each frame colour-matched to its neighbours channel
+    by channel, and faded out over `feather` pixels toward its edges so seams do
+    not show. Never measure from it: the sky vote reads the raw layers, and
+    `composite` is the measurement blend (terminus-52)."""
+    from scipy.ndimage import distance_transform_edt
+
+    layers = [_layer(t) for t in tiffs]
+    gains = channel_gains(layers) if gains is None else np.asarray(gains)
+    acc = np.zeros((height, width, 3))
+    wsum = np.zeros((height, width))
+    for path, g, (rgb, m, ox, oy) in zip(tiffs, gains, layers, strict=True):
+        if on_frame:
+            on_frame(path)
+        weight = np.minimum(distance_transform_edt(m), feather) / feather
+        ys, xs, Y, X = _placed(m, ox, oy, width, height)
+        w = weight[ys, xs]
+        acc[Y, X] += np.clip(rgb[ys, xs] * g, 0, 255) * w[:, None]
+        wsum[Y, X] += w
+    img = np.where(wsum[..., None] > 0, acc / np.maximum(wsum, 1e-9)[..., None], 0)
+    return img.clip(0, 255).astype(np.uint8)
 
 
 def composite(tiffs, width, height, gains=None):
@@ -449,11 +757,9 @@ def composite(tiffs, width, height, gains=None):
     acc = np.zeros((height, width, 3))
     cnt = np.zeros((height, width))
     for g, (rgb, m, ox, oy) in zip(gains, layers, strict=False):
-        ys, xs = np.mgrid[0 : m.shape[0], 0 : m.shape[1]]
-        Y, X = ys[m] + oy, xs[m] + ox
-        ok = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)
-        acc[Y[ok], X[ok]] += np.clip(rgb[m][ok] * g, 0, 255)
-        cnt[Y[ok], X[ok]] += 1
+        ys, xs, Y, X = _placed(m, ox, oy, width, height)
+        acc[Y, X] += np.clip(rgb[ys, xs] * g, 0, 255)
+        cnt[Y, X] += 1
     img = np.where(cnt[..., None] > 0, acc / np.maximum(cnt, 1)[..., None], 0)
     return img.clip(0, 255).astype(np.uint8), cnt, gains
 

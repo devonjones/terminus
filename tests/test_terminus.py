@@ -72,6 +72,32 @@ def test_export_all_applies_the_buffer_exactly_once(tmp_path):
     hrz, _ = export_all(str(p), str(tmp_path / "out"))
     body = [ln for ln in open(hrz).read().splitlines() if not ln.startswith("#")]
     assert body[0] == "0 15", f"expected one 3 deg buffer, got {body[0]}"
+    hrz, _ = export_all(str(p), str(tmp_path / "out5"), tree_buffer=5.0)
+    body = [ln for ln in open(hrz).read().splitlines() if not ln.startswith("#")]
+    assert body[0] == "0 17", f"expected the 5 deg override once, got {body[0]}"
+
+
+def test_horizon_from_a_mask_adds_no_tree_buffer(tmp_path):
+    """Planners read the measured line; the margin is the exporters' business."""
+    p = tmp_path / "m.yaml"
+    write_mask(str(p), {0: (12.0, "tree"), 180: (12.0, "tree")}, [], {"lat": 40, "lon": -105})
+    assert Horizon.from_mask(str(p)).altitude_at(0) == 12.0
+
+
+def test_fresh_labels_ignores_frames_that_are_not_kept(tmp_path):
+    """An off frame, or one nona left off the canvas, must not force the colour vote."""
+    from terminus import reblend
+
+    for f in ("layer0000.tif", "label0000.tif", "layer0001.tif", "layer0002.tif"):
+        (tmp_path / f).write_bytes(b"")
+    os.utime(tmp_path / "label0000.tif", ns=(2, 2))
+    for f in ("layer0000.tif", "layer0001.tif", "layer0002.tif"):
+        os.utime(tmp_path / f, ns=(1, 1))
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    a, b = str(tmp_path / "layer0000.tif"), str(tmp_path / "layer0001.tif")
+    layers = {"a.jpg": a, "b.jpg": b, "c.jpg": str(tmp_path / "layer0002.tif"), "d.jpg": None}
+    got = reblend.fresh_labels(str(tmp_path), names, layers, [a])
+    assert got == {a: str(tmp_path / "label0000.tif")}
 
 
 def test_stellarium_txt_has_no_comments():
@@ -9871,3 +9897,161 @@ def test_a_missing_bundled_tool_is_an_error_not_a_path_lookup(tmp_path, monkeypa
     with patch("shutil.which", side_effect=lambda t: "/usr/bin/" + t):
         with pytest.raises(mosaic.MosaicError, match="nona is missing from"):
             mosaic._run(["nona", "-o", "x"])
+
+
+def _sky_layer(path, sky_cols, box):
+    """A remapped frame inside `box`: blue (sky) in the canvas columns
+    `sky_cols`, brown elsewhere."""
+    import numpy as np
+    from PIL import Image
+
+    x0, y0, x1, y1 = box
+    rgba = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+    rgba[..., :3] = (120, 80, 40)
+    for x in range(x0, x1):
+        if x in sky_cols:
+            rgba[:, x - x0, :3] = (80, 120, 220)
+    rgba[..., 3] = 255
+    Image.fromarray(rgba, "RGBA").save(
+        path, tiffinfo={286: ((x0, 1),), 287: ((y0, 1),), 282: ((1, 1),), 283: ((1, 1),)}
+    )
+    return str(path)
+
+
+def _blue(rgb, valid):
+    return (rgb[..., 2] > rgb[..., 0]) & valid
+
+
+def test_vote_sky_needs_a_strict_majority_and_reports_who_was_outvoted(tmp_path):
+    """Terrain wins a tie: a horizon placed too high costs a target, one too low
+    sends the scope into a roof."""
+    from terminus.mosaic import vote_sky
+
+    paths = [
+        _sky_layer(tmp_path / "a.tif", {0, 1, 2}, (0, 0, 4, 2)),  # col 3: terrain
+        _sky_layer(tmp_path / "b.tif", {0, 1}, (0, 0, 4, 2)),  # cols 2, 3: terrain
+        _sky_layer(tmp_path / "c.tif", {0, 2}, (0, 0, 3, 2)),
+    ]
+    sky, disagree = vote_sky(paths, 6, 2, _blue)
+    assert sky[0].tolist() == [True, True, True, False, False, False]
+    # col 0 unanimous sky; col 1 2-of-3 (c outvoted); col 2 2-of-3 (b outvoted);
+    # col 3 unanimous terrain.
+    assert disagree[0, :4].round(3).tolist() == [0.0, 0.333, 0.333, 0.0]
+    assert disagree[0, 4:].tolist() == [0.0, 0.0], "no frame covers here"
+
+
+def test_vote_sky_breaks_a_tie_toward_terrain(tmp_path):
+    from terminus.mosaic import vote_sky
+
+    paths = [
+        _sky_layer(tmp_path / "a.tif", {0}, (0, 0, 1, 1)),
+        _sky_layer(tmp_path / "b.tif", set(), (0, 0, 1, 1)),
+    ]
+    sky, disagree = vote_sky(paths, 1, 1, _blue)
+    assert not sky[0, 0] and disagree[0, 0] == 0.5
+
+
+def test_canvas_size_reads_the_projects_panorama_line(tmp_path):
+    from terminus.mosaic import MosaicError, canvas_size
+
+    pto = tmp_path / "final.pto"
+    pto.write_text('p f2 w2880 h1440 v360 n"TIFF_m"\ni w4000 h3000 n"a.jpg"\n')
+    assert canvas_size(str(pto)) == (2880, 1440)
+    pto.write_text('i w4000 h3000 n"a.jpg"\n')
+    with pytest.raises(MosaicError):
+        canvas_size(str(pto))
+
+
+def test_cpfind_progress_becomes_events(monkeypatch):
+    from terminus import mosaic
+
+    seen = []
+    monkeypatch.setattr(mosaic, "EVENTS", seen.append)
+    follow = mosaic._follow_cpfind(["a.jpg", "b.jpg", "c.jpg"])
+    for line in (
+        "--- Analyze Images ---",
+        "i1 : Analyzing image...",
+        "i0 : Analyzing image...",
+        "i1 : Caching keypoints...",
+        "--- Find matches ---",
+        "i0 <> i2 : Found 17 matches",
+        "--- Something cpfind adds one day ---",
+        "Using 11 threads",
+    ):
+        follow(line)
+    assert seen == [
+        {"detail": "finding features in each photo"},
+        {"working": ["b.jpg"]},
+        {"working": ["a.jpg", "b.jpg"]},
+        {"working": ["a.jpg"]},
+        {"detail": "comparing neighbouring photos"},
+        {"pair": ["a.jpg", "c.jpg"], "matches": 17, "working": ["a.jpg", "c.jpg"]},
+    ], "unknown stages and chatter are ignored"
+
+
+def test_sky_outline_runs_where_the_open_sky_meets_terrain():
+    import numpy as np
+
+    from terminus.skymask import sky_outline
+
+    votes = np.zeros((20, 30), np.int32)
+    cover = np.full((20, 30), 2, np.int32)
+    votes[:8] = 2  # sky above row 8
+    votes[14:16, 10:12] = 2  # a sky-coloured patch inside the ground: not open sky
+    edge = sky_outline(votes, cover)
+    assert edge[7].all(), "the line runs along the last sky row"
+    assert not edge[:4].any() and not edge[11:].any(), "nowhere else: not the patch"
+
+
+def test_export_writes_the_planning_line_without_a_second_tree_buffer(tmp_path):
+    from terminus.export import export_all, write_mask
+    from terminus.horizon import Horizon
+
+    mask = tmp_path / "h.yaml"
+    cols = {az: {"alt": 10.0, "planning": 18.0, "type": "tree"} for az in range(0, 360, 10)}
+    write_mask(str(mask), cols, [], {"oriented": True})
+    hrz, txt = export_all(str(mask), str(tmp_path / "out"))
+    alts = {
+        float(line.split()[1]) for line in open(hrz) if line.strip() and not line.startswith("#")
+    }
+    assert alts == {18.0}, "the planning line, already buffered: not 10, not 21"
+    assert Horizon.from_mask(str(mask)).altitude_at(45) == 18.0, "planners get planning too"
+
+
+def test_a_mixed_mask_buffers_the_trees_that_have_no_planning_line(tmp_path):
+    from terminus.export import TREE_BUFFER_DEG, load_planning, write_mask
+
+    mask = tmp_path / "m.yaml"
+    cols = {0: {"alt": 5.0, "planning": 7.0, "type": "tree"}, 180: {"alt": 5.0, "type": "tree"},
+            90: {"alt": 5.0, "type": "structure"}}  # fmt: skip
+    write_mask(str(mask), cols, [], {"oriented": True})
+    _meta, rows = load_planning(str(mask))
+    assert {az: alt for az, alt, _ in rows} == {0: 7.0, 90: 5.0, 180: 5.0 + TREE_BUFFER_DEG}
+
+
+def test_export_pictures_apply_the_buffer_exactly_once(tmp_path, monkeypatch):
+    """The CLI's Sky Safari and landscape paths read the buffered planning line,
+    so the exporters must add nothing more."""
+    from terminus import cli, export, landscape
+
+    seen = {}
+
+    def record(kind):
+        def fake(*a, **kw):
+            rows = a[0] if kind == "skysafari" else a[1]
+            seen[kind] = rows[0][1] + kw["tree_buffer"]
+            return str(tmp_path / kind)
+
+        return fake
+
+    monkeypatch.setattr(landscape, "to_skysafari_png", record("skysafari"))
+    monkeypatch.setattr(landscape, "write_landscape", record("landscape"))
+    monkeypatch.setattr(
+        export,
+        "to_pvsyst_hor",
+        lambda rows, meta, buf, **kw: seen.setdefault("pvsyst", rows[0][1] + buf) and "",
+    )
+    p = tmp_path / "m.yaml"
+    write_mask(str(p), {0: (12.0, "tree")}, [], {"lat": 40, "lon": -105, "oriented": True})
+    cli.main(["export", str(p), "--skysafari", "--landscape", "--pvsyst"])
+    assert seen == {"skysafari": 15.0, "landscape": 15.0, "pvsyst": 15.0}
