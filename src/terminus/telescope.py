@@ -129,3 +129,72 @@ def refit(site, doc=None, near=None):
         "columns": cols,
         "summary": summary,
     }
+
+
+TAGS = ("false edge", "pocket", "near object")
+
+
+def view(site):
+    """The columns for the app, each with its residual from the stored fit, and
+    its frames by name only. None when the site has no telescope columns."""
+    doc = load(site)
+    if not doc["columns"]:
+        return None
+    fit = doc.get("fit")
+    res = {c["az"]: c["residual"] for c in (fit or {}).get("columns", ())}
+    cols = [
+        {
+            **{k: c.get(k) for k in ("az", "alt", "uncertainty", "method", "included", "note")},
+            "tags": list(c.get("tags") or []),
+            "residual": res.get(c["az"]),
+            "frames": [
+                {"alt": f["alt"], "sky": f["sky"], "name": os.path.basename(f["file"])}
+                for f in c.get("frames", ())
+            ],
+        }
+        for c in doc["columns"]
+    ]
+    out = {k: v for k, v in (fit or {}).items() if k != "columns"} if fit else None
+    return {"note": doc.get("note", ""), "columns": cols, "fit": out}
+
+
+def _column(doc, az):
+    for c in doc["columns"]:
+        if c["az"] == az:
+            return c
+    raise ValueError(f"no telescope column at az {az:g}")
+
+
+def edit(site, az, included=None, tags=None):
+    """Include or exclude a column, or tag it, then refit near the last fit."""
+    doc = load(site)
+    c = _column(doc, az)
+    if included is not None:
+        c["included"] = bool(included)
+    if tags is not None:
+        bad = [t for t in tags if t not in TAGS]
+        if bad:
+            raise ValueError(f"unknown tags {bad}; known: {', '.join(TAGS)}")
+        c["tags"] = list(tags)
+    last = (doc.get("fit") or {}).get("solution")
+    doc["fit"] = refit(site, doc, near=last) if last else doc.get("fit")
+    save(site, doc)
+    return view(site)
+
+
+def fit_all(site):
+    """The full search: after an import, or when a local refit may be lost. Minutes."""
+    doc = load(site)
+    if not doc["columns"]:
+        raise ValueError("this site has no telescope columns to fit")
+    doc["fit"] = refit(site, doc)
+    save(site, doc)
+    return view(site)
+
+
+def frame_path(site, az, name):
+    """The file of one of a column's frames, by its name; None if there is none."""
+    if not FRAME_NAME.fullmatch(name):
+        return None
+    path = os.path.join(site, FRAMES, f"az{int(az):03d}", name)
+    return path if os.path.isfile(path) else None

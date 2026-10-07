@@ -30,6 +30,9 @@
     },
     "scope_frame": {
       "$ref": "#/$defs/ScopeFrame"
+    },
+    "columns": {
+      "$ref": "#/$defs/Columns"
     }
   },
   "additionalProperties": false,
@@ -807,6 +810,195 @@
         "exposure_ms",
         "median",
         "saturated"
+      ],
+      "additionalProperties": false
+    },
+    "ColumnFrame": {
+      "type": "object",
+      "properties": {
+        "alt": {
+          "type": "number"
+        },
+        "sky": {
+          "type": "number",
+          "description": "fraction of the frame that is sky, as judged when taken"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alt",
+        "sky",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "TelescopeColumn": {
+      "type": "object",
+      "properties": {
+        "az": {
+          "type": "number"
+        },
+        "alt": {
+          "type": "number"
+        },
+        "uncertainty": {
+          "type": "number"
+        },
+        "method": {
+          "enum": [
+            "focused",
+            "coarse",
+            "frame",
+            "clicked"
+          ]
+        },
+        "included": {
+          "type": "boolean"
+        },
+        "note": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "false edge",
+              "pocket",
+              "near object"
+            ]
+          }
+        },
+        "residual": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "photo minus measured, deg, from the last fit; null when not fitted"
+        },
+        "frames": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnFrame"
+          }
+        }
+      },
+      "required": [
+        "az",
+        "alt",
+        "uncertainty",
+        "method",
+        "included",
+        "note",
+        "tags",
+        "residual",
+        "frames"
+      ],
+      "additionalProperties": false
+    },
+    "ColumnFit": {
+      "type": "object",
+      "properties": {
+        "solution": {
+          "type": "object",
+          "properties": {
+            "yaw": {
+              "type": "number"
+            },
+            "pitch": {
+              "type": "number"
+            },
+            "tilt_mag": {
+              "type": "number"
+            },
+            "tilt_dir": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "yaw",
+            "pitch",
+            "tilt_mag",
+            "tilt_dir"
+          ],
+          "additionalProperties": false
+        },
+        "yaw_pm": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "integer"
+            },
+            "rms": {
+              "type": "number"
+            },
+            "median": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "max": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "within_2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "n",
+            "rms",
+            "median",
+            "max",
+            "within_2"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "solution",
+        "yaw_pm",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "Columns": {
+      "type": "object",
+      "properties": {
+        "note": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TelescopeColumn"
+          }
+        },
+        "fit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColumnFit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "note",
+        "columns",
+        "fit"
       ],
       "additionalProperties": false
     }

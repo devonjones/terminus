@@ -45,6 +45,10 @@ Routes (payload shapes: schema.json beside this file):
   POST /scope/point       {"az", "alt"}: Sun-guarded slew -> the scope's status
   POST /scope/frame       {"exposure_ms"}: one raw frame -> {exposure_ms, median, saturated}
   GET  /scope/frame.jpg   that frame in colour (204 before the first)
+  GET  /site/columns      the open site's telescope columns and their fit (204: none)
+  POST /site/columns/edit {"az", "included"?, "tags"?}: change one column, refit near the last fit
+  POST /site/columns/fit  the full fit over every included column (minutes)
+  GET  /site/column/frame.jpg?az=&name=   one of a column's frames
   GET  /dev/state         state plus recent log lines; exists only with --dev
 """
 
@@ -65,7 +69,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
-from .. import __version__
+from .. import __version__, telescope
 from ..client import SeestarError
 from ..export import MaskError
 from ..sweep import PointingError, SunGuard
@@ -250,6 +254,10 @@ class _Handler(BaseHTTPRequestHandler):
             "/scope/discover": lambda: self._send(200, {"scopes": scopes.discover()}),
             "/scope/status": lambda: self._send(200, sv.scope.status()),
             "/scope/frame.jpg": self._preview,
+            "/site/columns": lambda: self._site_view(telescope.view),
+            "/site/column/frame.jpg": lambda: self._site_view(
+                lambda d: _read(telescope.frame_path(d, self._num_query("az"), self._query("name")))
+            ),
         }
         if sv.dev:
             routes["/dev/state"] = lambda: self._send(
@@ -276,6 +284,8 @@ class _Handler(BaseHTTPRequestHandler):
             "/scope/park": self._park,
             "/scope/point": lambda: self._point(body.get("az"), body.get("alt")),
             "/scope/frame": lambda: self._frame(body.get("exposure_ms")),
+            "/site/columns/edit": lambda: self._edit_column(body),
+            "/site/columns/fit": self._fit_columns,
             "/scope/disconnect": self._disconnect,
         }
         self._dispatch(routes)
@@ -288,6 +298,34 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _name(self):
         return self._query("name")
+
+    def _num_query(self, key):
+        try:
+            return float(self._query(key))
+        except ValueError:
+            raise sites.SiteError(f"?{key}= must be a number") from None
+
+    def _fit_columns(self):
+        try:
+            self._send(200, telescope.fit_all(self.server.site_dir()))
+        except ValueError as e:
+            raise sites.SiteError(str(e)) from None
+
+    def _edit_column(self, body):
+        az, included, tags = body.get("az"), body.get("included"), body.get("tags")
+        if not isinstance(az, (int, float)) or isinstance(az, bool):
+            raise sites.SiteError("az must be a number")
+        if included is not None and not isinstance(included, bool):
+            raise sites.SiteError("included must be true or false")
+        if tags is not None and not (
+            isinstance(tags, list) and all(isinstance(t, str) for t in tags)
+        ):
+            raise sites.SiteError("tags must be a list of names")
+        try:
+            out = telescope.edit(self.server.site_dir(), float(az), included, tags)
+        except ValueError as e:
+            raise sites.SiteError(str(e)) from None
+        self._send(200, out)
 
     def _dispatch(self, routes):
         route = routes.get(urlsplit(self.path).path)
@@ -480,6 +518,14 @@ def main(argv=None):
         server.serve_forever()
     finally:
         _shutdown(server)
+
+
+def _read(path):
+    """A file's bytes, or None (a 204) when there is no such file."""
+    if path is None:
+        return None
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
 def _shutdown(server):

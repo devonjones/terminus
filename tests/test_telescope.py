@@ -101,3 +101,94 @@ def test_a_near_fit_searches_only_near(site):
     fit = telescope.refit(str(site), columns(site, measured(site, azs)), near=far)
     off = abs(((fit["solution"]["yaw"] - 200.0 + 180) % 360) - 180)
     assert off <= orient.NEAR_YAW_DEG + 2.0  # refinement may creep past the grid; not to 37
+
+
+# ---- the sidecar's routes (the fit itself is stubbed: tested above) --------
+from test_server import _site, call, conforms, serve  # noqa: E402, F401
+
+FAKE_FIT = {
+    "solution": {"yaw": 186.0, "pitch": -1.5, "tilt_mag": 7.0, "tilt_dir": 300.0},
+    "yaw_pm": 4.0,
+    "columns": [],
+    "summary": {"n": 3, "rms": 0.4, "median": 0.3, "max": 0.7, "within_2": 3},
+}
+
+
+@pytest.fixture
+def opened(serve, tmp_path, monkeypatch):  # noqa: F811
+    d = _site(tmp_path)
+    run = tmp_path / "run"
+    (run / "frames").mkdir(parents=True)
+    (run / "frames" / "az090_alt05.25_sky040.jpg").write_bytes(b"\xff\xd8 a frame")
+    (run / "f.yaml").write_text(yaml.safe_dump({"horizon": {90: {"alt": 5.4}, 200: {"alt": 40.0},
+                                                              250: {"alt": 12.0}}}))  # fmt: skip
+    telescope.import_run(str(d), [str(run / "f.yaml")], str(run / "frames"))
+    calls = []
+
+    def fake_refit(site, doc=None, near=None):
+        calls.append(near)
+        cols = [{"az": c["az"], "alt": c["alt"], "method": c["method"], "included": c["included"],
+                 "residual": 0.3 if c["included"] else None} for c in doc["columns"]]  # fmt: skip
+        return {**FAKE_FIT, "columns": cols}
+
+    monkeypatch.setattr(telescope, "refit", fake_refit)
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": d.name})
+    return s, calls
+
+
+def test_columns_route_lists_them_without_paths(opened):
+    s, _ = opened
+    code, v = call(s, "GET", "/site/columns")
+    assert code == 200 and v["fit"] is None and [c["az"] for c in v["columns"]] == [90, 200, 250]
+    conforms("Columns", v)
+    assert v["columns"][0]["frames"] == [
+        {"alt": 5.25, "sky": 0.4, "name": "az090_alt05.25_sky040.jpg"}
+    ]
+    assert "scope" not in json_text(v)  # names, never paths
+
+
+def json_text(v):
+    import json
+
+    return json.dumps(v)
+
+
+def test_a_full_fit_then_an_edit_refits_near_it(opened):
+    s, calls = opened
+    code, v = call(s, "POST", "/site/columns/fit", {})
+    assert code == 200 and v["fit"]["summary"]["rms"] == 0.4 and calls == [None]
+    conforms("Columns", v)
+    code, v = call(
+        s, "POST", "/site/columns/edit", {"az": 250, "included": False, "tags": ["false edge"]}
+    )
+    assert code == 200 and calls[-1] == FAKE_FIT["solution"]  # local, from the last fit
+    row = next(c for c in v["columns"] if c["az"] == 250)
+    assert row["included"] is False and row["tags"] == ["false edge"] and row["residual"] is None
+
+
+@pytest.mark.parametrize(
+    "body", [{"az": "250"}, {"az": 999}, {"az": 250, "included": "no"},
+             {"az": 250, "tags": "pocket"}, {"az": 250, "tags": ["cloud"]}],
+)  # fmt: skip
+def test_an_edit_refuses_what_it_cannot_apply(opened, body):
+    s, _ = opened
+    assert call(s, "POST", "/site/columns/edit", body)[0] == 400
+
+
+def test_a_frame_by_name_and_nothing_else(opened):
+    s, _ = opened
+    code, img = call(s, "GET", "/site/column/frame.jpg?az=90&name=az090_alt05.25_sky040.jpg")
+    assert code == 200 and img.startswith(b"\xff\xd8")
+    for q in ("az=90&name=../../../photo_mask.yaml", "az=90&name=az090_alt09.99_sky000.jpg",
+              "az=x&name=az090_alt05.25_sky040.jpg"):  # fmt: skip
+        assert call(s, "GET", f"/site/column/frame.jpg?{q}")[0] in (204, 400)
+
+
+def test_a_site_without_columns(serve, tmp_path):  # noqa: F811
+    d = _site(tmp_path)
+    s = serve(sites_root=str(tmp_path))
+    call(s, "POST", "/site/open", {"slug": d.name})
+    assert call(s, "GET", "/site/columns")[0] == 204
+    code, body = call(s, "POST", "/site/columns/fit", {})
+    assert code == 400 and "no telescope columns" in body["error"]
