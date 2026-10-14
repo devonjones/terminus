@@ -1,18 +1,16 @@
 # external-process-reviewer
-**Checks:** Subprocess/child_process calls (ffmpeg, Hugin tools, sidecar spawn) with shell=True and non-literal args (P1), or missing timeout, stderr capture, distinct timeout/non-zero/not-installed handling, Popen without context manager, unchecked binary, unvalidated output (P2).
-**Spawn when:** diff touches `src/terminus/mosaic.py`, `src/terminus/client.py`, or `app/main/**` (incl. `sidecar.ts`), or adds `subprocess`/`Popen`/`child_process`/`spawn(` anywhere under `src/**/*.py` or `app/**/*.ts`; skip when none of those change, and skip `*.test.ts` and `tests/**`.
-**Contents:** FLAG (P2) when a `subprocess` call · Do NOT flag
+model: sonnet
+verification: evidence-query — greps the diff for the subprocess call and its kwargs (`timeout=`, `shell=`, `stderr`) and quotes the line.
+**Checks:** Subprocess calls (ffmpeg, Hugin tools) with shell=True and non-literal args (P1), or missing timeout, stderr capture, distinct timeout/non-zero/not-installed handling, Popen without context manager, unchecked binary, unvalidated output (P2). The sidecar spawn is sidecar-lifecycle-reviewer's.
+**Spawn when:** diff touches `src/terminus/mosaic.py` or `src/terminus/client.py`, or adds `subprocess`/`Popen`/`child_process`/`spawn(` anywhere under `src/**/*.py` or `app/**/*.ts`; skip when none of those change, `app/main/sidecar.ts`-only diffs, `*.test.ts` and `tests/**`.
+**Contents:** FLAG (P1) · FLAG (P2) when a `subprocess` call · Do NOT flag
 
-From the pfsrd2 pack. terminus shells out constantly: **ffmpeg** for every frame
+terminus shells out constantly: **ffmpeg** for every frame
 capture, and six **Hugin** binaries (`pto_gen`, `cpfind`, `cpclean`,
 `autooptimiser`, `nona`, `pano_modify`) for registration. A hang or
 an unhelpful error here costs an observing session that cannot be repeated on
-demand.
-
-**The Electron main process spawning the sidecar (`app/main/sidecar.ts`) is in
-scope.** The same rules apply: a startup timeout, stderr captured (to
-`sidecar.log`), and spawn errors, early exits and timeouts reported as distinct
-messages.
+demand. Spawning the sidecar (`app/main/sidecar.ts`) is out of scope here:
+sidecar-lifecycle-reviewer owns its startup timeout and stderr.
 
 **FLAG (P1):** `shell=True` (or `spawn(..., {shell: true})`) with any non-literal argument.
 
@@ -39,5 +37,3 @@ messages.
   is optional and the scope path must keep working without it.
 - The `-loglevel error` flag on ffmpeg; quietening a chatty tool is not the same
   as discarding its errors.
-
----

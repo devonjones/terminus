@@ -1,27 +1,40 @@
 # Guidelines
 
+**Contents:** Roster and scope table · Tooling in CI · Severity convention · Standard of proof · Gemini is defunct
+
 terminus: a Python library + CLI that measures the local horizon with a Seestar
 S50 and exports it for N.I.N.A., Stellarium, and planners, and an Electron
 desktop app over a Python sidecar.
 
 ## How the pack runs
 
-**This file is consumed BY the `pr-review-loop` skill — do not run these reviewers
-directly.** The skill owns posting findings, verification, retirement, CI gating,
-and exit conditions.
+This directory is read by the `pr-review-loop` skill, one reviewer per file; do
+not run these reviewers directly. The orchestrator reads this README; each
+reviewer receives only its own file. The skill owns posting findings,
+verification, retirement, CI gating, and exit conditions.
+
+terminus has long-lived resources (the scope socket, the sidecar process, the
+RTSP view, per-frame temp files) and a local HTTP API on 127.0.0.1 that will move
+a telescope. The roster is tuned to what this project can get wrong: pointing the
+telescope somewhere dangerous, coordinate/azimuth-convention bugs, leaking the
+interop key, breaking exported file formats, accepting a failure as a measurement,
+and letting prose drift from the code. It is the 17 repo reviewers below plus the
+starters `code-reviewer`, `pr-test-analyzer` (test quality) and `type-design-analyzer`,
+and `alpaca-protocol-reviewer`, `fitting-validation-reviewer`, `test-determinism-reviewer`.
+Deliberate overlaps are recorded in `config.json` under `overlap_acknowledged`.
 
 **Per-reviewer file scope:**
 
 | Reviewer | Files in scope |
 |----------|----------------|
 | `sun-safety-reviewer` | `src/terminus/client.py`, `sweep.py`, `cli.py`, `server/**`, the Alpaca driver, `app/**` |
-| `coordinate-correctness-reviewer` | `src/terminus/sweep.py`, `horizon.py`, `orient.py`, `plan.py`, `app/src/**` |
+| `coordinate-correctness-reviewer` | `src/terminus/sweep.py`, `horizon.py`, `orient.py`, `plan.py`, `polar.py`, `app/src/**` |
 | `secrets-reviewer` | whole repo, `.gitignore`, `pyproject.toml`, `README.md`, `.github/workflows/**` |
-| `export-format-reviewer` | `src/terminus/export.py` |
+| `export-format-reviewer` | `src/terminus/export.py`, `landscape.py` |
 | `strategic-fragility-reviewer` | `src/**/*.py` (incl. the Alpaca driver) |
 | `complexity-reviewer` | `src/**/*.py` (never `tests/`) |
-| `clarity-reviewer` | `README.md`, docstrings/comments, `--help` text, the PR description |
-| `external-process-reviewer` | `src/terminus/mosaic.py`, `client.py`, `app/main/**` |
+| `clarity-reviewer` | `*.md`, docstrings/comments, `--help` text |
+| `external-process-reviewer` | `src/terminus/mosaic.py`, `client.py`, any `subprocess`/`child_process` use |
 | `error-handling-reviewer` | `src/**/*.py`, `app/**/*.ts` |
 | `resource-leak-reviewer` | `src/**/*.py` |
 | `test-coverage-reviewer` | `src/**/*.py`, `tests/**/*.py`, `app/**/*.ts` |
@@ -30,7 +43,13 @@ and exit conditions.
 | `sidecar-lifecycle-reviewer` | `app/main/**`, `src/terminus/server/**` |
 | `api-contract-reviewer` | `src/terminus/server/**`, `app/src/api/**`, `app/main/**` |
 | `ui-reviewer` | `app/src/**` |
-| `release-reviewer` | electron-builder config, `.github/workflows/**`, packaging scripts |
+| `release-reviewer` | `.github/workflows/**`, packaging scripts (no electron-builder config yet) |
+| `alpaca-protocol-reviewer` | `src/terminus/alpaca.py`, `tests/test_alpaca.py` |
+| `fitting-validation-reviewer` | `orient.py`, `polar.py`, `skymask.py`, `night.py`, `guide.py`, `landscape.py`, `mosaic.py`, `reproject.py`, `reblend.py` |
+| `test-determinism-reviewer` | `tests/**`, `app/**/*.test.ts`, `app/e2e/**` |
+| `code-reviewer` | any non-generated source change (CLAUDE.md compliance) |
+| `pr-test-analyzer` | added or edited tests (quality, not coverage) |
+| `type-design-analyzer` | type definitions in `src/**`, `app/**` |
 
 Skip reviewers whose scope doesn't match the diff. A reviewer's silence means
 nothing in its scope changed, not endorsement.

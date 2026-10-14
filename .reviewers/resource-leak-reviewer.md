@@ -1,9 +1,10 @@
 # resource-leak-reviewer
+model: sonnet
+verification: evidence-query — greps the diff for the acquire (`open(`, `mkstemp`, `Popen`, socket) and then for its close/unlink on every path, quoting both.
 **Checks:** Unclosed resources in Python: `open()` without a context manager, temp files not removed on every path incl. retries, `lru_cache` without maxsize on measured-data keys, sockets/subprocesses/RTSP views with no close path (P2); not the single long-lived Seestar socket.
 **Spawn when:** diff to `src/**/*.py` that adds `open(`, `tempfile`/`NamedTemporaryFile`/`mkstemp`, `lru_cache`/`cache`, `socket`, `Popen`, or RTSP/ffmpeg view code (`client.py`, `mosaic.py`, `server/views.py`); skip `tests/**`, docs and diffs with none of these.
 
-**Re-enabled.** It was disabled on the grounds that terminus has "no long-lived
-resources", and that was simply wrong. It has:
+terminus has long-lived resources:
 
 - a long-lived TCP control socket that reconnects mid-run
 - one temporary file per captured frame, and a sweep captures thousands
@@ -27,5 +28,3 @@ resources", and that was simply wrong. It has:
 connection is a hard constraint of the device — it tolerates exactly one, and
 opening a second has broken live runs — so it is held for the session on purpose
 and reconnected rather than reopened per call.
-
----

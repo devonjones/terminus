@@ -1,15 +1,13 @@
 # error-handling-reviewer
+model: sonnet
+verification: evidence-query — greps the diff for the handler shape (`except: pass`, `return` in `finally`, `raise` without `from`, floating promise) and quotes the line.
 **Checks:** Swallowed or masked exceptions (`except: pass`, default return, `return` in `finally`) as P1; bare `except:` or `except Exception` without re-raise as P2; `raise` in `except` without `from e` as P3; floating promises and swallowing catch in IPC/click handlers in `app/**` as P2.
 **Spawn when:** diff adds or changes `try`/`except`/`finally`/`raise`, `.catch`, `catch (` or promise-returning calls in `src/**/*.py` or `app/**/*.ts`; skip tests, docs, and diffs with no error-path changes.
+**Contents:** FLAG (P1) · FLAG (P2) · FLAG (P3) · JavaScript/TypeScript · Do NOT flag
 
-From the pfsrd2 pack. Universal Python error-handling hygiene: exceptions that
-vanish, `return` inside `finally`, bare `except:`, and lost exception context.
-
-**Division of labour with `strategic-fragility-reviewer`, so the two do not
-double-report.** That reviewer asks a domain question — *does a failure end up
-recorded as a measurement?* This one asks a language question — *is the error
-handled in a way that preserves the investigation trail?* A `except OSError:
-pass` around a cleanup call is fine by the first and flagged by the second.
+Language-level error-handling hygiene: exceptions that vanish, `return` inside
+`finally`, bare `except:`, and lost exception context. (Whether a failure ends up
+recorded as a *measurement* is strategic-fragility-reviewer's question, not this one.)
 
 **FLAG (P1):** silent swallowing (`except: pass`, or returning a default that
 masks the failure); `return` inside `finally`.
@@ -25,7 +23,13 @@ original traceback.
 (a floating promise with no `.catch`/`await`), or a `catch` in an IPC handler or
 click handler that swallows the error without showing or logging it.
 
-**Do NOT flag** the deliberate swallows listed under
-`strategic-fragility-reviewer`; they are argued there and are correct.
+**Do NOT flag** these deliberate swallows; they are correct:
 
----
+- sky-reference seeding and the mid-sweep refresh catching `PointingError`
+  (a convenience, nothing is measured)
+- the refine loop catching `PointingError` (optional work on an already-measured mask)
+- the scan loop skipping a failed column into `skipped`, abandoning the sweep only
+  after `MAX_POINTING_MISSES` consecutive failures and carrying the partial result out
+- `capture_rgb` retrying a repeated frame rather than raising
+- `cmd_sweep` reporting a failed `stop_view` and continuing
+- `except OSError: pass` around best-effort cleanup (closing, unlinking)

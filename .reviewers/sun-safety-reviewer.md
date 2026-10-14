@@ -1,7 +1,9 @@
 # sun-safety-reviewer
+model: sonnet
+verification: mixed — evidence-query for routing (grep every motion call site in the diff for `Pointer.point_to`); mutation for guard weakening (show a slew passes in a scratch copy with the check removed or the cone lowered).
 **Checks:** Slews that bypass the per-waypoint Sun check in `Pointer.point_to`, weakened Sun guards (target-only check, stale Sun, suppressed `SunGuard`, larger `slew_step_deg`, lower `sun_cone_deg`), trusting `scope_get_horiz_coord` in EQ mode, and guards living only in the UI or an in-shade switch that can default off or be set by an API route.
 **Spawn when:** A diff touches `src/terminus/client.py`, `sweep.py`, `cli.py`, `alpaca.py`, `src/terminus/server/**`, or `app/**` and adds or changes anything that can move the scope (`goto`, `Pointer`, `bisect_horizon`, `run_sweep`, an Alpaca slew, a sidecar route, `--dev` or `/dev/*`); skip diffs that only read (`equ_coord`, `mount_state`, `location`), run `--dry-run`, or are tests/docs only.
-**Contents:** FLAG (P1) when a PR · FLAG (P2) when a PR
+**Contents:** FLAG (P1) when a PR · FLAG (P2) when a PR · App (terminus-71) · Do NOT flag
 
 Review any change that can **move the telescope** (`client.goto`, `client.call`
 with a motion method, `sweep.Pointer`, `bisect_horizon`, `run_sweep`, CLI `point`/
@@ -35,7 +37,11 @@ route that moves the scope, and the dev channel (`--dev`, `/dev/*`).
 - FLAG (P1) an in-sun / in-shade switch that does not default to SUN, or that any
   API route (dev or not) can set. Only the human sets it, through the UI.
 
-**Do NOT flag:** read-only calls (`equ_coord`, `mount_state`, `location`), or
-`--dry-run` paths that issue no motion.
+**Do NOT flag:**
 
----
+- Read-only calls (`equ_coord`, `mount_state`, `location`), or `--dry-run` paths
+  that issue no motion.
+- The `goto` calls inside `Pointer` itself: `point_to` is the guarded path.
+- Tests that mock or stub `goto`/`Pointer` to exercise other logic.
+- Park and abort commands; they move the scope away from, not toward, a target.
+- Route auth, Host or Origin handling on `/dev/*` (local-api-reviewer owns the exposure; this reviewer owns the Sun guard).

@@ -1,7 +1,9 @@
 # clarity-reviewer
+model: sonnet
+verification: evidence-query — greps the code for every symbol, flag, config key, count and number a doc or docstring claims, and quotes the miss; wording/structure findings are judgement, labelled as such.
 **Checks:** Verbose or structurally weak markdown (filler, wall of text, no lede or examples, 'as mentioned above'), and Python docstrings/comments that restate the signature, go stale, or make claims (symbols, counts, measured numbers, absolutes) that do not match the code; also verifies documented commands, flags and config keys.
 **Spawn when:** A diff touches any `.md` file (`README.md`, `docs/**`, `LESSONS.md`) or adds/modifies a docstring, comment, or `--help` text in `src/**/*.py`; skip diffs with no prose, docstring or comment change, and long incident comments that record a failure or measurement.
-**Contents:** Markdown — how to check: Read the full file, not just the diff · Word-level patterns to flag · Filler words · Structural patterns to flag · Python docstrings — what to flag: Restate-the-signature docstrings; PEP 257 for public APIs; No docstrings on trivial private helpers; WHY over WHAT in comments; Stale comments; Grep-verify — a docstring's claims must match the code · Flag content issues if · Do NOT flag · Review approach
+**Contents:** Why this matters here · Markdown (how to check, word-level patterns, filler, structural patterns) · Python docstrings (what to flag, grep-verify) · Flag content issues if · Do NOT flag · Review approach · When flagging, provide · Severity
 
 Review markdown documentation AND Python docstrings/comments for terseness,
 structure, and factual accuracy. Every token costs money and attention — cut the
@@ -133,7 +135,7 @@ word adds no information AND the surrounding tone doesn't need softening.
    verify every command, flag, config key and import path against the code.
 4. For inline comments, flag restate-the-code and encourage WHY over WHAT.
 
+**Severity:** P1 a documented command, flag or method that is wrong or superseded (a stranger follows it and gets silently wrong data); P2 a stale or false docstring claim; P3 wording, structure and filler.
+
 **When flagging, provide:** the verbose or inaccurate text, a terse or accurate
 replacement, and a brief reason if it isn't obvious.
-
----

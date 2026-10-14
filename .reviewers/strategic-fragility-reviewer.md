@@ -1,22 +1,17 @@
 # strategic-fragility-reviewer
+model: sonnet
+verification: mixed — evidence-query for the P1 rules (trace the caught exception or unevidenced value to where it is recorded, quoting both lines); judgement for the P2 brittleness items, labelled as such.
 **Checks:** Failures turned into measurements: a value recorded without readback evidence, a caught exception falling through to a recorded result, a failure dropped from `skipped` or a partial sweep, 'blocked above ceiling' conflated with 'open to the search floor'; also needless brittleness (abort on a known-transient, removed retry, broad instrument-I/O catch that neither re-raises nor records).
 **Spawn when:** A diff to `src/**/*.py` (notably `sweep.py`, `client.py`, `alpaca.py`, `src/terminus/server/**`) adds or changes a state-changing scope call, a `try`/`except` or retry around instrument I/O, a recorded mask/profile/fiducial value, `skipped` handling, or an `assert`/`raise` pinning an invariant; skip tests, docs, and pure formatting or math-only changes.
-**Contents:** So the doctrine here splits along a line that pfsrd2 does not need · FLAG (P1) when a PR · FLAG (P2) when a PR
+**Contents:** Doctrine (interpretation brittle, execution robust) · The recurring failure · FLAG (P1) when a PR · Alpaca driver · FLAG (P2) when a PR · Do NOT flag
 
-Adapted from the pfsrd2 parser's reviewer of the same name — **and the
-adaptation is the point, because the two projects want opposite things from a
-failure.**
+terminus drives **hardware that is fragile by nature** — mounts stall near the
+pole, sockets drop on long runs, the video stream freezes, cloud drifts across a
+column, a goto occasionally does not arrive. Those are not surprises. They are
+the normal texture of a multi-hour unattended session, and a run that aborts on
+the first one collects nothing.
 
-pfsrd2 is a large batch parser. Fail-fast is right there: one malformed record
-among thousands is invisible to the eye, so stopping at the first surprise is
-the only way anyone finds out. terminus is not that. It drives **hardware that
-is fragile by nature** — mounts stall near the pole, sockets drop on long runs,
-the video stream freezes, cloud drifts across a column, a goto occasionally does
-not arrive. Those are not surprises. They are the normal texture of a
-multi-hour unattended session, and a run that aborts on the first one collects
-nothing.
-
-**So the doctrine here splits along a line that pfsrd2 does not need:**
+**So the doctrine splits along a line:**
 
 | | Rule |
 |---|---|
@@ -57,7 +52,7 @@ a measurement. Every one of these happened:
 - Collapses a non-result into a value, in particular conflating "blocked above
   the ceiling" with "open to the search floor".
 
-**The Alpaca driver (app stage 4) is in scope.** Alpaca calls also report
+**The Alpaca driver (`src/terminus/alpaca.py`) is in scope.** Alpaca calls also report
 success while doing nothing, so read back `Slewing`, `AtPark` and the position
 before recording anything.
 
@@ -89,5 +84,3 @@ downstream still get judged on evidence?"**
   measurement outranks the cleanup
 - a column that yields no edge becomes a bound or a stated non-result, and the
   sweep moves on
-
----

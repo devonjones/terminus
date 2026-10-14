@@ -1,9 +1,11 @@
 # api-contract-reviewer
-**Checks:** Sidecar route/payload changes made on one side only, hand-written TS payload types, breaking changes without a version bump, and JS re-implementations of engine math without a shared golden fixture.
+model: sonnet
+verification: evidence-query — greps both sides of a route/payload for the field or path that changed, and runs `npm run gen:api` in a scratch copy to show `generated.ts` is stale.
+**Checks:** Sidecar route/payload changes made on one side only, hand-written TS payload types, and breaking changes without a version bump.
 **Spawn when:** diff touches `src/terminus/server/**` (incl. `schema.json`), `app/src/api/**` (incl. `generated.ts`), `app/main/**`, or the version fields in `app/package.json`, `pyproject.toml`, `src/terminus/__init__.py`; skip if the diff touches none of these.
 
-Review the sidecar routes (`src/terminus/server/**`), their TypeScript side
-(`app/src/api/**`, `app/main/**`), and any shared schema or fixture.
+Review the sidecar routes (`src/terminus/server/**`) and their TypeScript side
+(`app/src/api/**`, `app/main/**`).
 
 **FLAG (P2) when a PR:**
 
@@ -15,7 +17,7 @@ Review the sidecar routes (`src/terminus/server/**`), their TypeScript side
 - Makes a breaking change without a version bump. The UI refuses a sidecar of a
   different version, so the versions in `app/package.json`, `pyproject.toml` and
   `src/terminus/__init__.py` move together.
-- Re-implements engine math in JS without a shared golden fixture read by both
-  the vitest and pytest suites (epic TESTING).
 
----
+**Do NOT flag:** hand-edits to `generated.ts` only when they match a fresh
+`gen:api` output; additive optional fields; route auth, Host or Origin handling
+(local-api-reviewer); JS re-implementing engine math (coordinate-correctness-reviewer).
