@@ -65,6 +65,7 @@ nothing in its scope changed, not endorsement.
 The `app` job, in `app/`:
 
 - `npm run lint` — eslint (typescript-eslint recommended)
+- `npm run gen:api && git diff --exit-code src/api/generated.ts` — `generated.ts` matches the sidecar schema
 - `npm run typecheck` — `tsc --noEmit`, strict
 - `npm run format:check` — prettier (print width 100)
 - `npm test` — vitest (main-process lifecycle with `child_process` mocked, front end in jsdom)

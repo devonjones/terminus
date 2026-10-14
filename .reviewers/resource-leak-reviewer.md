@@ -1,6 +1,6 @@
 # resource-leak-reviewer
 model: sonnet
-verification: evidence-query — greps the diff for the acquire (`open(`, `mkstemp`, `Popen`, socket) and then for its close/unlink on every path, quoting both.
+verification: evidence-query — greps the diff for the acquire (`open(`, `NamedTemporaryFile(delete=False)`, `Popen`, socket) and then for its close/unlink on every path, quoting both.
 **Checks:** Unclosed resources in Python: `open()` without a context manager, temp files not removed on every path incl. retries, `lru_cache` without maxsize on measured-data keys, sockets/subprocesses/RTSP views with no close path (P2); not the single long-lived Seestar socket.
 **Spawn when:** diff to `src/**/*.py` that adds `open(`, `tempfile`/`NamedTemporaryFile`/`mkstemp`, `lru_cache`/`cache`, `socket`, `Popen`, or RTSP/ffmpeg view code (`client.py`, `mosaic.py`, `server/views.py`); skip `tests/**`, docs and diffs with none of these.
 
