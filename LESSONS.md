@@ -101,7 +101,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `I-14` There is no still-image path for terrestrial frames; RTSP is not a choice
 - `I-15` The scenery stream is blind at night; star mode sees, on a different channel
 - `I-16` Near due north the mount cannot converge, and failed gotos escalate to connection resets
-- `I-17` The control port drops a quiet socket at 16 s, and holds device state while it images
+- `I-17` The control port drops a quiet socket at 16 s, holds device state while it images, and limits connections
 
 **Safety**
 
@@ -1262,7 +1262,7 @@ near-north candidates at night outright, and treat imaging-socket death as reope
 never as a column verdict. Daytime sweeps have measured az 0 successfully; the difference is an
 open question.
 
-### I-17 — The control port drops a quiet socket at 16 s, and holds device state while it images
+### I-17 — The control port drops a quiet socket at 16 s, holds device state while it images, and limits connections
 
 Measured 2026-10-18 on firmware 9.75 while building `terminus exporter`. `get_device_state`
 answers without the interop key (the handshake failed and the state came back anyway). The scope
@@ -1272,6 +1272,12 @@ its preview/imaging loop, `get_device_state` goes unanswered: no reply in 90 s w
 completing throughout. The pushed events (Imaging, Exposure, PlateSolve, Annotate, PiStatus) keep
 flowing on the same socket, so a passive monitor reads those while the scope works and takes the
 full state when it is idle.
+
+The control port also has a connection limit. With the phone app and one exporter connected, a
+third client got `{"Event":"Alert","Msg":"Exceed the maximum number of connections","code":429}`
+and an immediate hang-up. A monitor that holds its socket all night can therefore lock the app out
+on reconnect. The exporter connects for 10 s a minute and leaves pointing, tracking and the filter
+to Alpaca, whose HTTP GETs take no connection slot.
 
 ## Safety
 

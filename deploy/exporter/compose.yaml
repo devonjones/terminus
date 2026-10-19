@@ -7,5 +7,9 @@ services:
       SEESTAR_HOST: <scope-ip>
       POLL_S: "30"
       ON_DESK_DEG: "10"
+      # The scope allows few control connections and the phone app needs one: connect
+      # for NATIVE_HOLD_S out of every NATIVE_EVERY_S, never hold it all night.
+      NATIVE_HOLD_S: "10"
+      NATIVE_EVERY_S: "60"
     ports:
       - "9877:9877"

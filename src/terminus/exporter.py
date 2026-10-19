@@ -1,16 +1,19 @@
 """`terminus exporter`: the Seestar's own state as Prometheus metrics.
 
-Strictly passive. It sends two requests on the control port (4700), both reads
+Strictly passive. On the control port (4700) it sends two requests, both reads
 that need no interop key: `get_device_state`, and `get_verify_str` as a
 keepalive (the scope closes a socket that is quiet for ~16 s; measured
 2026-10-18, firmware 9.75). Everything else comes from the events the scope
 pushes on the same socket (Imaging, Exposure, PiStatus, Stack, ...). It never
-authenticates, never PUTs, never touches Alpaca, and never calls any other
-method: some, like pi_shutdown, are destructive.
+authenticates and never calls any other method: some, like pi_shutdown, are
+destructive. On Alpaca (32323) it sends GETs only, never a PUT, so no device is
+ever connected; that rules out CCD temperature, the dew heater and the focuser
+position, and leaves pointing, tracking, focuser temperature and the filter.
 
-While the scope images, get_device_state goes unanswered (no reply in 90 s of a
-preview loop), so one request stays outstanding until it is answered, and
-PiStatus events keep the battery and temperature current in the meantime.
+While the scope images, get_device_state goes unanswered all night. After
+STATE_TIMEOUT_S the request is counted as failed and the socket reopened rather
+than another request queued; PiStatus events keep the board temperature current,
+and Alpaca, polled in its own thread, keeps pointing current.
 
 One thread holds the socket and polls into a cache; /metrics renders the cache,
 so a scrape never reaches the scope. A dropped socket or a sleeping scope only
@@ -18,9 +21,11 @@ ages the cache: `seestar_up` goes to 0 and the last values keep serving with
 their timestamps.
 
 Configuration is by environment, for the container: SEESTAR_HOST,
-EXPORTER_PORT (9877), POLL_S (30), ON_DESK_DEG (10).
+EXPORTER_PORT (9877), POLL_S (30), ON_DESK_DEG (10), NATIVE_HOLD_S (10; 0 holds
+the connection open), NATIVE_EVERY_S (60; 0 for Alpaca only).
 """
 
+import http.client
 import json
 import logging
 import math
@@ -28,6 +33,7 @@ import os
 import socket
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger(__name__)
@@ -35,6 +41,54 @@ log = logging.getLogger(__name__)
 CONTROL_PORT = 4700
 KEEPALIVE_S = 10
 DEAD_S = 30  # nothing at all heard for this long, keepalives included: reconnect
+# An unanswered device state after this long counts as a failure and the socket is
+# reopened, which drops the request instead of queueing another behind it.
+STATE_TIMEOUT_S = 120
+ALPACA_PORT = 32323
+ALPACA_TIMEOUT_S = 10
+# Alpaca GETs that answer with every device disconnected (2026-10-18, while imaging).
+# CCD temperature, the dew-heater switch and focuser position need Connected=true,
+# which the exporter never sets, so they are absent.
+# The scope allows only a few control connections (it answers the next with an
+# Alert, code 429, and hangs up), and the phone app needs one. So the exporter holds
+# its connection for HOLD_S out of every EVERY_S rather than all night.
+NATIVE_HOLD_S = 10
+NATIVE_EVERY_S = 60
+# Further GETs that may or may not be implemented; whatever answers is exported as
+# seestar_alpaca_value{device,property}.
+ALPACA_EXTRA = [
+    ("telescope", p)
+    for p in (
+        "siderealtime",
+        "targetrightascension",
+        "targetdeclination",
+        "sideofpier",
+        "trackingrate",
+        "rightascensionrate",
+        "declinationrate",
+        "guideraterightascension",
+        "guideratedeclination",
+        "ispulseguiding",
+        "athome",
+        "atpark",
+        "alignmentmode",
+        "equatorialsystem",
+        "focallength",
+        "aperturediameter",
+    )
+] + [("focuser", p) for p in ("ismoving", "maxstep", "stepsize", "tempcomp")]
+ALPACA_READS = {
+    ("telescope", "rightascension"): "seestar_ra_hours",
+    ("telescope", "declination"): "seestar_dec_degrees",
+    ("telescope", "altitude"): "seestar_altitude_degrees",
+    ("telescope", "azimuth"): "seestar_azimuth_degrees",
+    ("telescope", "tracking"): "seestar_telescope_tracking",
+    ("telescope", "slewing"): "seestar_telescope_slewing",
+    ("focuser", "temperature"): "seestar_focuser_temp_celsius",
+    ("filterwheel", "position"): "seestar_filter_position",
+    ("telescope", "sitelatitude"): "seestar_site_latitude_degrees",
+    ("telescope", "sitelongitude"): "seestar_site_longitude_degrees",
+}
 ALLOWED_METHODS = frozenset({"get_device_state", "get_verify_str"})
 
 
@@ -47,19 +101,36 @@ class Cache:
         self.events = {}  # event name -> (last payload, time seen)
         self.last_poll = 0.0
         self.last_success = 0.0  # last device state
+        self.alpaca = {}  # metric name -> value
+        self.alpaca_extra = {}  # (device, property) -> value
+        self.filter_names = None
+        self.alpaca_last_poll = 0.0
+        self.alpaca_last_success = 0.0
+        self.alpaca_failures = 0
         self.last_heard = 0.0  # last line of any kind
         self.connected = False
         self.failures = 0
         self.connects = 0
+        self.refused = 0  # connections the scope turned away as over its limit
 
 
 class Poller:
-    def __init__(self, host, cache, poll_s=30.0, port=CONTROL_PORT):
+    def __init__(
+        self,
+        host,
+        cache,
+        poll_s=30.0,
+        port=CONTROL_PORT,
+        hold_s=NATIVE_HOLD_S,
+        every_s=NATIVE_EVERY_S,
+    ):
         self.host, self.port, self.cache, self.poll_s = host, port, cache, poll_s
+        self.hold_s, self.every_s = hold_s, every_s  # hold_s 0: keep the connection open
+        self.refused = False
         self.s = None
         self.buf = b""
         self.cid = 1000
-        self.pending = None  # id of the outstanding get_device_state
+        self.pending = None  # (id, sent at) of the outstanding get_device_state
 
     def send(self, method):
         if method not in ALLOWED_METHODS:  # the passive guarantee, enforced here
@@ -78,12 +149,16 @@ class Poller:
         c = self.cache
         with c.lock:
             c.last_heard = now
+            if d.get("Event") == "Alert" and d.get("code") == 429:
+                self.refused = True  # "Exceed the maximum number of connections"
             if "Event" in d:
                 c.events[str(d["Event"])] = (d, now)
-                if d["Event"] == "PiStatus" and c.state is not None:
+                if d["Event"] == "PiStatus":
+                    if c.state is None:
+                        c.state = {}
                     pi = c.state.setdefault("pi_status", {})
                     pi.update({k: v for k, v in d.items() if k not in ("Event", "Timestamp")})
-            elif self.pending is not None and d.get("id") == self.pending:
+            elif self.pending is not None and d.get("id") == self.pending[0]:
                 self.pending = None
                 if isinstance(d.get("result"), dict):
                     c.state, c.last_success = d["result"], now
@@ -91,10 +166,10 @@ class Poller:
                     c.failures += 1
 
     def session(self):
-        """One connection, until it drops."""
+        """One connection, for hold_s or until it drops."""
         self.s = socket.create_connection((self.host, self.port), timeout=10)
         self.s.settimeout(1.0)
-        self.buf, self.pending = b"", None
+        self.buf, self.pending, self.refused = b"", None, False
         opened = time.time()
         with self.cache.lock:
             self.cache.connected = True
@@ -102,10 +177,20 @@ class Poller:
         next_poll = next_keepalive = 0.0
         while True:
             now = time.time()
+            if self.refused:
+                with self.cache.lock:
+                    self.cache.refused += 1
+                raise ConnectionRefusedError("the scope is at its connection limit")
+            if self.hold_s and now - opened > self.hold_s:
+                return
             if now - max(opened, self.cache.last_heard) > DEAD_S:
                 raise TimeoutError(f"nothing heard for {DEAD_S}s")
+            if self.pending is not None and now - self.pending[1] > STATE_TIMEOUT_S:
+                with self.cache.lock:
+                    self.cache.failures += 1
+                raise TimeoutError(f"no device state in {STATE_TIMEOUT_S}s (the scope is imaging?)")
             if now >= next_poll and self.pending is None:
-                self.pending = self.send("get_device_state")
+                self.pending = (self.send("get_device_state"), now)
                 with self.cache.lock:
                     self.cache.last_poll = now
                 next_poll = now + self.poll_s
@@ -126,18 +211,24 @@ class Poller:
                     self.handle(line.decode("utf-8", "replace"), time.time())
 
     def run(self):
-        """Reconnect forever, backing off to a minute."""
+        """Connect every every_s for hold_s (or hold on), backing off to a minute on errors."""
         delay = 1
         while True:
             started = time.time()
             try:
                 self.session()
+                time.sleep(max(1, self.every_s - (time.time() - started)))
+                delay = 1
+                continue
+            except ConnectionRefusedError as e:
+                log.info("scope %s:%s: %s; next try in %ss", self.host, self.port, e, self.every_s)
+                time.sleep(self.every_s)
+                continue
             except Exception as e:  # never die: a scope that is off is the normal case
                 log.info("scope %s:%s: %s; retrying in %ss", self.host, self.port, e, delay)
             finally:
                 with self.cache.lock:
                     self.cache.connected = False
-                    self.cache.failures += 1
                 if self.s:
                     self.s.close()
             if self.cache.last_heard > started + 60:
@@ -146,12 +237,77 @@ class Poller:
             delay = min(60, delay * 2)
 
 
+class AlpacaPoller:
+    """GETs only, each on its own short timeout, in a thread of its own so that a
+    stalled native call never holds these up. Never PUTs, never connects anything."""
+
+    def __init__(self, host, cache, poll_s=30.0, port=ALPACA_PORT):
+        self.base = f"http://{host}:{port}/api/v1"
+        self.cache, self.poll_s = cache, poll_s
+
+    def get(self, dev, prop):
+        url = f"{self.base}/{dev}/0/{prop}?ClientID=42&ClientTransactionID=1"
+        with urllib.request.urlopen(url, timeout=ALPACA_TIMEOUT_S) as r:
+            d = json.loads(r.read())
+        return None if d.get("ErrorNumber") else d.get("Value")  # e.g. 1031, not connected
+
+    def poll_once(self):
+        values, ok, extra = {}, False, {}
+        for dev, prop in ALPACA_EXTRA:
+            try:
+                extra[(dev, prop)] = self.get(dev, prop)
+            except (OSError, ValueError, http.client.HTTPException):
+                pass
+        for (dev, prop), name in ALPACA_READS.items():
+            try:
+                values[name] = self.get(dev, prop)
+                ok = True
+            except (OSError, ValueError, http.client.HTTPException):
+                with self.cache.lock:
+                    self.cache.alpaca_failures += 1
+        names = None
+        if ok:
+            try:
+                names = self.get("filterwheel", "names")
+            except (OSError, ValueError, http.client.HTTPException):
+                pass
+        now = time.time()
+        with self.cache.lock:
+            self.cache.alpaca_last_poll = now
+            if ok:
+                self.cache.alpaca = {k: v for k, v in values.items() if v is not None}
+                self.cache.alpaca_extra = {k: v for k, v in extra.items() if v is not None}
+                self.cache.alpaca_last_success = now
+                if isinstance(names, list):
+                    self.cache.filter_names = names
+
+    def run(self):
+        while True:
+            try:
+                self.poll_once()
+            except Exception as e:  # never die
+                log.info("alpaca %s: %s", self.base, e)
+            time.sleep(self.poll_s)
+
+
 def _num(v):
     if isinstance(v, bool):
         return float(v)
     if isinstance(v, (int, float)) and math.isfinite(v):
         return float(v)
     return None
+
+
+def _flat(obj, prefix=""):
+    """Every number in a nested dict/list, as (dotted path, value)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _flat(v, f"{prefix}.{k}" if prefix else str(k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _flat(v, f"{prefix}.{i}" if prefix else str(i))
+    elif _num(obj) is not None:
+        yield prefix, obj
 
 
 def _label(v):
@@ -190,10 +346,54 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0):
         )
         m("seestar_connects_total", cache.connects, "control connections opened", kind="counter")
         m("seestar_last_poll_timestamp_seconds", cache.last_poll or None, "last poll sent")
+        m("seestar_last_heard_timestamp_seconds", cache.last_heard or None, "last line received")
         m(
-            "seestar_last_success_timestamp_seconds",
+            "seestar_state_last_success_timestamp_seconds",
             cache.last_success or None,
-            "last device state received",
+            "last device state received (none while the scope images)",
+        )
+        m(
+            "seestar_alpaca_last_poll_timestamp_seconds",
+            cache.alpaca_last_poll or None,
+            "last Alpaca poll attempted: the exporter's own heartbeat",
+        )
+        m(
+            "seestar_alpaca_last_success_timestamp_seconds",
+            cache.alpaca_last_success or None,
+            "last Alpaca poll with an answer",
+        )
+        m(
+            "seestar_alpaca_failures_total",
+            cache.alpaca_failures,
+            "Alpaca GETs failed",
+            kind="counter",
+        )
+        m(
+            "seestar_refused_total",
+            cache.refused,
+            "connections refused as over the scope's limit",
+            kind="counter",
+        )
+        alpaca = dict(cache.alpaca)
+        alpaca_extra = dict(cache.alpaca_extra)
+        filter_names = cache.filter_names
+
+    for name, v in sorted(alpaca.items()):
+        m(name, v, "from Alpaca")
+    for (dev, prop), v in sorted(alpaca_extra.items()):
+        m(
+            "seestar_alpaca_value",
+            v,
+            "any other Alpaca property that answers",
+            {"device": dev, "property": prop},
+        )
+    pos = _num(alpaca.get("seestar_filter_position"))
+    if filter_names and pos is not None and 0 <= pos < len(filter_names):
+        m(
+            "seestar_filter_info",
+            1,
+            "the filter in the light path",
+            {"filter": filter_names[int(pos)]},
         )
 
     dev = st.get("device") or {}
@@ -218,7 +418,10 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0):
     m("seestar_overtemp", pi.get("is_overtemp"), "1 when the board reports overtemperature")
     m("seestar_battery_overtemp", pi.get("battery_overtemp"), "1 when the battery is too hot")
 
-    tilt = ((st.get("balance_sensor") or {}).get("data") or {}).get("angle")
+    bal = (st.get("balance_sensor") or {}).get("data") or {}
+    tilt = bal.get("angle")
+    for axis in "xyz":
+        m("seestar_accel_g", bal.get(axis), "balance sensor (accelerometer) axis", {"axis": axis})
     m("seestar_tilt_degrees", tilt, "balance sensor tilt from level (about 90 - lat on a wedge)")
     if _num(tilt) is not None:
         m("seestar_on_desk", tilt < on_desk_deg, f"1 when tilt is under {on_desk_deg:g} deg")
@@ -226,6 +429,14 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0):
     comp = (st.get("compass_sensor") or {}).get("data") or {}
     m("seestar_compass_direction_degrees", comp.get("direction"), "compass heading")
     m("seestar_compass_interference", comp.get("interference"), "compass interference flag")
+    m("seestar_compass_stable", comp.get("stable"), "compass stable flag")
+    m("seestar_compass_declination_degrees", comp.get("declination"), "magnetic declination")
+    for axis in "xyz":
+        m("seestar_magnetometer", comp.get(axis), "compass raw axis", {"axis": axis})
+    ll = st.get("location_lon_lat")
+    if isinstance(ll, list) and len(ll) == 2:
+        m("seestar_location_lon_degrees", ll[0], "location stored in the scope")
+        m("seestar_location_lat_degrees", ll[1], "location stored in the scope")
 
     mount = st.get("mount") or {}
     m("seestar_mount_stowed", mount.get("close"), "1 when the arm is closed")
@@ -266,20 +477,36 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0):
                 "the event's last state",
                 {"event": name, "state": ev["state"]},
             )
-        for k, v in sorted(ev.items()):
-            if k not in ("Event", "Timestamp", "id") and _num(v) is not None:
-                m(
-                    "seestar_event_value",
-                    v,
-                    "numeric field of the last event",
-                    {"event": name, "field": k},
-                )
+        for path, v in _flat(
+            {k: x for k, x in ev.items() if k not in ("Event", "Timestamp", "id")}
+        ):
+            m(
+                "seestar_event_value",
+                v,
+                "numeric field of the last event (nested as a.b.0)",
+                {"event": name, "field": path},
+            )
+
+    # Every number in the device state, whatever the firmware adds.
+    for path, v in _flat(st):
+        block, _, field = path.partition(".")
+        m(
+            "seestar_state_value",
+            v,
+            "numeric field of the device state (nested as a.b.0)",
+            {"block": block, "field": field or block},
+        )
     return "\n".join(out) + "\n"
 
 
 def serve(host, port=9877, poll_s=30.0, on_desk_deg=10.0):
     cache = Cache()
-    threading.Thread(target=Poller(host, cache, poll_s).run, daemon=True).start()
+    hold_s = float(os.environ.get("NATIVE_HOLD_S", NATIVE_HOLD_S))
+    every_s = float(os.environ.get("NATIVE_EVERY_S", NATIVE_EVERY_S))
+    if every_s > 0:  # NATIVE_EVERY_S=0: Alpaca only, the control port is never touched
+        poller = Poller(host, cache, poll_s, hold_s=hold_s, every_s=every_s)
+        threading.Thread(target=poller.run, daemon=True).start()
+    threading.Thread(target=AlpacaPoller(host, cache, poll_s).run, daemon=True).start()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):

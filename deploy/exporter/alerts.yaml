@@ -2,6 +2,22 @@
 groups:
   - name: seestar
     rules:
+      # The exporter itself has hung: its Alpaca loop runs every POLL_S (30 s) whether
+      # or not the scope answers.
+      - alert: SeestarExporterStalled
+        expr: time() - seestar_alpaca_last_poll_timestamp_seconds > 90
+        for: 2m
+        annotations:
+          summary: "terminus exporter has not polled in {{ $value }}s"
+      # The scope is on (Alpaca answers) but the native side has gone quiet for 10 min.
+      # Device state alone stalls all night while imaging, so this keys on any line heard.
+      - alert: SeestarNativeSilent
+        expr: |
+          time() - seestar_alpaca_last_success_timestamp_seconds < 90
+          and on() time() - seestar_last_heard_timestamp_seconds > 600
+        for: 5m
+        annotations:
+          summary: "Seestar answers Alpaca but nothing on the control port for 10 minutes"
       - alert: SeestarBatteryLow
         expr: seestar_battery_percent < 20 and seestar_charging == 0
         for: 5m
