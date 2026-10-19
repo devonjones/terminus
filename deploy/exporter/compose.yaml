@@ -6,7 +6,8 @@ services:
     environment:
       SEESTAR_HOST: <scope-ip>
       # The interop key, mounted read-only; firmware 9.75 sends no device state without it.
-      # The container runs as nobody: on the host, chown 65534 and chmod 400 the key.
+      # The container runs as nobody, so either chown the key to 65534 on the host or
+      # run the service as the key's owner (user: "<uid>:<gid>"). Keep it mode 0400.
       SEESTAR_PEM: /run/secrets/seestar_client_key.pem
       POLL_S: "30"
       ON_DESK_DEG: "10"
