@@ -514,7 +514,10 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0, native_every_s=NATIVE
         m("seestar_accel_g", bal.get(axis), "balance sensor (accelerometer) axis", {"axis": axis})
     m("seestar_tilt_degrees", tilt, "balance sensor tilt from level (about 90 - lat on a wedge)")
     if _num(tilt) is not None:
-        m("seestar_on_desk", tilt < on_desk_deg, f"1 when tilt is under {on_desk_deg:g} deg")
+        # The angle is the z axis's to gravity: ~90 wherever z lies level (upright on a
+        # desk or on any side, measured 2026-10-19), 90 - latitude on the wedge.
+        on_desk = abs(tilt - 90) <= on_desk_deg
+        m("seestar_on_desk", on_desk, f"1 when tilt is within {on_desk_deg:g} deg of 90")
 
     comp = (st.get("compass_sensor") or {}).get("data") or {}
     m("seestar_compass_direction_degrees", comp.get("direction"), "compass heading")

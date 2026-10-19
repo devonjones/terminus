@@ -464,7 +464,7 @@
         "graphMode": "none",
         "textMode": "value"
       },
-      "description": "Tilt under ON_DESK_DEG: the scope is sitting flat, not on the EQ wedge."
+      "description": "Tilt within ON_DESK_DEG of 90: off the EQ wedge, upright or on a side."
     },
     {
       "type": "stat",
@@ -999,7 +999,7 @@
           "sort": "none"
         }
       },
-      "description": "Balance-sensor angle. ~0 on a desk; the wedge sets it near your latitude."
+      "description": "Balance-sensor angle. ~90 on a desk (upright or on a side); 90 - latitude on the wedge."
     },
     {
       "type": "timeseries",

@@ -56,9 +56,14 @@ def test_device_state_becomes_metrics():
     assert _value(out, "seestar_state_last_success_timestamp_seconds") == 1000.0
 
 
-def test_flat_on_a_desk_reads_on_desk():
-    c, _ = _poller({"balance_sensor": {"data": {"angle": 1.2}}})
-    assert _value(render(c, now=1000.0), "seestar_on_desk") == 1
+@pytest.mark.parametrize(
+    "angle, on_desk",
+    # measured 2026-10-19: upright, on two sides, rolled ~10 deg, on the wedge
+    [(89.8, 1), (90.6, 1), (91.0, 1), (89.4, 1), (48.2, 0), (1.2, 0)],
+)
+def test_on_desk_is_tilt_near_90_upright_or_on_a_side(angle, on_desk):
+    c, _ = _poller({"balance_sensor": {"data": {"angle": angle}}})
+    assert _value(render(c, now=1000.0), "seestar_on_desk") == on_desk
 
 
 def test_up_spans_the_gap_between_native_windows():
