@@ -631,7 +631,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "seestar_storage_used_percent",
+          "expr": "max(seestar_storage_used_percent) or max(last_over_time(seestar_event_value{event=\"DiskSpace\",field=\"used_percent\"}[7d]))",
           "legendFormat": "",
           "refId": "A",
           "instant": true,
@@ -680,7 +680,8 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value"
-      }
+      },
+      "description": "From the device state, or the DiskSpace event when the state leaves out sizes (it does while USB-C is connected)."
     },
     {
       "type": "stat",
