@@ -285,13 +285,31 @@ def test_the_connection_limit_is_counted_and_not_retried_at_once():
     srv.close()
 
 
-def test_a_short_session_lets_go_of_the_connection_after_hold_s(monkeypatch):
-    monkeypatch.setattr(exporter, "KEEPALIVE_S", 0.1)
+def test_a_short_session_lets_go_after_hold_s_and_hears_the_keepalive():
     sent = []
     srv = _fake_scope(sent)
+    c = Cache()
     t = time.time()
-    Poller("127.0.0.1", Cache(), port=srv.getsockname()[1], hold_s=0.5).session()
+    Poller("127.0.0.1", c, port=srv.getsockname()[1], hold_s=0.5).session()
     assert time.time() - t < 3
+    assert "get_verify_str" in sent and c.last_heard > 0  # alive though the state never came
+    srv.close()
+
+
+def test_the_connection_is_closed_before_the_pause_between_sessions(monkeypatch):
+    srv = _fake_scope([])
+    p = Poller("127.0.0.1", Cache(), port=srv.getsockname()[1], hold_s=0.3, every_s=60)
+
+    class Paused(Exception):
+        pass
+
+    def sleep(_):
+        assert p.s.fileno() == -1 and not p.cache.connected
+        raise Paused
+
+    monkeypatch.setattr(exporter.time, "sleep", sleep)
+    with pytest.raises(Paused):
+        p.run()
     srv.close()
 
 

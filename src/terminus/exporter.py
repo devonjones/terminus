@@ -201,6 +201,7 @@ class Poller:
                 self.pending = (self.send("get_device_state"), now)
                 with self.cache.lock:
                     self.cache.last_poll = now
+                self.send("get_verify_str")  # answered even when the state is not
                 next_poll = now + self.poll_s
                 next_keepalive = now + KEEPALIVE_S
             elif now >= next_keepalive:
@@ -225,24 +226,21 @@ class Poller:
             started = time.time()
             try:
                 self.session()
-                time.sleep(max(1, self.every_s - (time.time() - started)))
-                delay = 1
-                continue
+                pause, delay = max(1, self.every_s - (time.time() - started)), 1
             except ConnectionRefusedError as e:
                 log.info("scope %s:%s: %s; next try in %ss", self.host, self.port, e, self.every_s)
-                time.sleep(self.every_s)
-                continue
+                pause = self.every_s
             except Exception as e:  # never die: a scope that is off is the normal case
+                if self.cache.last_heard > started + 60:
+                    delay = 1  # the session lasted: a fresh drop retries at once
                 log.info("scope %s:%s: %s; retrying in %ss", self.host, self.port, e, delay)
-            finally:
+                pause, delay = delay, min(60, delay * 2)
+            finally:  # let go of the slot before the pause, never during it
                 with self.cache.lock:
                     self.cache.connected = False
                 if self.s:
                     self.s.close()
-            if self.cache.last_heard > started + 60:
-                delay = 1  # the session lasted: a fresh drop retries at once
-            time.sleep(delay)
-            delay = min(60, delay * 2)
+            time.sleep(pause)
 
 
 class AlpacaPoller:
