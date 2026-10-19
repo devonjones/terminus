@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     environment:
       SEESTAR_HOST: <scope-ip>
+      # The interop key, mounted read-only; firmware 9.75 sends no device state without it.
+      # The container runs as nobody: on the host, chown 65534 and chmod 400 the key.
+      SEESTAR_PEM: /run/secrets/seestar_client_key.pem
       POLL_S: "30"
       ON_DESK_DEG: "10"
       # The scope allows few control connections and the phone app needs one: connect
@@ -13,5 +16,7 @@ services:
       NATIVE_EVERY_S: "60"
       # Alpaca devices the exporter may set Connected=true on (never the camera).
       ALPACA_CONNECT: "focuser,switch"
+    volumes:
+      - <host-path>/seestar_client_key.pem:/run/secrets/seestar_client_key.pem:ro
     ports:
       - "9877:9877"

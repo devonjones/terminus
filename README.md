@@ -423,12 +423,17 @@ from terminus import mosaic, skymask, orient, plan
 
 A long-running, strictly passive Prometheus exporter for the scope: battery, temperatures,
 tilt (and whether the scope is on a desk or on its wedge), mount state, Wi-Fi, storage, and the
-events the scope pushes while imaging, focuser position and the dew heater. It needs no key, never moves anything and never connects the camera;
-its only write is Alpaca Connected=true on the focuser and dew-heater switch, to read them, reconnects forever, and serves `/metrics` from its own cache.
+events the scope pushes while imaging, focuser position and the dew heater. It never moves anything and never connects the camera.
+Firmware 9.75 sends the device state (battery, tilt, Wi-Fi, storage...) only to a client that
+has signed in with the [interop key](#the-interop-key-optional-the-native-link), so set
+`SEESTAR_PEM`; without it only events and Alpaca report. Its only write is Alpaca
+Connected=true on the focuser and dew-heater switch, to read them. It reconnects forever and
+serves `/metrics` from its own cache.
 
 ```bash
-SEESTAR_HOST=<scope-ip> terminus exporter          # :9877/metrics
-docker run -e SEESTAR_HOST=<scope-ip> -p 9877:9877 ghcr.io/devonjones/terminus:<sha>
+SEESTAR_HOST=<scope-ip> SEESTAR_PEM=~/.seestar/seestar_client_key.pem terminus exporter  # :9877/metrics
+docker run --user "$(id -u)" -e SEESTAR_HOST=<scope-ip> -e SEESTAR_PEM=/key.pem \
+  -v ~/.seestar/seestar_client_key.pem:/key.pem:ro -p 9877:9877 ghcr.io/devonjones/terminus:<sha>
 ```
 
 `deploy/exporter/` has a compose stack and Prometheus alert rules.

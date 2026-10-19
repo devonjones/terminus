@@ -1264,8 +1264,13 @@ open question.
 
 ### I-17 — The control port drops a quiet socket at 16 s, holds device state while it images, and limits connections
 
-Measured 2026-10-18 on firmware 9.75 while building `terminus exporter`. `get_device_state`
-answers without the interop key (the handshake failed and the state came back anyway). The scope
+Measured 2026-10-18/19 on firmware 9.75 while building `terminus exporter`. `get_device_state`
+is ignored, even idle, until the client has signed a challenge (`get_verify_str` →
+`verify_client`). That handshake now answers `code: 0` with a key envelope as the `result`, so a
+check for `result == 0` reads success as failure. A first test took that "failed" handshake plus an
+answered state as proof no key was needed, and the exporter ran a night with no state at all. A
+fresh `get_verify_str` after verifying undoes it, so a verified client must not use it as a
+keepalive. The scope
 closes any control socket that has sent nothing for about 16 s, idle or with a request still
 outstanding; `get_verify_str` every 10 s keeps it open and answers at once. While the app runs
 its preview/imaging loop, `get_device_state` goes unanswered: no reply in 90 s with frames

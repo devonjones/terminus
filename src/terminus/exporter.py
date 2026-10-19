@@ -1,12 +1,14 @@
 """`terminus exporter`: the Seestar's own state as Prometheus metrics.
 
-Strictly passive. On the control port (4700) it sends two requests, both reads
-that need no interop key: `get_device_state`, and `get_verify_str` as a
-keepalive (the scope closes a socket that is quiet for ~16 s; measured
-2026-10-18, firmware 9.75). Everything else comes from the events the scope
-pushes on the same socket (Imaging, Exposure, PiStatus, Stack, ...). It never
-authenticates and never calls any other method: some, like pi_shutdown, are
-destructive. On Alpaca (32323) it sends GETs, plus Connected=true to the focuser
+Strictly passive. On the control port (4700) it sends three requests:
+`get_verify_str`, `verify_client` to sign that challenge with the interop key
+(SEESTAR_PEM), and `get_device_state`, which firmware 9.75 ignores until the
+client has verified. The scope closes a socket that is quiet for ~16 s, so a
+keepalive goes every KEEPALIVE_S: `get_verify_str` unkeyed, a pi_status state
+read once verified (a new challenge undoes the verification).
+Everything else comes from the events the scope pushes on the same socket
+(Imaging, Exposure, PiStatus, Stack, ...). It never calls any other method: some,
+like pi_shutdown, are destructive. On Alpaca (32323) it sends GETs, plus Connected=true to the focuser
 and the switch (ALPACA_CONNECT, default "focuser,switch") for focuser position
 and the dew heater. It never connects the camera, so there is no CCD temperature.
 
@@ -21,6 +23,7 @@ ages the cache: `seestar_up` goes to 0 and the last values keep serving with
 their timestamps.
 
 Configuration is by environment, for the container: SEESTAR_HOST,
+SEESTAR_PEM (the interop key; without it only events and Alpaca report),
 EXPORTER_PORT (9877), POLL_S (30), ON_DESK_DEG (10), NATIVE_HOLD_S (10; 0 holds
 the connection open), NATIVE_EVERY_S (60; 0 for Alpaca only).
 """
@@ -37,6 +40,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .client import load_key, verified, verify_params
+
 log = logging.getLogger(__name__)
 
 CONTROL_PORT = 4700
@@ -48,8 +53,8 @@ STATE_TIMEOUT_S = 120
 ALPACA_PORT = 32323
 ALPACA_TIMEOUT_S = 10
 # Alpaca GETs that answer with every device disconnected (2026-10-18, while imaging).
-# CCD temperature, the dew-heater switch and focuser position need Connected=true,
-# which the exporter never sets, so they are absent.
+# Focuser position and the dew-heater switch need Connected=true (see CONNECTABLE);
+# CCD temperature would need the camera connected, which the exporter never does.
 # The scope allows only a few control connections (it answers the next with an
 # Alert, code 429, and hangs up), and the phone app needs one. So the exporter holds
 # its connection for HOLD_S out of every EVERY_S rather than all night.
@@ -95,7 +100,7 @@ ALPACA_READS = {
     ("telescope", "sitelatitude"): "seestar_site_latitude_degrees",
     ("telescope", "sitelongitude"): "seestar_site_longitude_degrees",
 }
-ALLOWED_METHODS = frozenset({"get_device_state", "get_verify_str"})
+ALLOWED_METHODS = frozenset({"get_device_state", "get_verify_str", "verify_client"})
 
 
 class Cache:
@@ -131,6 +136,7 @@ class Poller:
         port=CONTROL_PORT,
         hold_s=NATIVE_HOLD_S,
         every_s=NATIVE_EVERY_S,
+        key=None,
     ):
         self.host, self.port, self.cache, self.poll_s = host, port, cache, poll_s
         self.hold_s, self.every_s = hold_s, every_s  # hold_s 0: keep the connection open
@@ -139,12 +145,18 @@ class Poller:
         self.buf = b""
         self.cid = 1000
         self.pending = None  # (id, sent at) of the outstanding get_device_state
+        self.key = key  # interop key: verify each session before asking for the state
+        self.challenge_id = self.verify_id = self.challenge = None
+        self.authed = self.auth_failed = False
 
-    def send(self, method):
+    def send(self, method, params=None):
         if method not in ALLOWED_METHODS:  # the passive guarantee, enforced here
             raise ValueError(f"exporter refuses to call {method}")
         self.cid += 1
-        self.s.sendall((json.dumps({"id": self.cid, "method": method}) + "\r\n").encode())
+        msg = {"id": self.cid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.s.sendall((json.dumps(msg) + "\r\n").encode())
         return self.cid
 
     def handle(self, line, now):
@@ -166,6 +178,14 @@ class Poller:
                         c.state = {}
                     pi = c.state.setdefault("pi_status", {})
                     pi.update({k: v for k, v in d.items() if k not in ("Event", "Timestamp")})
+            elif self.challenge_id is not None and d.get("id") == self.challenge_id:
+                r = d.get("result")
+                self.challenge = r.get("str") if isinstance(r, dict) else None
+                self.challenge_id = None
+            elif self.verify_id is not None and d.get("id") == self.verify_id:
+                self.verify_id = None
+                self.authed = verified(d)
+                self.auth_failed = not self.authed
             elif self.pending is not None and d.get("id") == self.pending[0]:
                 self.pending = None
                 if isinstance(d.get("result"), dict):
@@ -178,17 +198,27 @@ class Poller:
         self.s = socket.create_connection((self.host, self.port), timeout=10)
         self.s.settimeout(1.0)
         self.buf, self.pending, self.refused = b"", None, False
+        self.challenge = self.verify_id = None
+        self.authed, self.auth_failed = self.key is None, False
+        self.challenge_id = self.send("get_verify_str") if self.key is not None else None
         opened = time.time()
         with self.cache.lock:
             self.cache.connected = True
             self.cache.connects += 1
-        next_poll = next_keepalive = 0.0
+        next_poll, next_keepalive = 0.0, opened + KEEPALIVE_S
         while True:
             now = time.time()
             if self.refused:
                 with self.cache.lock:
                     self.cache.refused += 1
                 raise ConnectionRefusedError("the scope is at its connection limit")
+            if self.auth_failed:
+                with self.cache.lock:
+                    self.cache.failures += 1
+                raise PermissionError("verify_client refused the signature (wrong key?)")
+            if self.challenge:
+                self.verify_id = self.send("verify_client", verify_params(self.key, self.challenge))
+                self.challenge = None
             if self.hold_s and now - opened > self.hold_s:
                 return
             if now - max(opened, self.cache.last_heard) > DEAD_S:
@@ -197,15 +227,21 @@ class Poller:
                 with self.cache.lock:
                     self.cache.failures += 1
                 raise TimeoutError(f"no device state in {STATE_TIMEOUT_S}s (the scope is imaging?)")
-            if now >= next_poll and self.pending is None:
+            if self.authed and now >= next_poll and self.pending is None:
                 self.pending = (self.send("get_device_state"), now)
                 with self.cache.lock:
                     self.cache.last_poll = now
-                self.send("get_verify_str")  # answered even when the state is not
+                if self.key is None:
+                    self.send("get_verify_str")  # answered even when the state is not
                 next_poll = now + self.poll_s
                 next_keepalive = now + KEEPALIVE_S
             elif now >= next_keepalive:
-                self.send("get_verify_str")
+                # a fresh challenge undoes verification, so a verified session keeps
+                # alive with a small state read instead
+                if self.key is None:
+                    self.send("get_verify_str")
+                else:
+                    self.send("get_device_state", {"keys": ["pi_status"]})
                 next_keepalive = now + KEEPALIVE_S
             try:
                 chunk = self.s.recv(65536)
@@ -551,12 +587,15 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0, native_every_s=NATIVE
     return "\n".join(out) + "\n"
 
 
-def serve(host, port=9877, poll_s=30.0, on_desk_deg=10.0):
+def serve(host, port=9877, poll_s=30.0, on_desk_deg=10.0, pem=None):
     cache = Cache()
+    key = load_key(pem) if pem else None  # a missing key fails here, at startup
+    if key is None:
+        log.warning("no SEESTAR_PEM: firmware 9.75 will not answer get_device_state")
     hold_s = float(os.environ.get("NATIVE_HOLD_S", NATIVE_HOLD_S))
     every_s = float(os.environ.get("NATIVE_EVERY_S", NATIVE_EVERY_S))
     if every_s > 0:  # NATIVE_EVERY_S=0: Alpaca only, the control port is never touched
-        poller = Poller(host, cache, poll_s, hold_s=hold_s, every_s=every_s)
+        poller = Poller(host, cache, poll_s, hold_s=hold_s, every_s=every_s, key=key)
         threading.Thread(target=poller.run, daemon=True).start()
     connect = [d for d in os.environ.get("ALPACA_CONNECT", "focuser,switch").split(",") if d]
     alpaca = AlpacaPoller(host, cache, poll_s, connect=connect)
@@ -594,4 +633,5 @@ def main_env(args=None):
         port=getattr(args, "port", None) or int(os.environ.get("EXPORTER_PORT", 9877)),
         poll_s=float(os.environ.get("POLL_S", 30)),
         on_desk_deg=float(os.environ.get("ON_DESK_DEG", 10)),
+        pem=os.environ.get("SEESTAR_PEM"),
     )

@@ -319,3 +319,90 @@ def test_every_number_is_exported_nested_ones_included():
     out = render(c, now=1002.0)
     assert _value(out, 'seestar_state_value{block="new_block",field="a.1.b"}') == 2.5
     assert _value(out, 'seestar_event_value{event="PlateSolve",field="result.ra_dec.1"}') == 18.8
+
+
+def _verifying_scope(public_key, sent):
+    """A control port that answers the device state only to a client that verified."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def run():
+        conn, _ = srv.accept()
+        buf, ok = b"", False
+        try:
+            while chunk := conn.recv(4096):
+                buf += chunk
+                *lines, buf = buf.split(b"\r\n")
+                for line in lines:
+                    d = json.loads(line)
+                    sent.append(d["method"])
+                    reply = None
+                    if d["method"] == "get_verify_str":  # a new challenge unverifies
+                        ok, reply = False, {"result": {"str": "challenge"}, "code": 0}
+                    elif d["method"] == "verify_client":
+                        try:
+                            sig = base64.b64decode(d["params"]["sign"])
+                            public_key.verify(sig, b"challenge", padding.PKCS1v15(), hashes.SHA1())
+                            ok = True
+                        except Exception:
+                            pass
+                        reply = {"result": {"key_envelope": {}}, "code": 0 if ok else 103}
+                    elif d["method"] == "get_device_state" and ok:
+                        reply = {"result": STATE, "code": 0}
+                    if reply:
+                        conn.sendall(json.dumps({"id": d["id"]} | reply).encode() + b"\r\n")
+        except OSError:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+    return srv
+
+
+def _key():
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def test_a_keyed_session_verifies_then_gets_the_state():
+    key, sent = _key(), []
+    srv = _verifying_scope(key.public_key(), sent)
+    c = Cache()
+    Poller("127.0.0.1", c, port=srv.getsockname()[1], hold_s=1.5, key=key).session()
+    assert sent[:3] == ["get_verify_str", "verify_client", "get_device_state"]
+    assert c.last_success > 0 and _value(render(c, now=c.last_success), "seestar_battery_percent")
+    srv.close()
+
+
+def test_a_refused_signature_never_asks_for_the_state():
+    sent = []
+    srv = _verifying_scope(_key().public_key(), sent)
+    c = Cache()
+    with pytest.raises(PermissionError):
+        Poller("127.0.0.1", c, port=srv.getsockname()[1], hold_s=3, key=_key()).session()
+    assert "get_device_state" not in sent and c.failures == 1
+    srv.close()
+
+
+def test_verified_reads_both_firmware_reply_shapes():
+    from terminus.client import verified
+
+    assert verified({"result": {"key_envelope": {}}, "code": 0})  # 9.75
+    assert verified({"result": 0})  # older firmware
+    assert not verified({"result": {"key_envelope": {}}, "code": 103})
+    assert not verified({"timeout": "verify_client"})
+
+
+def test_a_verified_session_keeps_alive_without_a_new_challenge(monkeypatch):
+    monkeypatch.setattr(exporter, "KEEPALIVE_S", 0.2)
+    key, sent = _key(), []
+    srv = _verifying_scope(key.public_key(), sent)
+    c = Cache()
+    Poller("127.0.0.1", c, port=srv.getsockname()[1], poll_s=0.5, hold_s=2, key=key).session()
+    assert sent.count("get_verify_str") == 1 and sent.count("get_device_state") >= 2
+    assert c.failures == 0 and c.last_success > c.last_poll - 1
+    srv.close()
