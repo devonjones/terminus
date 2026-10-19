@@ -423,8 +423,8 @@ from terminus import mosaic, skymask, orient, plan
 
 A long-running, strictly passive Prometheus exporter for the scope: battery, temperatures,
 tilt (and whether the scope is on a desk or on its wedge), mount state, Wi-Fi, storage, and the
-events the scope pushes while imaging. It only reads (no key, no Alpaca, nothing that moves or
-connects the camera), reconnects forever, and serves `/metrics` from its own cache.
+events the scope pushes while imaging, focuser position and the dew heater. It needs no key, never moves anything and never connects the camera;
+its only write is Alpaca Connected=true on the focuser and dew-heater switch, to read them, reconnects forever, and serves `/metrics` from its own cache.
 
 ```bash
 SEESTAR_HOST=<scope-ip> terminus exporter          # :9877/metrics

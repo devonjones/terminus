@@ -6,9 +6,9 @@ keepalive (the scope closes a socket that is quiet for ~16 s; measured
 2026-10-18, firmware 9.75). Everything else comes from the events the scope
 pushes on the same socket (Imaging, Exposure, PiStatus, Stack, ...). It never
 authenticates and never calls any other method: some, like pi_shutdown, are
-destructive. On Alpaca (32323) it sends GETs only, never a PUT, so no device is
-ever connected; that rules out CCD temperature, the dew heater and the focuser
-position, and leaves pointing, tracking, focuser temperature and the filter.
+destructive. On Alpaca (32323) it sends GETs, plus Connected=true to the focuser
+and the switch (ALPACA_CONNECT, default "focuser,switch") for focuser position
+and the dew heater. It never connects the camera, so there is no CCD temperature.
 
 While the scope images, get_device_state goes unanswered all night. After
 STATE_TIMEOUT_S the request is counted as failed and the socket reopened rather
@@ -33,6 +33,7 @@ import os
 import socket
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -77,6 +78,11 @@ ALPACA_EXTRA = [
         "aperturediameter",
     )
 ] + [("focuser", p) for p in ("ismoving", "maxstep", "stepsize", "tempcomp")]
+# The one write the exporter makes: Connected=true, on these devices only. Neither
+# moves anything or touches the imaging path; Devon chose to connect them (2026-10-18)
+# for focuser position and the dew heater. The camera is deliberately not allowed:
+# connecting it mid-stack could take the sensor from the app.
+CONNECTABLE = frozenset({"focuser", "switch"})
 ALPACA_READS = {
     ("telescope", "rightascension"): "seestar_ra_hours",
     ("telescope", "declination"): "seestar_dec_degrees",
@@ -103,6 +109,8 @@ class Cache:
         self.last_success = 0.0  # last device state
         self.alpaca = {}  # metric name -> value
         self.alpaca_extra = {}  # (device, property) -> value
+        self.switches = {}  # switch name -> value
+        self.alpaca_connects = 0
         self.filter_names = None
         self.alpaca_last_poll = 0.0
         self.alpaca_last_success = 0.0
@@ -238,18 +246,52 @@ class Poller:
 
 
 class AlpacaPoller:
-    """GETs only, each on its own short timeout, in a thread of its own so that a
-    stalled native call never holds these up. Never PUTs, never connects anything."""
+    """GETs, each on its own short timeout, in a thread of its own so that a stalled
+    native call never holds these up. The only write is Connected=true on a device in
+    `connect` (a subset of CONNECTABLE), sent when it reads as disconnected."""
 
-    def __init__(self, host, cache, poll_s=30.0, port=ALPACA_PORT):
+    def __init__(self, host, cache, poll_s=30.0, port=ALPACA_PORT, connect=CONNECTABLE):
+        if not set(connect) <= CONNECTABLE:
+            raise ValueError(f"exporter will only connect {sorted(CONNECTABLE)}")
         self.base = f"http://{host}:{port}/api/v1"
-        self.cache, self.poll_s = cache, poll_s
+        self.cache, self.poll_s, self.connect = cache, poll_s, frozenset(connect)
+        self.switch_names = {}
 
-    def get(self, dev, prop):
-        url = f"{self.base}/{dev}/0/{prop}?ClientID=42&ClientTransactionID=1"
-        with urllib.request.urlopen(url, timeout=ALPACA_TIMEOUT_S) as r:
+    def get(self, dev, prop, **params):
+        q = urllib.parse.urlencode({**params, "ClientID": 42, "ClientTransactionID": 1})
+        with urllib.request.urlopen(
+            f"{self.base}/{dev}/0/{prop}?{q}", timeout=ALPACA_TIMEOUT_S
+        ) as r:
             d = json.loads(r.read())
         return None if d.get("ErrorNumber") else d.get("Value")  # e.g. 1031, not connected
+
+    def connect_device(self, dev):
+        if dev not in CONNECTABLE:  # the write guarantee, enforced here
+            raise ValueError(f"exporter refuses to connect {dev}")
+        body = urllib.parse.urlencode(
+            {"Connected": "true", "ClientID": 42, "ClientTransactionID": 1}
+        )
+        req = urllib.request.Request(f"{self.base}/{dev}/0/connected", body.encode(), method="PUT")
+        with urllib.request.urlopen(req, timeout=ALPACA_TIMEOUT_S) as r:
+            r.read()
+        with self.cache.lock:
+            self.cache.alpaca_connects += 1
+
+    def connected_reads(self):
+        """Readings that need the device connected: {metric name: value}, and the
+        switches as {name: value}."""
+        values, switches = {}, {}
+        for dev in sorted(self.connect):
+            if self.get(dev, "connected") is False:
+                self.connect_device(dev)
+        if "focuser" in self.connect:
+            values["seestar_focuser_position"] = self.get("focuser", "position")
+        if "switch" in self.connect:
+            for i in range(int(self.get("switch", "maxswitch") or 0)):
+                if i not in self.switch_names:
+                    self.switch_names[i] = self.get("switch", "getswitchname", Id=i) or str(i)
+                switches[self.switch_names[i]] = self.get("switch", "getswitchvalue", Id=i)
+        return values, switches
 
     def poll_once(self):
         values, ok, extra = {}, False, {}
@@ -265,12 +307,15 @@ class AlpacaPoller:
             except (OSError, ValueError, http.client.HTTPException):
                 with self.cache.lock:
                     self.cache.alpaca_failures += 1
-        names = None
+        names, switches = None, {}
         if ok:
             try:
                 names = self.get("filterwheel", "names")
+                more, switches = self.connected_reads()
+                values.update(more)
             except (OSError, ValueError, http.client.HTTPException):
-                pass
+                with self.cache.lock:
+                    self.cache.alpaca_failures += 1
         now = time.time()
         with self.cache.lock:
             self.cache.alpaca_last_poll = now
@@ -278,6 +323,7 @@ class AlpacaPoller:
                 self.cache.alpaca = {k: v for k, v in values.items() if v is not None}
                 self.cache.alpaca_extra = {k: v for k, v in extra.items() if v is not None}
                 self.cache.alpaca_last_success = now
+                self.cache.switches = {k: v for k, v in switches.items() if v is not None}
                 if isinstance(names, list):
                     self.cache.filter_names = names
 
@@ -377,10 +423,19 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0, native_every_s=NATIVE
         )
         alpaca = dict(cache.alpaca)
         alpaca_extra = dict(cache.alpaca_extra)
+        switches = dict(cache.switches)
+        m(
+            "seestar_alpaca_connects_total",
+            cache.alpaca_connects,
+            "Connected=true sent to the focuser or switch",
+            kind="counter",
+        )
         filter_names = cache.filter_names
 
     for name, v in sorted(alpaca.items()):
         m(name, v, "from Alpaca")
+    for name, v in sorted(switches.items()):
+        m("seestar_switch_value", v, "Alpaca switch (the dew heater)", {"switch": name})
     for (dev, prop), v in sorted(alpaca_extra.items()):
         m(
             "seestar_alpaca_value",
@@ -458,8 +513,6 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0, native_every_s=NATIVE
             m("seestar_storage_total_bytes", vol["total_mb"] * 2**20, "total storage", lab)
         m("seestar_storage_used_percent", vol.get("used_percent"), "storage used", lab)
 
-    foc = st.get("focuser") or {}
-    m("seestar_focuser_position", foc.get("step"), "focuser step")
     m("seestar_camera_gain", (st.get("camera") or {}).get("gain"), "camera gain")
 
     # Pushed events: every top-level number (stacked_frame, dropped_frame, exp_us, ...)
@@ -507,7 +560,9 @@ def serve(host, port=9877, poll_s=30.0, on_desk_deg=10.0):
     if every_s > 0:  # NATIVE_EVERY_S=0: Alpaca only, the control port is never touched
         poller = Poller(host, cache, poll_s, hold_s=hold_s, every_s=every_s)
         threading.Thread(target=poller.run, daemon=True).start()
-    threading.Thread(target=AlpacaPoller(host, cache, poll_s).run, daemon=True).start()
+    connect = [d for d in os.environ.get("ALPACA_CONNECT", "focuser,switch").split(",") if d]
+    alpaca = AlpacaPoller(host, cache, poll_s, connect=connect)
+    threading.Thread(target=alpaca.run, daemon=True).start()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):

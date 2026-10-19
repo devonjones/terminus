@@ -11,5 +11,7 @@ services:
       # for NATIVE_HOLD_S out of every NATIVE_EVERY_S, never hold it all night.
       NATIVE_HOLD_S: "10"
       NATIVE_EVERY_S: "60"
+      # Alpaca devices the exporter may set Connected=true on (never the camera).
+      ALPACA_CONNECT: "focuser,switch"
     ports:
       - "9877:9877"

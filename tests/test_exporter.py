@@ -153,25 +153,67 @@ def test_an_unanswered_device_state_times_out_counts_and_reconnects(monkeypatch)
     srv.close()
 
 
-def test_alpaca_reads_only_and_skips_what_needs_connected(monkeypatch):
-    calls = []
+def _fake_alpaca(monkeypatch, connected=False):
+    gets, puts = [], []
+    state = {"focuser": connected, "switch": connected}
 
-    def fake_urlopen(url, timeout):
-        calls.append(url)
-        assert not isinstance(url, urllib.request.Request)  # a bare URL is a GET
-        value = {"rightascension": 19.9, "position": 2, "names": ["Dark", "IR", "LP"]}
-        prop = url.split("/")[-1].split("?")[0]
-        body = {"Value": value.get(prop, 1.0), "ErrorNumber": 1031 if prop == "slewing" else 0}
+    def urlopen(req, timeout):
+        if isinstance(req, urllib.request.Request) and req.get_method() == "PUT":
+            puts.append((req.full_url, req.data.decode()))
+            state[req.full_url.split("/")[-3]] = True
+            return io.BytesIO(b'{"ErrorNumber": 0}')
+        url = req if isinstance(req, str) else req.full_url
+        gets.append(url)
+        dev, prop = url.split("/")[-3], url.split("/")[-1].split("?")[0]
+        needs = {"position", "maxswitch", "getswitchname", "getswitchvalue"}
+        if prop in needs and not state.get(dev, True):
+            body = {"Value": 0, "ErrorNumber": 1031}
+        else:
+            value = {
+                "rightascension": 19.9,
+                "position": 1513 if dev == "focuser" else 1,
+                "names": ["Dark", "IR", "LP"],
+                "maxswitch": 1,
+                "getswitchname": "Dew heater",
+                "getswitchvalue": 0,
+                "connected": state.get(dev, False),
+            }.get(prop, 1.0)
+            body = {"Value": value, "ErrorNumber": 1031 if prop == "slewing" else 0}
         return io.BytesIO(json.dumps(body).encode())
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return gets, puts
+
+
+def test_alpaca_connects_the_focuser_and_switch_and_nothing_else(monkeypatch):
+    gets, puts = _fake_alpaca(monkeypatch)
     c = Cache()
     AlpacaPoller("scope", c).poll_once()
     out = render(c, now=c.alpaca_last_poll)
     assert _value(out, "seestar_ra_hours") == 19.9
+    assert _value(out, "seestar_focuser_position") == 1513
+    assert _value(out, 'seestar_switch_value{switch="Dew heater"}') == 0
+    assert _value(out, 'seestar_filter_info{filter="IR"}') == 1
     assert "seestar_telescope_slewing" not in out
-    assert _value(out, 'seestar_filter_info{filter="LP"}') == 1
-    assert all("/connected" not in u for u in calls)
+    assert sorted(u.split("/")[-3] for u, _ in puts) == ["focuser", "switch"]
+    assert all(body.startswith("Connected=true&") for _, body in puts)
+    # already connected: no further writes
+    AlpacaPoller("scope", c).poll_once()
+    assert len(puts) == 2
+
+
+def test_the_camera_can_never_be_connected():
+    with pytest.raises(ValueError):
+        AlpacaPoller("scope", Cache(), connect={"camera"})
+    with pytest.raises(ValueError):
+        AlpacaPoller("scope", Cache()).connect_device("camera")
+
+
+def test_alpaca_read_only_when_told_to_connect_nothing(monkeypatch):
+    gets, puts = _fake_alpaca(monkeypatch)
+    c = Cache()
+    AlpacaPoller("scope", c, connect=()).poll_once()
+    assert puts == [] and "seestar_focuser_position" not in render(c, now=c.alpaca_last_poll)
 
 
 def test_alpaca_down_keeps_the_heartbeat_but_not_the_success(monkeypatch):
