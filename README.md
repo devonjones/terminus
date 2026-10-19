@@ -419,6 +419,20 @@ h.altitude_at(120)                                    # horizon altitude at az 1
 from terminus import mosaic, skymask, orient, plan
 ```
 
+## Monitoring: `terminus exporter`
+
+A long-running, strictly passive Prometheus exporter for the scope: battery, temperatures,
+tilt (and whether the scope is on a desk or on its wedge), mount state, Wi-Fi, storage, and the
+events the scope pushes while imaging. It only reads (no key, no Alpaca, nothing that moves or
+connects the camera), reconnects forever, and serves `/metrics` from its own cache.
+
+```bash
+SEESTAR_HOST=<scope-ip> terminus exporter          # :9877/metrics
+docker run -e SEESTAR_HOST=<scope-ip> -p 9877:9877 ghcr.io/devonjones/terminus:<sha>
+```
+
+`deploy/exporter/` has a compose stack and Prometheus alert rules.
+
 ## Safety
 
 terminus recomputes the Sun's position for the exact current time and refuses any

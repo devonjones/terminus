@@ -1,0 +1,11 @@
+# Portainer stack for `terminus exporter` on hades. Pin the image to a full commit SHA.
+services:
+  seestar-exporter:
+    image: ghcr.io/devonjones/terminus:<full-commit-sha>
+    restart: unless-stopped
+    environment:
+      SEESTAR_HOST: <scope-ip>
+      POLL_S: "30"
+      ON_DESK_DEG: "10"
+    ports:
+      - "9877:9877"

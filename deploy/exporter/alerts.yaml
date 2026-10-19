@@ -1,0 +1,24 @@
+# Prometheus rules for `terminus exporter`.
+groups:
+  - name: seestar
+    rules:
+      - alert: SeestarBatteryLow
+        expr: seestar_battery_percent < 20 and seestar_charging == 0
+        for: 5m
+        annotations:
+          summary: "Seestar battery at {{ $value }}%"
+      - alert: SeestarBatteryCold
+        expr: seestar_battery_temp_celsius < 3
+        for: 10m
+        annotations:
+          summary: "Seestar battery at {{ $value }} °C"
+      # Stacking stalled: the scope is imaging off the desk but no frame has stacked
+      # in 10 minutes.
+      - alert: SeestarStackingStalled
+        expr: |
+          seestar_event_state{event="Imaging",state="working"} == 1
+          and on() seestar_on_desk == 0
+          and on() (time() - seestar_event_timestamp_seconds{event="Stack"}) > 600
+          and on() (time() - seestar_event_timestamp_seconds{event="Imaging"}) < 600
+        annotations:
+          summary: "Seestar imaging but nothing stacked for 10 minutes"
