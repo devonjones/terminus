@@ -61,9 +61,16 @@ def test_flat_on_a_desk_reads_on_desk():
     assert _value(render(c, now=1000.0), "seestar_on_desk") == 1
 
 
+def test_up_spans_the_gap_between_native_windows():
+    c, _ = _poller()  # last heard at 1000
+    assert _value(render(c, now=1000.0 + 100, native_every_s=60), "seestar_up") == 1
+    c.alpaca_last_success = 1200.0
+    assert _value(render(c, now=1210.0, native_every_s=60), "seestar_up") == 1
+
+
 def test_a_silent_scope_is_down_but_keeps_its_last_values():
     c, _ = _poller()
-    out = render(c, now=1000.0 + 91)
+    out = render(c, now=1000.0 + 121, native_every_s=60)
     assert _value(out, "seestar_up") == 0
     assert _value(out, "seestar_battery_percent") == 100
 

@@ -314,7 +314,7 @@ def _label(v):
     return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
 
-def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0):
+def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0, native_every_s=NATIVE_EVERY_S):
     """The cache as Prometheus text exposition."""
     now = time.time() if now is None else now
     out = []
@@ -334,8 +334,9 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0):
         events = dict(cache.events)
         m(
             "seestar_up",
-            cache.last_heard > now - 3 * poll_s,
-            "1 when the scope was heard from in three polls",
+            cache.alpaca_last_success > now - 2 * poll_s
+            or cache.last_heard > now - 2 * native_every_s,
+            "1 when Alpaca answered in two polls or the control port in two native windows",
         )
         m("seestar_connected", cache.connected, "1 while the control socket is open")
         m(
@@ -513,7 +514,9 @@ def serve(host, port=9877, poll_s=30.0, on_desk_deg=10.0):
             if self.path.split("?")[0] != "/metrics":
                 self.send_error(404)
                 return
-            body = render(cache, poll_s=poll_s, on_desk_deg=on_desk_deg).encode()
+            body = render(
+                cache, poll_s=poll_s, on_desk_deg=on_desk_deg, native_every_s=every_s
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
