@@ -137,8 +137,10 @@ def refit(site, doc=None, near=None):
     pockets = {az: c["pockets"] for az, c in load_columns(mask)[1].items() if c.get("pockets")}
     sample = guide.photo_sample(rows, pockets)
     sol = orient.fit(fids, sample, near=near)
-    if sol["window_edge"]:  # the optimum moved past the local window: search it all
-        sol = orient.fit(fids, sample)
+    if sol["window_edge"]:  # the full search takes minutes: not inside an edit
+        raise ColumnError(
+            "saved, but the best fit moved past the quick refit's window; run the full fit"
+        )
     half = orient.yaw_uncertainty(fids, sample, sol, step=2.0)
     res = sol["residuals"]
     cols = [

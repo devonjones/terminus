@@ -588,3 +588,23 @@ def test_the_links_point_is_sun_checked_and_stepped(monkeypatch):
     link.point(240.0, 30.0)
     az, alt = sky.radec_to_altaz(*mount.rd)
     assert mount.gotos and abs(az - 240.0) < 0.5 and abs(alt - 30.0) < 0.5
+
+
+def test_a_preview_is_never_of_somewhere_else():
+    """A failed capture, or a slew, leaves no older frame to show as the current one."""
+    link = scopes.AlpacaScope("h", connect=FakeMount)
+    link.sc.capture_raw16 = lambda s: np.full((4, 4), 1000, np.uint16)
+    link.frame(0.002)
+
+    def fail(s):
+        raise SeestarError("capture failed")
+
+    link.sc.capture_raw16 = fail
+    with pytest.raises(SeestarError):
+        link.frame(0.002)
+    assert link.preview_jpeg() is None
+    link.sc.capture_raw16 = lambda s: np.full((4, 4), 1000, np.uint16)
+    link.frame(0.002)
+    link.ptr.point_to = lambda az, alt: None
+    link.point(10.0, 20.0)
+    assert link.preview_jpeg() is None

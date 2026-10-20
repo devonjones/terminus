@@ -95,24 +95,27 @@ def test_import_merges_first_wins_and_brings_the_frames(site, tmp_path):
     assert telescope.load(str(site)) == doc
 
 
-def test_a_near_fit_on_its_windows_edge_searches_everything(site):
-    """Seeded at yaw 200 the window holds no answer; its best is on the edge, so the
-    refit searches the whole grid and finds the truth (37) rather than a local fit."""
+def test_a_near_fit_on_its_windows_edge_is_refused_not_kept(site):
+    """Seeded at yaw 200 the window holds no answer, so its best is on the edge.
+    The full search takes minutes, so the edit's quick refit refuses rather than
+    keep a local fit or run the full search inside the request."""
     azs = [10, 40, 75, 110, 150, 200, 250, 290, 330]
     far = {**NEAR, "yaw": 200.0}
-    fit = telescope.refit(str(site), columns(site, measured(site, azs)), near=far)
-    assert abs(((fit["solution"]["yaw"] - TRUE["yaw"] + 180) % 360) - 180) < 1.0
+    with pytest.raises(telescope.ColumnError, match="run the full fit"):
+        telescope.refit(str(site), columns(site, measured(site, azs)), near=far)
 
 
-@pytest.mark.parametrize("near, edge", [
-    (NEAR, False),
-    ({**NEAR, "yaw": 200.0}, True),
-    ({**NEAR, "tilt_mag": 9.0}, True),  # truth tilts 2: outside 9 +- NEAR_TILT_DEG
+@pytest.mark.parametrize("near, truth, edge", [
+    (NEAR, TRUE, False),
+    ({**NEAR, "yaw": 200.0}, TRUE, True),  # the window's low yaw end
+    ({**NEAR, "yaw": 20.0}, TRUE, True),  # its high yaw end: truth 37 is above 30
+    ({**NEAR, "tilt_mag": 9.0}, TRUE, True),  # low tilt end: truth 2 is under 6
+    ({**NEAR, "tilt_mag": 2.0}, {**TRUE, "tilt_mag": 9.0}, True),  # high tilt end
 ])  # fmt: skip
-def test_a_near_fit_says_when_its_best_is_on_the_windows_edge(site, near, edge):
+def test_a_near_fit_says_when_its_best_is_on_the_windows_edge(site, near, truth, edge):
     from terminus.export import load_mask
 
-    alts = measured(site, [10, 40, 75, 110, 150, 200, 250, 290, 330])
+    alts = measured(site, [10, 40, 75, 110, 150, 200, 250, 290, 330], truth)
     fids = [orient.Fiducial(az, alt) for az, alt in alts.items()]
     sample = guide.photo_sample(load_mask(str(site / telescope.PHOTO_MASK))[1])
     assert orient.fit(fids, sample, near=near)["window_edge"] is edge
@@ -452,11 +455,15 @@ def test_without_a_fit_an_edit_does_not_search_and_with_one_it_stays_near(opened
 
 def test_a_near_fit_refines_out_of_a_poor_tilt_seed(site):
     """The near window bounds the starting grid, for speed; the refinement after it
-    is free, so a seed 10 deg off in tilt still lands on the truth."""
-    azs = [10, 40, 75, 110, 150, 200, 250, 290, 330]
-    seed = {**NEAR, "tilt_mag": 12.0}  # the truth is 2.0
-    fit = telescope.refit(str(site), columns(site, measured(site, azs)), near=seed)
-    assert abs(fit["solution"]["tilt_mag"] - TRUE["tilt_mag"]) < 0.5
+    is free, so a seed 10 deg off in tilt still lands on the truth, and says its
+    grid's best was on the window's edge (so an edit's refit asks for the full one)."""
+    from terminus.export import load_mask
+
+    alts = measured(site, [10, 40, 75, 110, 150, 200, 250, 290, 330])
+    fids = [orient.Fiducial(az, alt) for az, alt in alts.items()]
+    sample = guide.photo_sample(load_mask(str(site / telescope.PHOTO_MASK))[1])
+    sol = orient.fit(fids, sample, near={**NEAR, "tilt_mag": 12.0})  # the truth is 2.0
+    assert abs(sol["tilt_mag"] - TRUE["tilt_mag"]) < 0.5 and sol["window_edge"]
 
 
 def test_the_columns_command_imports_without_a_config_and_refuses_a_fit_of_three(

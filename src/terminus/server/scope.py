@@ -127,10 +127,12 @@ class AlpacaScope:
 
     def point(self, az, alt):
         """Slew to (az, alt): Pointer's Sun-checked route, every waypoint."""
+        self.last = None  # a frame from before the slew is not of where it points
         self.ptr.point_to(az, alt)
 
     def frame(self, exposure_s):
         """One raw frame where the scope points; kept for the preview."""
+        self.last = None
         self.last = self.sc.capture_raw16(exposure_s)
         return {
             "exposure_ms": round(exposure_s * 1000.0, 3),

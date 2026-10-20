@@ -186,6 +186,8 @@ export async function mount(root: HTMLElement, api: TerminusApi): Promise<void> 
       v.error = "";
     } catch (e) {
       v.error = (e as Error).message;
+      // An edit can be saved before its refit fails: show what the engine now holds.
+      v.cols = await api.columns().catch(() => v.cols);
     }
     v.colBusy = "";
     render();

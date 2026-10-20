@@ -1277,6 +1277,21 @@ describe("telescope columns", () => {
     await waitFor(() => expect(api.editColumn).toHaveBeenCalledWith(40, { included: false }));
   });
 
+  it("a refit that fails shows the saved edit and no fit, with why", async () => {
+    const after = cols({ fit: null });
+    const api = withSite({
+      editColumn: vi.fn(async () => {
+        throw new Error("saved, but the best fit moved past the quick refit's window");
+      }),
+    });
+    await openFit(api);
+    api.columns = vi.fn(async () => after);
+    (await findByRole(root, "checkbox", { name: "Use az 40 in the fit" })).click();
+    await findByText(root, /moved past the quick refit's window/);
+    expect(api.columns).toHaveBeenCalled();
+    expect(root.textContent).not.toContain("yaw 186.20°");
+  });
+
   it("keeps focus on the control that was used, through the refit", async () => {
     const api = withSite();
     await openFit(api);
