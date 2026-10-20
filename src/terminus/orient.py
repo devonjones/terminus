@@ -574,6 +574,10 @@ def _record(f, used, residual, reason):
     }
 
 
+NEAR_YAW_DEG = 10.0
+NEAR_TILT_DEG = 3.0
+
+
 def fit(
     fids,
     sample,
@@ -584,6 +588,7 @@ def fit(
     robust=True,
     delta=4.0,
     min_headroom=None,
+    near=None,
 ):
     """Solve yaw, pitch and tilt against the fiducials.
 
@@ -593,6 +598,12 @@ def fit(
 
     min_headroom, if given, drops exact fiducials whose result sits closer than
     that to their own ceiling — the signature of a manufactured edge.
+
+    near, a previous solution, starts the grid only around it (yaw within
+    NEAR_YAW_DEG, tilt within NEAR_TILT_DEG): a refit after one column changed,
+    fast enough to run on every edit (the full grid takes minutes). The window
+    bounds the grid, not the answer: the refinement after it may walk out, and
+    `window_edge` says the grid's best was on the window's edge.
     """
     # WHY EACH COLUMN WAS OR WAS NOT USED, recorded alongside the answer. The
     # published fit used 16 of 30 available columns and nothing on disk records
@@ -623,9 +634,14 @@ def fit(
     def cost(y, p, tm, td):
         return cost_from(predict(used, sample, y, tm, td), p)
 
+    yaws = np.arange(0.0, 360.0, yaw_step)
+    tilts = all_tilts = np.arange(0.0, tilt_max + 1e-9, tilt_step)
+    if near is not None:
+        yaws = (near["yaw"] + np.arange(-NEAR_YAW_DEG, NEAR_YAW_DEG + 1e-9, yaw_step)) % 360.0
+        tilts = tilts[np.abs(tilts - near["tilt_mag"]) <= NEAR_TILT_DEG]
     best = None
-    for y in np.arange(0.0, 360.0, yaw_step):
-        for tm in np.arange(0.0, tilt_max + 1e-9, tilt_step):
+    for y in yaws:
+        for tm in tilts:
             dirs = [0.0] if tm == 0 else np.arange(0.0, 360.0, 30.0)
             for td in dirs:
                 # The rotation is the expensive part and pitch is a pure offset,
@@ -640,6 +656,12 @@ def fit(
                 if best is None or c < best[0]:
                     best = (c, y, p0, tm, td, n)
     _, y, p, tm, td, n = best
+    # The best grid point on the window's edge: the optimum may lie past it.
+    window_edge = near is not None and (
+        y in (yaws[0], yaws[-1])
+        or (tm == tilts[0] and tilts[0] > all_tilts[0])
+        or (tm == tilts[-1] and tilts[-1] < all_tilts[-1])
+    )
     for _ in range(3):  # local refinement
         improved = False
         for dy in (-yaw_step / 2, 0, yaw_step / 2):
@@ -666,6 +688,7 @@ def fit(
         "rms": float(np.sqrt((r[ok] ** 2).mean())),
         "n": int(ok.sum()),
         "n_bound": int(sum(1 for f in used if f.bound)),
+        "window_edge": bool(window_edge),
         "residuals": {used[i].az: float(r[i]) for i in range(len(used)) if ok[i]},
         # The set itself, not just its size. Enough to refit from this record
         # alone: az, the value, whether it was one-sided, and its weighting.

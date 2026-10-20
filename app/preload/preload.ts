@@ -28,5 +28,15 @@ const api: TerminusApi = {
   scopeStatus: () => ipcRenderer.invoke("scope:status"),
   parkScope: () => ipcRenderer.invoke("scope:park"),
   disconnectScope: () => ipcRenderer.invoke("scope:disconnect"),
+  pointScope: (az, alt) => ipcRenderer.invoke("scope:point", az, alt),
+  takeFrame: (exposureMs) => ipcRenderer.invoke("scope:frame", exposureMs),
+  framePreview: () => ipcRenderer.invoke("scope:frame-preview"),
+  columns: () => ipcRenderer.invoke("site:columns"),
+  editColumn: (az, change) => ipcRenderer.invoke("site:column-edit", az, change),
+  fitColumns: () => ipcRenderer.invoke("site:columns-fit"),
+  columnFrame: (az, name) => ipcRenderer.invoke("site:column-frame", az, name),
+  applyOrientation: () => ipcRenderer.invoke("site:columns-apply"),
+  clickEdge: (az, name, p1, p2, sky) =>
+    ipcRenderer.invoke("site:column-click", az, name, p1, p2, sky),
 };
 contextBridge.exposeInMainWorld("terminus", api);

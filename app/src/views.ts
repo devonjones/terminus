@@ -1,11 +1,15 @@
 import type {
   AppState,
+  ColumnTag,
+  Columns,
+  TelescopeColumn,
   BuildFrame,
   Disc,
   FitColumn,
   Frames,
   Horizon,
   Job,
+  ScopeFrame,
   ScopeList,
   ScopeStatus,
   SiteSummary,
@@ -27,6 +31,14 @@ function svg(tag: string, attrs: Record<string, string | number> = {}, ...childr
   const e = document.createElementNS(SVG, tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
   e.append(...children);
+  return e;
+}
+
+// A control that waits on the engine stays focusable, so a redraw can hand focus
+// back to it; while busy it is marked unavailable and its action does nothing.
+function waitable<T extends HTMLElement>(e: T, busy: string, act: () => void): T {
+  if (busy) e.setAttribute("aria-disabled", "true");
+  e.addEventListener("click", () => !busy && act());
   return e;
 }
 
@@ -318,6 +330,10 @@ export interface ConnectProps {
   status: ScopeStatus | null; // null until first read
   found: ScopeList["scopes"] | null; // null until a search has run
   busy: string; // what is in progress, in words; "" when idle
+  frame: ScopeFrame | null; // the last frame taken
+  preview: string | null; // blob: URL of that frame in colour
+  onPoint(az: number, alt: number): void;
+  onFrame(exposureMs: number): void;
   onFind(): void;
   onConnect(host: string): void;
   onPark(): void;
@@ -332,15 +348,15 @@ export function connectView(p: ConnectProps): HTMLElement {
   const busy = p.busy ? el("p", { textContent: p.busy, className: "busy" }) : "";
   const st = p.status;
   if (!p.linked) {
-    const find = el("button", { textContent: "Find telescopes", disabled: !!p.busy });
+    const find = waitable(el("button", { textContent: "Find telescopes" }), p.busy, p.onFind);
     find.dataset.focus = "scope-find";
-    find.addEventListener("click", p.onFind);
     const host = el("input", { type: "text", placeholder: "10.0.0.20" });
     host.setAttribute("aria-label", "Telescope address");
     host.dataset.focus = "scope-host";
-    const go = el("button", { textContent: "Connect", disabled: !!p.busy });
+    const go = waitable(el("button", { textContent: "Connect" }), p.busy, () => {
+      if (host.value.trim()) p.onConnect(host.value.trim());
+    });
     go.dataset.focus = "scope-connect";
-    go.addEventListener("click", () => host.value.trim() && p.onConnect(host.value.trim()));
     host.addEventListener("keydown", (e) => e.key === "Enter" && go.click());
     const list =
       p.found === null
@@ -351,8 +367,12 @@ export function connectView(p: ConnectProps): HTMLElement {
               "ul",
               { className: "found" },
               ...p.found.map((f) => {
-                const b = el("button", { textContent: `Connect to ${f.host}`, disabled: !!p.busy });
-                b.addEventListener("click", () => p.onConnect(f.host));
+                const b = waitable(
+                  el("button", { textContent: `Connect to ${f.host}` }),
+                  p.busy,
+                  () => p.onConnect(f.host),
+                );
+                b.dataset.focus = `scope-host:${f.host}`;
                 return el("li", {}, b);
               }),
             );
@@ -368,9 +388,12 @@ export function connectView(p: ConnectProps): HTMLElement {
       busy,
     );
   }
-  const leave = el("button", { textContent: "Park and disconnect", disabled: !!p.busy });
+  const leave = waitable(
+    el("button", { textContent: "Park and disconnect" }),
+    p.busy,
+    p.onDisconnect,
+  );
   leave.dataset.focus = "scope-disconnect";
-  leave.addEventListener("click", p.onDisconnect);
   if (!st || st.link === "none")
     return el(
       "div",
@@ -393,9 +416,12 @@ export function connectView(p: ConnectProps): HTMLElement {
     { className: "scope" },
     ...rows.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]),
   );
-  const park = el("button", { textContent: "Park", disabled: !!p.busy || !!st.stowed });
+  const park = waitable(
+    el("button", { textContent: "Park", disabled: !!st.stowed }),
+    p.busy,
+    p.onPark,
+  );
   park.dataset.focus = "scope-park";
-  park.addEventListener("click", p.onPark);
   const notes: Node[] = [];
   if (st.stowed)
     notes.push(
@@ -408,14 +434,62 @@ export function connectView(p: ConnectProps): HTMLElement {
     notes.push(
       el("p", { className: "banner warn", textContent: "Switch the mount to EQ mode in the app." }),
     );
+  if (!st.stowed && st.sun && st.sun.alt > 0)
+    notes.push(
+      el("p", {
+        className: "banner warn",
+        textContent:
+          "The Sun is up. Run with the scope in shade and a solar-safe cap to hand, and aim away " +
+          `from the Sun's part of the sky: every slew is kept ${st.cone ?? 30}° clear of it, but shade is what protects the camera.`,
+      }),
+    );
+  const aim: Node[] = st.stowed ? [] : [aimRow(p), frameRow(p)];
+  if (p.frame)
+    aim.push(
+      el("p", {
+        className: "frame-stats",
+        textContent: `${p.frame.exposure_ms} ms: median ${Math.round(p.frame.median)}, ${(
+          p.frame.saturated * 100
+        ).toFixed(1)}% saturated`,
+      }),
+    );
+  if (p.preview) aim.push(el("img", { src: p.preview, className: "frame", alt: "Last frame" }));
   return el(
     "div",
     { className: "connect" },
     table,
     ...notes,
     el("div", { className: "row" }, park, leave),
+    ...aim,
     busy,
   );
+}
+
+function numberBox(label: string, value: string, focus: string): HTMLInputElement {
+  const box = el("input", { type: "number", value, step: "any" });
+  box.setAttribute("aria-label", label);
+  box.dataset.focus = focus;
+  return box;
+}
+
+// Where to point: the engine checks the target and the path against the Sun.
+function aimRow(p: ConnectProps): HTMLElement {
+  const az = numberBox("Azimuth", "", "scope-az");
+  const alt = numberBox("Altitude", "", "scope-alt");
+  const go = waitable(el("button", { textContent: "Go" }), p.busy, () => {
+    if (az.value !== "" && alt.value !== "") p.onPoint(Number(az.value), Number(alt.value));
+  });
+  go.dataset.focus = "scope-go";
+  return el("div", { className: "row" }, "Go to az ", az, " alt ", alt, go);
+}
+
+function frameRow(p: ConnectProps): HTMLElement {
+  const ms = numberBox("Exposure (ms)", String(p.frame?.exposure_ms ?? 2), "scope-ms");
+  const take = waitable(el("button", { textContent: "Take a frame" }), p.busy, () => {
+    if (ms.value !== "") p.onFrame(Number(ms.value));
+  });
+  take.dataset.focus = "scope-frame";
+  return el("div", { className: "row" }, ms, " ms ", take);
 }
 
 export interface CurateProps {
@@ -813,4 +887,217 @@ export function fitView(h: Horizon | null): HTMLElement {
     ),
   );
   return el("div", {}, ...parts);
+}
+
+export interface ColumnsProps {
+  cols: Columns;
+  selected: number | null; // az of the column whose frames are shown
+  frames: Map<string, string>; // "az/name" -> blob: URL
+  busy: string;
+  onSelect(az: number): void;
+  onInclude(az: number, on: boolean): void;
+  onTag(az: number, tag: ColumnTag, on: boolean): void;
+  onFitAll(): void;
+  onApply(): void;
+  clicks: Clicks | null; // an edge being clicked in one frame
+  onFrameClick(az: number, name: string, pt: [number, number]): void;
+}
+
+export interface Clicks {
+  az: number;
+  name: string;
+  pts: [number, number][];
+}
+
+const CLICK_STEPS = [
+  "Click a point on the edge in a frame.",
+  "Click a second point on the edge.",
+  "Click once in the sky.",
+];
+
+const TAGS: ColumnTag[] = ["false edge", "pocket", "near object"];
+const signed = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}°`;
+
+// The telescope columns, editable: include or exclude, tag, and see each one's
+// frames. Every change refits in the engine; the numbers here are its answer.
+export function columnsView(p: ColumnsProps): HTMLElement {
+  const fit = p.cols.fit;
+  const all = waitable(el("button", { textContent: "Fit all columns" }), p.busy, p.onFitAll);
+  all.dataset.focus = "fit-all";
+  const head = fit
+    ? el(
+        "p",
+        { className: "solution" },
+        `yaw ${fit.solution.yaw.toFixed(2)}°${fit.yaw_pm != null ? ` ± ${fit.yaw_pm.toFixed(0)}°` : " (not bounded)"}` +
+          ` · pitch ${fit.solution.pitch.toFixed(2)}° · tilt ${fit.solution.tilt_mag.toFixed(2)}° toward ${fit.solution.tilt_dir.toFixed(0)}°`,
+      )
+    : el("p", { textContent: "Not fitted yet." });
+  const rows = [...p.cols.columns].sort((a, b) => a.az - b.az).map((c) => columnRow(c, p));
+  const table = el(
+    "table",
+    { className: "fit columns" },
+    el(
+      "thead",
+      {},
+      el(
+        "tr",
+        {},
+        ...["az", "measured", "how", "residual", "in fit", "tags", ""].map((h) =>
+          el("th", { textContent: h }),
+        ),
+      ),
+    ),
+    el("tbody", {}, ...rows),
+  );
+  if (fit) {
+    const m = fit.summary;
+    const f = (n: number | null | undefined) => (n == null ? "—" : `${n.toFixed(2)}°`);
+    table.append(
+      el(
+        "tfoot",
+        {},
+        el(
+          "tr",
+          {},
+          el("td", {
+            colSpan: 7,
+            textContent: `${m.n} fitted · rms ${f(m.rms)} · median ${f(m.median)} · max ${f(m.max)} · ${m.within_2} within 2°`,
+          }),
+        ),
+      ),
+    );
+  }
+  const apply = waitable(
+    el("button", {
+      textContent: "Apply this orientation",
+      disabled: !fit,
+      title: fit ? "Re-read the site's horizon with this rotation" : "Fit the columns first",
+    }),
+    p.busy,
+    p.onApply,
+  );
+  apply.dataset.focus = "apply-orientation";
+  const parts: Node[] = [el("div", { className: "row" }, head, all, apply), table];
+  if (p.busy) parts.push(el("p", { className: "busy", textContent: p.busy }));
+  const sel = p.cols.columns.find((c) => c.az === p.selected);
+  if (sel) parts.push(strip(sel, p));
+  if (p.cols.note) parts.push(el("p", { className: "note", textContent: p.cols.note }));
+  return el("div", { className: "columns-view" }, ...parts);
+}
+
+function columnRow(c: TelescopeColumn, p: ColumnsProps): HTMLTableRowElement {
+  const inc = el("input", { type: "checkbox", checked: c.included, disabled: !c.usable });
+  inc.setAttribute("aria-label", `Use az ${c.az} in the fit`);
+  if (!c.usable) inc.title = c.note;
+  if (p.busy) inc.setAttribute("aria-disabled", "true");
+  inc.dataset.focus = `include:${c.az}`;
+  inc.addEventListener("change", () => {
+    if (p.busy)
+      inc.checked = c.included; // waiting on the engine: undo the tick
+    else p.onInclude(c.az, inc.checked);
+  });
+  const tags = el(
+    "span",
+    { className: "tags" },
+    ...TAGS.map((t) => {
+      const on = c.tags.includes(t);
+      const b = waitable(
+        el("button", { textContent: t, className: on ? "tag on" : "tag" }),
+        p.busy,
+        () => p.onTag(c.az, t, !on),
+      );
+      b.setAttribute("aria-pressed", String(on));
+      b.dataset.focus = `tag:${c.az}:${t}`;
+      return b;
+    }),
+  );
+  const look = el("button", {
+    textContent: c.frames.length ? `${c.frames.length} frames` : "no frames",
+    disabled: !c.frames.length,
+  });
+  look.addEventListener("click", () => p.onSelect(c.az));
+  look.dataset.focus = `frames:${c.az}`;
+  const tr = el(
+    "tr",
+    {
+      className: [c.included ? "" : "unused", c.az === p.selected ? "selected" : ""]
+        .join(" ")
+        .trim(),
+    },
+    el("td", { textContent: c.az.toFixed(0) }),
+    el("td", { textContent: c.alt == null ? "—" : `${c.bound ? "≥ " : ""}${c.alt.toFixed(2)}°` }),
+    el("td", { textContent: c.method }),
+    el("td", { textContent: c.residual == null ? "—" : signed(c.residual) }),
+    el("td", {}, inc),
+    el("td", {}, tags),
+    el("td", {}, look),
+  );
+  return tr;
+}
+
+// A column's frames from the top down, each marked where the measured edge and
+// the fit's prediction fall.
+function strip(c: TelescopeColumn, p: ColumnsProps): HTMLElement {
+  const frames = p.frames;
+  const sorted = [...c.frames].sort((a, b) => b.alt - a.alt);
+  const step = sorted.length > 1 ? Math.abs(sorted[0].alt - sorted[1].alt) : 0.25;
+  const predicted = c.residual == null || c.alt == null ? null : c.alt + c.residual;
+  const near = (alt: number, x: number | null) => x != null && Math.abs(alt - x) <= step / 2;
+  const tiles = sorted.map((f) => {
+    const url = frames.get(`${c.az}/${f.name}`);
+    const mine = p.clicks && p.clicks.az === c.az && p.clicks.name === f.name ? p.clicks.pts : [];
+    const marks = [near(f.alt, c.alt) ? "measured" : "", near(f.alt, predicted) ? "predicted" : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return el(
+      "figure",
+      { className: marks ? "frame marked" : "frame" },
+      url ? clickable(url, c.az, f, mine, p) : el("div", { className: "loading" }),
+      el("figcaption", {
+        textContent: `${f.alt.toFixed(2)}° · ${Math.round(f.sky * 100)}% sky${marks ? ` · ${marks}` : ""}`,
+      }),
+    );
+  });
+  return el(
+    "section",
+    { className: "column-strip" },
+    el("h2", {
+      textContent:
+        `az ${c.az.toFixed(0)}: ` +
+        (c.alt == null ? `no measurement (${c.note})` : `measured ${c.alt.toFixed(2)}°`) +
+        (predicted == null ? "" : `, predicted ${predicted.toFixed(2)}°`),
+    }),
+    el("p", {
+      className: "hint",
+      textContent:
+        CLICK_STEPS[Math.min(p.clicks?.pts.length ?? 0, 2)] +
+        " The edge's altitude comes from how much of the frame lies on the sky side.",
+    }),
+    el("div", { className: "tiles" }, ...tiles),
+  );
+}
+
+// A frame that takes clicks: points in 0-1 fractions of the image, shown as dots.
+function clickable(
+  url: string,
+  az: number,
+  f: { alt: number; name: string },
+  pts: [number, number][],
+  p: ColumnsProps,
+): HTMLElement {
+  const img = el("img", { src: url, alt: `az ${az} alt ${f.alt}` });
+  img.addEventListener("click", (e) => {
+    const r = img.getBoundingClientRect();
+    if (!r.width || !r.height || p.busy) return;
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    p.onFrameClick(az, f.name, [x, y]);
+  });
+  const dots = pts.map(([x, y], i) => {
+    const d = el("span", { className: i < 2 ? "dot edge" : "dot sky" });
+    d.style.left = `${(x * 100).toFixed(1)}%`;
+    d.style.top = `${(y * 100).toFixed(1)}%`;
+    return d;
+  });
+  return el("div", { className: "clickable" }, img, ...dots);
 }

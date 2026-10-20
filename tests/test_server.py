@@ -103,6 +103,20 @@ def test_app_and_sidecar_versions_match():
         ("POST", "/site/frames"),
         ("POST", "/site/rename"),
         ("POST", "/site/delete"),
+        ("GET", "/scope/discover"),
+        ("GET", "/scope/status"),
+        ("GET", "/scope/frame.jpg"),
+        ("POST", "/scope/connect"),
+        ("POST", "/scope/park"),
+        ("POST", "/scope/disconnect"),
+        ("POST", "/scope/point"),  # the first route that moves the tube
+        ("POST", "/scope/frame"),
+        ("GET", "/site/columns"),
+        ("GET", "/site/column/frame.jpg?az=90&name=az090_alt05.25_sky040.jpg"),
+        ("POST", "/site/columns/edit"),
+        ("POST", "/site/columns/fit"),
+        ("POST", "/site/columns/click"),
+        ("POST", "/site/columns/apply"),
     ],
 )
 def test_refuses_without_token_host_or_with_origin(

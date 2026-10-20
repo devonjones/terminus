@@ -42,6 +42,16 @@ Routes (payload shapes: schema.json beside this file):
   POST /scope/connect     {"host": name}: link a Seestar over Alpaca -> the new state
   POST /scope/park        Sun-guarded park; the scope's status after it
   POST /scope/disconnect  park, then unlink -> the new state
+  POST /scope/point       {"az", "alt"}: Sun-guarded slew -> the scope's status
+  POST /scope/frame       {"exposure_ms"}: one raw frame -> {exposure_ms, median, saturated}
+  GET  /scope/frame.jpg   that frame in colour (204 before the first)
+  GET  /site/columns      the open site's telescope columns and their fit (204: none)
+  POST /site/columns/edit {"az", "included"?, "tags"?}: change one column, refit near the last fit if any
+  POST /site/columns/fit  the full fit over every included column (minutes)
+  POST /site/columns/apply  write the fit as the site's orientation, re-read the horizon
+  POST /site/columns/click {"az", "name", "p1", "p2", "sky"}: the edge clicked in a frame
+                          (two points on it, one in the sky, 0-1 fractions) -> the columns
+  GET  /site/column/frame.jpg?az=&name=   one of a column's frames
   GET  /dev/state         state plus recent log lines; exists only with --dev
 """
 
@@ -50,6 +60,7 @@ import collections
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -62,7 +73,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
-from .. import __version__
+from .. import __version__, telescope
 from ..client import SeestarError
 from ..export import MaskError
 from ..sweep import PointingError, SunGuard
@@ -246,6 +257,11 @@ class _Handler(BaseHTTPRequestHandler):
             ),
             "/scope/discover": lambda: self._send(200, {"scopes": scopes.discover()}),
             "/scope/status": lambda: self._send(200, sv.scope.status()),
+            "/scope/frame.jpg": self._preview,
+            "/site/columns": lambda: self._site_view(telescope.view),
+            "/site/column/frame.jpg": lambda: self._site_view(
+                lambda d: _read(telescope.frame_path(d, self._num_query("az"), self._query("name")))
+            ),
         }
         if sv.dev:
             routes["/dev/state"] = lambda: self._send(
@@ -270,6 +286,12 @@ class _Handler(BaseHTTPRequestHandler):
             "/site/delete": lambda: self._delete(body.get("slug")),
             "/scope/connect": lambda: self._connect(body.get("host")),
             "/scope/park": self._park,
+            "/scope/point": lambda: self._point(body.get("az"), body.get("alt")),
+            "/scope/frame": lambda: self._frame(body.get("exposure_ms")),
+            "/site/columns/edit": lambda: self._edit_column(body),
+            "/site/columns/fit": self._fit_columns,
+            "/site/columns/click": lambda: self._click_edge(body),
+            "/site/columns/apply": self._apply_orientation,
             "/scope/disconnect": self._disconnect,
         }
         self._dispatch(routes)
@@ -282,6 +304,69 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _name(self):
         return self._query("name")
+
+    def _num_query(self, key):
+        try:
+            v = float(self._query(key))
+        except ValueError:
+            v = math.nan
+        if not math.isfinite(v):
+            raise sites.SiteError(f"?{key}= must be a number")
+        return v
+
+    def _click_edge(self, body):
+        def point(v):
+            ok = isinstance(v, list) and len(v) == 2
+            ok = ok and all(_is_num(x) for x in v)
+            if not ok or not all(0 <= x <= 1 for x in v):
+                raise sites.SiteError("points are [x, y] in 0-1 image fractions")
+            return (float(v[0]), float(v[1]))
+
+        az, name = body.get("az"), body.get("name")
+        if not _is_num(az) or not isinstance(name, str):
+            raise sites.SiteError("az must be a number and name a frame's name")
+        p1, p2, sky = point(body.get("p1")), point(body.get("p2")), point(body.get("sky"))
+        try:
+            out = telescope.click(self.server.site_dir(), float(az), name, p1, p2, sky)
+        except telescope.ColumnError as e:
+            raise sites.SiteError(str(e)) from None
+        self._send(200, out)
+
+    def _apply_orientation(self):
+        """Write the fit as the site's orientation and re-read the horizon with it."""
+        sv = self.server
+        d = sv.site_dir()
+        if sv.jobs.busy():
+            raise sites.SiteError("a site is already being built")
+        try:
+            telescope.write_orientation(d, os.path.join(d, sites.ORIENTATION))
+        except telescope.ColumnError as e:
+            raise sites.SiteError(str(e)) from None
+        log.info("site %s: orientation applied, re-reading the horizon", sv.slug)
+        sv.jobs.start(sv.slug, d, "orient")
+        self._send(200, sv.snapshot())
+
+    def _fit_columns(self):
+        try:
+            self._send(200, telescope.fit_all(self.server.site_dir()))
+        except telescope.ColumnError as e:
+            raise sites.SiteError(str(e)) from None
+
+    def _edit_column(self, body):
+        az, included, tags = body.get("az"), body.get("included"), body.get("tags")
+        if not _is_num(az):
+            raise sites.SiteError("az must be a number")
+        if included is not None and not isinstance(included, bool):
+            raise sites.SiteError("included must be true or false")
+        if tags is not None and not (
+            isinstance(tags, list) and all(isinstance(t, str) for t in tags)
+        ):
+            raise sites.SiteError("tags must be a list of names")
+        try:
+            out = telescope.edit(self.server.site_dir(), float(az), included, tags)
+        except telescope.ColumnError as e:
+            raise sites.SiteError(str(e)) from None
+        self._send(200, out)
 
     def _dispatch(self, routes):
         route = routes.get(urlsplit(self.path).path)
@@ -316,6 +401,29 @@ class _Handler(BaseHTTPRequestHandler):
             sv.scope = scopes.AlpacaScope(host)
         log.info("scope linked: %s", host)
         self._send(200, sv.snapshot())
+
+    def _point(self, az, alt):
+        ok = _is_num(az) and _is_num(alt)
+        if not ok or not (0 <= az < 360 and -5 <= alt <= 90):
+            return self._send(400, {"error": "az must be 0-360 and alt -5 to 90 degrees"})
+        with self.server.linking:
+            self.server.scope.point(float(az), float(alt))
+        self._send(200, self.server.scope.status())
+
+    def _frame(self, exposure_ms):
+        ok = _is_num(exposure_ms)
+        if not ok or not 0.05 <= exposure_ms <= 10_000:
+            return self._send(400, {"error": "exposure_ms must be 0.05 to 10000"})
+        with self.server.linking:
+            self._send(200, self.server.scope.frame(exposure_ms / 1000.0))
+
+    def _preview(self):
+        jpg = self.server.scope.preview_jpeg()
+        if jpg is None:
+            self.send_response(204)
+            self.end_headers()
+            return
+        self._send_bytes(jpg, "image/jpeg")
 
     def _park(self):
         with self.server.linking:
@@ -451,6 +559,19 @@ def main(argv=None):
         server.serve_forever()
     finally:
         _shutdown(server)
+
+
+def _is_num(v):
+    """A finite JSON number: bool is an int in Python, and NaN fails every range."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _read(path):
+    """A file's bytes, or None (a 204) when there is no such file."""
+    if path is None:
+        return None
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
 def _shutdown(server):
