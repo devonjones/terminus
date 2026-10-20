@@ -344,6 +344,9 @@ class AlpacaPoller:
                 if isinstance(e, OSError):
                     return  # unreachable: one timeout, not one per read
         ok = any(v is not None for v in values.values())
+        if not ok:  # every read answered an Alpaca error
+            with self.cache.lock:
+                self.cache.alpaca_failures += 1
         if ok:
             for dev, prop in ALPACA_EXTRA:
                 try:

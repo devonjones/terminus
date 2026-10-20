@@ -404,6 +404,7 @@ def test_verified_reads_both_firmware_reply_shapes():
     assert not verified({"code": 207, "result": 0})
     assert not verified({"result": False})
     assert not verified({"code": 0, "result": "error"})
+    assert not verified({"result": {"key_envelope": {}}})  # an envelope needs code 0
     assert not verified({"timeout": "verify_client"})
 
 
@@ -436,8 +437,8 @@ def test_up_is_also_reported_per_source():
 
 def test_a_hostile_label_cannot_break_the_exposition():
     c = Cache()
-    c.switches = {'a"b\nc': 1}
-    assert 'seestar_switch_value{switch="a\\"b c"} 1' in render(c, now=1.0)
+    c.switches = {'a"b\nc\\d': 1}
+    assert 'seestar_switch_value{switch="a\\"b c\\\\d"} 1' in render(c, now=1.0)
 
 
 def test_switch_names_are_asked_for_once(monkeypatch):
@@ -457,7 +458,8 @@ def _serve(monkeypatch, **env):
 
     def run():
         try:
-            exporter.serve("scope", port=port, pem=env.get("SEESTAR_PEM"))
+            # poll_s: one poll while the fake is patched in, none after the test
+            exporter.serve("scope", port=port, poll_s=3600, pem=env.get("SEESTAR_PEM"))
         except Exception as e:
             err.append(e)
 
@@ -477,6 +479,8 @@ def test_serve_answers_metrics_and_404s_the_rest(monkeypatch):
             break
         except ConnectionRefusedError:
             time.sleep(0.1)
+    else:
+        pytest.fail(f"serve never listened: {err}")
     assert r.status == 200 and b"seestar_up" in r.read()
     conn.request("GET", "/other")
     assert conn.getresponse().status == 404 and not err
@@ -494,6 +498,7 @@ def test_serve_refuses_a_camera_connect_and_a_missing_key(monkeypatch, tmp_path)
 def test_the_default_alpaca_connect_never_includes_the_camera(monkeypatch):
     monkeypatch.delenv("ALPACA_CONNECT", raising=False)
     monkeypatch.setenv("NATIVE_EVERY_S", "0")
+    monkeypatch.setattr(exporter, "Poller", None)  # NATIVE_EVERY_S=0 never builds one
     seen = []
     monkeypatch.setattr(
         exporter, "AlpacaPoller", lambda *a, connect, **k: seen.append(set(connect)) or 1 / 0
@@ -507,3 +512,18 @@ def test_main_env_needs_a_host(monkeypatch):
     monkeypatch.delenv("SEESTAR_HOST", raising=False)
     with pytest.raises(SystemExit):
         exporter.main_env()
+
+
+def test_alpaca_answering_only_errors_is_a_failure_not_a_success(monkeypatch):
+    gets = []
+
+    def urlopen(req, timeout):
+        gets.append(req if isinstance(req, str) else req.full_url)
+        return io.BytesIO(b'{"Value": 0, "ErrorNumber": 1031}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    c = Cache()
+    AlpacaPoller("scope", c, connect=()).poll_once()
+    assert c.alpaca_last_success == 0 and c.alpaca_failures == 1
+    assert len(gets) == len(exporter.ALPACA_READS)  # no speculative probes after
+    assert _value(render(c, now=time.time()), "seestar_alpaca_up") == 0
