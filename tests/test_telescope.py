@@ -107,7 +107,8 @@ def test_a_near_fit_on_its_windows_edge_is_refused_not_kept(site):
 
 @pytest.mark.parametrize("near, truth, edge", [
     (NEAR, TRUE, False),
-    ({**NEAR, "yaw": 200.0}, TRUE, True),  # the window's low yaw end
+    ({**NEAR, "yaw": 200.0}, TRUE, True),  # no answer in the window: lands on an end
+    ({**NEAR, "yaw": 55.0}, TRUE, True),  # its low yaw end: truth 37 is under 45
     ({**NEAR, "yaw": 20.0}, TRUE, True),  # its high yaw end: truth 37 is above 30
     ({**NEAR, "tilt_mag": 9.0}, TRUE, True),  # low tilt end: truth 2 is under 6
     ({**NEAR, "tilt_mag": 2.0}, {**TRUE, "tilt_mag": 9.0}, True),  # high tilt end
