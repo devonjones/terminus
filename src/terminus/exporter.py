@@ -12,10 +12,11 @@ like pi_shutdown, are destructive. On Alpaca (32323) it sends GETs, plus Connect
 and the switch (ALPACA_CONNECT, default "focuser,switch") for focuser position
 and the dew heater. It never connects the camera, so there is no CCD temperature.
 
-While the scope images, get_device_state goes unanswered all night. After
-STATE_TIMEOUT_S the request is counted as failed and the socket reopened rather
-than another request queued; PiStatus events keep the board temperature current,
-and Alpaca, polled in its own thread, keeps pointing current.
+While the scope images, get_device_state goes unanswered all night; the request is
+dropped when the window closes (holding the connection, NATIVE_HOLD_S=0, it is
+counted failed after STATE_TIMEOUT_S and the socket reopened). PiStatus events keep
+the board temperature current, and Alpaca, polled in its own thread, keeps pointing
+current.
 
 One thread holds the socket and polls into a cache; /metrics renders the cache,
 so a scrape never reaches the scope. A dropped socket or a sleeping scope only
@@ -50,14 +51,12 @@ DEAD_S = 30  # nothing at all heard for this long, keepalives included: reconnec
 # An unanswered device state after this long counts as a failure and the socket is
 # reopened, which drops the request instead of queueing another behind it.
 STATE_TIMEOUT_S = 120
+VERIFY_TIMEOUT_S = 8  # an unanswered sign-in counts as a failure
 ALPACA_PORT = 32323
 ALPACA_TIMEOUT_S = 10
-# Alpaca GETs that answer with every device disconnected (2026-10-18, while imaging).
-# Focuser position and the dew-heater switch need Connected=true (see CONNECTABLE);
-# CCD temperature would need the camera connected, which the exporter never does.
-# The scope allows only a few control connections (it answers the next with an
-# Alert, code 429, and hangs up), and the phone app needs one. So the exporter holds
-# its connection for HOLD_S out of every EVERY_S rather than all night.
+# The scope can refuse a control connection (an Alert, code 429, and a hang-up), and
+# the phone app needs one. So the exporter holds its connection for HOLD_S out of
+# every EVERY_S rather than all night.
 NATIVE_HOLD_S = 10
 NATIVE_EVERY_S = 60
 # Further GETs that may or may not be implemented; whatever answers is exported as
@@ -88,6 +87,7 @@ ALPACA_EXTRA = [
 # for focuser position and the dew heater. The camera is deliberately not allowed:
 # connecting it mid-stack could take the sensor from the app.
 CONNECTABLE = frozenset({"focuser", "switch"})
+# These answer with every device disconnected (2026-10-18, while imaging).
 ALPACA_READS = {
     ("telescope", "rightascension"): "seestar_ra_hours",
     ("telescope", "declination"): "seestar_dec_degrees",
@@ -216,6 +216,10 @@ class Poller:
                 with self.cache.lock:
                     self.cache.failures += 1
                 raise PermissionError("verify_client refused the signature (wrong key?)")
+            if not self.authed and now - opened > VERIFY_TIMEOUT_S:
+                with self.cache.lock:
+                    self.cache.failures += 1
+                raise TimeoutError(f"no sign-in in {VERIFY_TIMEOUT_S}s")
             if self.challenge:
                 self.verify_id = self.send("verify_client", verify_params(self.key, self.challenge))
                 self.challenge = None
@@ -328,21 +332,24 @@ class AlpacaPoller:
         return values, switches
 
     def poll_once(self):
-        values, ok, extra = {}, False, {}
-        for dev, prop in ALPACA_EXTRA:
-            try:
-                extra[(dev, prop)] = self.get(dev, prop)
-            except (OSError, ValueError, http.client.HTTPException):
-                pass
+        with self.cache.lock:
+            self.cache.alpaca_last_poll = time.time()
+        values, extra, names, switches = {}, {}, None, {}
         for (dev, prop), name in ALPACA_READS.items():
             try:
                 values[name] = self.get(dev, prop)
-                ok = True
-            except (OSError, ValueError, http.client.HTTPException):
+            except (OSError, ValueError, http.client.HTTPException) as e:
                 with self.cache.lock:
                     self.cache.alpaca_failures += 1
-        names, switches = None, {}
+                if isinstance(e, OSError):
+                    return  # unreachable: one timeout, not one per read
+        ok = any(v is not None for v in values.values())
         if ok:
+            for dev, prop in ALPACA_EXTRA:
+                try:
+                    extra[(dev, prop)] = self.get(dev, prop)
+                except (OSError, ValueError, http.client.HTTPException):
+                    pass  # speculative: most are unimplemented
             try:
                 names = self.get("filterwheel", "names")
                 more, switches = self.connected_reads()
@@ -352,7 +359,6 @@ class AlpacaPoller:
                     self.cache.alpaca_failures += 1
         now = time.time()
         with self.cache.lock:
-            self.cache.alpaca_last_poll = now
             if ok:
                 self.cache.alpaca = {k: v for k, v in values.items() if v is not None}
                 self.cache.alpaca_extra = {k: v for k, v in extra.items() if v is not None}
@@ -418,6 +424,8 @@ def render(cache, now=None, poll_s=30.0, on_desk_deg=10.0, native_every_s=NATIVE
             or cache.last_heard > now - 2 * native_every_s,
             "1 when Alpaca answered in two polls or the control port in two native windows",
         )
+        m("seestar_alpaca_up", cache.alpaca_last_success > now - 2 * poll_s, "Alpaca fresh")
+        m("seestar_native_up", cache.last_heard > now - 2 * native_every_s, "control port heard")
         m("seestar_connected", cache.connected, "1 while the control socket is open")
         m(
             "seestar_request_failures_total",

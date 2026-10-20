@@ -422,8 +422,9 @@ from terminus import mosaic, skymask, orient, plan
 ## Monitoring: `terminus exporter`
 
 A long-running, strictly passive Prometheus exporter for the scope: battery, temperatures,
-tilt (and whether the scope is on a desk or on its wedge), mount state, Wi-Fi, storage, and the
-events the scope pushes while imaging, focuser position and the dew heater. It never moves anything and never connects the camera.
+tilt (and whether the scope is on a desk or on its wedge), mount state, Wi-Fi, storage, focuser
+position, the dew heater, and the events the scope pushes while imaging. It never moves anything
+and never connects the camera.
 Firmware 9.75 sends the device state (battery, tilt, Wi-Fi, storage...) only to a client that
 has signed in with the [interop key](#the-interop-key-optional-the-native-link), so set
 `SEESTAR_PEM`; without it only events and Alpaca report. Its only write is Alpaca

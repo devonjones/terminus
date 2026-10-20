@@ -40,9 +40,18 @@ def verify_params(key, challenge):
     return {"sign": base64.b64encode(sig).decode(), "data": challenge}
 
 
+def _zero(x):
+    return type(x) is int and x == 0  # not False
+
+
 def verified(reply):
     """9.75 answers code 0 with a key envelope as the result; older firmware, result 0."""
-    return isinstance(reply, dict) and 0 in (reply.get("code"), reply.get("result"))
+    if not isinstance(reply, dict):
+        return False
+    code, result = reply.get("code"), reply.get("result")
+    if code is not None and not _zero(code):
+        return False
+    return _zero(result) or (_zero(code) and isinstance(result, dict))
 
 
 def load_key(pem_path):

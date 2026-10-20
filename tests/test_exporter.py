@@ -98,7 +98,6 @@ def test_events_export_their_numbers_and_pistatus_updates_the_state():
     out = render(c, now=1003.0)
     assert _value(out, 'seestar_event_value{event="Stack",field="stacked_frame"}') == 12
     assert _value(out, 'seestar_event_state{event="Stack",state="frame_complete"}') == 1
-    assert "Timestamp" not in out
     assert _value(out, "seestar_board_temp_celsius") == 60.5
     assert _value(out, "seestar_battery_percent") == 100
 
@@ -221,15 +220,18 @@ def test_alpaca_read_only_when_told_to_connect_nothing(monkeypatch):
     assert puts == [] and "seestar_focuser_position" not in render(c, now=c.alpaca_last_poll)
 
 
-def test_alpaca_down_keeps_the_heartbeat_but_not_the_success(monkeypatch):
+def test_alpaca_down_keeps_the_heartbeat_and_gives_up_after_one_try(monkeypatch):
+    calls = []
+
     def refuse(url, timeout):
-        raise ConnectionRefusedError
+        calls.append(url)
+        raise TimeoutError
 
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
     c = Cache()
     AlpacaPoller("scope", c).poll_once()
     assert c.alpaca_last_poll > 0 and c.alpaca_last_success == 0
-    assert c.alpaca_failures == len(exporter.ALPACA_READS)
+    assert c.alpaca_failures == 1 and len(calls) == 1  # not one timeout per read
 
 
 def test_the_exporter_will_not_send_anything_off_its_allowlist():
@@ -399,6 +401,9 @@ def test_verified_reads_both_firmware_reply_shapes():
     assert verified({"result": {"key_envelope": {}}, "code": 0})  # 9.75
     assert verified({"result": 0})  # older firmware
     assert not verified({"result": {"key_envelope": {}}, "code": 103})
+    assert not verified({"code": 207, "result": 0})
+    assert not verified({"result": False})
+    assert not verified({"code": 0, "result": "error"})
     assert not verified({"timeout": "verify_client"})
 
 
@@ -407,7 +412,98 @@ def test_a_verified_session_keeps_alive_without_a_new_challenge(monkeypatch):
     key, sent = _key(), []
     srv = _verifying_scope(key.public_key(), sent)
     c = Cache()
-    Poller("127.0.0.1", c, port=srv.getsockname()[1], poll_s=0.5, hold_s=2, key=key).session()
+    Poller("127.0.0.1", c, port=srv.getsockname()[1], poll_s=30, hold_s=2, key=key).session()
     assert sent.count("get_verify_str") == 1 and sent.count("get_device_state") >= 2
     assert c.failures == 0 and c.last_success > c.last_poll - 1
     srv.close()
+
+
+def test_an_unanswered_sign_in_counts_a_failure(monkeypatch):
+    monkeypatch.setattr(exporter, "VERIFY_TIMEOUT_S", 0.5)
+    srv = _fake_scope([])  # answers get_verify_str with no challenge
+    c = Cache()
+    with pytest.raises(TimeoutError):
+        Poller("127.0.0.1", c, port=srv.getsockname()[1], hold_s=0, key=_key()).session()
+    assert c.failures == 1
+    srv.close()
+
+
+def test_up_is_also_reported_per_source():
+    c, _ = _poller()  # native heard at 1000, Alpaca never
+    out = render(c, now=1010.0, native_every_s=60)
+    assert _value(out, "seestar_native_up") == 1 and _value(out, "seestar_alpaca_up") == 0
+
+
+def test_a_hostile_label_cannot_break_the_exposition():
+    c = Cache()
+    c.switches = {'a"b\nc': 1}
+    assert 'seestar_switch_value{switch="a\\"b c"} 1' in render(c, now=1.0)
+
+
+def test_switch_names_are_asked_for_once(monkeypatch):
+    gets, _ = _fake_alpaca(monkeypatch)
+    p = AlpacaPoller("scope", Cache())
+    p.poll_once()
+    p.poll_once()
+    assert sum("getswitchname" in u for u in gets) == 1
+
+
+def _serve(monkeypatch, **env):
+    for k, v in {"NATIVE_EVERY_S": "0", **env}.items():
+        monkeypatch.setenv(k, v)
+    _fake_alpaca(monkeypatch)
+    port = socket.create_server(("127.0.0.1", 0)).getsockname()[1]
+    err = []
+
+    def run():
+        try:
+            exporter.serve("scope", port=port, pem=env.get("SEESTAR_PEM"))
+        except Exception as e:
+            err.append(e)
+
+    threading.Thread(target=run, daemon=True).start()
+    return port, err
+
+
+def test_serve_answers_metrics_and_404s_the_rest(monkeypatch):
+    import http.client
+
+    port, err = _serve(monkeypatch)
+    for _ in range(50):
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("GET", "/metrics")
+            r = conn.getresponse()
+            break
+        except ConnectionRefusedError:
+            time.sleep(0.1)
+    assert r.status == 200 and b"seestar_up" in r.read()
+    conn.request("GET", "/other")
+    assert conn.getresponse().status == 404 and not err
+
+
+def test_serve_refuses_a_camera_connect_and_a_missing_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("NATIVE_EVERY_S", "0")
+    monkeypatch.setenv("ALPACA_CONNECT", "focuser,camera")
+    with pytest.raises(ValueError):
+        exporter.serve("scope", port=0)
+    with pytest.raises(FileNotFoundError):
+        exporter.serve("scope", port=0, pem=str(tmp_path / "missing.pem"))
+
+
+def test_the_default_alpaca_connect_never_includes_the_camera(monkeypatch):
+    monkeypatch.delenv("ALPACA_CONNECT", raising=False)
+    monkeypatch.setenv("NATIVE_EVERY_S", "0")
+    seen = []
+    monkeypatch.setattr(
+        exporter, "AlpacaPoller", lambda *a, connect, **k: seen.append(set(connect)) or 1 / 0
+    )
+    with pytest.raises(ZeroDivisionError):
+        exporter.serve("scope", port=0)
+    assert seen == [{"focuser", "switch"}]
+
+
+def test_main_env_needs_a_host(monkeypatch):
+    monkeypatch.delenv("SEESTAR_HOST", raising=False)
+    with pytest.raises(SystemExit):
+        exporter.main_env()

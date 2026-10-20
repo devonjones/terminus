@@ -1270,19 +1270,20 @@ is ignored, even idle, until the client has signed a challenge (`get_verify_str`
 check for `result == 0` reads success as failure. A first test took that "failed" handshake plus an
 answered state as proof no key was needed, and the exporter ran a night with no state at all. A
 fresh `get_verify_str` after verifying undoes it, so a verified client must not use it as a
-keepalive. The scope
-closes any control socket that has sent nothing for about 16 s, idle or with a request still
-outstanding; `get_verify_str` every 10 s keeps it open and answers at once. While the app runs
+keepalive. The scope closes any control socket that has sent nothing for about 16 s, idle or
+with a request still outstanding; `get_verify_str` every 10 s keeps it open and answers at once. While the app runs
 its preview/imaging loop, `get_device_state` goes unanswered: no reply in 90 s with frames
 completing throughout. The pushed events (Imaging, Exposure, PlateSolve, Annotate, PiStatus) keep
 flowing on the same socket, so a passive monitor reads those while the scope works and takes the
 full state when it is idle.
 
-The control port also has a connection limit. With the phone app and one exporter connected, a
+The control port can also refuse a connection. With the phone app and one exporter connected, a
 third client got `{"Event":"Alert","Msg":"Exceed the maximum number of connections","code":429}`
-and an immediate hang-up. A monitor that holds its socket all night can therefore lock the app out
-on reconnect. The exporter connects for 10 s a minute and leaves pointing, tracking and the filter
-to Alpaca, whose HTTP GETs take no connection slot.
+and an immediate hang-up. It is not a simple count: on 2026-10-19, with focuser, switch and
+camera connected over Alpaca, the scope accepted 40 unsigned sockets in four runs of five, and in
+the fifth refused the 33rd; an earlier run refused the second. What it counts is still unknown. A
+monitor that holds its socket all night may lock the app out on reconnect, so the exporter
+connects for 10 s a minute and leaves pointing, tracking and the filter to Alpaca.
 
 ## Safety
 
