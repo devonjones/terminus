@@ -36,7 +36,7 @@ SETTLE = 1.5
 log = logging.getLogger(__name__)
 GOTO_TIMEOUT = 90
 # Routes are sampled between waypoints; a sample may land a little under the
-# floor on a leg whose ends are on it, and the mount is given the same allowance.
+# floor on a leg whose ends are on it, so the route check allows this much.
 ROUTE_FLOOR_SLACK_DEG = 0.5
 SKY_REF_MAX_AGE = 420  # re-measure open-sky brightness at least this often (s)
 ARRIVE_DEG = 0.6  # goto counts as arrived within this true angular distance
@@ -396,6 +396,9 @@ class Pointer:
         if abs(target_alt - alt) < 1e-9:
             turn_alt = self._escape_turn_alt(az, alt, here_sep)
             turn = self.escape_turn(az, turn_alt)
+            if turn_alt != alt:  # the climb as checked: straight up this azimuth, in steps
+                for a in [*np.arange(alt + step, turn_alt, step), turn_alt]:
+                    self._goto_wait(*self.sky.altaz_to_radec(az, float(a)), 0.3)
             here, turned = az, 0.0
             cleared = True
             while ang_sep(here, turn_alt, *self.sky.sun()) < self.cone + self.ESCAPE_MARGIN_DEG:

@@ -28,6 +28,8 @@ from typing import Literal
 import numpy as np
 
 FRAME_DEG = 1.276  # the S50 frame's long side on the sky (1920 px at 2.39"/px)
+# The thresholds below were set on the real frames in tests/data/judge_frames.npz
+# (overcast night 2026-10-06, clear day 2026-10-07; LESSONS M-25), which pin them.
 POOL = 12  # Bayer cells averaged per feature cell
 EDGE_LOG_L = 0.15  # a split is an edge if the sides differ this much in log brightness...
 EDGE_CHROMA = 0.15  # ...or this much in (B-R)/L (by day)
@@ -97,6 +99,11 @@ class Verdict:
     kind: Literal["sky", "terrain", "edge"]
     sky: float  # fraction of the frame that is sky: 1 or 0 unless an edge
 
+    def __post_init__(self):
+        want = {"sky": (1.0, 1.0), "terrain": (0.0, 0.0), "edge": (0.0, 1.0)}.get(self.kind)
+        if want is None or not want[0] <= self.sky <= want[1]:
+            raise ValueError(f"not a verdict: {self.kind} with sky {self.sky}")
+
 
 def judge_frame(raw, ref, night=False):
     """One frame against its column's open-sky features `ref` (mean of a sky frame)."""
@@ -155,7 +162,7 @@ class Edge:
     is already blocked (the horizon is at least `alt`, that frame's altitude);
     "below" when every frame is sky (it is under the lowest frame, `alt`)."""
 
-    alt: float | None
+    alt: float
     status: Literal["edge", "above", "below"]
 
 

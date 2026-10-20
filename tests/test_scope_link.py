@@ -521,9 +521,12 @@ def test_the_preview_is_in_colour_red_where_grbg_puts_it():
 
 def test_the_link_frame_keeps_the_raw_for_the_preview():
     link = scopes.AlpacaScope("h", connect=FakeMount)
-    link.sc.capture_raw16 = lambda s: np.full((4, 4), 65504, np.uint16)
+    raw = np.full((4, 4), 1000, np.uint16)
+    raw[0, :3] = 65504  # 3 of 16 saturated
+    raw[1, 0] = scopes.SATURATED - 1  # bright but not saturated
+    link.sc.capture_raw16 = lambda s: raw
     f = link.frame(0.002)
-    assert f == {"exposure_ms": 2.0, "median": 65504.0, "saturated": 1.0}
+    assert f == {"exposure_ms": 2.0, "median": 1000.0, "saturated": 0.1875}
     assert link.preview_jpeg()[:2] == b"\xff\xd8"
 
 
@@ -563,8 +566,25 @@ def test_an_escape_turn_stops_at_the_first_step_clear_at_the_altitude_it_flies(m
     mount = _Mount(sky.altaz_to_radec(saz - 9.5, 1.0))  # one step lands between the two
     ptr = Pointer(mount, sky, 30.0, 1.0)
     ptr.escape()
-    turn = [sky.radec_to_altaz(*g) for g in mount.gotos]
+    pts = [sky.radec_to_altaz(*g) for g in mount.gotos]
+    climb = [p for p in pts if abs(((p[0] - saz + 9.5 + 180) % 360) - 180) < 0.05]
+    assert pts[: len(climb)] == climb and abs(climb[-1][1] - 5.0) < 0.1  # straight up first
+    turn = pts[len(climb) :]
     clear = ptr.cone + ptr.ESCAPE_MARGIN_DEG
     seps = [ang_sep(az, alt, saz, salt) for az, alt in turn]
     assert all(abs(alt - 5.0) < 0.1 for _, alt in turn)
     assert seps[-1] >= clear and all(s < clear for s in seps[:-1])
+
+
+def test_the_links_point_is_sun_checked_and_stepped(monkeypatch):
+    """AlpacaScope.point is the app's one commanded slew: through Pointer, never a
+    bare goto. Into the Sun it refuses before moving; elsewhere it arrives."""
+    sky = _morning(monkeypatch)  # Sun about az 110 alt 14
+    mount = _Mount(sky.altaz_to_radec(200.0, 30.0))
+    link = scopes.AlpacaScope("h", connect=lambda host, port: mount)
+    with pytest.raises(SunGuard):
+        link.point(110.0, 15.0)
+    assert mount.gotos == []
+    link.point(240.0, 30.0)
+    az, alt = sky.radec_to_altaz(*mount.rd)
+    assert mount.gotos and abs(az - 240.0) < 0.5 and abs(alt - 30.0) < 0.5

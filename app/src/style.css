@@ -2,6 +2,7 @@
   color-scheme: light dark;
   /* Warning text: 4.5:1 or better on the page in either theme. */
   --warn-text: #b3261e;
+  --sky-dot: #1d4ed8;
   font-family: system-ui, sans-serif;
 }
 body {
@@ -489,7 +490,8 @@ table.columns .tag.on {
   background: var(--warn-text);
 }
 .column-strip .dot.sky {
-  background: #3b82f6;
+  background: var(--sky-dot);
+  border-radius: 0; /* square: not told from the round edge dots by colour alone */
 }
 .column-strip figcaption {
   font-size: 0.8em;
@@ -540,6 +542,7 @@ svg.graph {
 @media (prefers-color-scheme: dark) {
   :root {
     --warn-text: #ff7a66;
+    --sky-dot: #7cb4ff;
   }
 }
 .legend {

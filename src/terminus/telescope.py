@@ -137,6 +137,8 @@ def refit(site, doc=None, near=None):
     pockets = {az: c["pockets"] for az, c in load_columns(mask)[1].items() if c.get("pockets")}
     sample = guide.photo_sample(rows, pockets)
     sol = orient.fit(fids, sample, near=near)
+    if sol["window_edge"]:  # the optimum moved past the local window: search it all
+        sol = orient.fit(fids, sample)
     half = orient.yaw_uncertainty(fids, sample, sol, step=2.0)
     res = sol["residuals"]
     cols = [
@@ -170,6 +172,8 @@ def view(site):
     if not doc["columns"]:
         return None
     fit = doc.get("fit")
+    if fit and fit.get("stale"):
+        fit = None  # a failed refit's predecessor: not the fit of these columns
     res = {c["az"]: c["residual"] for c in (fit or {}).get("columns", ())}
     cols = [
         {
@@ -201,8 +205,10 @@ def _refit_near_last(site, doc):
     that would leave the fit under its four columns is refused, not saved."""
     if doc.get("fit") and len(fiducials(doc)) < 4:
         raise ColumnError("that leaves fewer than four columns in the fit; it needs four")
-    save(site, doc)  # the measurement survives a refit that fails
     last = (doc.get("fit") or {}).get("solution")
+    if last:
+        doc["fit"]["stale"] = True  # until the refit replaces it
+    save(site, doc)  # the measurement survives a refit that fails
     if last:
         doc["fit"] = refit(site, doc, near=last)
         save(site, doc)
@@ -301,6 +307,8 @@ def write_orientation(site, path):
     fit = doc.get("fit")
     if not fit:
         raise ColumnError("fit the columns before applying an orientation")
+    if fit.get("stale"):
+        raise ColumnError("the last refit failed; fit the columns again before applying")
     res = {c["az"]: c["residual"] for c in fit["columns"]}
     meta = {
         **fit["solution"],

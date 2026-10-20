@@ -157,7 +157,7 @@ are append-only: never renumber, mark superseded entries rather than deleting th
 - `D-15` A file at a canonical path is not evidence that it is current
 - `D-16` Checkpoint attempts, not successes — and re-judge saved profiles on load
 - `D-17` A tree's horizon is the top of its canopy, when the frames can see it
-- `D-18` In shade the Sun cone shrinks to about 10 deg; it is never lifted
+- `D-18` In shade the Sun cone shrinks to about 10 deg; shade never lifts it
 
 ---
 
@@ -2019,7 +2019,7 @@ The leafy band below it is what the second horizon is for (planning versus actua
 fuzz between). An under-canopy reading (the lowest 50% crossing, under the leaves: 6.39 at az
 330 against a canopy top near 17.5) is a different quantity, not a better one.
 
-### D-18 — In shade the Sun cone shrinks to about 10 deg; it is never lifted
+### D-18 — In shade the Sun cone shrinks to about 10 deg; shade never lifts it
 
 Decided, not yet built: the engine keeps the 30-degree cone in both modes until the
 switch is wired. Devon, 2026-10-07, after a morning in which the 30-degree cone and the mount's horizon

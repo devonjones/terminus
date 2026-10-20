@@ -95,12 +95,27 @@ def test_import_merges_first_wins_and_brings_the_frames(site, tmp_path):
     assert telescope.load(str(site)) == doc
 
 
-def test_a_near_fit_searches_only_near(site):
+def test_a_near_fit_on_its_windows_edge_searches_everything(site):
+    """Seeded at yaw 200 the window holds no answer; its best is on the edge, so the
+    refit searches the whole grid and finds the truth (37) rather than a local fit."""
     azs = [10, 40, 75, 110, 150, 200, 250, 290, 330]
     far = {**NEAR, "yaw": 200.0}
     fit = telescope.refit(str(site), columns(site, measured(site, azs)), near=far)
-    off = abs(((fit["solution"]["yaw"] - 200.0 + 180) % 360) - 180)
-    assert off <= orient.NEAR_YAW_DEG + 2.0  # refinement may creep past the grid; not to 37
+    assert abs(((fit["solution"]["yaw"] - TRUE["yaw"] + 180) % 360) - 180) < 1.0
+
+
+@pytest.mark.parametrize("near, edge", [
+    (NEAR, False),
+    ({**NEAR, "yaw": 200.0}, True),
+    ({**NEAR, "tilt_mag": 9.0}, True),  # truth tilts 2: outside 9 +- NEAR_TILT_DEG
+])  # fmt: skip
+def test_a_near_fit_says_when_its_best_is_on_the_windows_edge(site, near, edge):
+    from terminus.export import load_mask
+
+    alts = measured(site, [10, 40, 75, 110, 150, 200, 250, 290, 330])
+    fids = [orient.Fiducial(az, alt) for az, alt in alts.items()]
+    sample = guide.photo_sample(load_mask(str(site / telescope.PHOTO_MASK))[1])
+    assert orient.fit(fids, sample, near=near)["window_edge"] is edge
 
 
 # ---- the sidecar's routes (the fit itself is stubbed: tested above) --------
@@ -183,6 +198,15 @@ def test_a_full_fit_then_an_edit_refits_near_it(opened):
 def test_an_edit_refuses_what_it_cannot_apply(opened, body):
     s, _ = opened
     assert call(s, "POST", "/site/columns/edit", body)[0] == 400
+
+
+def test_a_frame_name_cannot_climb_out_of_its_column(tmp_path):
+    good = "az090_alt05.25_sky040.jpg"
+    for d in ("az090", "evil"):
+        (tmp_path / telescope.FRAMES / d).mkdir(parents=True)
+        (tmp_path / telescope.FRAMES / d / good).write_bytes(b"x")
+    assert telescope.frame_path(str(tmp_path), 90, good)
+    assert telescope.frame_path(str(tmp_path), 90, f"../evil/{good}") is None
 
 
 def test_a_frame_by_name_and_nothing_else(opened):
@@ -449,3 +473,22 @@ def test_the_columns_command_imports_without_a_config_and_refuses_a_fit_of_three
     with pytest.raises(SystemExit):
         cli.main(["columns", str(site), "--fit"])
     assert "four" in capsys.readouterr().err
+
+
+def test_a_failed_refit_leaves_no_fit_to_apply(site, monkeypatch):
+    doc = columns(site, measured(site, [10, 40, 75, 110, 150]))
+    cols = [{**{k: c[k] for k in ("az", "alt", "method", "included")}, "residual": 0.1}
+            for c in doc["columns"]]  # fmt: skip
+    doc["fit"] = {**FAKE_FIT, "columns": cols}
+    telescope.save(str(site), doc)
+
+    def broken(*a, **k):
+        raise OSError("photo_mask.yaml unreadable")
+
+    monkeypatch.setattr(telescope, "refit", broken)
+    with pytest.raises(OSError):
+        telescope.edit(str(site), 40.0, included=False)
+    assert telescope.load(str(site))["columns"][1]["included"] is False  # the edit kept
+    assert telescope.view(str(site))["fit"] is None
+    with pytest.raises(telescope.ColumnError, match="refit failed"):
+        telescope.write_orientation(str(site), str(site / "o.yaml"))

@@ -80,7 +80,7 @@ def test_a_straight_split_is_found_at_any_angle():
     f = np.zeros((h, w, 3), np.float32)
     f[..., 0] = np.where(side, 10.0, 9.0)  # log brightness: one side e times the other
     s = judge.best_split(f)
-    assert abs(s.angle - 30) <= judge.ANGLE_STEP_DEG and s.contrast(night=True)
+    assert abs(s.angle - 30) <= 3 and s.contrast(night=True)
     assert abs(min(s.frac_a, 1 - s.frac_a) - side.mean().clip(max=1 - side.mean())) < 0.03
 
 
@@ -110,9 +110,12 @@ def test_blocked_above_and_open_below_are_never_the_same_answer():
     assert column_edge(open_) == judge.Edge(38.0, "below")
 
 
-def test_an_unknown_verdict_is_refused_not_read_as_terrain():
-    with pytest.raises(ValueError, match="unknown verdict"):
-        column_edge([(30.0, Verdict("sky", 1.0)), (20.0, Verdict("Edge", 0.4))])
+@pytest.mark.parametrize(
+    "kind, sky", [("Edge", 0.4), ("edge", 1.5), ("sky", 0.0), ("terrain", 1.0), ("edge", -0.1)]
+)
+def test_a_verdict_that_says_nothing_true_is_refused(kind, sky):
+    with pytest.raises(ValueError, match="not a verdict"):
+        Verdict(kind, sky)
 
 
 def _split(left, right):
@@ -135,3 +138,11 @@ def test_at_night_colour_does_not_decide():
     f = _split((7.0, 0.05, 0.4), (7.0, 0.05, 0.4))
     assert judge.judge_features(f, sky_, night=True).kind == "sky"
     assert judge.judge_features(f, sky_, night=False).kind == "terrain"  # by day it would not be
+
+
+def test_at_night_colour_alone_makes_no_edge():
+    """Equal brightness, different colour: an edge by day, not at night."""
+    sky_, wall = (7.0, 0.5, 0.5), (7.0, 0.1, 0.4)
+    f, ref = _split(sky_, wall), np.array(sky_, np.float32)
+    assert judge.judge_features(f, ref, night=False).kind == "edge"
+    assert judge.judge_features(f, ref, night=True).kind != "edge"
