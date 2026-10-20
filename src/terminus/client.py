@@ -34,15 +34,38 @@ class SeestarError(RuntimeError):
     pass
 
 
+def verify_params(key, challenge):
+    """verify_client's params: the challenge signed with the interop key."""
+    sig = key.sign(challenge.encode(), padding.PKCS1v15(), hashes.SHA1())
+    return {"sign": base64.b64encode(sig).decode(), "data": challenge}
+
+
+def _zero(x):
+    return type(x) is int and x == 0  # not False
+
+
+def verified(reply):
+    """9.75 answers code 0 with a key envelope as the result; older firmware, result 0."""
+    if not isinstance(reply, dict):
+        return False
+    code, result = reply.get("code"), reply.get("result")
+    if code is not None and not _zero(code):
+        return False
+    return _zero(result) or (_zero(code) and isinstance(result, dict))
+
+
+def load_key(pem_path):
+    with open(os.path.expanduser(pem_path), "rb") as f:
+        return serialization.load_pem_private_key(
+            f.read(), password=None, backend=default_backend()
+        )
+
+
 class Seestar:
     def __init__(self, host, pem_path):
         self.host = host
-        pem_path = os.path.expanduser(pem_path)
         try:
-            with open(pem_path, "rb") as f:
-                self.key = serialization.load_pem_private_key(
-                    f.read(), password=None, backend=default_backend()
-                )
+            self.key = load_key(pem_path)
         except FileNotFoundError:
             raise SeestarError(
                 f"interop key not found at {pem_path} — see the README for how to extract it"
@@ -152,9 +175,8 @@ class Seestar:
         )
         if not challenge:
             return False
-        sig = self.key.sign(challenge.encode(), padding.PKCS1v15(), hashes.SHA1())
-        vr = self.call("verify_client", {"sign": base64.b64encode(sig).decode(), "data": challenge})
-        return isinstance(vr, dict) and vr.get("result", vr.get("code", -1)) == 0
+        vr = self.call("verify_client", verify_params(self.key, challenge))
+        return verified(vr)
 
     # ---- mount -----------------------------------------------------------
     def equ_coord(self):
