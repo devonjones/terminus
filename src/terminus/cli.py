@@ -2360,7 +2360,14 @@ def cmd_horizon(sc, cfg, args):  # sc, cfg unused: offline
 NEEDS_SCOPE = {"preflight", "point", "classify", "sweep", "park", "unpark"}
 # Offline: no scope, no network, and no config.toml — a user with photographs
 # and no telescope must not be made to write one.
-OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar", "columns"}
+# The exporter takes its settings from the environment and talks to the scope itself.
+OFFLINE = {"mosaic", "reblend", "skymask", "horizon", "export", "polar", "columns", "exporter"}
+
+
+def cmd_exporter(sc, cfg, args):  # sc, cfg unused: it holds its own passive link
+    from .exporter import main_env
+
+    main_env(args)
 
 
 def _is_offline(args):
@@ -2686,6 +2693,9 @@ def main(argv=None):
         "the mask records what the photograph shows. The usable-gap envelope now "
         "lives in `terminus export`, which knows the instrument (terminus-55)",
     )
+    xp = sub.add_parser("exporter", help="serve the scope's state as Prometheus metrics (passive)")
+    xp.add_argument("--host", default=None, help="the scope (default: $SEESTAR_HOST)")
+    xp.add_argument("--port", type=int, default=None, help="listen port (default: 9877)")
     for sp in (sub.choices["preflight"], sub.choices["classify"]):
         sp.add_argument("--dry-run", action="store_true")  # harmless, keeps a uniform namespace
     args = p.parse_args(argv)
@@ -2706,6 +2716,7 @@ def main(argv=None):
         "horizon": cmd_horizon,
         "skymask": cmd_skymask,
         "orient": cmd_orient,
+        "exporter": cmd_exporter,
     }
     try:
         cfg = {} if _is_offline(args) else load_config(args.config)

@@ -1,0 +1,40 @@
+{
+  "overlap_acknowledged": {
+    "error-handling-reviewer": {
+      "overlaps_with": "strategic-fragility-reviewer",
+      "reason": "Language question (is the handler hygienic) versus domain question (does a failure become a measurement); error-handling inlines the deliberate swallows so the two do not both report them."
+    },
+    "secrets-reviewer": {
+      "overlaps_with": "code-reviewer",
+      "reason": "code-reviewer only posts quotable CLAUDE.md rules and clear bugs; secrets owns key material and credentials."
+    },
+    "resource-leak-reviewer": {
+      "overlaps_with": "code-reviewer",
+      "reason": "code-reviewer's generic bug list includes leaks; resource-leak owns the terminus-specific resources."
+    },
+    "test-coverage-reviewer": {
+      "overlaps_with": "pr-test-analyzer",
+      "reason": "pr-test-analyzer judges the quality of tests that exist; test-coverage judges whether a test exists."
+    },
+    "local-api-reviewer": {
+      "overlaps_with": "sun-safety-reviewer",
+      "reason": "Both mention /dev/*: sun-safety owns the guard, local-api owns the exposure."
+    },
+    "external-process-reviewer": {
+      "overlaps_with": "sidecar-lifecycle-reviewer",
+      "reason": "Both touch app/main; sidecar-lifecycle owns the sidecar spawn, startup timeout and stderr, external-process owns other subprocesses."
+    },
+    "test-determinism-reviewer": {
+      "overlaps_with": "pr-test-analyzer",
+      "reason": "Both read tests; test-determinism owns clock/network/order dependence, pr-test-analyzer owns assertions that cannot fail."
+    },
+    "fitting-validation-reviewer": {
+      "overlaps_with": "strategic-fragility-reviewer",
+      "reason": "Both reject plausible wrong numbers; fitting-validation covers fit and estimator logic, strategic-fragility covers failure paths recorded as measurements."
+    }
+  },
+  "bots": {
+    "gemini": false,
+    "cursor": false
+  }
+}

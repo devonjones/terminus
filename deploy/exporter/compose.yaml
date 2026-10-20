@@ -1,0 +1,23 @@
+# Portainer stack for `terminus exporter` on hades. Pin the image to a full commit SHA.
+services:
+  seestar-exporter:
+    image: ghcr.io/devonjones/terminus:<full-commit-sha>
+    restart: unless-stopped
+    environment:
+      SEESTAR_HOST: <scope-ip>
+      # The interop key, mounted read-only; firmware 9.75 sends no device state without it.
+      # The container runs as nobody, so either chown the key to 65534 on the host or
+      # run the service as the key's owner (user: "<uid>:<gid>"). Keep it mode 0400.
+      SEESTAR_PEM: /run/secrets/seestar_client_key.pem
+      POLL_S: "30"
+      ON_DESK_DEG: "10"
+      # The scope allows few control connections and the phone app needs one: connect
+      # for NATIVE_HOLD_S out of every NATIVE_EVERY_S, never hold it all night.
+      NATIVE_HOLD_S: "10"
+      NATIVE_EVERY_S: "60"
+      # Alpaca devices the exporter may set Connected=true on (never the camera).
+      ALPACA_CONNECT: "focuser,switch"
+    volumes:
+      - <host-path>/seestar_client_key.pem:/run/secrets/seestar_client_key.pem:ro
+    ports:
+      - "9877:9877"
