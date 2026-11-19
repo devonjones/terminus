@@ -398,3 +398,49 @@ def test_a_refusal_whose_body_breaks_off_is_still_a_scope_error(scope):
     fake.handle = truncated
     with pytest.raises(SeestarError, match="400"):
         sc.is_eq_mode()
+
+
+def _acts_then_hangs(fake, prop):
+    """The scope takes the command, then the reply never arrives (terminus-a7a)."""
+    orig = fake.handle
+
+    def handle(req, method):
+        out = orig(req, method)
+        return None if req.path.split("?")[0].endswith("/" + prop) else out
+
+    fake.handle = handle
+
+
+@pytest.mark.parametrize("prop, call", [("slewtocoordinatesasync", "goto"), ("park", "park")])
+def test_a_motion_command_that_goes_unanswered_is_not_resent(scope, prop, call):
+    fake, sc = scope
+    _acts_then_hangs(fake, prop)
+    with pytest.raises(SeestarError, match="may have acted"):
+        sc.goto(5.0, 20.0) if call == "goto" else sc.park()
+    assert [p for _, p, _ in fake.puts].count(prop) == 1
+
+
+def test_a_motion_command_refused_by_a_busy_server_is_not_resent(scope):
+    fake, sc = scope
+    orig, sent = fake.handle, []
+
+    def busy(req, method):
+        if req.path.endswith("/park"):
+            sent.append(1)
+            req.send_response(503)
+            req.send_header("Content-Length", "0")
+            req.end_headers()
+            return None
+        return orig(req, method)
+
+    fake.handle = busy
+    with pytest.raises(SeestarError):
+        sc.park()
+    assert sent == [1]
+
+
+def test_a_repeat_safe_put_is_still_retried(scope):
+    fake, sc = scope
+    fake.drop = alpaca.RETRIES - 1
+    sc.abort()
+    assert ("telescope", "abortslew") in [(d, p) for d, p, _ in fake.puts]

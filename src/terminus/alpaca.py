@@ -8,8 +8,9 @@ The Telescope reports EquatorialSystem 1 (JNow): its RA/Dec reproduce its own
 az/alt to 0.003 deg read as JNow, 0.3 deg off read as J2000 (2026-10-06). The
 rest of terminus works in ICRS, so this converts at the boundary.
 
-The server drops requests under load, so every call has a long timeout and
-retries. Measured 2026-10-05: setting Tracking returns 1279 and takes anyway,
+The server drops requests under load, so every call has a long timeout, and
+reads and repeat-safe commands retry (a goto or park is sent once).
+Measured 2026-10-05: setting Tracking returns 1279 and takes anyway,
 and gotos are refused while it is off.
 """
 
@@ -34,6 +35,10 @@ log = logging.getLogger(__name__)
 PORT = 32323
 TIMEOUT_S = 30
 RETRIES = 3
+# PUTs safe to send twice. Anything else (a goto, a park, any new motion) gets
+# one attempt: a PUT that timed out may already be acting, and a retry would move
+# the mount later, after its waypoint's Sun check (LESSONS SAFE-08).
+_RETRYABLE_PUTS = {"connected", "tracking", "abortslew", "startexposure"}
 CLIENT_ID = 7
 
 
@@ -97,9 +102,9 @@ class Alpaca:
         self._put("telescope", "connected", Connected="true")
 
     # ---- transport -------------------------------------------------------
-    def _request(self, req, raw=False):
+    def _request(self, req, raw=False, tries=RETRIES):
         last = None
-        for attempt in range(RETRIES):
+        for attempt in range(tries):
             try:
                 with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
                     body = r.read()
@@ -118,7 +123,12 @@ class Alpaca:
             except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
                 last = e
                 time.sleep(1 + attempt)
-        raise SeestarError(f"Alpaca request failed after {RETRIES} tries: {req.full_url}: {last}")
+        if tries == 1:
+            raise SeestarError(
+                f"Alpaca gave no answer to {req.full_url}: {last}. Not resent, since the "
+                "scope may have acted on it: check where it is pointing before continuing"
+            )
+        raise SeestarError(f"Alpaca request failed after {tries} tries: {req.full_url}: {last}")
 
     def _ids(self):
         return {"ClientID": CLIENT_ID, "ClientTransactionID": next(self._txn)}
@@ -131,7 +141,8 @@ class Alpaca:
     def _put(self, dev, method, check=True, **params):
         data = urllib.parse.urlencode({**params, **self._ids()}).encode()
         d = self._request(
-            urllib.request.Request(f"{self.base}/{dev}/0/{method}", data, method="PUT")
+            urllib.request.Request(f"{self.base}/{dev}/0/{method}", data, method="PUT"),
+            tries=RETRIES if method in _RETRYABLE_PUTS else 1,
         )
         return _check(d, f"{dev}.{method}") if check else d
 
